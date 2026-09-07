@@ -36,7 +36,12 @@ dependencies = [
 # отвечает `no such option: --group`, ни слова не говоря про свою версию.
 # Лечится `python3 -m pip install -U pip` внутри виртуального окружения.
 [dependency-groups]
-dev = ["pytest==9.1.1"]
+# ⚠️ pytest-xdist объявлен здесь, а не ставится руками. Замер 07.09.2026:
+# он стоял только в `.venv` разработчика (`pip install pytest-xdist` 06.09),
+# в этом файле и в `uv.lock` его не было вовсе — то есть `pytest -n auto`,
+# на котором держатся все замеры времени в документации, в свежем клоне
+# не работал. Нашёл первый же прогон CI, ещё до запуска на бегунке.
+dev = ["pytest==9.1.1", "pytest-xdist==3.8.0"]
 # ⚠️ patchelf — не питонья библиотека, а системный инструмент, который Nuitka
 # требует БЕЗУСЛОВНО: без него `--standalone` на Linux отказывается сразу
 # («FATAL: Error, standalone mode on Linux requires 'patchelf' to be installed»),
