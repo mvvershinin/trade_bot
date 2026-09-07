@@ -122,6 +122,7 @@ jobs:
       - name: Пропуски сверки — в сводку прогона
         if: always()
         run: |
+          set -o pipefail
           {
             echo "### Итог прогона pytest"
             echo
