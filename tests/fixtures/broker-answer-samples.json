@@ -1,0 +1,12 @@
+{
+  "подделка": "подделка-для-теста: ни одно значение в этом файле не является действующим доступом; строки собраны вручную по таблицам документации БКС",
+  "пояснение": "Поддельный ответ сервиса авторизации БКС. Все значения выдуманы. Файл нужен тесту, проверяющему, что программа вырезает токен из текста, даже когда его прислал сервер.",
+  "ответ_авторизации": {
+    "access_token": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJGQUtFIn0.QQQQQQQQQQQQ",
+    "refresh_token": "FAKE-unknown-to-registry-0123456789abcdef",
+    "token_type": "bearer",
+    "expires_in": 86400,
+    "scope": "openid profile"
+  },
+  "заголовок_запроса": "Authorization: Bearer FAKE-header-abcdefghijklmnopqrstuvwxyz"
+}
