@@ -182,6 +182,8 @@ jobs:
         shell: bash
     env:
       TERMINAL_VERSION: ${{ needs.version.outputs.version }}
+      # Русский текст в выводе сборочных скриптов против cp1252 на Windows.
+      PYTHONUTF8: '1'
     steps:
       - name: Забрать код
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -221,6 +223,13 @@ jobs:
       # Windows без готового компилятора, а не обходной приём (проверено
       # по документации Nuitka 08.09.2026, живьём на Windows — нет, машины
       # нет). Первый прогон здесь и покажет, сколько именно занимает загрузка.
+      # ⚠️ Замер 08.09.2026, тег v0.1.0: сборка упала за 26 секунд, не начав
+      # компиляцию. `tools/make_icon.py:93` печатает размер иконки строкой
+      # с русской «Б», а Python на бегунке Windows отдаёт stdout в cp1252 —
+      # `UnicodeEncodeError: 'charmap' codec can't encode character '\u0411'`.
+      # Наша сборочная оснастка не работала на Windows потому, что говорит
+      # с человеком по-русски. Режим UTF-8 включается на всё задание: русский
+      # текст печатают и `windows_package.py`, и сам `build.py`.
       - name: Сборка Nuitka (MinGW64)
         run: uv run python tools/build.py
 
