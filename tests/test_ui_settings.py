@@ -27,7 +27,7 @@ from ui.models import (
     ReversalMoment,
     Settings,
 )
-from ui.settings_dialog import SettingsDialog
+from ui.settings_dialog import RULE_NOT_ARRIVED, SettingsDialog
 
 
 @pytest.fixture()
@@ -82,6 +82,30 @@ def make_dialog(qapp, monkeypatch):
 def dialog(make_dialog):
     """Окно настроек с умолчаниями — частый случай строителя выше."""
     return make_dialog()
+
+
+@pytest.fixture()
+def make_window(qapp):
+    """Главное окно с подставным портом: часы остановлены, уборка своя.
+
+    Часы останавливаются здесь, а не в каждом тесте, и это не сокращение:
+    `QTimer` на секунду, оставшийся жить, тикает в чужом цикле событий уже
+    после того, как окно разрушено. Одно место — один способ ошибиться.
+    """
+    built: list[ui.main_window.MainWindow] = []
+
+    def build(port) -> ui.main_window.MainWindow:
+        window = ui.main_window.MainWindow(port=port, sanitize=redact)
+        window._timer.stop()
+        built.append(window)
+        return window
+
+    yield build
+
+    for window in built:
+        window.close()
+        window.deleteLater()
+    settle_qt(qapp)
 
 
 @pytest.fixture()
@@ -660,7 +684,7 @@ def test_apply_reaches_the_subscriber(dialog) -> None:
     assert received[0].volume == 2
 
 
-def test_change_travels_from_window_to_engine(qapp, monkeypatch) -> None:
+def test_change_travels_from_window_to_engine(qapp, monkeypatch, make_window) -> None:
     """Полный путь: окно → диалог → порт. Перезапуска нет.
 
     Диалог подменён на такой, который сразу правит поле и нажимает «Применить»:
@@ -680,20 +704,169 @@ def test_change_travels_from_window_to_engine(qapp, monkeypatch) -> None:
 
     monkeypatch.setattr(ui.main_window, "SettingsDialog", Instant)
     port = RecordingPort()
-    window = ui.main_window.MainWindow(port=port, sanitize=redact)
-    window._timer.stop()
-    try:
-        window.open_settings()
-    finally:
-        window.close()
-        window.deleteLater()
-        qapp.processEvents()
+    window = make_window(port)
+    window.open_settings()
 
     applied = [payload for name, payload in port.calls if name == "apply_settings"]
     assert applied, "настройки не дошли до движка"
     assert applied[-1].average_period == 9
     assert applied[-1].volume == 4
     assert window.settings().average_period == 9
+
+
+# ------------------------------------------------- правило робота словами
+#
+# Ради этого абзаца задача и делается. Сегодня окно показывает «Период
+# средней» и «Порог пересечения» и нигде не говорит, что программа с ними
+# делает: узнать правило можно было только прочитав исходник. Владелец счёта
+# не программист, а решения по этим полям — решения о деньгах.
+
+
+def test_the_rule_paragraph_lives_next_to_the_fields_it_explains(dialog) -> None:
+    """Абзац с правилом — на вкладке «Сигнал», рядом с полями сигнала.
+
+    На чужой вкладке он объяснял бы поля, которых на ней нет, а найти его
+    было бы негде: человек ищет объяснение там, где правит числа.
+    """
+    page = dialog.page_of("Сигнал")
+    assert page is not None, "вкладки «Сигнал» в окне нет вовсе"
+    assert page.isAncestorOf(dialog.rule_note), (
+        "правило робота словами лежит не на вкладке «Сигнал»"
+    )
+
+
+def test_the_window_says_out_loud_that_the_rule_has_not_arrived(dialog) -> None:
+    """Правило не приехало — окно говорит об этом, а не молчит пустым местом.
+
+    Пустая строка под заголовком «Что робот делает с этими настройками»
+    читается как «ничего не делает». Правило 13 `CLAUDE.md`: молчание —
+    самостоятельный дефект.
+    """
+    assert dialog.rule_note.text() == RULE_NOT_ARRIVED
+    assert dialog.rule_note.text().strip(), "под заголовком пусто"
+
+
+def test_the_rule_is_shown_as_it_came(dialog) -> None:
+    """Текст показывается как есть: окно его не сочиняет и не сокращает."""
+    rule = (
+        "На закрытии каждой свечи робот сравнивает цену закрытия со средней.\n\n"
+        "• Закрытие выше EMA(15) — робот хочет быть в лонге."
+    )
+    dialog.set_strategy_rule(rule)
+    assert dialog.rule_note.text() == rule
+    # Пустая строка возвращает честное «не приехало», а не оставляет прежнее:
+    # прежнее правило рядом с новыми настройками — это ложь, а не пробел.
+    dialog.set_strategy_rule("")
+    assert dialog.rule_note.text() == RULE_NOT_ARRIVED
+
+
+def test_the_rule_is_plain_text_not_markup(dialog) -> None:
+    """Разметку окно не угадывает: «<» в тексте съел бы половину абзаца.
+
+    Строка приходит снаружи и собирается торговым модулем. QLabel
+    по умолчанию угадывает разметку, и молча.
+    """
+    from PySide6.QtCore import Qt
+
+    assert dialog.rule_note.textFormat() == Qt.TextFormat.PlainText
+    dialog.set_strategy_rule("закрытие < EMA(15) — шорт")
+    assert "<" in dialog.rule_note.text()
+
+
+def test_the_rule_reaches_the_open_window_from_the_port(
+    qapp, monkeypatch, make_window
+) -> None:
+    """Пункт приёмки: поменял период, нажал «Применить» — абзац изменился.
+
+    Проверяется весь путь окна: главное окно слушает порт, держит открытое
+    окно настроек и перерисовывает абзац по сигналу. Без хранения ссылки
+    на открытое окно человек поменял бы период, нажал «Применить» и продолжал
+    читать описание **прежнего** правила — то есть окно врало бы ровно в том
+    месте, ради которого заведено.
+
+    Мутация, обязанная ронять проверку: убрать `self._settings_dialog`
+    из `MainWindow.open_settings` либо перестать звать `set_strategy_rule`
+    в `_on_strategy_rule`.
+    """
+    class PortThatAnswers(RecordingPort):
+        """Порт, отвечающий на «Применить» новым правилом — как настоящий.
+
+        `HistoryPort.apply_settings` испускает `strategy_rule_changed`
+        синхронно, внутри самой команды: подмена повторяет эту форму,
+        а не придумывает свою.
+        """
+
+        def apply_settings(self, settings: Settings) -> None:
+            super().apply_settings(settings)
+            self.strategy_rule_changed.emit(
+                f"Правило: закрытие выше EMA({settings.average_period}) — лонг."
+            )
+
+    seen: list[str] = []
+
+    class Instant(SettingsDialog):
+        def confirm(self, values) -> bool:
+            return True
+
+        def exec(self) -> int:
+            seen.append(self.rule_note.text())
+            self.average_period.setValue(20)
+            self.buttons.button(QDialogButtonBox.StandardButton.Apply).click()
+            seen.append(self.rule_note.text())
+            return 1
+
+    monkeypatch.setattr(ui.main_window, "SettingsDialog", Instant)
+    port = PortThatAnswers()
+    window = make_window(port)
+    port.strategy_rule_changed.emit("Правило: закрытие выше EMA(15) — лонг.")
+    window.open_settings()
+
+    assert seen[0] == "Правило: закрытие выше EMA(15) — лонг.", (
+        "открытое окно настроек не получило правила, известного главному окну"
+    )
+    assert seen[1] == "Правило: закрытие выше EMA(20) — лонг.", (
+        "после «Применить» абзац остался с прежним правилом"
+    )
+
+
+def test_the_window_does_not_talk_to_the_settings_it_closed(
+    qapp, monkeypatch, make_window
+) -> None:
+    """Закрытому окну настроек новое правило не рассказывают, а следующему — да.
+
+    Ссылка на закрытый диалог, оставленная у главного окна, — это обращение
+    к разрушенному объекту Qt при первом же новом правиле.
+
+    ⚠️ Проверяется **факт обращения**, а не падение, и это замер, а не вкус:
+    исключение из слота Qt наружу из `emit` не выходит — PySide печатает
+    трассировку и продолжает (проверено 08.09.2026). Тест «программа
+    не упала» был бы поэтому вакуумным.
+    """
+    told: list[str] = []
+
+    class Instant(SettingsDialog):
+        def set_strategy_rule(self, text: str) -> None:
+            told.append(text)
+            super().set_strategy_rule(text)
+
+        def exec(self) -> int:
+            return 1
+
+    monkeypatch.setattr(ui.main_window, "SettingsDialog", Instant)
+    port = RecordingPort()
+    window = make_window(port)
+
+    window.open_settings()
+    after_first = len(told)
+    port.strategy_rule_changed.emit("Правило после закрытия окна.")
+    assert len(told) == after_first, (
+        "главное окно рассказало новое правило уже закрытому окну настроек"
+    )
+
+    window.open_settings()
+    assert told[-1] == "Правило после закрытия окна.", (
+        "правило, пришедшее при закрытом окне, не досталось следующему открытию"
+    )
 
 
 def test_tab_order_follows_the_screen(dialog, qapp) -> None:

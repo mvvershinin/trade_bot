@@ -41,6 +41,7 @@ from app.runs import (
     result_note,
     settings_text,
     show_runs,
+    snapshot_marks,
 )
 from backtest import Costs
 from engine import DayMarks, EngineSettings, Mode, PartialCandles, Reversal, TradingWindow
@@ -328,6 +329,63 @@ def test_changing_any_strategy_setting_changes_the_snapshot(name: str) -> None:
     assert settings_text(engine, base, strategy_title="x") != settings_text(
         engine, other, strategy_title="x"
     ), f"настройка модуля `{name}` не видна в снимке"
+
+
+def test_the_snapshot_says_what_the_robot_did_with_those_numbers() -> None:
+    """Снимок прогона несёт не только значения полей, но и **правило словами**.
+
+    Список значений отвечает на вопрос «чем гнали» наполовину: «период 15,
+    порог 0» не говорит, что робот с ними делал. Разбирают прогон через месяц
+    и разбирают именно правило.
+
+    Мутация, обязанная ронять проверку: убрать сборку правила
+    из `app/runs.py::settings_text`.
+    """
+    text = settings_text(
+        EngineSettings(), EmaReverseSettings(), strategy_title="Реверс"
+    )
+    assert "Правило робота словами:" in text, "снимок не называет правило вовсе"
+    assert "Закрытие выше EMA(15) — робот хочет быть в лонге." in text, (
+        "правило записано без утверждений — читать в нём нечего"
+    )
+    assert "EMA(20)" not in text, "в снимке чужие числа"
+
+
+def test_the_rule_in_the_snapshot_follows_the_settings() -> None:
+    """Правило в снимке пересчитывается, а не написано один раз навсегда.
+
+    Записанное однажды и не следящее за настройками, оно было бы хуже
+    отсутствующего: разбор прогона опирался бы на правило чужого прогона.
+    """
+    engine = EngineSettings()
+    twenty = settings_text(
+        engine, EmaReverseSettings(period=20), strategy_title="Реверс"
+    )
+    assert "Закрытие выше EMA(20) — робот хочет быть в лонге." in twenty
+    assert "EMA(15)" not in twenty
+
+
+def test_the_rule_does_not_leak_into_the_marks_of_the_snapshot() -> None:
+    """Абзацы правила — не поля снимка, и читатель их полем не считает.
+
+    `snapshot_marks` считает подписью поля всё, что начинается с отступа
+    и содержит «: ». Отступ в абзаце описания превратил бы предложение
+    в поле — и сверка набора с прогоном (`_made_with`) искала бы это «поле»
+    в чужих записях, то есть перестала бы узнавать свои прогоны.
+    """
+    text = settings_text(
+        EngineSettings(), EmaReverseSettings(), strategy_title="Реверс"
+    )
+    marks = snapshot_marks(text)
+    assert set(marks) == (
+        {title for title in marks if not title.startswith("•")}
+    ), "строка описания попала в подписи полей снимка"
+    assert len(marks) == len(fields(EngineSettings)) + len(
+        fields(EmaReverseSettings)
+    ), (
+        "число подписей снимка изменилось: описание правила перестало быть "
+        f"текстом и стало полем. Подписи: {sorted(marks)}"
+    )
 
 
 def test_the_costs_the_money_was_counted_on_are_written_next_to_it() -> None:

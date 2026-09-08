@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # только для подписи: Qt поднимается после QT_QPA_PLATFORM
     from ui.calendar_dialog import CalendarDialog
+    from ui.settings_dialog import SettingsDialog
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -104,6 +105,12 @@ def main(argv: list[str] | None = None) -> int:
         help="открыть календарь нерабочих дней вместо главного окна",
     )
     parser.add_argument(
+        "--settings",
+        dest="settings",
+        action="store_true",
+        help="открыть окно настроек вместо главного окна",
+    )
+    parser.add_argument(
         "--dark",
         dest="dark",
         action="store_true",
@@ -137,6 +144,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.calendar:
         return _finish(application, _demo_calendar(), args)
 
+    if args.settings:
+        return _finish(application, _demo_settings(), args)
+
     # Та же чистка, что в бою (`app/main.py`): показ не должен отличаться
     # от программы тем, что у него нет предохранителя.
     window = MainWindow(port=DetachedPort(), sanitize=scrub)
@@ -147,6 +157,34 @@ def main(argv: list[str] | None = None) -> int:
     window.set_trades(synthetic.trades(), synthetic.summary())
     window.set_decisions(synthetic.decisions())
     return _finish(application, window, args)
+
+
+def _demo_settings() -> "SettingsDialog":
+    """Окно настроек с правилом робота словами — для снимка и для глаз.
+
+    Правило приходит в окно **готовой строкой** от торгового модуля через
+    порт; здесь порта нет, поэтому строка берётся тем же вызовом, которым
+    её собирает `app/` (`convert.strategy_rule`). Второго текста при этом
+    не появляется: считает его по-прежнему модуль.
+
+    ⚠️ Ключ нужен потому, что `--shot` главного окна снимает **главное**
+    окно, а абзац живёт в модальном диалоге: увидеть глазами, помещается ли
+    он и как переносится, из консоли иначе нечем.
+    """
+    from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
+    from ui.models import Settings  # noqa: PLC0415 — тянет PySide6
+    from ui.settings_dialog import SettingsDialog  # noqa: PLC0415 — тянет PySide6
+
+    values = Settings()
+    dialog = SettingsDialog(values)
+    dialog.set_strategy_rule(convert.strategy_rule(values))
+    # Вкладка «Сигнал» — вторая: снимок обязан открываться на ней, иначе
+    # смотреть было бы не на что.
+    page = dialog.page_of("Сигнал")
+    if page is not None:
+        dialog.tabs.setCurrentWidget(page)
+    dialog.resize(700, 820)
+    return dialog
 
 
 def _demo_calendar() -> CalendarDialog:

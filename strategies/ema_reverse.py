@@ -94,17 +94,27 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from math import isfinite
+from typing import Final
 
 from strategies.average import AverageKind, MovingAverage
-from strategies.contracts import Bar, Decision, Intent, check_bar
+from strategies.contracts import (
+    Bar,
+    Claim,
+    Decision,
+    Description,
+    Intent,
+    check_bar,
+)
 
 __all__ = [
     "OnPriceEqualsAverage",
     "EmaReverseSettings",
     "EmaReverse",
     "DEFAULT_PERIOD",
+    "describe",
 ]
 
 #: Период средней у прототипа. В программу проверки входят ещё 9 и 20 (DOMAIN.md §4).
@@ -599,16 +609,243 @@ def _inside_band(
     )
 
 
+#: Что означает закрытие ровно на средней — намерение и хвост строки журнала.
+#:
+#: Таблица, а не два `if`, и причина не в длине: то же самое соответствие
+#: нужно **описанию правила словами** (`describe`). Написанное дважды, оно
+#: разъехалось бы молча — в окне одно, в решениях робота другое, и поймать
+#: это можно было бы только сравнением руками.
+_ON_EQUAL: Final[dict[OnPriceEqualsAverage, tuple[Intent, str]]] = {
+    OnPriceEqualsAverage.LIKE_PROTOTYPE: (
+        Intent.NONE, "ни входа, ни выхода, как у прототипа"
+    ),
+    OnPriceEqualsAverage.TREAT_AS_LONG: (
+        Intent.LONG, "по настройке считаем сигналом на лонг"
+    ),
+    OnPriceEqualsAverage.TREAT_AS_SHORT: (
+        Intent.SHORT, "по настройке считаем сигналом на шорт"
+    ),
+}
+
+
 def _on_equal(
     setting: OnPriceEqualsAverage, close: float, label: str
 ) -> tuple[Intent, str]:
     """Закрытие ровно на средней — по настройке, а не по знаку сравнения."""
-    head = f"Закрытие {_number(close)} ровно на {label}"
-    if setting is OnPriceEqualsAverage.TREAT_AS_LONG:
-        return Intent.LONG, f"{head} — по настройке считаем сигналом на лонг"
-    if setting is OnPriceEqualsAverage.TREAT_AS_SHORT:
-        return Intent.SHORT, f"{head} — по настройке считаем сигналом на шорт"
-    return Intent.NONE, f"{head} — ни входа, ни выхода, как у прототипа"
+    intent, tail = _ON_EQUAL[setting]
+    return intent, f"Закрытие {_number(close)} ровно на {label} — {tail}"
+
+
+#: Стороны, о которых модуль вообще умеет говорить: подпись, знак и намерение.
+#:
+#: Таблица, а не две почти одинаковые ветки. «Выше» и «ниже» отличаются ровно
+#: знаком; написанные порознь, они однажды разъедутся — в одной поправят слово,
+#: в другой забудут, и описание начнёт врать про одну из двух сторон.
+_SIDES: Final[tuple[tuple[str, float, Intent], ...]] = (
+    ("выше", 1.0, Intent.LONG),
+    ("ниже", -1.0, Intent.SHORT),
+)
+
+#: Во сколько раз закрытие-образец отходит от границы полосы и какую долю
+#: средней добавляет сверх неё.
+#:
+#: ⚠️ Числа не «с запасом на всякий случай», а вычислены. Образец подаётся
+#: модулю, тот **сперва включает его в среднюю** и только потом сравнивает:
+#: средняя успевает шагнуть навстречу образцу. Шаг экспоненциальной средней —
+#: доля `k = 2/(период+1)` расстояния, то есть не больше двух третей при
+#: периоде ≥ 2; простая средняя за один шаг проходит не больше того же.
+#: Условие «образец остался за полосой после шага» сводится к
+#: `m·(1 − k) > (средняя + m)·порог`, и оба множителя ниже его закрывают:
+#: четырёхкратный отход — для крупных порогов, два процента средней — для
+#: нулевого и мелких.
+#:
+#: ⚠️ Период 1 не покрывается ничем и покрыт быть не может: там средняя
+#: **равна** закрытию всегда, ни одно закрытие не бывает выше своей же
+#: средней, и утверждения «выше»/«ниже» становятся невыполнимыми — не
+#: ложными, а недостижимыми. Поле окна начинается с 5 (`ui/settings_dialog.py`),
+#: так что до владельца счёта этот случай не доходит.
+_PROBE_REACH: Final[float] = 4.0
+_PROBE_LIFT: Final[float] = 0.02
+
+
+def _probe(settings: EmaReverseSettings, sign: float) -> Callable[[float], float]:
+    """Закрытие, которое заведомо по нужную сторону полосы. По значению средней.
+
+    Нужно ровно для одного: чтобы описание правила можно было **исполнить** —
+    построить свечу, удовлетворяющую заявленному отношению, подать её модулю
+    и сверить намерение с заявленным (`strategies/contracts.py`, `Claim`).
+    Арифметику полосы знает только модуль, поэтому образец строит он.
+    """
+
+    def probe(average: float) -> float:
+        # `average * (порог / 100)` — то же выражение, что в `_side`, и это
+        # важно: сравнение идёт по нему, а не по «примерно такому же».
+        edge = average * (settings.threshold_percent / 100.0)
+        beyond = max(
+            _PROBE_REACH * abs(edge), abs(average) * _PROBE_LIFT, _PROBE_LIFT
+        )
+        return average + sign * (abs(edge) + beyond)
+
+    return probe
+
+
+def _relation(where: str, *, banded: bool, confirmed: bool) -> str:
+    """Отношение **без чисел** — для списка выбора модуля.
+
+    Чисел здесь нет намеренно, включая число подтверждающих свечей: эта
+    отрисовка показывается до «Применить», когда настройки ещё не приняты,
+    и любое число в ней было бы числом из чужого набора.
+    """
+    band = "полосы вокруг средней" if banded else "средней"
+    head = "несколько закрытий подряд" if confirmed else "закрытие"
+    return f"{head} {where} {band}"
+
+
+def _detail(settings: EmaReverseSettings, where: str) -> str:
+    """То же отношение с нынешними числами — для окна, журнала и снимка."""
+    label = settings.label
+    if settings.threshold_percent > 0:
+        place = f"полосы {_percent(settings.threshold_percent)} вокруг {label}"
+    else:
+        place = label
+    if settings.confirm_bars > 1:
+        return f"{_bars(settings.confirm_bars)} подряд закрылись {where} {place}"
+    return f"закрытие {where} {place}"
+
+
+def _middle_claim(settings: EmaReverseSettings) -> Claim:
+    """Утверждение про середину: полоса при включённом пороге, равенство без него.
+
+    Два случая, а не один, потому что модуль их и различает: при пороге
+    настройка «закрытие ровно на средней» не читается вовсе — равенство лежит
+    внутри полосы по построению, и полоса сильнее (`_inside_band`). Описание
+    обязано повторять это, иначе оно объявит настройку действующей там, где
+    она не действует.
+    """
+    label = settings.label
+    if settings.threshold_percent > 0:
+        return Claim(
+            relation="закрытие внутри полосы вокруг средней",
+            detail=(
+                f"закрытие внутри полосы {_percent(settings.threshold_percent)} "
+                f"вокруг {label}"
+            ),
+            intent=Intent.NONE,
+            probe=lambda average: average,
+        )
+    return Claim(
+        relation="закрытие ровно на средней",
+        detail=f"закрытие ровно на {label}",
+        # Из той же таблицы, по которой модуль и решает (`_ON_EQUAL`):
+        # второе перечисление разъехалось бы с первым молча.
+        intent=_ON_EQUAL[settings.on_equal][0],
+        probe=lambda average: average,
+    )
+
+
+def _warmup_note(settings: EmaReverseSettings) -> str:
+    return (
+        f"Пока свечей с начала показанного отрезка не больше {settings.period}, "
+        "средняя ещё не набрана и сигналов нет вовсе: первое возможное решение "
+        f"— на свече номер {settings.period + 1}."
+    )
+
+
+def _filter_note(settings: EmaReverseSettings) -> str:
+    """Состояние фильтра против пилы и его следствие — словами.
+
+    ⚠️ Оба поля выключены умолчанием, и человек, читающий описание, обязан
+    понимать, что видит поведение **без них**. Поэтому строка есть всегда,
+    в том числе про выключённый фильтр: отсутствие строки читалось бы как
+    «фильтра нет вовсе».
+
+    ⚠️ Следствие включённой полосы названо отдельно и не для красоты: «фильтр
+    против пилы» читается как «меньше входов», а полоса гасит **и выход тоже**
+    (разбор в `_side`). Позиция живёт дольше — это не то, чего ждёт человек,
+    поставивший порог.
+    """
+    band = _percent(settings.threshold_percent)
+    confirm = _bars(settings.confirm_bars)
+    if settings.threshold_percent <= 0 and settings.confirm_bars <= 1:
+        return (
+            f"Фильтр против пилы выключен: полоса {band}, подтверждение "
+            f"{confirm}. Это в точности поведение вашего нынешнего робота — "
+            "сигналом считается любое пересечение средней, каким бы мелким "
+            "оно ни было."
+        )
+    lines = [
+        f"Фильтр против пилы включён: полоса {band} вокруг средней, "
+        f"подтверждение {confirm} подряд по одну сторону."
+    ]
+    if settings.threshold_percent > 0:
+        lines.append(
+            "Полоса гасит и выход тоже: пока обратное закрытие не вышло "
+            "за полосу, выходить не на чем — позиция живёт дольше и может "
+            "дожить до конца торгового окна."
+        )
+    if settings.confirm_bars > 1:
+        lines.append(
+            "Подтверждение задерживает и вход, и выход: пока свечей подряд "
+            "по одну сторону меньше нужного, намерения нет."
+        )
+    return " ".join(lines)
+
+
+#: Обрамляющие фразы, одинаковые при любых настройках.
+#:
+#: ⚠️ Они **рукописные и машиной не проверяются** — исполняется только таблица
+#: утверждений. Названо вслух, чтобы следующий не принял зелёный прогон
+#: за проверку этих двух абзацев.
+_REVERSAL_NOTE: Final[str] = (
+    "Отдельного сигнала «выйти» у этого алгоритма нет: система реверсная, "
+    "выходом служит противоположный сигнал — поэтому робот всё время держит "
+    "сторону рынка, а роль стоп-лосса играет переворот."
+)
+_BOUNDARY_NOTE: Final[str] = (
+    "Это всё, что решает алгоритм. Войдёт ли робот на самом деле — решают "
+    "общие настройки: торговое окно, режим работы, тейк-профит, объём "
+    "и предохранители. Любая из них может отменить любое намерение выше."
+)
+
+
+def describe(settings: EmaReverseSettings) -> Description:
+    """Как модуль принимает решение — словами, с нынешними числами.
+
+    Собирается из таблицы утверждений, а не пишется руками: разбор приёма
+    и цена отказа от него — в `strategies/contracts.py`, класс `Claim`.
+
+    ⚠️ Результатов на истории здесь нет и не будет. Замер 06.09.2026 (убыток
+    на независимом периоде) — отчёт о результатах; описание рассказывает
+    правило. Смешать их значит превратить объяснение в обещание.
+    """
+    banded = settings.threshold_percent > 0
+    confirmed = settings.confirm_bars > 1
+    claims = tuple(
+        Claim(
+            relation=_relation(where, banded=banded, confirmed=confirmed),
+            detail=_detail(settings, where),
+            intent=intent,
+            probe=_probe(settings, sign),
+            bars=settings.confirm_bars,
+        )
+        for where, sign, intent in _SIDES
+    )
+    return Description(
+        title=EmaReverse.title,
+        lead=(
+            "На закрытии каждой свечи робот сравнивает цену закрытия этой же "
+            f"свечи со скользящей средней. Средняя: {settings.kind.label}, "
+            f"период {settings.period} свечей, считается по ценам закрытия; "
+            f"дальше в тексте она обозначена {settings.label}."
+        ),
+        claims=(*claims, _middle_claim(settings)),
+        notes=(
+            _REVERSAL_NOTE,
+            _warmup_note(settings),
+            _filter_note(settings),
+            _BOUNDARY_NOTE,
+        ),
+    )
 
 
 def _number(value: float) -> str:

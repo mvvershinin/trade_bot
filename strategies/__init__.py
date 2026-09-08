@@ -26,22 +26,50 @@
 * решение по незакрытой свече;
 * появление объёма, комиссии, окна, тейка или брокера в любом виде;
 * средняя, посчитанная не по закрытиям или не по всему поданному ряду.
+
+Какие модули существуют — знает `strategies/registry.py`
+--------------------------------------------------------
+Модуль сменный, и выбор живёт в настройках (ТЗ §4.8). Список того, из чего
+выбирают, лежит **одной таблицей** в `strategies/registry.py`: запись на модуль,
+в ней `id`, название, класс настроек, сборка, соответствие полей общим
+настройкам программы и описание правила словами. Больше нигде в программе
+имён торговых модулей быть не должно — движок работает через порт `Strategy`.
+
+⛔ Реестр собирается **явными импортами**. `importlib`, обход пакета `pkgutil`
+и точки входа здесь запрещены: Nuitka линкует то, что видит статически,
+и собранная программа получила бы пустой список модулей при полностью зелёном
+прогоне тестов из исходников.
 """
 
+from strategies import registry
 from strategies.average import AverageKind, MovingAverage, average_series
-from strategies.contracts import Bar, Decision, Intent, Strategy, check_bar
+from strategies.contracts import (
+    Bar,
+    Claim,
+    Decision,
+    Description,
+    Intent,
+    Strategy,
+    check_bar,
+)
 from strategies.ema_reverse import (
     DEFAULT_PERIOD,
     EmaReverse,
     EmaReverseSettings,
     OnPriceEqualsAverage,
 )
+from strategies.registry import DEFAULT_ID, StrategyEntry, UnknownStrategy
 
 __all__ = [
     "Bar",
     "Intent",
     "Decision",
     "Strategy",
+    # Описание правила словами: таблица утверждений (`Claim`) и три отрисовки
+    # из неё (`Description`). Собирает описание сам модуль — текст принадлежит
+    # тому, кто его посчитал; `app/` только перекладывает готовую строку в окно.
+    "Claim",
+    "Description",
     "check_bar",
     "AverageKind",
     "MovingAverage",
@@ -50,4 +78,11 @@ __all__ = [
     "EmaReverseSettings",
     "OnPriceEqualsAverage",
     "DEFAULT_PERIOD",
+    # Реестр берётся модулем целиком (`registry.find(...)`, `registry.entries()`),
+    # а не россыпью коротких имён: `find` и `entries` в общем пространстве имён
+    # пакета не говорят, чего именно они ищут.
+    "registry",
+    "StrategyEntry",
+    "UnknownStrategy",
+    "DEFAULT_ID",
 ]

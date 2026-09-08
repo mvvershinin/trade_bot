@@ -81,6 +81,7 @@ class TerminalPort(QObject):
     decisions_replaced = Signal(object)   # tuple[DecisionRow, ...]
     decision_appended = Signal(object)    # DecisionRow
     settings_applied = Signal(object)     # Settings — эхо движка, а не наше
+    strategy_rule_changed = Signal(str)   # правило робота словами, с числами
     busy_changed = Signal(bool, str)      # идёт длинная операция, что именно
     progress_changed = Signal(int, str)   # 0…100, подпись
     failed = Signal(str)                  # человеческая фраза, не код ошибки
@@ -163,7 +164,14 @@ class TerminalPort(QObject):
         self._not_connected("Применение настроек")
 
     def request_settings(self) -> None:
-        """Попросить текущие настройки. Ответ придёт сигналом `settings_applied`."""
+        """Попросить текущие настройки.
+
+        Ответ приходит **двумя** сигналами: `settings_applied` — значения
+        полей, `strategy_rule_changed` — правило робота словами, с этими же
+        числами. Второй нужен потому, что правило считает торговый модуль,
+        а окно торговых слоёв не импортирует (ARCHITECTURE.md §2): текст
+        принадлежит тому, кто его посчитал, окно его только показывает.
+        """
         self._not_connected("Чтение настроек")
 
     def request_chart(self, instrument: str, timeframe: str) -> None:

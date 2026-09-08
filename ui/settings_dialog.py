@@ -75,6 +75,16 @@ from ui.wheel_guard import guard_wheel
 
 TIMEFRAMES = ("1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "День")
 
+#: Что стоит в поле описания, пока правило не пришло от торгового модуля.
+#:
+#: Пустое место под заголовком «Что робот делает с этими настройками»
+#: читалось бы как «ничего не делает» — а это окно, открытое без торговой
+#: части (снимок экрана, разбор журнала) либо не доехавший сигнал.
+RULE_NOT_ARRIVED = (
+    "Правило робота словами сюда ещё не пришло: окно открыто без торговой "
+    "части либо движок не успел ответить. Настройки ниже при этом настоящие."
+)
+
 #: Раскладка окна по вкладкам: заголовок и строители групп на нём.
 #:
 #: Порядок вкладок — порядок работы с ними: сначала «чем торгуем и на чём»,
@@ -82,7 +92,11 @@ TIMEFRAMES = ("1 минута", "5 минут", "15 минут", "30 минут"
 #: и в конце настройки самой программы.
 _TAB_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Инструмент и данные", ("_instrument_group", "_point_group")),
-    ("Сигнал", ("_signal_group", "_filter_group")),
+    # ⚠️ Правило словами стоит **первым** на вкладке, до полей. Человек,
+    # открывший «Сигнал», читает сперва, что робот делает, и только потом
+    # правит числа. Ниже полей этот абзац дочитывали бы уже после того,
+    # как поменяли период.
+    ("Сигнал", ("_rule_group", "_signal_group", "_filter_group")),
     ("Вход и выход", ("_entry_group", "_take_group")),
     ("Торговое окно", ("_time_group",)),
     ("Деньги", ("_volume_group", "_risk_group", "_commission_group")),
@@ -433,6 +447,7 @@ class SettingsDialog(QDialog):
         self._build_cost_fields()
         self._build_time_fields()
         self._build_risk_fields()
+        self._build_rule_field()
 
     def _build_instrument_fields(self) -> None:
         """Инструмент, размер свечи и две глубины — загрузки и показа."""
@@ -688,6 +703,27 @@ class SettingsDialog(QDialog):
         self.guards_note = QLabel()
         self.guards_note.setWordWrap(True)
 
+    def _build_rule_field(self) -> None:
+        """Поле «что робот делает с этими настройками» — правило словами.
+
+        Текст приходит **готовым** от торгового модуля через порт
+        (`strategy_rule_changed`): окно торговых слоёв не импортирует
+        и правило посчитать не может (ARCHITECTURE.md §2). Написанный здесь
+        руками абзац разошёлся бы с кодом при первой правке модуля —
+        и разошёлся бы молча, текст не падает.
+        """
+        self.rule_note = QLabel(RULE_NOT_ARRIVED)
+        self.rule_note.setWordWrap(True)
+        # ⚠️ Простой текст, а не разметка: в описании есть «•» и «—», а завтра
+        # может появиться «<». QLabel по умолчанию угадывает разметку и съел бы
+        # половину абзаца молча.
+        self.rule_note.setTextFormat(Qt.TextFormat.PlainText)
+        # Абзац читают и переносят в переписку: выделение мышью тут уместно,
+        # а поле ввода на его месте выглядело бы редактируемым.
+        self.rule_note.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+
     def _notice(self) -> QLabel:
         label = QLabel(
             "Значения в полях — отправная точка, а не рекомендация. Тейк 0,5% "
@@ -776,6 +812,25 @@ class SettingsDialog(QDialog):
         layout = box.layout()
         if isinstance(layout, QFormLayout):
             layout.addRow(self.point_note)
+        return box
+
+    def _rule_group(self) -> QGroupBox:
+        """Правило робота словами — то, ради чего человек сюда и заходит.
+
+        Сегодня окно показывает «Период средней» и «Порог пересечения»
+        и нигде не говорит, что программа с ними делает: узнать это можно
+        было только прочитав исходник. Владелец счёта не программист,
+        а решения по этим полям — решения о деньгах.
+        """
+        box = QGroupBox("Что робот делает с этими настройками")
+        form = QFormLayout(box)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.addRow(self.rule_note)
+        form.addRow(_hint(
+            "Текст собирает сам алгоритм по применённым настройкам, "
+            "а не окно. Поправили поля ниже — описание обновится "
+            "после «Применить»."
+        ))
         return box
 
     def _signal_group(self) -> QGroupBox:
@@ -1042,6 +1097,15 @@ class SettingsDialog(QDialog):
             scroll.setFrameShape(QFrame.Shape.NoFrame)
             tabs.addTab(scroll, title)
         return tabs
+
+    def set_strategy_rule(self, text: str) -> None:
+        """Показать правило робота словами. Пустая строка — сказать, что его нет.
+
+        ⚠️ Молчание здесь запрещено правилом 13 `CLAUDE.md`: пустое место
+        под заголовком «Что робот делает с этими настройками» читается как
+        «ничего не делает». Не доехавший текст обязан назвать себя не доехавшим.
+        """
+        self.rule_note.setText(text.strip() or RULE_NOT_ARRIVED)
 
     def page_of(self, tab: str) -> QWidget | None:
         """Страница вкладки по её заголовку. `None` — такой вкладки нет.

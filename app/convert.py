@@ -67,6 +67,7 @@ from market import TradeSide as StoredTradeSide
 from strategies import AverageKind as StrategyAverageKind
 from strategies import EmaReverseSettings
 from strategies import OnPriceEqualsAverage as StrategyOnEqual
+from strategies import registry
 from ui.backend import SettingsDiff
 from ui.formatting import (
     fmt_datetime,
@@ -111,6 +112,9 @@ __all__ = [
     "instrument_of",
     "engine_settings",
     "strategy_settings",
+    "strategy_rule",
+    "rule_of",
+    "rule_headline_of",
     "run_costs",
     "window_changes",
     "guard_changes",
@@ -579,6 +583,49 @@ def strategy_settings(values: Settings) -> EmaReverseSettings:
     if not values.filter_enabled:
         fields.update(_FILTER_OFF)
     return EmaReverseSettings(**fields)
+
+
+# ---------------------------------------------------------------------------
+# Правило робота словами: единственная дорога описания из модуля в окно
+# ---------------------------------------------------------------------------
+#
+# ⚠️ `ui/` не импортирует `strategies/` и не будет: окно берёт у торговых
+# слоёв готовые значения, а не считает торговое (ARCHITECTURE.md §2).
+# Описание правила — такая же готовая строка, как `backtest.headline`:
+# собирает её тот, кто знает правило, а сборка только перекладывает.
+#
+# ⚠️ Три функции, а не одна, потому что читателя три и им нужно разное:
+# окно и снимок прогона читают абзацами, журнал решений — таблица, и
+# многострочный абзац в ней не читается. Все три отрисовки собираются
+# из **одной** таблицы утверждений модуля, поэтому разойтись между собой
+# они не могут (`strategies/contracts.py`, `Description`).
+
+
+def rule_of(module: EmaReverseSettings) -> str:
+    """Правило торгового модуля словами, абзацами, с нынешними числами.
+
+    Настройки **модуля** на входе, а не окна: то же описание нужно снимку
+    настроек прогона (`app/runs.py::settings_text`), а туда доезжают уже
+    переведённые настройки, окна там нет.
+    """
+    return registry.default_entry().description(module).full()
+
+
+def rule_headline_of(module: EmaReverseSettings) -> str:
+    """То же правило одной строкой — для журнала решений."""
+    return registry.default_entry().description(module).headline()
+
+
+def strategy_rule(values: Settings) -> str:
+    """Настройки окна → правило робота словами. То, что читает человек.
+
+    ⚠️ Считается по **применённым** настройкам, а не по тому, что стоит
+    в полях: пока «Применить» не нажато, робот работает по прежним, и
+    описание, дорисованное на каждый щелчок, обещало бы поведение, которого
+    сейчас нет. Дорисовывать его в окне значило бы завести вторую сборку
+    настроек модуля рядом с этой — и разошлись бы они молча.
+    """
+    return rule_of(strategy_settings(values))
 
 
 def run_costs(values: Settings) -> Costs:

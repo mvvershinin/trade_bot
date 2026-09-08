@@ -1191,7 +1191,18 @@ class HistoryPort(TerminalPort):
 
         changes = convert.window_changes(self._values, settings)
         changes += fresh.changes_from(self._engine_settings)
-        changes += module.changes_from(convert.strategy_settings(self._values))
+        rule_changed = module.changes_from(convert.strategy_settings(self._values))
+        changes += rule_changed
+        if rule_changed:
+            # ⚠️ Одной строкой мало: «Период средней: 15 → 20» говорит, что
+            # поменяли, и не говорит, каким стало **правило**. Через месяц
+            # разбирают именно правило — «почему в тот день робот повёл себя
+            # иначе», — а восстанавливать его из чисел по памяти некому.
+            # Строка собрана из той же таблицы утверждений, что и решения
+            # модуля, поэтому разойтись с ними не может.
+            changes.append(
+                f"Правило теперь читается так — {convert.rule_headline_of(module)}"
+            )
         guards = convert.guard_changes(self._values, settings)
         self._values = settings
         self._engine_settings = fresh
@@ -1202,6 +1213,7 @@ class HistoryPort(TerminalPort):
             # знает, на что подписан сейчас, а порт этого не знает.
             self._retarget(convert.instrument_of(settings.instrument))
         self._send(self.settings_applied, settings)
+        self._send(self.strategy_rule_changed, convert.rule_of(module))
         if guards:
             self.note(
                 "Предохранители изменены",
@@ -1217,7 +1229,19 @@ class HistoryPort(TerminalPort):
         self._apply("Настройки изменены", reason)
 
     def request_settings(self) -> None:
+        """Текущие настройки и текущее правило робота словами.
+
+        Два сигнала, а не один: правило `ui/` посчитать не может — окно
+        не импортирует торговые слои (ARCHITECTURE.md §2). Отправляется оно
+        **вместе** с настройками и здесь, и при их применении: окно, спросившее
+        настройки при открытии, иначе показывало бы поля без объяснения,
+        что робот с ними делает, до первого «Применить».
+        """
         self._send(self.settings_applied, self._values)
+        self._send(
+            self.strategy_rule_changed,
+            convert.strategy_rule(self._values),
+        )
 
     def request_chart(self, instrument: str, timeframe: str) -> None:
         self.apply_settings(self._values.replace(instrument=instrument, timeframe=timeframe))

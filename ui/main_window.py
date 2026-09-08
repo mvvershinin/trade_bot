@@ -425,6 +425,10 @@ class MainWindow(QMainWindow):
         self._settings = settings or Settings()
         self._sanitize = sanitize
         self._state = RobotState()
+        #: Правило робота словами и открытое окно настроек — разбор обоих
+        #: в `_on_strategy_rule` и `open_settings`.
+        self._strategy_rule = ""
+        self._settings_dialog: SettingsDialog | None = None
         #: Окно собрано целиком. Сторож для `changeEvent`: событие палитры
         #: приходит и в середине сборки, а `apply_theme()` трогает график
         #: и журналы — их в этот момент ещё нет.
@@ -434,17 +438,7 @@ class MainWindow(QMainWindow):
         self.resize(1360, 900)
 
         self.status_panel = StatusPanel()
-        # Порядок плашек — порядок срочности. Остановка сверху: пока робот
-        # остановлен, всё остальное вторично.
-        self.halt_banner = _Banner()
-        self.stuck_banner = _Banner()
-        self.token_banner = _Banner()
-        self.mode_banner = _Banner()
-        #: Плашка «показан прогон на истории». Живые свечи на закреплённый
-        #: отрезок не приходят вовсе, и без этой строки застывший график
-        #: неотличим от потерянной связи (`app/port.py::_Span`).
-        self.history_banner = _Banner(on_close=self.show_recent_data,
-                                      close_hint=UNPIN_HINT)
+        self._build_banners()
         #: Полоска идущего прогона. `None` — прогон не запрашивали.
         self._progress: QProgressDialog | None = None
         self.chart = ChartPanel()
@@ -492,6 +486,22 @@ class MainWindow(QMainWindow):
         self._tick()
         # Последняя строка сборки — и именно её проверяет `changeEvent`.
         self._ready = True
+
+    def _build_banners(self) -> None:
+        """Пять плашек над графиком. Порядок объявления — порядок срочности.
+
+        Остановка сверху: пока робот остановлен, всё остальное вторично.
+        Порядок на экране задаётся раскладкой ниже и повторяет этот.
+        """
+        self.halt_banner = _Banner()
+        self.stuck_banner = _Banner()
+        self.token_banner = _Banner()
+        self.mode_banner = _Banner()
+        #: Плашка «показан прогон на истории». Живые свечи на закреплённый
+        #: отрезок не приходят вовсе, и без этой строки застывший график
+        #: неотличим от потерянной связи (`app/port.py::_Span`).
+        self.history_banner = _Banner(on_close=self.show_recent_data,
+                                      close_hint=UNPIN_HINT)
 
     # --------------------------------------------------------------- сборка
 
@@ -723,6 +733,7 @@ class MainWindow(QMainWindow):
         port.decisions_replaced.connect(self.journals.set_decisions)
         port.decision_appended.connect(self.journals.append_decision)
         port.settings_applied.connect(self._on_settings_echo)
+        port.strategy_rule_changed.connect(self._on_strategy_rule)
         port.failed.connect(self.show_error)
         port.stuck_changed.connect(self.show_stuck)
         port.busy_changed.connect(self._on_busy)
@@ -1093,11 +1104,23 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def open_settings(self) -> None:
+        """Окно настроек. Правило робота словами едет в него вместе с полями.
+
+        ⚠️ Ссылка на открытое окно держится, пока оно открыто, и не ради
+        удобства: «Применить» уходит движку, движок отвечает новым правилом,
+        и обновить абзац на экране некому, если окно потеряно. Человек
+        поменял бы период, нажал «Применить» и продолжал читать описание
+        прежнего правила — то есть окно врало бы ровно в том месте,
+        ради которого заведено.
+        """
         dialog = SettingsDialog(self._settings, self)
         dialog.settings_changed.connect(self._on_settings_changed)
+        dialog.set_strategy_rule(self._strategy_rule)
+        self._settings_dialog = dialog
         try:
             dialog.exec()
         finally:
+            self._settings_dialog = None
             # ⚠️ Без этого диалог живёт до конца работы программы: родителем
             # ему назначено окно, а окно не закрывается. Каждое открытие
             # настроек оставляло за собой ещё одну копию — вместе с полями,
@@ -1500,6 +1523,19 @@ class MainWindow(QMainWindow):
 
     def _on_settings_echo(self, settings: Settings) -> None:
         self._settings = settings
+
+    def _on_strategy_rule(self, rule: str) -> None:
+        """Правило робота словами — от торгового модуля через порт.
+
+        Хранится здесь, потому что окно настроек открывается позже сигнала:
+        спросить правило заново некому — порт отвечает событиями, а не
+        возвратом значения. Пустая строка означает «ещё не приходило»,
+        и окно настроек скажет об этом само, а не покажет пустое место
+        (`ui/settings_dialog.py::RULE_NOT_ARRIVED`).
+        """
+        self._strategy_rule = rule
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_strategy_rule(rule)
 
     def settings(self) -> Settings:
         return self._settings

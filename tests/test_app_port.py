@@ -141,6 +141,8 @@ class Recorded:
         self.busy: list[tuple[bool, str]] = []
         self.progress: list[tuple[int, str]] = []
         self.settings: list[Settings] = []
+        #: Правило робота словами — каждое, что порт отправил в окно.
+        self.rules: list[str] = []
         #: Строки журнала по одной, как они появлялись. Нужны там, где до
         #: полной публикации журнала дело не доходит: `decisions_replaced`
         #: отправляется в конце прохода, а строка об изменении настройки
@@ -162,6 +164,7 @@ class Recorded:
         port.busy_changed.connect(lambda on, what: self.busy.append((on, what)))
         port.progress_changed.connect(lambda p, what: self.progress.append((p, what)))
         port.settings_applied.connect(self.settings.append)
+        port.strategy_rule_changed.connect(self.rules.append)
 
 
 async def _run(port: HistoryPort, worker: MarketWorker | None = None) -> None:
@@ -426,6 +429,119 @@ def test_changing_the_mode_changes_the_deals(loop, database) -> None:
     before, after = loop.run_until_complete(go())
     assert before > 0
     assert after == 0, "в режиме «Выключен» сделок быть не может"
+
+
+def test_the_new_rule_in_words_reaches_the_journal(loop, database) -> None:
+    """Сменили период — в журнале и число, и **правило целиком** новыми словами.
+
+    Строка «Период средней: 15 → 20» говорит, что поменяли, и не говорит,
+    каким стало правило. Разбирают через месяц именно правило — «почему
+    в тот день робот повёл себя иначе», — а восстанавливать его из чисел
+    по памяти некому.
+
+    Мутация, обязанная ронять проверку: убрать `changes.append(...)`
+    с `rule_headline_of` в `HistoryPort.apply_settings`.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        recorded = Recorded(port)
+        try:
+            await _run(port)
+            port.apply_settings(Settings().replace(average_period=20))
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return recorded
+
+    recorded = loop.run_until_complete(go())
+    said = [
+        row.reason
+        for row in recorded.appended
+        if getattr(row, "event", "") == "Настройки изменены"
+    ]
+    assert said, "изменение настроек не попало в журнал"
+    told = said[-1]
+    assert "Период средней: 15 → 20" in told, "прежнего и нового значения нет"
+    assert "Правило теперь читается так" in told, (
+        "журнал назвал изменившееся число и не назвал получившееся правило"
+    )
+    assert "EMA(20)" in told, "правило в журнале осталось с прежним периодом"
+    assert "EMA(15)" not in told.split("Правило теперь читается так")[1], (
+        "в новом правиле стоит прежняя средняя"
+    )
+
+
+def test_a_change_that_does_not_touch_the_module_says_nothing_about_the_rule(
+    loop, database
+) -> None:
+    """Объём поменяли — правило не изменилось, и строки про него нет.
+
+    Строка про правило на **каждое** изменение настроек превратила бы журнал
+    в стену повторов, и читать его перестали бы целиком.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        recorded = Recorded(port)
+        try:
+            await _run(port)
+            port.apply_settings(Settings().replace(volume=2))
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return recorded
+
+    recorded = loop.run_until_complete(go())
+    said = [
+        row.reason
+        for row in recorded.appended
+        if getattr(row, "event", "") == "Настройки изменены"
+    ]
+    assert said, "изменение настроек не попало в журнал"
+    assert "Правило теперь читается так" not in said[-1]
+
+
+def test_the_rule_in_words_reaches_the_window(loop, database) -> None:
+    """Правило словами уезжает в окно вместе с настройками, и с новыми числами.
+
+    Окно посчитать его не может: `ui/` не импортирует торговые слои
+    (ARCHITECTURE.md §2). Значит текст обязан приехать готовым — и приехать
+    **и по запросу настроек, и после их применения**: окно, спросившее
+    настройки при открытии, иначе показывало бы поля без объяснения,
+    что робот с ними делает.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        recorded = Recorded(port)
+        try:
+            await _run(port)
+            port.request_settings()
+            asked = list(recorded.rules)
+            port.apply_settings(Settings().replace(average_period=20))
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return asked, recorded
+
+    asked, recorded = loop.run_until_complete(go())
+    assert asked, "на запрос настроек правило словами не пришло"
+    assert "EMA(15)" in asked[-1], "правило пришло без нынешних чисел"
+    assert recorded.rules[-1] != asked[-1], "после «Применить» правило не обновилось"
+    assert "EMA(20)" in recorded.rules[-1], "в правиле остался прежний период"
+    assert "робот хочет быть в лонге" in recorded.rules[-1], (
+        "правило приехало без утверждений — показывать человеку нечего"
+    )
 
 
 def test_a_settings_change_writes_a_line_in_the_journal(loop, database) -> None:
