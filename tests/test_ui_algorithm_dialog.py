@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 from helpers import settle_qt
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QDialogButtonBox, QLabel
 
 from ui.algorithm_dialog import (
     ALONE_NOTE,
@@ -197,6 +197,80 @@ def test_an_empty_catalogue_says_it_did_not_arrive(make_choice) -> None:
     said = [label.text() for label in window.findChildren(QLabel)]
     assert EMPTY_NOTE in said
     assert not window.details_button.isEnabled()
+
+
+def test_an_empty_catalogue_does_not_order_a_choice_that_cannot_be_made(
+    make_choice,
+) -> None:
+    """Тупик: окно велело выбрать из списка, которого нет. Так больше нельзя.
+
+    Владелец счёта 09.09.2026 прочитал в этом окне дословно: «Сейчас
+    в настройках стоит алгоритм „ema_reverse“, а в этой сборке его нет.
+    Выберите один из списка — иначе робот работать не сможет», — при пустом
+    списке. Указание, которое невозможно выполнить, хуже молчания: молчание
+    заставляет искать, а такое указание заставляет искать не там.
+
+    Проверяется **три** вещи разом, и все три — про выход из тупика:
+    требования выбора нет; названо, что сейчас в настройках; «ОК» выключен,
+    потому что принимать нечего.
+
+    Мутация, обязанная ронять проверку: убрать развилку по `self._options`
+    из `_show_summary` — прежний текст вернётся дословно.
+    """
+    window = make_choice()
+    window.set_chosen("ema_reverse")
+    said = window.summary.text()
+    assert "Выберите один из списка" not in said, (
+        f"окно снова требует выбрать из пустого списка: {said!r}"
+    )
+    assert "ema_reverse" in said, (
+        "окно не сказало, какой алгоритм стоит в настройках сейчас"
+    )
+    accept = window.buttons.button(QDialogButtonBox.StandardButton.Ok)
+    assert not accept.isEnabled(), (
+        "«ОК» при пустом списке жмётся и не делает ничего — нажатие, "
+        "после которого не происходит и не говорится ничего"
+    )
+    assert "Отменой" in accept.toolTip(), (
+        "выключенный «ОК» не говорит, как выйти из окна"
+    )
+
+
+def test_a_missing_algorithm_in_a_real_catalogue_still_asks_for_a_choice(
+    make_choice,
+) -> None:
+    """Канарейка предыдущей: список есть — указание выбрать из него уместно.
+
+    Без этой проверки развилку можно было бы «починить», убрав требование
+    выбора вообще, — и человек с устаревшим файлом настроек остался бы
+    без единственного действия, которое ему помогает.
+    """
+    window = make_choice(FIRST)
+    window.set_chosen("atr_channel")
+    said = window.summary.text()
+    assert "Выберите один из списка" in said, (
+        f"список есть, а выбрать из него окно не предлагает: {said!r}"
+    )
+    assert window.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled(), (
+        "«ОК» выключен там, где выбрать есть из чего"
+    )
+
+
+def test_an_empty_catalogue_says_what_to_do_next(make_choice) -> None:
+    """Мало сказать «списка нет» — надо сказать, что делать. Правило 13.
+
+    Выход из этого окна ровно один — «Отмена», и он назван; дальше названо
+    и то, чем список можно получить. Прежняя редакция обрывалась на «выбрать
+    сейчас не из чего», и следующий шаг человек искал сам.
+    """
+    window = make_choice()
+    said = [label.text() for label in window.findChildren(QLabel)]
+    assert any("Отменой" in text for text in said), (
+        "окно не сказало, как из него выйти, ничего не сломав"
+    )
+    assert any("перезапустите программу" in text for text in said), (
+        "окно не сказало, чем добыть список"
+    )
 
 
 # ------------------------------------------------------------- «Подробнее»

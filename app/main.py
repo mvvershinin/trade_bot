@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import os
 import pathlib
@@ -56,14 +57,49 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # ⚠️ только для подписей: настоящие импорты слоёв идут
     # внутри `_run`, после того как выставлены QT_API и QT_QPA_PLATFORM.
     # Наверху они подняли бы Qt при разборе ключей и при `--help`.
+    from PySide6.QtGui import QPixmap
+    from PySide6.QtWidgets import QApplication
+
     from app.live_feed import LiveLink
     from app.logs import LogSetup
     from app.port import HistoryPort
     from app.settings_store import Loaded, SettingsStore
     from market import MarketWorker
+    from ui.main_window import MainWindow
     from ui.models import DecisionLevel, Settings
 
 __all__ = ["main"]
+
+def _shot_wish(args: argparse.Namespace) -> "_Shot":
+    """Ключи командной строки → просьба о снимке. Одна строка в главной корутине.
+
+    Отдельной функцией, а не сборкой на месте: главная корутина стоит вплотную
+    к пределу длины (`tests/test_function_size.py`), и разбор ключей — не то,
+    ради чего читают сборку программы.
+    """
+    return _Shot(pathlib.Path(args.snapshot), args.shot_of, args.shot_tab)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Shot:
+    """Просьба о снимке: куда сохранить, что снять и какую вкладку показать.
+
+    Одной вещью, а не тремя аргументами подряд: три строки в подписи легко
+    переставить местами, и перепутанные «что» и «куда» дали бы файл с именем
+    вкладки. Заодно это одно место, где видно, из чего просьба состоит.
+    """
+
+    target: pathlib.Path
+    what: str = "window"
+    tab: str = ""
+
+
+#: Пауза перед снимком открытого окна, миллисекунды.
+#:
+#: Не «на всякий случай»: `exec()` начинает свой цикл событий, и первому же
+#: таймеру в нём достаётся окно, которое Qt ещё не разложил. Снимок вышел бы
+#: с недорисованными полями — то есть картинкой, по которой ничего не проверишь.
+_SHOT_PAUSE_MS = 250
 
 log = logging.getLogger(__name__)
 
@@ -127,10 +163,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         prog="python3 -m app.main",
         description="«Терминал» — прогон робота по истории из базы свечей.",
     )
-    parser.add_argument(
-        "--shot", dest="snapshot", metavar="FILE",
-        help="сохранить вид окна в файл и выйти (работает на машине без экрана)",
-    )
+    _add_shot_arguments(parser)
     parser.add_argument(
         "--db", dest="database", metavar="FILE",
         help="файл базы свечей; по умолчанию — тот, что назначен market/paths.py",
@@ -180,7 +213,44 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     )
     _add_journal_arguments(parser)
     _add_fetch_arguments(parser)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if (args.shot_of != "window" or args.shot_tab) and not args.snapshot:
+        # Отказ вслух, а не молчаливое «ключ ничего не сделал». Ключ без
+        # `--shot` — это просьба снять окно, которую некуда сохранить.
+        parser.error(
+            "ключи --shot-of и --shot-tab работают только вместе с --shot: "
+            "снимок некуда сохранить"
+        )
+    return args
+
+
+def _add_shot_arguments(parser: argparse.ArgumentParser) -> None:
+    """Ключи снимка экрана. Отдельной функцией — как журнал и загрузка.
+
+    ⚠️ `--shot-of` заведён по цене дефекта. Снимки окна выбора алгоритма
+    делались `tools/demo.py`, где каталог подаётся диалогу прямо в конструктор:
+    настоящая дорога — порт, сигнал, окно — снимком не проверялась ни разу,
+    и пустой список дожил до владельца счёта 09.09.2026. Правило 12
+    `CLAUDE.md`: проверка идёт тем путём, которым пойдёт человек.
+    """
+    parser.add_argument(
+        "--shot", dest="snapshot", metavar="FILE",
+        help="сохранить вид окна в файл и выйти (работает на машине без экрана)",
+    )
+    parser.add_argument(
+        "--shot-of", dest="shot_of", default="window", metavar="WHAT",
+        choices=("window", "settings", "algorithm"),
+        help="что именно снимать ключом --shot: window — главное окно "
+             "(по умолчанию), settings — окно настроек, algorithm — окно "
+             "выбора торгового алгоритма. Окна при этом открываются тем же "
+             "путём, каким их открывает человек: щелчком по кнопке настоящей "
+             "программы, а не постройкой диалога вручную",
+    )
+    parser.add_argument(
+        "--shot-tab", dest="shot_tab", default="", metavar="NAME",
+        help="какую вкладку окна настроек показать на снимке, например "
+             "«Сигнал». Без ключа снимается та, что открылась",
+    )
 
 
 def _add_journal_arguments(parser: argparse.ArgumentParser) -> None:
@@ -596,7 +666,7 @@ async def _run(
         window.show()
         live = _live_feed(port, worker, database.parent, values, args)
         if args.snapshot:
-            return await _snapshot(application, window, port, pathlib.Path(args.snapshot))
+            return await _snapshot(application, window, port, _shot_wish(args))
         await closed.wait()
         return 0
     finally:
@@ -859,27 +929,108 @@ def _unreadable(database: pathlib.Path, error: Exception) -> str:
     )
 
 
-async def _snapshot(application, window, port, target: pathlib.Path) -> int:
-    """Сохранить вид окна в файл. Работает на машине без экрана."""
+async def _snapshot(
+    application: QApplication, window: MainWindow, port: HistoryPort, shot: _Shot
+) -> int:
+    """Сохранить вид окна в файл. Работает на машине без экрана.
+
+    ⚠️ `_Shot.what` снимает не только главное окно, и заведён он по цене дефекта.
+    Пустой список алгоритмов и указание «выберите один из списка», выбирать
+    в котором было не из чего, дожили до владельца счёта 09.09.2026 потому,
+    что проверялись снимками из `tools/demo.py`, **где каталог подаётся
+    диалогу прямо в конструктор**. Настоящая дорога — порт, сигнал, окно —
+    снимком не проверялась ни разу. Правило 12 `CLAUDE.md`: проверка идёт
+    тем путём, которым пойдёт человек.
+    """
     await port.wait()
     # Прогон рассылает сигналы; окну надо дать их разобрать и разложить
     # виджеты, иначе снимок получится с недорисованным графиком.
     for _ in range(3):
         application.processEvents()
         await asyncio.sleep(0)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    shot.target.parent.mkdir(parents=True, exist_ok=True)
+    picture = window.grab() if shot.what == "window" else _shot_of_dialog(
+        application, window, shot.what, tab=shot.tab
+    )
+    if picture is None:
+        print(
+            f"не удалось снять окно «{shot.what}»: программа его не открыла. "
+            "Если это окно выбора алгоритма — вероятнее всего кнопка выбора "
+            "выключена, потому что каталог алгоритмов до окна не доехал",
+            file=sys.stderr,
+        )
+        return 1
     # Результат `save()` обязателен к проверке: он возвращает False молча —
     # например, когда по расширению не удалось понять формат. Отчёт,
     # сообщающий «сохранено» там, где файла нет, хуже отсутствующего.
-    if not window.grab().save(str(target)):
+    if not picture.save(str(shot.target)):
         print(
-            f"не удалось сохранить снимок в {target}. Проверьте расширение "
+            f"не удалось сохранить снимок в {shot.target}. Проверьте расширение "
             "файла (.png) и права на каталог",
             file=sys.stderr,
         )
         return 1
-    print(f"снимок сохранён: {target.resolve()}")
+    print(f"снимок сохранён: {shot.target.resolve()}")
     return 0
+
+
+def _shot_of_dialog(
+    application: QApplication, window: MainWindow, what: str, *, tab: str = ""
+) -> QPixmap | None:
+    """Снимок окна, которое программа открывает **сама**, а не мы за неё.
+
+    Ни один диалог здесь не строится. Открывается настоящее окно настроек
+    (`MainWindow.open_settings`), а окно выбора — **щелчком по той самой
+    кнопке**, которую жмёт человек. Поэтому снимок доказывает и то, что
+    каталог доехал, и то, что кнопка не выключена: выключенная `click()`
+    не срабатывает вовсе (`QAbstractButton::click` выходит на неактивной
+    кнопке), окно не откроется, и снимка не будет — отказом, а не пустой
+    картинкой.
+
+    Возврат `None` означает «окно не открылось», и молчать об этом нельзя:
+    файл, сохранённый с главным окном вместо запрошенного, — это ровно тот
+    подложный снимок, из-за которого дефект и дожил до владельца счёта.
+
+    ⚠️ Работа идёт таймерами, потому что `exec()` крутит **свой** цикл
+    событий: изнутри него до нас управление не вернётся, и снять окно можно
+    только тем, что исполнится в этом же цикле.
+    """
+    from PySide6.QtCore import QTimer  # noqa: PLC0415 — слои Qt после QT_API
+
+    from ui.settings_dialog import SettingsDialog  # noqa: PLC0415 — то же
+
+    taken: list[QPixmap] = []
+
+    def take_the_topmost() -> None:
+        """Снять самое верхнее модальное окно и закрыть его."""
+        top = application.activeModalWidget()
+        if top is None:
+            return
+        taken.append(top.grab())
+        top.close()
+
+    def inside_the_settings() -> None:
+        """Мы внутри цикла окна настроек: снять его либо пойти глубже.
+
+        ⚠️ Проверка типа — не про подписи. Наверху могло оказаться не то
+        окно (предупреждение, подтверждение), и снимок такого под именем
+        «настройки» был бы подлогом того же рода, что и снимок из демонстрации.
+        """
+        dialog = application.activeModalWidget()
+        if not isinstance(dialog, SettingsDialog):
+            return
+        if tab and (page := dialog.page_of(tab)) is not None:
+            dialog.tabs.setCurrentWidget(page)
+        if what == "algorithm":
+            QTimer.singleShot(_SHOT_PAUSE_MS, take_the_topmost)
+            dialog.algorithm_button.click()
+        else:
+            taken.append(dialog.grab())
+        dialog.close()
+
+    QTimer.singleShot(_SHOT_PAUSE_MS, inside_the_settings)
+    window.open_settings()
+    return taken[0] if taken else None
 
 
 def _on_interrupt(closed: asyncio.Event) -> None:

@@ -952,6 +952,102 @@ def test_the_catalogue_reaches_the_open_window_from_the_port(
     )
 
 
+def test_the_window_asks_the_port_for_the_catalogue_when_settings_open(
+    qapp, monkeypatch, make_window
+) -> None:
+    """Каталог доезжает до окна настроек **без** «Применить» — потому что спросили.
+
+    Пункт приёмки, пойманный на владельце счёта 09.09.2026: он запустил
+    программу, открыл настройки и увидел `ema_reverse` вместо названия,
+    пустой список выбора и указание выбрать из пустоты. Причина — вызова
+    `request_settings` не было ни в одной строке продуктового кода: каталог
+    уезжал в окно только из `apply_settings`, то есть после первого
+    «Применить».
+
+    ⚠️ Каталог здесь **никто не подаёт руками**: ни `set_algorithms`
+    на диалоге, ни `algorithms_changed.emit` до открытия. Он приходит ровно
+    так, как приходит у настоящего порта, — ответом на просьбу окна. Прежняя
+    проверка подавала его прямо в конструктор диалога и потому зеленела при
+    полностью отсутствующей проводке.
+
+    Мутация, обязанная ронять проверку: снять `self.port.request_settings()`
+    из `MainWindow.open_settings`.
+    """
+    class PortWithACatalogue(RecordingPort):
+        """Порт, отвечающий на просьбу двумя сигналами — как `HistoryPort`.
+
+        Форма ответа списана с `app/port.py::HistoryPort.request_settings`:
+        сперва значения полей, следом каталог. Синхронно, в самом вызове.
+        """
+
+        def request_settings(self) -> None:
+            self.calls.append(("request_settings", None))
+            self.settings_applied.emit(Settings())
+            self.algorithms_changed.emit((AlgorithmOption(
+                id="ema_reverse",
+                title="Реверс по скользящей средней",
+                summary="Закрытие выше средней — лонг.",
+                details="Правило абзацами.",
+                chosen=True,
+            ),))
+
+    seen: dict[str, object] = {}
+
+    class Instant(SettingsDialog):
+        def exec(self) -> int:
+            seen["name"] = self.algorithm_name.text()
+            seen["note"] = self.algorithm_note.text()
+            seen["button"] = self.algorithm_button.isEnabled()
+            return 0
+
+    monkeypatch.setattr(ui.main_window, "SettingsDialog", Instant)
+    port = PortWithACatalogue()
+    window = make_window(port)
+    window.open_settings()
+
+    assert ("request_settings", None) in port.calls, (
+        "окно открыло настройки, ни о чём не спросив порт: каталог взяться "
+        "неоткуда"
+    )
+    assert seen["name"] == "Реверс по скользящей средней", (
+        f"на вкладке стоит {seen.get('name')!r} вместо названия алгоритма"
+    )
+    assert not seen["note"], (
+        f"рядом с исправным названием осталась строка беды: {seen.get('note')!r}"
+    )
+    assert seen["button"], "кнопка выбора выключена при пришедшем каталоге"
+
+
+def test_the_choose_button_is_off_while_there_is_nothing_to_choose(dialog) -> None:
+    """Каталог не пришёл — кнопка выбора выключена, и сказано почему.
+
+    Владелец счёта 09.09.2026 нажал её при пустом каталоге и получил окно
+    с пустым списком и требованием выбрать из него. Кнопка, ведущая в тупик,
+    обязана быть выключена **с объяснением**, а не отказывать после нажатия
+    (§6 брифа окна, тот же случай, что «Старт» на токене «только чтение»).
+
+    Мутация, обязанная ронять проверку: убрать `setEnabled` из
+    `_show_algorithm` либо вернуть кнопке одну подсказку на оба случая.
+    """
+    assert not dialog.algorithm_button.isEnabled(), (
+        "кнопка выбора жмётся при пустом каталоге и ведёт в пустое окно"
+    )
+    assert "выключена" in dialog.algorithm_button.toolTip(), (
+        "выключенная кнопка не говорит, почему она выключена"
+    )
+    assert "перезапустите программу" in dialog.algorithm_note.text(), (
+        "окно сказало, что списка нет, и не сказало, что с этим делать"
+    )
+
+    dialog.set_algorithms((_option(),))
+    assert dialog.algorithm_button.isEnabled(), (
+        "каталог приехал, а кнопка выбора осталась выключенной"
+    )
+    assert "Подробнее" in dialog.algorithm_button.toolTip(), (
+        "на живой кнопке осталась подсказка про выключенную"
+    )
+
+
 def test_the_window_does_not_talk_to_the_settings_it_closed(
     qapp, monkeypatch, make_window
 ) -> None:

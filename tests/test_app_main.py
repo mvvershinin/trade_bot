@@ -231,6 +231,57 @@ def test_the_two_palette_keys_refuse_to_stand_together() -> None:
         _arguments(["--light", "--dark"])
 
 
+def test_the_shot_keys_refuse_to_work_without_a_shot() -> None:
+    """`--shot-of` и `--shot-tab` без `--shot` — отказ вслух, а не «ничего».
+
+    Ключ, который молча ничего не делает, — это полчаса поиска причины,
+    по которой снимок «не изменился». Правило 13 `CLAUDE.md`.
+    """
+    from app.main import _arguments
+
+    with pytest.raises(SystemExit):
+        _arguments(["--shot-of", "settings"])
+    with pytest.raises(SystemExit):
+        _arguments(["--shot-tab", "Сигнал"])
+    # Канарейка: вместе с `--shot` те же ключи обязаны разбираться молча.
+    args = _arguments(["--shot", "x.png", "--shot-of", "algorithm"])
+    assert args.shot_of == "algorithm"
+
+
+@pytest.mark.slow
+def test_the_program_opens_its_own_algorithm_window_and_it_is_not_empty(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Каталог алгоритмов доезжает до окна выбора в **настоящей** программе.
+
+    ⚠️ Это проверка проводки, а не картинки, и она про правило 12 `CLAUDE.md`.
+    Прежние снимки этого окна делались `tools/demo.py`, где каталог подаётся
+    диалогу прямо в конструктор: настоящая дорога — порт, сигнал, окно —
+    не проверялась ничем, и владелец счёта 09.09.2026 получил пустой список.
+
+    Окно здесь открывает сама программа, а окно выбора — **щелчок по той
+    самой кнопке** (`app/main.py::_shot_of_dialog`). Кнопка выключена, когда
+    каталог не доехал, а `QAbstractButton::click()` на выключенной кнопке
+    не делает ничего: окно не откроется, снимка не будет, программа выйдет
+    кодом 1 и скажет почему. Поэтому существующий файл — доказательство того,
+    что каталог доехал.
+
+    Мутация, обязанная ронять проверку: снять `self.port.request_settings()`
+    из `MainWindow.open_settings`.
+    """
+    shot = tmp_path / "algorithm.png"
+    outcome = _run(
+        "--db", str(_database(tmp_path / "candles.sqlite3")),
+        "--shot", str(shot), "--shot-of", "algorithm",
+    )
+    assert outcome.returncode == 0, (
+        "программа не смогла открыть своё же окно выбора алгоритма:\n"
+        + outcome.stdout + outcome.stderr
+    )
+    assert shot.exists(), outcome.stdout + outcome.stderr
+    assert shot.stat().st_size > 3000, "снимок подозрительно мал — окно пустое?"
+
+
 # ------------------------------------------------ собранная поставка
 
 def test_a_built_program_does_not_advise_a_python_that_is_not_there() -> None:

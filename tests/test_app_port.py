@@ -557,6 +557,77 @@ def test_the_catalogue_of_algorithms_reaches_the_window(loop, database) -> None:
     )
 
 
+def test_the_settings_window_names_the_algorithm_before_any_apply(
+    loop, database, monkeypatch
+) -> None:
+    """Настоящая дорога целиком: порт → сигнал → окно настроек. Без «Применить».
+
+    ⚠️ Это тот путь, которым идёт человек, и именно он не проверялся ничем.
+    Соседняя проверка выше зовёт `port.request_settings()` руками и потому
+    зеленела при полностью отсутствующей проводке: из продуктового кода этот
+    метод не вызывался **ни разу**, каталог уезжал в окно только из
+    `apply_settings`. Владелец счёта 09.09.2026 открыл настройки сразу после
+    запуска и увидел `ema_reverse` вместо названия и пустой список выбора.
+
+    Здесь подменён единственный кусок — `exec()` окна настроек: модальный
+    цикл в прогоне ждал бы человека вечно. Всё остальное настоящее: порт,
+    реестр алгоритмов, сборка каталога, само окно настроек и его вкладка.
+
+    Мутация, обязанная ронять проверку: снять `self.port.request_settings()`
+    из `MainWindow.open_settings`.
+    """
+    from ui.main_window import MainWindow
+    from ui.settings_dialog import SettingsDialog
+
+    seen: dict[str, object] = {}
+
+    def instead_of_exec(dialog: SettingsDialog) -> int:
+        """Снять с окна то, что увидел бы человек, и закрыть его."""
+        seen["name"] = dialog.algorithm_name.text()
+        seen["note"] = dialog.algorithm_note.text()
+        seen["button"] = dialog.algorithm_button.isEnabled()
+        seen["rows"] = len(dialog._algorithms)  # noqa: SLF001 — состав каталога
+        return 0
+
+    monkeypatch.setattr(SettingsDialog, "exec", instead_of_exec)
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        window = MainWindow(port=port, settings=Settings(), sanitize=redact)
+        window._timer.stop()  # noqa: SLF001 — часы в тесте только мешают
+        try:
+            window.open_settings()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return window
+
+    window = loop.run_until_complete(go())
+    try:
+        assert seen, "окно настроек не открылось — проверять нечего"
+        assert seen["rows"] == len(registry.entries()), (
+            "до окна доехал не весь реестр алгоритмов: "
+            f"{seen['rows']} из {len(registry.entries())}"
+        )
+        assert seen["name"] != Settings().strategy_id, (
+            "на вкладке снова стоит имя латиницей вместо названия алгоритма"
+        )
+        assert seen["name"] == registry.default_entry().title, (
+            f"название не то, что в реестре: {seen['name']!r}"
+        )
+        assert not seen["note"], (
+            f"рядом с названием осталась строка беды: {seen['note']!r}"
+        )
+        assert seen["button"], (
+            "кнопка выбора алгоритма выключена при живом каталоге"
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+
+
 def test_a_settings_change_writes_a_line_in_the_journal(loop, database) -> None:
     """Список изменений даёт движок, а не окно и не порт."""
 
