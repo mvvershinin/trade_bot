@@ -13,6 +13,18 @@ r"""Собрать из результата Nuitka то, что отдаётс�
    Это папка с настройками и, возможно, с файлом токена: попасть в артефакт
    поставки она не имеет права ни при каких условиях.
 3. Кладёт рядом `README.txt` и `Запустить.bat` — чек-лист DESKTOP-2026 §3.
+4. Архивирует `dist/Terminal` в `dist/Terminal-{версия}-windows-x86_64.zip` —
+   это то, что релизный workflow (`.github/workflows/release.yml`) кладёт
+   в Releases. Версия — из `TERMINAL_VERSION` (тот же механизм и то же
+   умолчание "0.1.0", что в `tools/build.py`; см. его докстринг про то,
+   почему это НЕ версия из заголовка окна и не там правится).
+
+   ⚠️ Архив — через `shutil.make_archive`/`zipfile` из стандартной
+   библиотеки, не через внешний `7z`. Замер 08.09.2026: `7-Zip` **не
+   гарантированно предустановлен** на `windows-latest` (issue
+   actions/runner-images#9361, снят из части образов) — здесь его нет
+   и не будет ни при каких условиях, чтобы это не превратилось во второй
+   сюрприз про Windows-раннер вдобавок к MinGW.
 
 Про кодировки, потому что на них тут всё и ломается
 ---------------------------------------------------
@@ -33,6 +45,7 @@ r"""Собрать из результата Nuitka то, что отдаётс�
 
 from __future__ import annotations
 
+import os
 import pathlib
 import shutil
 import sys
@@ -40,6 +53,10 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "build" / "main.dist"
 TARGET = ROOT / "dist" / "Terminal"
+
+#: Тот же механизм и то же умолчание, что `tools/build.py::APP_VERSION` —
+#: релизный workflow ставит переменную окружения один раз на оба шага.
+APP_VERSION = os.environ.get("TERMINAL_VERSION", "0.1.0")
 
 README = """\
 «Терминал» — программа автоматической торговли на Московской бирже
@@ -187,6 +204,24 @@ def package() -> int:
     files = [p for p in TARGET.rglob("*") if p.is_file()]
     total = sum(p.stat().st_size for p in files)
     print(f"{TARGET}: {len(files)} файлов, {total} Б = {total / 1024 / 1024:.0f} МБ")
+
+    # zipfile стандартной библиотеки, не внешний `7z`: на `windows-latest`
+    # 7-Zip больше не гарантирован (actions/runner-images#9361, замер
+    # 08.09.2026) — заводить зависимость от инструмента, которого может
+    # не быть на раннере, ради последнего шага сборки бессмысленно.
+    #
+    # ⚠️ Путь собирается строкой, а не `Path.with_suffix(".zip")`: версия
+    # вида "0.1.0" сама содержит точки, и `with_suffix` меняет не то —
+    # отрезает от ПОСЛЕДНЕЙ точки во всём имени, а не добавляет ".zip"
+    # в конец. Найдено прогоном 08.09.2026: `shutil.make_archive` создавал
+    # файл правильно, а следующая строка падала на несуществующем
+    # "Terminal-0.1.zip" при чтении размера для отчёта.
+    archive_base = ROOT / "dist" / f"Terminal-{APP_VERSION}-windows-x86_64"
+    archive = pathlib.Path(f"{archive_base}.zip")
+    if archive.exists():
+        archive.unlink()
+    shutil.make_archive(str(archive_base), "zip", root_dir=TARGET.parent, base_dir=TARGET.name)
+    print(f"{archive}: {archive.stat().st_size / 1024 / 1024:.0f} МБ")
     return 0
 
 
