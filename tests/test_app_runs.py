@@ -28,7 +28,7 @@ import pytest
 
 os.environ.setdefault("QT_API", "pyside6")  # до первого импорта qasync
 
-from app import convert
+from app import convert, runs
 from app.port import HistoryPort
 from app.runs import (
     _COSTS_TITLES,
@@ -58,7 +58,13 @@ from market import (
     build_bars,
 )
 from market.journal import SECRET_MASK, redact
-from strategies import AverageKind, EmaReverse, EmaReverseSettings, OnPriceEqualsAverage
+from strategies import (
+    AverageKind,
+    EmaReverse,
+    EmaReverseSettings,
+    OnPriceEqualsAverage,
+    registry,
+)
 from ui.models import RunOrigin as WindowOrigin
 from ui.models import Settings
 
@@ -728,3 +734,37 @@ def test_a_field_of_the_record_is_never_left_empty() -> None:
     for field in dataclasses.fields(SessionRecord):
         value = getattr(record, field.name)
         assert value not in ("", None), f"колонка `{field.name}` осталась пустой"
+
+
+# ---------------------------------------------------------------------------
+# Выбранный алгоритм в снимке прогона
+# ---------------------------------------------------------------------------
+
+
+def test_the_snapshot_names_the_algorithm_that_was_chosen() -> None:
+    """Снимок называет **выбранный** алгоритм, а не тот, который был первым.
+
+    Через месяц разбирают по снимку, чем гнали прогон. Название, вписанное
+    константой на месте вызова, осталось бы прежним после смены алгоритма —
+    и снимок называл бы не то, чем считали.
+
+    Мутация, обязанная ронять проверку: вернуть в `snapshot_of` константу
+    вместо `convert.strategy_title(values)`.
+    """
+    text = runs.snapshot_of(Settings())
+    assert f"Торговый алгоритм: {registry.default_entry().title}" in text, (
+        "снимок не называет выбранный алгоритм"
+    )
+
+
+def test_the_snapshot_title_comes_from_the_registry_by_the_chosen_name() -> None:
+    """Название берётся у реестра по имени из настроек, а не пишется в `app/`.
+
+    ⚠️ Незнакомое имя показывается как есть — и это не мягкость: снимок пишут
+    в базу, и запись, упавшая из-за незнакомого имени, унесла бы с собой
+    условия прогона целиком.
+    """
+    assert convert.strategy_title(Settings()) == registry.default_entry().title
+    assert convert.strategy_title(
+        Settings().replace(strategy_id="atr_channel")
+    ) == "atr_channel"

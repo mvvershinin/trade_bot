@@ -82,7 +82,7 @@ from market import (
     default_db_path,
     userdata_dir,
 )
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import EmaReverseSettings
 from ui import backend
 from ui.backend import RunStats, TemplateRun
 from ui.formatting import fmt_datetime, fmt_money, fmt_share
@@ -288,10 +288,11 @@ def settings_text(
     из тех же чисел, расходятся невозможным образом: описание строится
     из той же таблицы утверждений, что и решения модуля.
 
-    ⚠️ Правило берётся у **модуля по умолчанию**, пока модуль в программе
-    один. Выпадающий список появится вместе с `Settings.strategy_id` (З4
-    миниплана `strategy-modules-switchable.md`), и тогда сюда придёт запись
-    реестра целиком — вместо отдельно переданного `strategy_title`.
+    ⚠️ Название алгоритма приходит **доводом**, а правило собирается по его
+    настройкам. Разъехаться они не могут только потому, что название берётся
+    у реестра по выбранному имени (`convert.strategy_title`), а не пишется
+    константой на месте вызова: константа осталась бы прежней после смены
+    алгоритма, и снимок назвал бы не то, чем гнали прогон.
 
     ⚠️ Абзацы правила пишутся **без отступа** намеренно: `snapshot_marks`
     считает подписью поля всё, что начинается с отступа и содержит «: ».
@@ -300,7 +301,9 @@ def settings_text(
     записях.
     """
     lines = _block("Настройки движка", engine, _ENGINE_TITLES)
-    lines += _block(f"Торговый модуль: {strategy_title}", strategy, _STRATEGY_TITLES)
+    lines += _block(
+        f"Торговый алгоритм: {strategy_title}", strategy, _STRATEGY_TITLES
+    )
     lines += ["", "Правило робота словами:"]
     lines += convert.rule_of(strategy).splitlines()
     return "\n".join(lines)
@@ -574,7 +577,9 @@ def snapshot_of(values: Settings) -> str:
     """
     engine = convert.engine_settings(values, _SNAPSHOT_MODE)
     module = convert.strategy_settings(values)
-    return settings_text(engine, module, strategy_title=EmaReverse.title)
+    return settings_text(
+        engine, module, strategy_title=convert.strategy_title(values)
+    )
 
 
 def snapshot_marks(text: str) -> dict[str, str]:
@@ -755,7 +760,7 @@ def session_lines(session: JournalSession) -> list[str]:
         f"{_STEP}Начат:   {fmt_datetime(session.started_at)} МСК",
         f"{_STEP}Окончен: {ended}",
         f"{_STEP}Инструмент: {session.symbol or '—'}, {session.timeframe or '—'}",
-        f"{_STEP}Торговый модуль: {session.strategy or '—'}",
+        f"{_STEP}Торговый алгоритм: {session.strategy or '—'}",
         f"{_STEP}Версия программы: {session.app_version or '—'}",
     ]
     if session.note:

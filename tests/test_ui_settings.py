@@ -14,20 +14,22 @@ from datetime import date, time
 from pathlib import Path
 
 import pytest
-from PySide6.QtWidgets import QDialogButtonBox, QLabel
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel
 
 import ui.main_window
+import ui.settings_dialog
 from helpers import RecordingPort, settle_qt
 from market import redact
 from ui.models import (
     AfterTakeProfit,
+    AlgorithmOption,
     AverageKind,
     CalendarDay,
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
 )
-from ui.settings_dialog import RULE_NOT_ARRIVED, SettingsDialog
+from ui.settings_dialog import CATALOGUE_NOT_ARRIVED, SettingsDialog
 
 
 @pytest.fixture()
@@ -714,93 +716,208 @@ def test_change_travels_from_window_to_engine(qapp, monkeypatch, make_window) ->
     assert window.settings().average_period == 9
 
 
-# ------------------------------------------------- правило робота словами
+# ------------------------------------------- выбранный алгоритм и его окно
 #
-# Ради этого абзаца задача и делается. Сегодня окно показывает «Период
-# средней» и «Порог пересечения» и нигде не говорит, что программа с ними
-# делает: узнать правило можно было только прочитав исходник. Владелец счёта
-# не программист, а решения по этим полям — решения о деньгах.
+# На вкладке «Сигнал» стоит **строка**, а не абзац. До 08.09.2026 здесь было
+# полное описание правила: 391 точка при умолчаниях, 459 при включённом
+# фильтре против пилы — половина вкладки, поля средней уходили под прокрутку.
+# Описание переехало в отдельное окно (`tests/test_ui_algorithm_dialog.py`),
+# здесь проверяется то, что осталось: название, кнопка и обмен значением.
 
 
-def test_the_rule_paragraph_lives_next_to_the_fields_it_explains(dialog) -> None:
-    """Абзац с правилом — на вкладке «Сигнал», рядом с полями сигнала.
+def _option(
+    strategy_id: str = "ema_reverse",
+    title: str = "Реверс по средней",
+    *,
+    chosen: bool = True,
+) -> AlgorithmOption:
+    """Строка каталога для проверки. Тексты подставные и это намеренно.
 
-    На чужой вкладке он объяснял бы поля, которых на ней нет, а найти его
-    было бы негде: человек ищет объяснение там, где правит числа.
+    Настоящие собирает сам алгоритм (`strategies/`), и проверяются они там же.
+    Окно обязано показывать пришедшее как есть, каким бы оно ни было.
+    """
+    return AlgorithmOption(
+        id=strategy_id,
+        title=title,
+        summary=f"{title}: закрытие выше средней — робот хочет быть в лонге.",
+        details=f"{title}. Правило абзацами.\n\n• Закрытие выше средней — лонг.",
+        chosen=chosen,
+    )
+
+
+def test_the_algorithm_row_lives_on_the_signal_tab(dialog) -> None:
+    """Название алгоритма и кнопка выбора — на вкладке «Сигнал», над полями.
+
+    На чужой вкладке они объясняли бы поля, которых на ней нет: человек ищет
+    ответ «чьи это настройки» там, где правит числа.
     """
     page = dialog.page_of("Сигнал")
     assert page is not None, "вкладки «Сигнал» в окне нет вовсе"
-    assert page.isAncestorOf(dialog.rule_note), (
-        "правило робота словами лежит не на вкладке «Сигнал»"
+    assert page.isAncestorOf(dialog.algorithm_name), (
+        "название алгоритма лежит не на вкладке «Сигнал»"
+    )
+    assert page.isAncestorOf(dialog.algorithm_button), (
+        "кнопка выбора алгоритма лежит не на вкладке «Сигнал»"
     )
 
 
-def test_the_window_says_out_loud_that_the_rule_has_not_arrived(dialog) -> None:
-    """Правило не приехало — окно говорит об этом, а не молчит пустым местом.
+def test_the_signal_tab_keeps_a_line_and_not_the_whole_description(dialog) -> None:
+    """Полное описание правила на вкладку не попадает ни одной строкой.
 
-    Пустая строка под заголовком «Что робот делает с этими настройками»
-    читается как «ничего не делает». Правило 13 `CLAUDE.md`: молчание —
-    самостоятельный дефект.
+    Ради этого задача и делалась: абзац занимал половину вкладки и вытеснял
+    поля средней под прокрутку. Проверяется не высота в точках (она зависит
+    от шрифта машины), а сам факт: длинного текста на вкладке нет.
+
+    Мутация, обязанная ронять проверку: вернуть описание ярлыком в
+    `_algorithm_group`.
     """
-    assert dialog.rule_note.text() == RULE_NOT_ARRIVED
-    assert dialog.rule_note.text().strip(), "под заголовком пусто"
-
-
-def test_the_rule_is_shown_as_it_came(dialog) -> None:
-    """Текст показывается как есть: окно его не сочиняет и не сокращает."""
-    rule = (
-        "На закрытии каждой свечи робот сравнивает цену закрытия со средней.\n\n"
-        "• Закрытие выше EMA(15) — робот хочет быть в лонге."
+    option = _option()
+    long_details = option.details + "\n\n" + "Ещё абзац описания. " * 40
+    dialog.set_algorithms((AlgorithmOption(
+        id=option.id, title=option.title, summary=option.summary,
+        details=long_details, chosen=True,
+    ),))
+    page = dialog.page_of("Сигнал")
+    assert page is not None
+    shown = [label.text() for label in page.findChildren(QLabel)]
+    assert not any(long_details in text for text in shown), (
+        "полное описание правила снова стоит на вкладке «Сигнал»"
     )
-    dialog.set_strategy_rule(rule)
-    assert dialog.rule_note.text() == rule
-    # Пустая строка возвращает честное «не приехало», а не оставляет прежнее:
-    # прежнее правило рядом с новыми настройками — это ложь, а не пробел.
-    dialog.set_strategy_rule("")
-    assert dialog.rule_note.text() == RULE_NOT_ARRIVED
+    assert any(option.title in text for text in shown), (
+        "вкладка не называет выбранный алгоритм вовсе"
+    )
 
 
-def test_the_rule_is_plain_text_not_markup(dialog) -> None:
-    """Разметку окно не угадывает: «<» в тексте съел бы половину абзаца.
+def test_the_window_says_out_loud_that_the_catalogue_has_not_arrived(dialog) -> None:
+    """Каталог не приехал — окно говорит об этом, а не молчит пустым местом.
 
-    Строка приходит снаружи и собирается торговым модулем. QLabel
-    по умолчанию угадывает разметку, и молча.
+    Пустая строка на месте названия читается как «алгоритма нет». Правило 13
+    `CLAUDE.md`: молчание — самостоятельный дефект.
     """
+    assert dialog.algorithm_note.text() == CATALOGUE_NOT_ARRIVED
+    assert dialog.algorithm_name.text() == Settings().strategy_id, (
+        "имя выбранного алгоритма не показано вовсе"
+    )
+
+
+def test_the_catalogue_names_the_chosen_algorithm(dialog) -> None:
+    """Каталог пришёл — на вкладке стоит название, а не имя латиницей.
+
+    ⚠️ И **только** название: строка беды спрятана, правило словами живёт
+    в окне выбора. Абзац на вкладке занимал 391–459 точек и вытеснял поля
+    средней под прокрутку — ради этого задача и делалась.
+    """
+    dialog.set_algorithms((_option(),))
+    assert dialog.algorithm_name.text() == "Реверс по средней"
+    assert not dialog.algorithm_note.text(), (
+        "рядом с исправным названием осталась строка беды"
+    )
+    assert "лонг" in dialog.algorithm_name.toolTip(), (
+        "правило одной фразой не досталось даже всплывающей подсказке"
+    )
+
+
+def test_an_algorithm_missing_from_the_catalogue_is_said_out_loud(dialog) -> None:
+    """Выбран алгоритм, которого в сборке нет: сказать, а не подменить молча.
+
+    Файл настроек более новой сборки приносит незнакомое имя. Подстановка
+    умолчания означала бы торговлю правилом, которого владелец счёта
+    не выбирал, при исправном виде окна.
+    """
+    dialog.set_values(Settings(strategy_id="atr_channel"))
+    dialog.set_algorithms((_option(chosen=False),))
+    assert dialog.algorithm_name.text() == "atr_channel"
+    assert "нет" in dialog.algorithm_note.text(), (
+        "окно не сказало, что такого алгоритма в сборке нет"
+    )
+    assert dialog.values().strategy_id == "atr_channel", (
+        "окно молча подменило выбранный алгоритм"
+    )
+
+
+def test_the_name_is_plain_text_not_markup(dialog) -> None:
+    """Разметку окно не угадывает: «<» в названии съел бы всё, что за ним."""
     from PySide6.QtCore import Qt
 
-    assert dialog.rule_note.textFormat() == Qt.TextFormat.PlainText
-    dialog.set_strategy_rule("закрытие < EMA(15) — шорт")
-    assert "<" in dialog.rule_note.text()
+    assert dialog.algorithm_name.textFormat() == Qt.TextFormat.PlainText
+    dialog.set_algorithms((_option(title="Реверс <по средней>"),))
+    assert "<" in dialog.algorithm_name.text()
 
 
-def test_the_rule_reaches_the_open_window_from_the_port(
+def test_the_chosen_algorithm_reaches_the_settings(dialog, monkeypatch) -> None:
+    """Выбрал алгоритм в окне выбора — он уехал в `Settings` по «Применить».
+
+    Проверяется вся дорога окна: кнопка открывает выбор, выбор возвращает имя,
+    имя попадает в `values()`. Мутация, обязанная ронять проверку: перестать
+    класть `self._strategy_id` в `values()`.
+    """
+    catalogue = (_option(), _option("atr_channel", "Канал ATR", chosen=False))
+    dialog.set_algorithms(catalogue)
+
+    class Picks(ui.settings_dialog.AlgorithmDialog):
+        """Окно выбора, которое сразу выбирает второй алгоритм и соглашается."""
+
+        def exec(self) -> int:
+            self.set_chosen("atr_channel")
+            return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(ui.settings_dialog, "AlgorithmDialog", Picks)
+    dialog.choose_algorithm()
+    assert dialog.algorithm_name.text() == "Канал ATR"
+    assert dialog.values().strategy_id == "atr_channel"
+
+
+def test_a_refused_choice_changes_nothing(dialog, monkeypatch) -> None:
+    """Закрыл окно выбора «Отменой» — выбранный алгоритм остался прежним.
+
+    Канарейка предыдущей проверки: окно, кладущее выбор в настройки
+    независимо от ответа, зеленело бы на ней и меняло бы торговое правило
+    после «Отмены».
+    """
+    dialog.set_algorithms((_option(), _option("atr_channel", "Канал ATR", chosen=False)))
+
+    class Refuses(ui.settings_dialog.AlgorithmDialog):
+        def exec(self) -> int:
+            self.set_chosen("atr_channel")
+            return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr(ui.settings_dialog, "AlgorithmDialog", Refuses)
+    dialog.choose_algorithm()
+    assert dialog.values().strategy_id == "ema_reverse"
+
+
+def test_the_catalogue_reaches_the_open_window_from_the_port(
     qapp, monkeypatch, make_window
 ) -> None:
-    """Пункт приёмки: поменял период, нажал «Применить» — абзац изменился.
+    """Пункт приёмки: поменял период, нажал «Применить» — описание обновилось.
 
     Проверяется весь путь окна: главное окно слушает порт, держит открытое
-    окно настроек и перерисовывает абзац по сигналу. Без хранения ссылки
-    на открытое окно человек поменял бы период, нажал «Применить» и продолжал
-    читать описание **прежнего** правила — то есть окно врало бы ровно в том
-    месте, ради которого заведено.
+    окно настроек и передаёт ему новый каталог. Без хранения ссылки
+    на открытое окно человек поменял бы период, нажал «Применить» и читал бы
+    в «Подробнее» описание **прежнего** правила — то есть окно врало бы ровно
+    в том месте, ради которого заведено.
 
     Мутация, обязанная ронять проверку: убрать `self._settings_dialog`
-    из `MainWindow.open_settings` либо перестать звать `set_strategy_rule`
-    в `_on_strategy_rule`.
+    из `MainWindow.open_settings` либо перестать звать `set_algorithms`
+    в `_on_algorithms`.
     """
     class PortThatAnswers(RecordingPort):
-        """Порт, отвечающий на «Применить» новым правилом — как настоящий.
+        """Порт, отвечающий на «Применить» новым каталогом — как настоящий.
 
-        `HistoryPort.apply_settings` испускает `strategy_rule_changed`
-        синхронно, внутри самой команды: подмена повторяет эту форму,
-        а не придумывает свою.
+        `HistoryPort.apply_settings` испускает `algorithms_changed` синхронно,
+        внутри самой команды: подмена повторяет эту форму, а не придумывает
+        свою.
         """
 
         def apply_settings(self, settings: Settings) -> None:
             super().apply_settings(settings)
-            self.strategy_rule_changed.emit(
-                f"Правило: закрытие выше EMA({settings.average_period}) — лонг."
-            )
+            self.algorithms_changed.emit((AlgorithmOption(
+                id="ema_reverse",
+                title="Реверс по средней",
+                summary="Правило одной фразой.",
+                details=f"Закрытие выше EMA({settings.average_period}) — лонг.",
+                chosen=True,
+            ),))
 
     seen: list[str] = []
 
@@ -809,45 +926,51 @@ def test_the_rule_reaches_the_open_window_from_the_port(
             return True
 
         def exec(self) -> int:
-            seen.append(self.rule_note.text())
+            seen.append(self._algorithms[0].details if self._algorithms else "")
             self.average_period.setValue(20)
             self.buttons.button(QDialogButtonBox.StandardButton.Apply).click()
-            seen.append(self.rule_note.text())
+            seen.append(self._algorithms[0].details if self._algorithms else "")
             return 1
 
     monkeypatch.setattr(ui.main_window, "SettingsDialog", Instant)
     port = PortThatAnswers()
     window = make_window(port)
-    port.strategy_rule_changed.emit("Правило: закрытие выше EMA(15) — лонг.")
+    port.algorithms_changed.emit((AlgorithmOption(
+        id="ema_reverse",
+        title="Реверс по средней",
+        summary="Правило одной фразой.",
+        details="Закрытие выше EMA(15) — лонг.",
+        chosen=True,
+    ),))
     window.open_settings()
 
-    assert seen[0] == "Правило: закрытие выше EMA(15) — лонг.", (
-        "открытое окно настроек не получило правила, известного главному окну"
+    assert seen[0] == "Закрытие выше EMA(15) — лонг.", (
+        "открытое окно настроек не получило каталога, известного главному окну"
     )
-    assert seen[1] == "Правило: закрытие выше EMA(20) — лонг.", (
-        "после «Применить» абзац остался с прежним правилом"
+    assert seen[1] == "Закрытие выше EMA(20) — лонг.", (
+        "после «Применить» описание осталось с прежним правилом"
     )
 
 
 def test_the_window_does_not_talk_to_the_settings_it_closed(
     qapp, monkeypatch, make_window
 ) -> None:
-    """Закрытому окну настроек новое правило не рассказывают, а следующему — да.
+    """Закрытому окну настроек новый каталог не рассказывают, а следующему — да.
 
     Ссылка на закрытый диалог, оставленная у главного окна, — это обращение
-    к разрушенному объекту Qt при первом же новом правиле.
+    к разрушенному объекту Qt при первом же новом каталоге.
 
     ⚠️ Проверяется **факт обращения**, а не падение, и это замер, а не вкус:
     исключение из слота Qt наружу из `emit` не выходит — PySide печатает
     трассировку и продолжает (проверено 08.09.2026). Тест «программа
     не упала» был бы поэтому вакуумным.
     """
-    told: list[str] = []
+    told: list[int] = []
 
     class Instant(SettingsDialog):
-        def set_strategy_rule(self, text: str) -> None:
-            told.append(text)
-            super().set_strategy_rule(text)
+        def set_algorithms(self, options) -> None:
+            told.append(len(tuple(options)))
+            super().set_algorithms(options)
 
         def exec(self) -> int:
             return 1
@@ -858,14 +981,16 @@ def test_the_window_does_not_talk_to_the_settings_it_closed(
 
     window.open_settings()
     after_first = len(told)
-    port.strategy_rule_changed.emit("Правило после закрытия окна.")
+    port.algorithms_changed.emit((AlgorithmOption(
+        id="ema_reverse", title="Реверс", summary="s", details="d", chosen=True,
+    ),))
     assert len(told) == after_first, (
-        "главное окно рассказало новое правило уже закрытому окну настроек"
+        "главное окно рассказало новый каталог уже закрытому окну настроек"
     )
 
     window.open_settings()
-    assert told[-1] == "Правило после закрытия окна.", (
-        "правило, пришедшее при закрытом окне, не досталось следующему открытию"
+    assert told[-1] == 1, (
+        "каталог, пришедший при закрытом окне, не достался следующему открытию"
     )
 
 
@@ -1662,6 +1787,12 @@ SAMPLE = Settings(
     timeframe="15 минут",
     depth_days=45,
     history_depth_days=120,
+    # ⚠️ Имя нарочно **не из реестра**: окно значений не проверяет и проверять
+    # не может — реестра оно не видит (ARCHITECTURE.md §2). Проверяется здесь
+    # ровно то, что окно обязано делать: пронести пришедшее снаружи имя через
+    # обмен без подмены. Годится ли оно, решает `app/convert.py`, и отказ
+    # проверяется там же.
+    strategy_id="atr_channel",
     average_period=21,
     average_kind=AverageKind.SMA,
     filter_enabled=True,

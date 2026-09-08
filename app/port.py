@@ -1193,7 +1193,13 @@ class HistoryPort(TerminalPort):
         changes += fresh.changes_from(self._engine_settings)
         rule_changed = module.changes_from(convert.strategy_settings(self._values))
         changes += rule_changed
-        if rule_changed:
+        # ⚠️ Смена самого алгоритма меняет правило целиком, а его настройки
+        # при этом могут совпасть до поля: `changes_from` тогда пуст, и строки
+        # с новым правилом не было бы ровно в том случае, когда она нужнее
+        # всего. Имя алгоритма своей строкой в журнал уже попало
+        # (`convert._WINDOW_TOLD`), но имя — это «что поменялось»,
+        # а не «во что оно превратилось».
+        if rule_changed or self._values.strategy_id != settings.strategy_id:
             # ⚠️ Одной строкой мало: «Период средней: 15 → 20» говорит, что
             # поменяли, и не говорит, каким стало **правило**. Через месяц
             # разбирают именно правило — «почему в тот день робот повёл себя
@@ -1213,7 +1219,7 @@ class HistoryPort(TerminalPort):
             # знает, на что подписан сейчас, а порт этого не знает.
             self._retarget(convert.instrument_of(settings.instrument))
         self._send(self.settings_applied, settings)
-        self._send(self.strategy_rule_changed, convert.rule_of(module))
+        self._send(self.algorithms_changed, convert.algorithms(settings))
         if guards:
             self.note(
                 "Предохранители изменены",
@@ -1238,10 +1244,7 @@ class HistoryPort(TerminalPort):
         что робот с ними делает, до первого «Применить».
         """
         self._send(self.settings_applied, self._values)
-        self._send(
-            self.strategy_rule_changed,
-            convert.strategy_rule(self._values),
-        )
+        self._send(self.algorithms_changed, convert.algorithms(self._values))
 
     def request_chart(self, instrument: str, timeframe: str) -> None:
         self.apply_settings(self._values.replace(instrument=instrument, timeframe=timeframe))
@@ -2712,6 +2715,12 @@ class HistoryPort(TerminalPort):
         return (
             symbol,
             frame.values.timeframe,
+            # ⚠️ Имя алгоритма — отдельной частью ключа, а не через настройки
+            # модуля: у двух алгоритмов настройки бывают одинаковыми по полям
+            # и разными по смыслу. Без него окно показывало бы новый алгоритм,
+            # а решения считал бы прежний (ловушка 7 миниплана
+            # `strategy-modules-switchable.md`).
+            frame.values.strategy_id,
             frame.engine,
             convert.strategy_settings(frame.values),
             convert.run_costs(frame.values),
@@ -2747,7 +2756,7 @@ class HistoryPort(TerminalPort):
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=EmaReverse.title,
+            strategy_title=convert.strategy_title(frame.values),
             app_version=version(),
             days=self._days,
             until=self._until,
@@ -2837,7 +2846,7 @@ class HistoryPort(TerminalPort):
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=EmaReverse.title,
+            strategy_title=convert.strategy_title(frame.values),
             app_version=version(),
             days=self._days,
             until=self._until,
@@ -3386,7 +3395,7 @@ class HistoryPort(TerminalPort):
             settings_text=settings_text(
                 self._engine_settings,
                 convert.strategy_settings(self._values),
-                strategy_title=EmaReverse.title,
+                strategy_title=convert.strategy_title(self._values),
             ),
         ))
 

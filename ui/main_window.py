@@ -62,6 +62,7 @@ from ui.formatting import MSK, fmt_time
 from ui.history_dialog import HistoryDialog
 from ui.journals import JournalTabs
 from ui.models import (
+    AlgorithmOption,
     BacktestOptions,
     BacktestReport,
     Candle,
@@ -425,9 +426,9 @@ class MainWindow(QMainWindow):
         self._settings = settings or Settings()
         self._sanitize = sanitize
         self._state = RobotState()
-        #: Правило робота словами и открытое окно настроек — разбор обоих
-        #: в `_on_strategy_rule` и `open_settings`.
-        self._strategy_rule = ""
+        #: Каталог торговых алгоритмов и открытое окно настроек — разбор обоих
+        #: в `_on_algorithms` и `open_settings`.
+        self._algorithms: tuple[AlgorithmOption, ...] = ()
         self._settings_dialog: SettingsDialog | None = None
         #: Окно собрано целиком. Сторож для `changeEvent`: событие палитры
         #: приходит и в середине сборки, а `apply_theme()` трогает график
@@ -733,7 +734,7 @@ class MainWindow(QMainWindow):
         port.decisions_replaced.connect(self.journals.set_decisions)
         port.decision_appended.connect(self.journals.append_decision)
         port.settings_applied.connect(self._on_settings_echo)
-        port.strategy_rule_changed.connect(self._on_strategy_rule)
+        port.algorithms_changed.connect(self._on_algorithms)
         port.failed.connect(self.show_error)
         port.stuck_changed.connect(self.show_stuck)
         port.busy_changed.connect(self._on_busy)
@@ -1104,18 +1105,18 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def open_settings(self) -> None:
-        """Окно настроек. Правило робота словами едет в него вместе с полями.
+        """Окно настроек. Каталог алгоритмов едет в него вместе с полями.
 
         ⚠️ Ссылка на открытое окно держится, пока оно открыто, и не ради
-        удобства: «Применить» уходит движку, движок отвечает новым правилом,
-        и обновить абзац на экране некому, если окно потеряно. Человек
-        поменял бы период, нажал «Применить» и продолжал читать описание
-        прежнего правила — то есть окно врало бы ровно в том месте,
-        ради которого заведено.
+        удобства: «Применить» уходит движку, движок отвечает новым каталогом
+        с пересчитанным описанием, и обновить его на экране некому, если окно
+        потеряно. Человек поменял бы период, нажал «Применить» и читал бы
+        в «Подробнее» описание прежнего правила — то есть окно врало бы ровно
+        в том месте, ради которого заведено.
         """
         dialog = SettingsDialog(self._settings, self)
         dialog.settings_changed.connect(self._on_settings_changed)
-        dialog.set_strategy_rule(self._strategy_rule)
+        dialog.set_algorithms(self._algorithms)
         self._settings_dialog = dialog
         try:
             dialog.exec()
@@ -1524,18 +1525,18 @@ class MainWindow(QMainWindow):
     def _on_settings_echo(self, settings: Settings) -> None:
         self._settings = settings
 
-    def _on_strategy_rule(self, rule: str) -> None:
-        """Правило робота словами — от торгового модуля через порт.
+    def _on_algorithms(self, options: tuple[AlgorithmOption, ...]) -> None:
+        """Каталог торговых алгоритмов — от торговой части через порт.
 
         Хранится здесь, потому что окно настроек открывается позже сигнала:
-        спросить правило заново некому — порт отвечает событиями, а не
-        возвратом значения. Пустая строка означает «ещё не приходило»,
+        спросить каталог заново некому — порт отвечает событиями, а не
+        возвратом значения. Пустой кортеж означает «ещё не приходило»,
         и окно настроек скажет об этом само, а не покажет пустое место
-        (`ui/settings_dialog.py::RULE_NOT_ARRIVED`).
+        (`ui/settings_dialog.py::CATALOGUE_NOT_ARRIVED`).
         """
-        self._strategy_rule = rule
+        self._algorithms = tuple(options)
         if self._settings_dialog is not None:
-            self._settings_dialog.set_strategy_rule(rule)
+            self._settings_dialog.set_algorithms(self._algorithms)
 
     def settings(self) -> Settings:
         return self._settings

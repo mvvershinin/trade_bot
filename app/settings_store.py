@@ -67,6 +67,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+from strategies import registry
 from ui.models import Settings
 from ui.settings_codec import encode_fields, field_codecs, read_fields
 from ui.userdata_file import write_atomically
@@ -110,6 +111,36 @@ class Loaded:
     values: Settings
     notes: tuple[str, ...] = ()
     troubles: tuple[str, ...] = ()
+
+
+def _known_algorithm(values: Settings) -> tuple[Settings, tuple[str, ...]]:
+    """Выбранный алгоритм есть в этой сборке — или берётся умолчание, но вслух.
+
+    ⚠️ Отдельная проверка, потому что укладка её не делает и делать не может:
+    `strategy_id` — обычная строка, и файл более новой сборки пройдёт разбор
+    целиком, а сломается позже — на первой же попытке собрать настройки
+    алгоритма, то есть при запуске робота.
+
+    Почему **умолчание с оговоркой**, а не отказ читать файл. Отказ здесь
+    не на что опереть: прежних настроек в этот момент не существует, программа
+    только открывается. Отказ означал бы «программа не запускается, потому что
+    в файле новое имя алгоритма» — а в файле рядом лежит всё, что человек
+    подбирал руками.
+
+    ⚠️ Молчаливой подменой это быть не имеет права (правило 13 `CLAUDE.md`):
+    подменён **не размер поля, а правило принятия решений**. Строка идёт
+    в `troubles`, то есть доходит до журнала решений предупреждением.
+    """
+    if values.strategy_id in registry.known_ids():
+        return values, ()
+    fallback = registry.default_entry()
+    return values.replace(strategy_id=fallback.id), (
+        f"Торгового алгоритма «{values.strategy_id}» в этой сборке нет — "
+        f"взят «{fallback.title}». Скорее всего файл настроек сделан более "
+        "новой сборкой программы: обновите её, иначе робот будет работать "
+        "не тем правилом, которое вы выбирали.",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Сам файл
@@ -186,7 +217,10 @@ class SettingsStore:
                 + ", ".join(missing)
                 + ". Так бывает после обновления программы."
             )
-        return Loaded(start.replace(**changes), tuple(notes), tuple(troubles))
+        values = start.replace(**changes)
+        values, unknown_algorithm = _known_algorithm(values)
+        troubles.extend(unknown_algorithm)
+        return Loaded(values, tuple(notes), tuple(troubles))
 
     def _quarantine(self, error: Exception) -> tuple[str, ...]:
         """Отложить испорченный файл в сторону и сказать, куда именно.

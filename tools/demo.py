@@ -39,6 +39,7 @@ import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # только для подписи: Qt поднимается после QT_QPA_PLATFORM
+    from ui.algorithm_dialog import AlgorithmDetails, AlgorithmDialog
     from ui.calendar_dialog import CalendarDialog
     from ui.settings_dialog import SettingsDialog
 
@@ -111,6 +112,24 @@ def main(argv: list[str] | None = None) -> int:
         help="открыть окно настроек вместо главного окна",
     )
     parser.add_argument(
+        "--algorithms",
+        dest="algorithms",
+        action="store_true",
+        help="открыть окно выбора торгового алгоритма",
+    )
+    parser.add_argument(
+        "--algorithm-details",
+        dest="algorithm_details",
+        action="store_true",
+        help="открыть всплывающее описание правила — то же, что «Подробнее»",
+    )
+    parser.add_argument(
+        "--saw-filter",
+        dest="saw_filter",
+        action="store_true",
+        help="включить фильтр против пилы: описание правила длиннее всего",
+    )
+    parser.add_argument(
         "--dark",
         dest="dark",
         action="store_true",
@@ -145,7 +164,15 @@ def main(argv: list[str] | None = None) -> int:
         return _finish(application, _demo_calendar(), args)
 
     if args.settings:
-        return _finish(application, _demo_settings(), args)
+        return _finish(application, _demo_settings(filtered=args.saw_filter), args)
+
+    if args.algorithms:
+        return _finish(application, _demo_algorithms(filtered=args.saw_filter), args)
+
+    if args.algorithm_details:
+        return _finish(
+            application, _demo_algorithm_details(filtered=args.saw_filter), args
+        )
 
     # Та же чистка, что в бою (`app/main.py`): показ не должен отличаться
     # от программы тем, что у него нет предохранителя.
@@ -159,32 +186,67 @@ def main(argv: list[str] | None = None) -> int:
     return _finish(application, window, args)
 
 
-def _demo_settings() -> "SettingsDialog":
-    """Окно настроек с правилом робота словами — для снимка и для глаз.
+def _demo_settings(*, filtered: bool = False) -> "SettingsDialog":
+    """Окно настроек на вкладке «Сигнал» — для снимка и для глаз.
 
-    Правило приходит в окно **готовой строкой** от торгового модуля через
-    порт; здесь порта нет, поэтому строка берётся тем же вызовом, которым
-    её собирает `app/` (`convert.strategy_rule`). Второго текста при этом
-    не появляется: считает его по-прежнему модуль.
+    Каталог алгоритмов приходит в окно **готовыми строками** от торговой
+    части через порт; здесь порта нет, поэтому каталог берётся тем же
+    вызовом, которым его собирает `app/` (`convert.algorithms`). Второго
+    текста при этом не появляется: считает его по-прежнему сам алгоритм.
 
-    ⚠️ Ключ нужен потому, что `--shot` главного окна снимает **главное**
-    окно, а абзац живёт в модальном диалоге: увидеть глазами, помещается ли
-    он и как переносится, из консоли иначе нечем.
+    :param filtered: включить фильтр против пилы. Описание при нём длиннее
+        всего (459 точек против 391), и мерить помещаемость надо на нём.
     """
     from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
-    from ui.models import Settings  # noqa: PLC0415 — тянет PySide6
     from ui.settings_dialog import SettingsDialog  # noqa: PLC0415 — тянет PySide6
 
-    values = Settings()
+    values = _demo_values(filtered=filtered)
     dialog = SettingsDialog(values)
-    dialog.set_strategy_rule(convert.strategy_rule(values))
+    dialog.set_algorithms(convert.algorithms(values))
     # Вкладка «Сигнал» — вторая: снимок обязан открываться на ней, иначе
     # смотреть было бы не на что.
     page = dialog.page_of("Сигнал")
     if page is not None:
         dialog.tabs.setCurrentWidget(page)
-    dialog.resize(700, 820)
     return dialog
+
+
+def _demo_values(*, filtered: bool):  # noqa: ANN202 — Settings тянет PySide6
+    """Настройки для показа: умолчания либо включённый фильтр против пилы."""
+    from ui.models import Settings  # noqa: PLC0415 — тянет PySide6
+
+    values = Settings()
+    if not filtered:
+        return values
+    return values.replace(
+        filter_enabled=True, threshold_percent=0.04, confirm_bars=3
+    )
+
+
+def _demo_algorithms(*, filtered: bool = False) -> "AlgorithmDialog":
+    """Окно выбора алгоритма — для снимка и для глаз.
+
+    ⚠️ Отдельный ключ нужен потому, что `--shot` снимает **одно** окно,
+    а выбор алгоритма живёт в модальном диалоге поверх модального окна
+    настроек: увидеть, как он выглядит и помещается ли описание, из консоли
+    иначе нечем (`CLAUDE.md`, правило 12).
+    """
+    from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
+    from ui.algorithm_dialog import AlgorithmDialog  # noqa: PLC0415 — тянет PySide6
+
+    values = _demo_values(filtered=filtered)
+    dialog = AlgorithmDialog(convert.algorithms(values))
+    dialog.set_chosen(values.strategy_id)
+    return dialog
+
+
+def _demo_algorithm_details(*, filtered: bool = False) -> "AlgorithmDetails":
+    """Всплывающее описание правила — то, что показывает «Подробнее»."""
+    from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
+    from ui.algorithm_dialog import AlgorithmDetails  # noqa: PLC0415 — тянет PySide6
+
+    values = _demo_values(filtered=filtered)
+    return AlgorithmDetails(convert.algorithms(values)[0])
 
 
 def _demo_calendar() -> CalendarDialog:

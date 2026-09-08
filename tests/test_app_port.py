@@ -38,6 +38,7 @@ from market import (
     Timeframe,
 )
 from market.journal import SECRET_MASK, redact
+from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     CalendarDay,
@@ -51,7 +52,8 @@ from ui.models import (
     Settings,
 )
 
-from app.port import NO_GUARDS, HistoryPort
+from app import convert
+from app.port import NO_GUARDS, HistoryPort, _Frame
 
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)  # пятница, до открытия окна
 
@@ -141,8 +143,8 @@ class Recorded:
         self.busy: list[tuple[bool, str]] = []
         self.progress: list[tuple[int, str]] = []
         self.settings: list[Settings] = []
-        #: Правило робота словами — каждое, что порт отправил в окно.
-        self.rules: list[str] = []
+        #: Каталог алгоритмов — каждый, что порт отправил в окно.
+        self.catalogues: list[tuple] = []
         #: Строки журнала по одной, как они появлялись. Нужны там, где до
         #: полной публикации журнала дело не доходит: `decisions_replaced`
         #: отправляется в конце прохода, а строка об изменении настройки
@@ -164,7 +166,7 @@ class Recorded:
         port.busy_changed.connect(lambda on, what: self.busy.append((on, what)))
         port.progress_changed.connect(lambda p, what: self.progress.append((p, what)))
         port.settings_applied.connect(self.settings.append)
-        port.strategy_rule_changed.connect(self.rules.append)
+        port.algorithms_changed.connect(self.catalogues.append)
 
 
 async def _run(port: HistoryPort, worker: MarketWorker | None = None) -> None:
@@ -508,14 +510,14 @@ def test_a_change_that_does_not_touch_the_module_says_nothing_about_the_rule(
     assert "Правило теперь читается так" not in said[-1]
 
 
-def test_the_rule_in_words_reaches_the_window(loop, database) -> None:
-    """Правило словами уезжает в окно вместе с настройками, и с новыми числами.
+def test_the_catalogue_of_algorithms_reaches_the_window(loop, database) -> None:
+    """Каталог алгоритмов уезжает в окно вместе с настройками, с новыми числами.
 
     Окно посчитать его не может: `ui/` не импортирует торговые слои
-    (ARCHITECTURE.md §2). Значит текст обязан приехать готовым — и приехать
+    (ARCHITECTURE.md §2). Значит каталог обязан приехать готовым — и приехать
     **и по запросу настроек, и после их применения**: окно, спросившее
-    настройки при открытии, иначе показывало бы поля без объяснения,
-    что робот с ними делает.
+    настройки при открытии, иначе не знало бы даже названия алгоритма,
+    которым работает робот.
     """
 
     async def go():
@@ -526,7 +528,7 @@ def test_the_rule_in_words_reaches_the_window(loop, database) -> None:
         try:
             await _run(port)
             port.request_settings()
-            asked = list(recorded.rules)
+            asked = list(recorded.catalogues)
             port.apply_settings(Settings().replace(average_period=20))
             await port.wait()
         finally:
@@ -535,12 +537,23 @@ def test_the_rule_in_words_reaches_the_window(loop, database) -> None:
         return asked, recorded
 
     asked, recorded = loop.run_until_complete(go())
-    assert asked, "на запрос настроек правило словами не пришло"
-    assert "EMA(15)" in asked[-1], "правило пришло без нынешних чисел"
-    assert recorded.rules[-1] != asked[-1], "после «Применить» правило не обновилось"
-    assert "EMA(20)" in recorded.rules[-1], "в правиле остался прежний период"
-    assert "робот хочет быть в лонге" in recorded.rules[-1], (
-        "правило приехало без утверждений — показывать человеку нечего"
+    assert asked, "на запрос настроек каталог алгоритмов не пришёл"
+    first = asked[-1]
+    assert first, "каталог приехал пустым — выбирать человеку не из чего"
+    assert first[0].title, "у алгоритма в каталоге нет названия"
+    assert first[0].chosen, "выбранный алгоритм в каталоге не помечен"
+    assert "EMA(15)" in first[0].details, "описание пришло без нынешних чисел"
+    assert first[0].summary and not any(
+        sign.isdigit() for sign in first[0].summary
+    ), "правило одной фразой обязано читаться без чисел"
+
+    latest = recorded.catalogues[-1]
+    assert latest[0].details != first[0].details, (
+        "после «Применить» описание не обновилось"
+    )
+    assert "EMA(20)" in latest[0].details, "в описании остался прежний период"
+    assert "робот хочет быть в лонге" in latest[0].details, (
+        "описание приехало без утверждений — показывать человеку нечего"
     )
 
 
@@ -586,9 +599,26 @@ def _something_else(field: str, expected_value):
     Значения не подбираются под ожидаемый текст: тест проверяет, что запись
     об изменении вообще появилась, а не как она сформулирована.
     """
+    if field == "strategy_id":
+        return _another_algorithm() or f"{expected_value}/иначе"
     if field in _ANOTHER_VALUE:
         return _ANOTHER_VALUE[field]
     return _another_of_the_same_type(field, expected_value)
+
+
+def _another_algorithm() -> str | None:
+    """Второй торговый алгоритм сборки. `None` — он в ней один.
+
+    ⚠️ Спрашивается у реестра, а не записывается здесь именем. В сборке
+    сегодня один алгоритм, и любое другое имя для порта незнакомо: он обязан
+    такие настройки **отвергнуть**, а не записать «было → стало». Как только
+    второй алгоритм появится, проверка ниже сама перейдёт на сильное
+    утверждение — правки теста для этого не потребуется.
+    """
+    others = [
+        name for name in registry.known_ids() if name != Settings().strategy_id
+    ]
+    return others[0] if others else None
 
 
 def _another_of_the_same_type(field: str, expected_value):
@@ -658,6 +688,16 @@ def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, fiel
         f"поле «{field}» изменено, а в журнале написано, что всё осталось "
         f"как было. Строки журнала: {reasons}"
     )
+    if field == "strategy_id" and _another_algorithm() is None:
+        # Единственное поле с закрытым набором значений, и сегодня в наборе
+        # одно имя. Молчать порт всё равно не имеет права: незнакомый алгоритм
+        # обязан быть отвергнут вслух, а прежние настройки — остаться в силе.
+        # Сама строка «было → стало» проверяется на паре имён в
+        # `tests/test_app_convert.py`, где значения не проверяются.
+        assert any("в этой сборке нет" in explanation for explanation in reasons), (
+            f"незнакомый алгоритм принят молча: {reasons}"
+        )
+        return
     assert any("→" in explanation for explanation in reasons), (
         f"изменение поля «{field}» не попало в журнал ни одной строкой "
         f"с прежним и новым значением: {reasons}"
@@ -3317,3 +3357,56 @@ def test_no_developer_speak_reaches_the_window(loop, database) -> None:
             assert mark not in line, (
                 f"в окно уехал текст для разработчика («{mark}»):\n{line}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Живой ход знает, каким алгоритмом он идёт
+# ---------------------------------------------------------------------------
+
+
+def _watch_key_of(loop, database: pathlib.Path, values: Settings) -> tuple:
+    """Ключ живого хода при этих настройках. Прогон не гоняется."""
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        try:
+            frame = _Frame(
+                values=values,
+                engine=convert.engine_settings(values, Mode.OFF),
+            )
+            return port._watch_key(frame, "MXU6")  # noqa: SLF001 — сторож на ключ
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    # Через переменную, а не возвратом: цикл событий отдаёт `Any`, и `mypy`
+    # считает находкой возврат `Any` из функции с объявленным типом.
+    key: tuple = loop.run_until_complete(go())
+    return key
+
+
+def test_the_live_run_is_keyed_by_the_chosen_algorithm(loop, database) -> None:
+    """Имя алгоритма входит в то, чем задан живой ход.
+
+    Без него окно показывало бы новый алгоритм, а решения считал бы прежний:
+    ход не пересобрался бы, потому что настройки модуля могли совпасть до поля
+    (ловушка 7 миниплана `strategy-modules-switchable.md`).
+
+    Мутация, обязанная ронять проверку: убрать `frame.values.strategy_id`
+    из `HistoryPort._watch_key`.
+    """
+    values = Settings()
+    key = _watch_key_of(loop, database, values)
+    assert values.strategy_id in key, (
+        f"имя алгоритма не входит в ключ живого хода: {key}"
+    )
+    other = _another_algorithm()
+    if other is not None:
+        # Как только в сборке появится второй алгоритм, проверка сама станет
+        # сильнее: смена алгоритма обязана давать другой ключ, то есть новый
+        # прогрев с той же границы.
+        assert _watch_key_of(
+            loop, database, values.replace(strategy_id=other)
+        ) != key, "смена алгоритма не пересобирает живой ход"

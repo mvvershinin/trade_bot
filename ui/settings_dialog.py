@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import cast
 
 from PySide6.QtCore import QEvent, QSignalBlocker, QTime, Qt, Signal
@@ -51,8 +52,10 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QTabWidget,
@@ -62,9 +65,11 @@ from PySide6.QtWidgets import (
 )
 
 from market import warmup_bars
+from ui.algorithm_dialog import AlgorithmDialog
 from ui.confirm_changes import confirm_changes
 from ui.models import (
     AfterTakeProfit,
+    AlgorithmOption,
     AverageKind,
     OnPriceEqualsAverage,
     ReversalMoment,
@@ -75,14 +80,15 @@ from ui.wheel_guard import guard_wheel
 
 TIMEFRAMES = ("1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "День")
 
-#: Что стоит в поле описания, пока правило не пришло от торгового модуля.
+#: Что написано вместо названия алгоритма, пока каталог не пришёл.
 #:
-#: Пустое место под заголовком «Что робот делает с этими настройками»
-#: читалось бы как «ничего не делает» — а это окно, открытое без торговой
-#: части (снимок экрана, разбор журнала) либо не доехавший сигнал.
-RULE_NOT_ARRIVED = (
-    "Правило робота словами сюда ещё не пришло: окно открыто без торговой "
-    "части либо движок не успел ответить. Настройки ниже при этом настоящие."
+#: ⚠️ Молчание здесь запрещено правилом 13 `CLAUDE.md`: пустая строка на месте
+#: названия читается как «алгоритма нет». Каталог приходит от торговой части
+#: (`app/convert.py::algorithms`), и окно, открытое без неё — снимок экрана,
+#: разбор журнала, — обязано сказать об этом, а не показать пустое место.
+CATALOGUE_NOT_ARRIVED = (
+    "Список алгоритмов сюда не пришёл: окно открыто без торговой части "
+    "либо программа не успела ответить. Выбранное имя показано как есть."
 )
 
 #: Раскладка окна по вкладкам: заголовок и строители групп на нём.
@@ -92,11 +98,12 @@ RULE_NOT_ARRIVED = (
 #: и в конце настройки самой программы.
 _TAB_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Инструмент и данные", ("_instrument_group", "_point_group")),
-    # ⚠️ Правило словами стоит **первым** на вкладке, до полей. Человек,
-    # открывший «Сигнал», читает сперва, что робот делает, и только потом
-    # правит числа. Ниже полей этот абзац дочитывали бы уже после того,
-    # как поменяли период.
-    ("Сигнал", ("_rule_group", "_signal_group", "_filter_group")),
+    # ⚠️ Выбранный алгоритм назван **первым** на вкладке, до полей: поля
+    # средней настраивают его, и читать их, не зная, чей они, бессмысленно.
+    # Это **строка и кнопка**, а не абзац: описание правила занимает 391–459
+    # точек и вытесняло бы поля под прокрутку — замер 08.09.2026. Полное
+    # описание живёт в отдельном окне (`ui/algorithm_dialog.py`).
+    ("Сигнал", ("_algorithm_group", "_signal_group", "_filter_group")),
     ("Вход и выход", ("_entry_group", "_take_group")),
     ("Торговое окно", ("_time_group",)),
     ("Деньги", ("_volume_group", "_risk_group", "_commission_group")),
@@ -132,6 +139,7 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("price_step", "Инструмент и данные", "price_step"),
     ("ruble_per_point", "Инструмент и данные", "ruble_per_point"),
     ("ruble_per_point_source", "Инструмент и данные", "point_note"),
+    ("strategy_id", "Сигнал", "algorithm_name"),
     ("average_period", "Сигнал", "average_period"),
     ("average_kind", "Сигнал", "average_kind"),
     ("on_price_equals_average", "Сигнал", "on_price_equals_average"),
@@ -447,7 +455,7 @@ class SettingsDialog(QDialog):
         self._build_cost_fields()
         self._build_time_fields()
         self._build_risk_fields()
-        self._build_rule_field()
+        self._build_algorithm_row()
 
     def _build_instrument_fields(self) -> None:
         """Инструмент, размер свечи и две глубины — загрузки и показа."""
@@ -703,26 +711,53 @@ class SettingsDialog(QDialog):
         self.guards_note = QLabel()
         self.guards_note.setWordWrap(True)
 
-    def _build_rule_field(self) -> None:
-        """Поле «что робот делает с этими настройками» — правило словами.
+    def _build_algorithm_row(self) -> None:
+        """Строка «какой алгоритм выбран» и кнопка в окно выбора.
 
-        Текст приходит **готовым** от торгового модуля через порт
-        (`strategy_rule_changed`): окно торговых слоёв не импортирует
-        и правило посчитать не может (ARCHITECTURE.md §2). Написанный здесь
-        руками абзац разошёлся бы с кодом при первой правке модуля —
-        и разошёлся бы молча, текст не падает.
+        ⚠️ Строка, а не абзац. До 08.09.2026 здесь стояло полное описание
+        правила: 391 точка при умолчаниях, 459 при включённом фильтре против
+        пилы — половина вкладки, поля средней уходили под прокрутку. Описание
+        переехало в отдельное окно, где его читают целиком и с прокруткой.
+
+        ⚠️ Название приходит **готовым** из каталога (`AlgorithmOption.title`),
+        а не пишется здесь: окно торговых слоёв не импортирует
+        (ARCHITECTURE.md §2), и второй список названий разошёлся бы с первым
+        молча — в окне одно, в журнале другое.
         """
-        self.rule_note = QLabel(RULE_NOT_ARRIVED)
-        self.rule_note.setWordWrap(True)
-        # ⚠️ Простой текст, а не разметка: в описании есть «•» и «—», а завтра
-        # может появиться «<». QLabel по умолчанию угадывает разметку и съел бы
-        # половину абзаца молча.
-        self.rule_note.setTextFormat(Qt.TextFormat.PlainText)
-        # Абзац читают и переносят в переписку: выделение мышью тут уместно,
-        # а поле ввода на его месте выглядело бы редактируемым.
-        self.rule_note.setTextInteractionFlags(
+        #: Имя выбранного алгоритма латиницей. Держится отдельно от каталога:
+        #: `values()` обязан вернуть его даже тогда, когда каталог не приехал,
+        #: иначе «Применить» молча сменил бы алгоритм на умолчание.
+        self._strategy_id = Settings().strategy_id
+        #: Каталог, пришедший от торговой части. Пустой — окно об этом скажет.
+        self._algorithms: tuple[AlgorithmOption, ...] = ()
+
+        self.algorithm_name = QLabel()
+        self.algorithm_name.setWordWrap(True)
+        # Простой текст, а не разметка: название приходит снаружи, а угадывание
+        # разметки съело бы «<» и всё, что за ним, не сказав об этом.
+        self.algorithm_name.setTextFormat(Qt.TextFormat.PlainText)
+        self.algorithm_name.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        font = self.algorithm_name.font()
+        font.setBold(True)
+        self.algorithm_name.setFont(font)
+
+        self.algorithm_button = QPushButton("Выбрать алгоритм…")
+        # ⚠️ Не кнопка по умолчанию: Enter в окне настроек означает «ОК».
+        self.algorithm_button.setAutoDefault(False)
+        self.algorithm_button.setDefault(False)
+        self.algorithm_button.setToolTip(
+            "Открыть список торговых алгоритмов. Там же кнопка «Подробнее» — "
+            "она показывает словами, как алгоритм принимает решения."
+        )
+        self.algorithm_button.clicked.connect(self.choose_algorithm)
+
+        #: Строка про **беду**: каталог не приехал либо выбранного алгоритма
+        #: в сборке нет. В обычном случае пустая и спрятанная — вкладка обязана
+        #: остаться строкой, а не абзацем, ради чего задача и делалась.
+        self.algorithm_note = _hint("")
+        self._show_algorithm()
 
     def _notice(self) -> QLabel:
         label = QLabel(
@@ -814,22 +849,26 @@ class SettingsDialog(QDialog):
             layout.addRow(self.point_note)
         return box
 
-    def _rule_group(self) -> QGroupBox:
-        """Правило робота словами — то, ради чего человек сюда и заходит.
+    def _algorithm_group(self) -> QGroupBox:
+        """Какой алгоритм выбран — строкой, и кнопка, открывающая выбор.
 
-        Сегодня окно показывает «Период средней» и «Порог пересечения»
-        и нигде не говорит, что программа с ними делает: узнать это можно
-        было только прочитав исходник. Владелец счёта не программист,
-        а решения по этим полям — решения о деньгах.
+        Окно показывает «Период средней» и «Порог пересечения» и само по себе
+        не говорит, **что** программа с ними делает: узнать это можно было
+        только прочитав исходник. Владелец счёта не программист, а решения
+        по этим полям — решения о деньгах. Ответ живёт за кнопкой ниже,
+        в окне «Торговый алгоритм» → «Подробнее».
         """
-        box = QGroupBox("Что робот делает с этими настройками")
-        form = QFormLayout(box)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        form.addRow(self.rule_note)
-        form.addRow(_hint(
-            "Текст собирает сам алгоритм по применённым настройкам, "
-            "а не окно. Поправили поля ниже — описание обновится "
-            "после «Применить»."
+        box = QGroupBox("Торговый алгоритм")
+        body = QVBoxLayout(box)
+        row = QHBoxLayout()
+        row.addWidget(self.algorithm_name, 1)
+        row.addWidget(self.algorithm_button)
+        body.addLayout(row)
+        body.addWidget(self.algorithm_note)
+        body.addWidget(_hint(
+            "Алгоритм решает только направление: лонг, шорт или ничего. "
+            "Поля ниже — его настройки; что он с ними делает, показывает "
+            "кнопка «Подробнее» в окне выбора."
         ))
         return box
 
@@ -1098,14 +1137,92 @@ class SettingsDialog(QDialog):
             tabs.addTab(scroll, title)
         return tabs
 
-    def set_strategy_rule(self, text: str) -> None:
-        """Показать правило робота словами. Пустая строка — сказать, что его нет.
+    def set_algorithms(self, options: Sequence[AlgorithmOption]) -> None:
+        """Показать каталог алгоритмов. Пустой — сказать, что он не приехал.
 
-        ⚠️ Молчание здесь запрещено правилом 13 `CLAUDE.md`: пустое место
-        под заголовком «Что робот делает с этими настройками» читается как
-        «ничего не делает». Не доехавший текст обязан назвать себя не доехавшим.
+        Каталог приходит от торговой части и обновляется на каждом применении
+        настроек: описание выбранного алгоритма считается по **применённым**
+        числам, а не по тому, что стоит в полях сию секунду.
+
+        ⚠️ Выбор в `Settings` этот вызов **не меняет**. Каталог — это то, из
+        чего выбирают; выбранное имя держится отдельно и меняется только
+        мышкой человека либо приходом настроек (`set_values`).
         """
-        self.rule_note.setText(text.strip() or RULE_NOT_ARRIVED)
+        self._algorithms = tuple(options)
+        self._show_algorithm()
+
+    def choose_algorithm(self) -> None:
+        """Открыть окно выбора алгоритма и запомнить выбранное.
+
+        Ничего не применяет: имя ложится в поля окна и уходит движку обычным
+        путём, по «Применить» или «ОК», вместе с остальными настройками.
+        Отдельная дорога к движку означала бы смену торгового правила
+        в обход подтверждения «было → стало».
+        """
+        dialog = AlgorithmDialog(self._algorithms, self)
+        dialog.set_chosen(self._strategy_id)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            chosen = dialog.chosen_id()
+        finally:
+            # Без этого окно живёт до конца работы программы: родителем ему
+            # назначено окно настроек, а `exec()` его не удаляет.
+            dialog.deleteLater()
+        if not chosen:
+            return
+        self._strategy_id = chosen
+        self._show_algorithm()
+
+    def _show_algorithm(self) -> None:
+        """Название выбранного алгоритма и оговорка, если что-то не так.
+
+        Три случая, и каждый говорится вслух.
+
+        * Всё в порядке — **только название**, строка беды спрятана. Правило
+          словами живёт в окне выбора: абзац на вкладке занимал 391–459 точек
+          и вытеснял поля средней под прокрутку (замер 08.09.2026), ради чего
+          задача и делалась.
+        * Каталог не приехал — показано имя латиницей и сказано почему.
+          Окно, открытое без торговой части, обязано назвать себя таким.
+        * Каталог есть, а выбранного в нём нет — это сборка постарше, чем
+          файл настроек, и молчать нельзя: робот таким алгоритмом работать
+          не сможет.
+        """
+        found = next(
+            (item for item in self._algorithms if item.id == self._strategy_id),
+            None,
+        )
+        if found is not None:
+            self.algorithm_name.setText(found.title)
+            # Правило одной фразой — во всплывающей подсказке: тому, кто ведёт
+            # мышью, оно достаётся без нажатий, а вкладка остаётся строкой.
+            self.algorithm_name.setToolTip(found.summary)
+            self._say_about_the_algorithm("", alarming=False)
+            return
+        self.algorithm_name.setText(self._strategy_id or "не выбран")
+        self.algorithm_name.setToolTip("")
+        if not self._algorithms:
+            self._say_about_the_algorithm(CATALOGUE_NOT_ARRIVED, alarming=False)
+            return
+        self._say_about_the_algorithm(
+            f"⚠️ Алгоритма «{self._strategy_id}» в этой сборке нет — робот "
+            "работать им не сможет. Скорее всего настройки или шаблон сделаны "
+            "более новой сборкой программы. Выберите алгоритм из списка "
+            "кнопкой справа либо обновите программу целиком.",
+            alarming=True,
+        )
+
+    def _say_about_the_algorithm(self, text: str, *, alarming: bool) -> None:
+        """Строка беды под названием. Пустая — спрятать, а не оставить пробел.
+
+        ⚠️ Спрятать, а не очистить: пустой ярлык с переносом строк держит
+        высоту строки и раздвигает группу на пустом месте — ровно то, против
+        чего эта вкладка и перестраивалась.
+        """
+        self._paint_note(self.algorithm_note, alarming=alarming)
+        self.algorithm_note.setText(text)
+        self.algorithm_note.setVisible(bool(text))
 
     def page_of(self, tab: str) -> QWidget | None:
         """Страница вкладки по её заголовку. `None` — такой вкладки нет.
@@ -1136,6 +1253,7 @@ class SettingsDialog(QDialog):
             self.history_depth_days, self.depth_days,
             self.price_step, self.ruble_per_point,
             # «Сигнал»
+            self.algorithm_button,
             self.average_period, self.average_kind,
             self.on_price_equals_average,
             self.filter_enabled, self.threshold_percent, self.confirm_bars,
@@ -1163,18 +1281,10 @@ class SettingsDialog(QDialog):
     def set_values(self, settings: Settings) -> None:
         """Показать настройки в полях."""
         self.instrument.setText(settings.instrument)
-        # ⚠️ Неизвестный размер свечи ДОБАВЛЯЕТСЯ в список, а не заменяется
-        # на «5 минут». Прежняя подмена была молчаливой и меняла стратегию
-        # целиком: настройка приходила одна, на «ОК» уходила другая, и в журнале
-        # решений этой правки не было. Правило файла №1 — значение, пришедшее
-        # снаружи, не подменяется молча — не знает исключений для списков.
-        index = self.timeframe.findText(settings.timeframe)
-        if index < 0 and settings.timeframe:
-            self.timeframe.insertItem(0, settings.timeframe)
-            index = 0
-        self.timeframe.setCurrentIndex(max(index, 0))
+        self._show_timeframe(settings.timeframe)
         self.depth_days.setValue(settings.depth_days)
         self.history_depth_days.setValue(max(settings.history_depth_days, 1))
+        self._take_algorithm(settings.strategy_id)
         self.average_period.setValue(settings.average_period)
         self.threshold_percent.setValue(settings.threshold_percent)
         self.confirm_bars.setValue(settings.confirm_bars)
@@ -1238,6 +1348,35 @@ class SettingsDialog(QDialog):
         self._sync_filter()
         self._sync_window_close()
 
+    def _show_timeframe(self, timeframe: str) -> None:
+        """Размер свечи в списке. Незнакомый ДОБАВЛЯЕТСЯ, а не подменяется.
+
+        Прежняя подмена на «5 минут» была молчаливой и меняла стратегию
+        целиком: настройка приходила одна, на «ОК» уходила другая, и в журнале
+        решений этой правки не было. Правило файла №1 — значение, пришедшее
+        снаружи, не подменяется молча — исключений для списков не знает.
+
+        Отдельным шагом от `set_values`, потому что это единственное поле
+        обмена с ветвлением, и объяснение к нему длиннее самого поля.
+        """
+        index = self.timeframe.findText(timeframe)
+        if index < 0 and timeframe:
+            self.timeframe.insertItem(0, timeframe)
+            index = 0
+        self.timeframe.setCurrentIndex(max(index, 0))
+
+    def _take_algorithm(self, strategy_id: str) -> None:
+        """Имя выбранного алгоритма — как пришло, без сверки с каталогом.
+
+        ⚠️ Незнакомое имя показывается как есть, а `_show_algorithm` говорит
+        вслух, что такого алгоритма в этой сборке нет. Подстановка умолчания
+        была бы сменой торгового правила без ведома владельца счёта: на экране
+        всё выглядело бы исправно, а робот работал бы не тем, что записано
+        в настройках.
+        """
+        self._strategy_id = strategy_id
+        self._show_algorithm()
+
     def _show_volume_and_guards(self, settings: Settings) -> None:
         """Объём, потолок и два процента предохранителей — отдельным шагом.
 
@@ -1277,6 +1416,11 @@ class SettingsDialog(QDialog):
             timeframe=self.timeframe.currentText(),
             depth_days=self.depth_days.value(),
             history_depth_days=self.history_depth_days.value(),
+            # ⚠️ Имя алгоритма отдаётся как есть, даже если каталог не приехал
+            # и названия мы не знаем. Подстановка умолчания на этом месте была
+            # бы сменой торгового правила, которой владелец счёта не делал
+            # и которой не будет в журнале решений.
+            strategy_id=self._strategy_id,
             average_period=self.average_period.value(),
             # ⚠️ Числа отдаются такими, какие стоят в полях, независимо
             # от галочки. Выключенный фильтр — это не «нули в окне»,

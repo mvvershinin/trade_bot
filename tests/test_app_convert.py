@@ -26,6 +26,7 @@ from engine import DayMarks, TradingWindow
 from engine import window as engine_window
 from market import Candle, MSK, Timeframe
 from strategies import AverageKind as StrategyAverageKind
+from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     AverageKind,
@@ -850,3 +851,133 @@ def test_every_non_trading_rule_has_words_for_the_band() -> None:
         rule for rule, trading, _ in engine_window._DAY_RULES if not trading
     }
     assert silent == set(convert._QUIET_OF_RULE)
+
+
+# ---------------------------------------------------------------------------
+# Выбор торгового алгоритма: строка журнала, каталог для окна, громкий отказ
+# ---------------------------------------------------------------------------
+#
+# Задача З4 миниплана `strategy-modules-switchable.md`, редакция 08.09.2026.
+# Здесь проверяется дорога от поля окна до журнала и до окна выбора; само
+# описание правила проверяется у алгоритма (`tests/test_strategies_description.py`),
+# а окно — в `tests/test_ui_algorithm_dialog.py`.
+
+
+def test_the_change_of_algorithm_is_named_in_the_journal() -> None:
+    """Сменили алгоритм — в журнале строка с прежним и новым **названием**.
+
+    ТЗ §4.4 А: изменение настройки пишется с прежним и новым значением.
+    Смена алгоритма — самое крупное изменение, какое бывает: меняется
+    не число в правиле, а само правило.
+
+    ⚠️ Значения здесь не проверяются на принадлежность реестру намеренно:
+    `window_changes` — сборщик строк журнала, и строка обязана получиться
+    и на имени, которого в сборке нет. Иначе разбор «что случилось» пропадал
+    бы ровно в том случае, ради которого его читают.
+
+    Мутация, обязанная ронять проверку: убрать `strategy_id` из `_WINDOW_TOLD`.
+    """
+    said = convert.window_changes(
+        Settings(),
+        Settings().replace(strategy_id="atr_channel"),
+    )
+    line = next((row for row in said if row.startswith("Торговый алгоритм")), "")
+    assert line, f"смена алгоритма не попала в журнал ни одной строкой: {said}"
+    assert "→" in line, "строка не показывает прежнее и новое значение"
+    before, _, after = line.partition("→")
+    assert "Реверс" in before, (
+        "прежний алгоритм назван именем латиницей, а не названием для человека"
+    )
+    assert "atr_channel" in after and "нет" in after, (
+        "новое имя не названо либо не сказано, что такого алгоритма в сборке нет"
+    )
+
+
+def test_a_field_without_a_journal_line_cannot_appear() -> None:
+    """Канарейка предыдущей проверки: поле без подписи роняет сборку строк.
+
+    Строка про безымянные поля собирается один раз при импорте
+    (`_SILENT_FIELDS`), поэтому проверяется она, а не текст журнала.
+    """
+    assert convert._SILENT_FIELDS == (), (  # noqa: SLF001 — сторож на внутреннюю таблицу
+        "поля окна остались без строки в журнале: "
+        f"{convert._SILENT_FIELDS}"  # noqa: SLF001 — то же
+    )
+
+
+def test_an_unknown_algorithm_is_refused_out_loud() -> None:
+    """Незнакомый алгоритм — отказ с фразой, а не подстановка умолчания.
+
+    Подстановка означала бы торговлю правилом, которого владелец счёта
+    не выбирал, при исправном виде окна. Отказ ловит `HistoryPort`
+    и показывает «Настройки не приняты», прежние остаются в силе.
+    """
+    with pytest.raises(convert.SettingsRefused) as refusal:
+        convert.strategy_settings(Settings().replace(strategy_id="atr_channel"))
+    said = str(refusal.value)
+    assert "atr_channel" in said, "отказ не называет, какой алгоритм требуется"
+    assert registry.DEFAULT_ID in said, "отказ не называет, какие алгоритмы есть"
+
+
+def test_the_window_default_algorithm_is_the_registry_default() -> None:
+    """Умолчание окна и умолчание реестра — одно и то же имя.
+
+    Окно реестра не видит (ARCHITECTURE.md §2), поэтому имя стоит в нём
+    строкой. Разъехавшись, эти два умолчания дали бы сборку, которая торгует
+    не тем правилом, о котором договаривались, и заметить это по экрану
+    нельзя.
+    """
+    assert Settings().strategy_id == registry.DEFAULT_ID
+
+
+def test_the_catalogue_carries_the_algorithms_own_words() -> None:
+    """Каталог для окна собран из реестра, а не написан в `app/`.
+
+    ⚠️ Сверяется с тем, что говорит о себе сам алгоритм. Второй текст рядом
+    с первым разошёлся бы при первой правке алгоритма — молча, текст не падает.
+    """
+    values = Settings()
+    catalogue = convert.algorithms(values)
+    assert catalogue, "каталог алгоритмов пуст — выбирать человеку не из чего"
+    assert [item.id for item in catalogue] == list(registry.known_ids())
+    chosen = next(item for item in catalogue if item.chosen)
+    assert chosen.id == values.strategy_id
+    entry = registry.find(chosen.id)
+    assert chosen.title == entry.title
+    assert chosen.summary == entry.summary
+    assert chosen.details == convert.strategy_rule(values)
+
+
+def test_the_catalogue_shows_the_numbers_that_are_applied() -> None:
+    """Описание выбранного алгоритма считается по применённым настройкам.
+
+    Мутация, обязанная ронять проверку: собирать описание по умолчаниям
+    алгоритма вместо полей окна. Человек читал бы правило про период 15,
+    имея в настройках 40.
+    """
+    chosen = convert.algorithms(Settings().replace(average_period=40))[0]
+    assert "40" in chosen.details, "описание не увидело нынешнего периода"
+    assert not any(sign.isdigit() for sign in chosen.summary), (
+        "правило одной фразой обязано читаться без чисел: оно показывается "
+        "до всякого «Применить»"
+    )
+
+
+def test_the_catalogue_does_not_fall_over_a_refusal() -> None:
+    """Настройки собрать не удалось — каталог всё равно приезжает и говорит это.
+
+    Окно выбора — место, куда человек приходит разобраться. Окно, упавшее
+    вместо ответа, лишает его и разбора тоже. Причина отказа обязана быть
+    в тексте, а не в трассировке.
+    """
+    # Период 0 приходит не из окна (там поле начинается с 5), а из файла
+    # настроек, правленного руками, — и проверку на него делает сам алгоритм.
+    catalogue = convert.algorithms(Settings().replace(average_period=0))
+    assert catalogue, "каталог не приехал вовсе"
+    assert "Показать правило с вашими числами не удалось" in catalogue[0].details
+    assert "период средней" in catalogue[0].details, (
+        "причина отказа названа не словами алгоритма, а общей фразой"
+    )
+    assert "умолчаниями" in catalogue[0].details, (
+        "не сказано, что числа в показанном правиле не принадлежат человеку"
+    )
