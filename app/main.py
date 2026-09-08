@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # ⚠️ только для подписей: настоящие импорты слоёв идут
     # внутри `_run`, после того как выставлены QT_API и QT_QPA_PLATFORM.
     # Наверху они подняли бы Qt при разборе ключей и при `--help`.
-    from PySide6.QtGui import QPixmap
+    from PySide6.QtGui import QPalette, QPixmap
     from PySide6.QtWidgets import QApplication
 
     from app.live_feed import LiveLink
@@ -351,6 +351,18 @@ def _use_dark_palette(application) -> None:
     ⚠️ Зовётся **до** сборки окна: тема читается при создании виджетов,
     и подмена после `MainWindow(...)` дошла бы не до всех.
     """
+    application.setStyle("Fusion")
+    application.setPalette(_dark_palette())
+
+
+def _dark_palette() -> "QPalette":
+    """Сама палитра, отдельно от её установки — чтобы её можно было проверить.
+
+    Проверка цветов иначе требовала бы подменить палитру **общего на весь
+    прогон** приложения Qt и вернуть её назад: сосед по процессу, которому
+    достался промежуток, красился бы не тем. Функция, возвращающая палитру,
+    проверяется без единого глобального изменения.
+    """
     from PySide6.QtGui import QColor, QPalette  # noqa: PLC0415 — Qt поднимается
     # только внутри `main()`, после QT_QPA_PLATFORM; наверху он поднялся бы
     # при разборе ключей и при `--help`
@@ -370,8 +382,25 @@ def _use_dark_palette(application) -> None:
     palette.setColor(QPalette.ColorRole.Mid, QColor("#8a8590"))
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#d9a441"))
     palette.setColor(QPalette.ColorRole.HighlightedText, paper)
-    application.setStyle("Fusion")
-    application.setPalette(palette)
+    # ⚠️ Выключенное состояние обязано быть **видно**, и без этих строк его
+    # видно не было. `setColor(role, цвет)` красит **все** группы разом,
+    # включая `Disabled`: текст выключенной кнопки выходил того же цвета,
+    # что и живой, и отличалась она одной рамкой (замер 09.09.2026: 314
+    # различающихся точек из 3350 против 1039 в системной палитре).
+    #
+    # Кнопка, выглядящая живой и молчащая на нажатие, — это молчание
+    # по правилу 13 `CLAUDE.md`, и касается это не одной кнопки: так же
+    # выглядели «Старт» на токене только для чтения и любое другое
+    # запрещённое действие. Цвет взят не новый, а уже стоящий в палитре
+    # (`Mid`): 4,8:1 на кнопке против 13,9:1 у живого текста — втрое тусклее
+    # и по-прежнему читаемо.
+    for role in (
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#8a8590"))
+    return palette
 
 
 def _speak_utf8() -> None:

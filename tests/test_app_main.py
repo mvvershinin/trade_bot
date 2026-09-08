@@ -231,6 +231,54 @@ def test_the_two_palette_keys_refuse_to_stand_together() -> None:
         _arguments(["--light", "--dark"])
 
 
+def test_the_dark_palette_shows_that_a_control_is_switched_off(qapp) -> None:
+    """Выключенная кнопка обязана **выглядеть** выключенной, а не только быть.
+
+    Замер 09.09.2026, найдено при правке окна выбора алгоритма. `QPalette.
+    setColor(role, цвет)` красит **все** группы разом, включая `Disabled`:
+    текст выключенной кнопки выходил того же цвета, что и живой, и отличалась
+    она одной рамкой — 314 различающихся точек из 3350 против 1039 в системной
+    палитре. Кнопка, выглядящая живой и молчащая на нажатие, — это молчание
+    по правилу 13 `CLAUDE.md`, и касается это не одной кнопки: так же
+    выглядели «Старт» на токене только для чтения и любой другой запрет.
+
+    ⚠️ Проверяется **возвращённая** палитра, а не палитра приложения:
+    приложение Qt в прогоне одно на всю сессию, и подмена его палитры
+    покрасила бы не тем соседа по процессу.
+
+    ⚠️ Порог снизу тоже нужен. Выключенное — не значит нечитаемое: человек
+    обязан прочесть, чего именно ему не дают. 4,5:1 — обычный порог WCAG
+    для текста.
+
+    Мутация, обязанная ронять проверку: убрать цикл по `ColorGroup.Disabled`
+    из `_dark_palette`.
+    """
+    from PySide6.QtGui import QPalette
+
+    from app.main import _dark_palette
+    from ui.theme import contrast
+
+    palette = _dark_palette()
+    for role in (
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+    ):
+        live = palette.color(QPalette.ColorGroup.Active, role)
+        off = palette.color(QPalette.ColorGroup.Disabled, role)
+        assert off != live, (
+            f"выключенный {role.name} того же цвета, что живой: запрет не виден"
+        )
+        paper = palette.color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button)
+        faded = contrast(off.name(), paper.name())
+        assert faded >= 4.5, (
+            f"выключенный {role.name} нечитаем: {faded:.1f}:1 против порога 4,5"
+        )
+        assert faded < contrast(live.name(), paper.name()), (
+            f"выключенный {role.name} не тусклее живого — отличить их нельзя"
+        )
+
+
 def test_the_shot_keys_refuse_to_work_without_a_shot() -> None:
     """`--shot-of` и `--shot-tab` без `--shot` — отказ вслух, а не «ничего».
 
@@ -266,12 +314,25 @@ def test_the_program_opens_its_own_algorithm_window_and_it_is_not_empty(
     кодом 1 и скажет почему. Поэтому существующий файл — доказательство того,
     что каталог доехал.
 
+    ⚠️ **`--symbol XXZ9` здесь несущий, а не декоративный.** С настоящим
+    тикером проверка **зеленела при снятой проводке** — проверено мутацией
+    09.09.2026. Механизм: порт спрашивает у биржи стоимость пункта, ответ
+    приходит через `_point_taken`, тот кладёт число **через `apply_settings`**,
+    а `apply_settings` заодно отправляет каталог. То есть каталог доезжал
+    до окна случайной попутной дорогой, зависящей от того, ответила ли биржа
+    и успела ли ответить до снимка. Сторож на такой дороге не стережёт ничего.
+    Тикера `XXZ9` на бирже нет: ответа не будет ни при живой сети (пустая
+    карточка), ни при мёртвой (исключение), — обе ветки кончаются
+    `_point_trouble`, а он настроек не применяет.
+
     Мутация, обязанная ронять проверку: снять `self.port.request_settings()`
-    из `MainWindow.open_settings`.
+    из `MainWindow.open_settings`. Проверено: программа выходит кодом 1
+    и говорит, что окно не открылось.
     """
     shot = tmp_path / "algorithm.png"
     outcome = _run(
         "--db", str(_database(tmp_path / "candles.sqlite3")),
+        "--symbol", "XXZ9",
         "--shot", str(shot), "--shot-of", "algorithm",
     )
     assert outcome.returncode == 0, (

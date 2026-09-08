@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import pytest
 from helpers import settle_qt
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import QDialogButtonBox, QLabel
 
 from ui.algorithm_dialog import (
     ALONE_NOTE,
     EMPTY_NOTE,
+    WINDOW_HEIGHT,
     AlgorithmDetails,
     AlgorithmDialog,
     details_preamble,
@@ -253,6 +254,71 @@ def test_a_missing_algorithm_in_a_real_catalogue_still_asks_for_a_choice(
     )
     assert window.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled(), (
         "«ОК» выключен там, где выбрать есть из чего"
+    )
+
+
+def _height_the_text_needs(label: QLabel) -> int:
+    """Сколько точек нужно тексту ярлыка при его нынешней ширине.
+
+    ⚠️ Считается по шрифту, а не спрашивается у Qt. `QLabel.heightForWidth`
+    в разложенном окне возвращает **уже отведённую** высоту, а не нужную:
+    проверка на нём зеленела при заведомо сжатых надписях (замер 09.09.2026).
+    То же и с пересечением прямоугольников — компоновщик раздаёт их
+    непересекающимися, просто вдвое ниже нужного, а текст рисуется поверх
+    соседа, выйдя за свой.
+    """
+    return label.fontMetrics().boundingRect(
+        QRect(0, 0, label.width(), 0),
+        int(Qt.TextFlag.TextWordWrap),
+        label.text(),
+    ).height()
+
+
+def test_the_window_grows_under_a_long_rule_instead_of_squeezing_it(
+    make_choice,
+) -> None:
+    """Окно растёт под текст, а не режет его и не кладёт строки друг на друга.
+
+    Замер 09.09.2026, найдено глазами на снимке: строка про непришедший
+    список легла **поверх** строки про выбранную настройку, и прочитать
+    нельзя было ни ту, ни другую. Причина — ярлык с переносом сообщает
+    компоновщику минимум в одну строку, а высота окна была задана числом.
+
+    Правило одной фразой приходит **снаружи**, от самого алгоритма
+    (`strategies/`), и его длину окно не выбирает: сегодня она в две строки,
+    завтра у другого алгоритма в шесть.
+
+    Мутация, обязанная ронять проверку: убрать вызов `_fit_the_window`
+    из `_show_summary`.
+    """
+    wordy = AlgorithmOption(
+        id="wordy", title="Многословный",
+        summary="Очень длинное правило одной фразой. " * 12,
+        details="Правило абзацами.",
+    )
+    window = make_choice(wordy)
+    window.set_chosen("wordy")
+    layout = window.layout()
+    assert layout is not None
+    layout.activate()
+
+    assert window.height() > WINDOW_HEIGHT, (
+        f"окно осталось прежней высоты ({window.height()}) под текстом, "
+        "который в неё не помещается"
+    )
+    shown = [
+        label for label in window.findChildren(QLabel)
+        if label.text() and not label.isHidden()
+    ]
+    assert len(shown) >= 3, "надписей меньше, чем должно быть: проверка вакуумна"
+    cramped = [
+        (label.text()[:40], label.height(), _height_the_text_needs(label))
+        for label in shown
+        if _height_the_text_needs(label) > label.height()
+    ]
+    assert not cramped, (
+        "надписи не помещаются в отведённую им высоту и лягут поверх соседей "
+        f"(текст, дано, нужно): {cramped}"
     )
 
 
