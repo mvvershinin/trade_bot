@@ -198,7 +198,18 @@ def _windows_flags() -> list[str]:
         # Отдельным процессом, а не импортом: `tools/` пакетом не является,
         # и `import make_icon` разрешается по-разному в зависимости от того,
         # чем позвали `build.py`. Генератор дешёвый, вызывается раз на сборку.
-        subprocess.check_call([sys.executable, str(ROOT / "tools" / "make_icon.py")])
+        # ⚠️ Режим UTF-8 подпроцессу — обязателен, а не для красоты.
+        # Замер 08.09.2026 на теге v0.1.0: `make_icon.py` печатает размер
+        # строкой с русской «Б», Python на Windows отдаёт stdout в кодировке
+        # консоли (там cp1252), и генератор иконки падал с UnicodeEncodeError,
+        # роняя сборку за 26 секунд до начала компиляции. В CI это же включено
+        # на уровне задания, здесь — чтобы сборка работала и у человека,
+        # запустившего `build.py` руками на своей Windows.
+        environment = dict(os.environ, PYTHONUTF8="1")
+        subprocess.check_call(
+            [sys.executable, str(ROOT / "tools" / "make_icon.py")],
+            env=environment,
+        )
     flags.append(f"--windows-icon-from-ico={icon}")
     return flags
 
