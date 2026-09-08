@@ -64,6 +64,15 @@ jobs:
       # несёт остальное сам.
       - name: Системные библиотеки Qt (offscreen)
         run: |
+          # ⚠️ В образе бегунка лежат сторонние репозитории, которыми мы
+          # не пользуемся. Замер 08.09.2026: packages.microsoft.com отдал
+          # 403 Forbidden, `apt-get update` вышел с кодом 100, и прогон упал
+          # на шаге установки библиотек Qt — при полностью исправном коде.
+          # Соседний PR в те же минуты прошёл зелёным, то есть отказ плавучий.
+          # Убираем чужие списки до обновления: так отказ ИМЕННО репозиториев
+          # Ubuntu по-прежнему роняет шаг, а чужая поломка нас не касается.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list \
+                     /etc/apt/sources.list.d/microsoft*.sources
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             libgl1 \
