@@ -30,7 +30,6 @@ from PySide6.QtWidgets import QDialogButtonBox, QLabel
 from ui.algorithm_dialog import (
     ALONE_NOTE,
     EMPTY_NOTE,
-    WINDOW_HEIGHT,
     AlgorithmDetails,
     AlgorithmDialog,
     details_preamble,
@@ -257,8 +256,12 @@ def test_a_missing_algorithm_in_a_real_catalogue_still_asks_for_a_choice(
     )
 
 
-def _height_the_text_needs(label: QLabel) -> int:
-    """Сколько точек нужно тексту ярлыка при его нынешней ширине.
+def _height_the_text_needs(label: QLabel, text: str | None = None) -> int:
+    """Сколько точек нужно тексту при нынешней ширине ярлыка.
+
+    Текст можно передать чужой — тогда меряется он, а не показанный сейчас.
+    Так подбирается правило, которое в окно заведомо не влезает
+    (`_a_rule_taller_than`), — **до** того, как окно с ним построено.
 
     ⚠️ Считается по шрифту, а не спрашивается у Qt. `QLabel.heightForWidth`
     в разложенном окне возвращает **уже отведённую** высоту, а не нужную:
@@ -270,8 +273,48 @@ def _height_the_text_needs(label: QLabel) -> int:
     return label.fontMetrics().boundingRect(
         QRect(0, 0, label.width(), 0),
         int(Qt.TextFlag.TextWordWrap),
-        label.text(),
+        label.text() if text is None else text,
     ).height()
+
+
+#: Сколько раз подбор длины правила успевает удвоить текст, прежде чем
+#: признать поломку мерки. Шестнадцать удвоений — это 65 536 повторов фразы,
+#: то есть больше двух мегабайт: столько не потребуется ни при каком шрифте,
+#: а вот шрифт нулевой высоты крутил бы такой цикл вечно.
+RULE_DOUBLINGS = 16
+
+
+def _a_rule_taller_than(label: QLabel, points: int) -> str:
+    """Правило одной фразой, которому при ширине `label` нужно больше `points`.
+
+    ⚠️ Длина здесь **считается по шрифту той машины, где идёт прогон**, а не
+    зашита множителем. Зашитый множитель и есть та самая зависимость от чужих
+    шрифтов, на которой проверка упала на бегунке CI 09.09.2026, вечером того
+    же дня, при полностью исправной программе: та же строка более узким шрифтом укладывается
+    в меньшее число строк, в окно **влезает**, и растить его не за чем.
+    Замер той же минуты: `QT_FONT_DPI=72` даёт на этой машине высоту строки
+    13 точек против 17, и текст, которому нужно было 102 точки, обходится 52.
+
+    Множитель, подобранный «чтобы уж точно не влезло», лечит симптом до
+    первого шрифта пошире, и следующий множитель придётся снова удваивать.
+    """
+    phrase = "Очень длинное правило одной фразой. "
+    text = phrase
+    for _ in range(RULE_DOUBLINGS):
+        if _height_the_text_needs(label, text) > points:
+            return text
+        text += text
+    raise AssertionError(
+        f"правило доросло до {len(text)} знаков и всё ещё умещается "
+        f"в {points} точек: у шрифта нулевая высота либо мерка сломана"
+    )
+
+
+def _lay_out(window: AlgorithmDialog) -> None:
+    """Разложить окно сейчас, а не когда-нибудь: меряем уже расставленное."""
+    layout = window.layout()
+    assert layout is not None, "у окна нет компоновки — мерить нечего"
+    layout.activate()
 
 
 def test_the_window_grows_under_a_long_rule_instead_of_squeezing_it(
@@ -288,23 +331,56 @@ def test_the_window_grows_under_a_long_rule_instead_of_squeezing_it(
     (`strategies/`), и его длину окно не выбирает: сегодня она в две строки,
     завтра у другого алгоритма в шесть.
 
-    Мутация, обязанная ронять проверку: убрать вызов `_fit_the_window`
-    из `_show_summary`.
+    Стережётся здесь **инвариант, а не число точек**, и это правка того же
+    вечера, после падения на бегунке CI (прогон 34354445362):
+
+    1. окно с длинным правилом выше, чем **оно же** с коротким. Мерка —
+       второе такое же окно, а не зашитая константа: константу надо с чем-то
+       сравнивать, и сравнение упирается в шрифты хозяина машины;
+    2. ни одной надписи не отведено меньше, чем нужно её тексту по шрифту.
+       Первого пункта мало: окно, выросшее на десять точек вместо ста,
+       сжимает текст ровно так же.
+
+    Насколько длинное правило считается длинным, тоже не зашито: строка
+    подбирается так, чтобы ей одной было мало всей высоты короткого окна
+    (`_a_rule_taller_than`). Тогда содержимому заведомо нужно больше, чем
+    у окна есть, при любом шрифте — а без такого подбора при узком шрифте
+    текст умещается и растить окно **правильно** не надо.
+
+    Мутации, обязанные ронять проверку:
+    * убрать вызов `_fit_the_window` из `_show_summary` — окно не вырастет
+      вовсе, падают оба пункта;
+    * растить окно на постоянную добавку вместо `heightForWidth` — первый
+      пункт пройдёт, второй обязан упасть.
     """
+    terse = AlgorithmOption(
+        id="terse", title="Немногословный",
+        summary="Правило одной фразой.",
+        details="Правило абзацами.",
+    )
+    modest = make_choice(terse)
+    modest.set_chosen("terse")
+    _lay_out(modest)
+    under_a_short_rule = modest.height()
+
     wordy = AlgorithmOption(
         id="wordy", title="Многословный",
-        summary="Очень длинное правило одной фразой. " * 12,
+        summary=_a_rule_taller_than(modest.summary, under_a_short_rule),
         details="Правило абзацами.",
     )
     window = make_choice(wordy)
     window.set_chosen("wordy")
-    layout = window.layout()
-    assert layout is not None
-    layout.activate()
+    _lay_out(window)
 
-    assert window.height() > WINDOW_HEIGHT, (
-        f"окно осталось прежней высоты ({window.height()}) под текстом, "
-        "который в неё не помещается"
+    assert window.summary.width() == modest.summary.width(), (
+        "строка под списком получила в двух окнах разную ширину "
+        f"({window.summary.width()} и {modest.summary.width()}) — длина "
+        "правила подбиралась не по той ширине, на которой его покажут"
+    )
+    assert window.height() > under_a_short_rule, (
+        f"окно осталось прежней высоты ({window.height()}) под правилом, "
+        f"которому одному нужно больше {under_a_short_rule} точек — "
+        "ровно столько занимает всё окно с коротким правилом"
     )
     shown = [
         label for label in window.findChildren(QLabel)
