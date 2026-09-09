@@ -23,6 +23,7 @@ from engine import (
     ExitReason,
     Fill,
     JournalLevel,
+    LevelTouch,
     Mode,
     OrderAction,
     OrderRequest,
@@ -977,7 +978,7 @@ def test_a_deal_on_the_armed_level_is_a_take_profit_because_the_order_says_so() 
     order = OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим уровень",
-        order_id="take:long:тест", price=100.5,
+        order_id="take:long:тест", price=100.5, touch=LevelTouch.RISE,
     )
     state = EngineState(position=armed, pending=(order,))
     result = apply_fill(state, Fill(

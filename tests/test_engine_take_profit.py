@@ -49,6 +49,7 @@ from engine import (
     ExitReason,
     Fill,
     JournalLevel,
+    LevelTouch,
     Mode,
     OrderAction,
     OrderRequest,
@@ -66,6 +67,7 @@ from engine import (
     order_words,
     take_order_id,
 )
+from engine.pipeline import _arm_order
 from strategies import Intent
 from tests.engine_helpers import (
     ListSource,
@@ -154,14 +156,14 @@ def guarding(position, *, at: tuple[int, int] = (10, 5)) -> OrderRequest:
     уровень сторожится, его заявка лежит в `pending` всё время позиции.
     Тесты отказов, собранные с пустым полётом, проверяют не то и пропускают
     ровно те находки, ради которых написаны.
+
+    ⚠️ Заявка собирается **производственным** `_arm_order`, а не руками.
+    Своя сборка означала бы вторую копию таблицы стороны касания в оснастке,
+    и тесты стали бы слепы ровно к той ошибке, из которой вырос `B-046`.
     """
     level = position.take_profit
     assert level is not None, "позиция без уровня — вооружать нечего"
-    return OrderRequest(
-        action=OrderAction.ARM_TAKE_PROFIT, side=position.side,
-        volume=position.volume, submitted_at=bar(*at).closes_at,
-        reason="сторожим уровень", order_id=take_order_id(position), price=level,
-    )
+    return _arm_order(position, bar(*at).closes_at, level)
 
 
 def guarded_state(position, **rest) -> EngineState:
@@ -738,11 +740,8 @@ def test_a_deal_by_a_level_that_is_no_longer_in_flight_halts_the_robot() -> None
     """
     level = fixed_level(PRICE, 1, 0.5)
     assert level is not None
-    arm = OrderRequest(
-        action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
-        submitted_at=bar(10, 5).closes_at, reason="сторожим",
-        order_id=take_order_id(armed()), price=level,
-    )
+    arm = guarding(armed())
+    assert arm.price == level, "оснастка вооружает не тот уровень"
     lines: list = []
     engine = Engine(
         ScriptedStrategy([decision(Intent.SHORT, close=PRICE)] * 3),
@@ -1461,7 +1460,7 @@ def test_the_take_profit_date_is_taken_from_the_time_of_the_deal() -> None:
     order = OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
-        order_id="take:long:тест", price=level,
+        order_id="take:long:тест", price=level, touch=LevelTouch.RISE,
     )
     engine = Engine(
         ScriptedStrategy([]), WORKING,
@@ -1500,10 +1499,10 @@ def test_the_trailing_take_counts_as_the_same_event_for_the_stop_rule() -> None:
         step_percent=0.05, peak=PRICE * 1.01, level=PRICE * 1.008,
     )
     moving = replace(armed(plan=plan, level=PRICE * 1.008), take=plan)
-    order = OrderRequest(
-        action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
-        submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
-        order_id=take_order_id(moving), price=plan.level,
+    order = guarding(moving, at=INSIDE)
+    assert order.touch is LevelTouch.FALL, (
+        "скользящий уровень лонга стоит ПОЗАДИ рынка — до него откатываются "
+        "сверху, а не дорастают снизу (B-046)"
     )
     engine = Engine(
         ScriptedStrategy([]), WORKING.replace(trailing_take_profit=True),
@@ -2213,7 +2212,7 @@ def test_the_words_for_an_order_name_all_four_actions() -> None:
     arm = OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
-        order_id=take_order_id(guarded), price=211_050.0,
+        order_id=take_order_id(guarded), price=211_050.0, touch=LevelTouch.RISE,
     )
     cancel = OrderRequest(
         action=OrderAction.CANCEL_TAKE_PROFIT, side=Side.LONG, volume=1.0,

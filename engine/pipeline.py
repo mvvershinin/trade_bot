@@ -101,6 +101,7 @@ from engine.contracts import (
     Fill,
     JournalEntry,
     JournalLevel,
+    LevelTouch,
     OrderAction,
     OrderRequest,
     Position,
@@ -1091,8 +1092,40 @@ def take_order_id(position: Position) -> str:
     return f"take:{position.side.value}:{position.entry_time.isoformat()}"
 
 
+#: С какой стороны цена доходит до сторожимого уровня — **таблица**, а не
+#: цепочка `if`. Ключ: «скользящий ли уровень» и сторона позиции.
+#:
+#: Неподвижный тейк стоит в сторону прибыли от цены входа, и до него доходят
+#: **со стороны прибыли**: у лонга снизу, у шорта сверху. Скользящий стоит
+#: на отступе **позади** лучшей достигнутой цены — это стоп, и до него
+#: откатываются с обратной стороны.
+#:
+#: Проверено по коду: `fixed_level` кладёт уровень `entry ± entry·p/100`,
+#: `TakeProfit._offset_from` — `peak − side_sign·peak·off/100`.
+#:
+#: ⚠️ **Единственное место вывода стороны касания во всём продукте.** Второе
+#: означало бы, что таблица существует в двух копиях, и первая же правка
+#: развела бы их молча. Обе подачи вооружения идут через `_arm_order`.
+_TOUCH_SIDE: dict[tuple[bool, Side], LevelTouch] = {
+    (False, Side.LONG): LevelTouch.RISE,
+    (False, Side.SHORT): LevelTouch.FALL,
+    (True, Side.LONG): LevelTouch.FALL,
+    (True, Side.SHORT): LevelTouch.RISE,
+}
+
+
 def _arm_order(position: Position, at: datetime, level: float) -> OrderRequest:
-    """Заявка «сторожи уровень X». Уровень посчитан вызывающим."""
+    """Заявка «сторожи уровень X». Уровень посчитан вызывающим.
+
+    Сторона касания берётся из таблицы `_TOUCH_SIDE` и уходит в заявку:
+    исполнитель её **не выводит**. Ровно из вывода на его стороне и вырос
+    `B-046` — скользящий уровень, лежащий позади рынка, сторожился как
+    уровень впереди рынка и срабатывал на первой же свече.
+
+    ⚠️ Решение 0008 при этом цело: движок объявляет, *с какой стороны* до
+    уровня доходят, и по-прежнему не читает `high`, `low` и не сравнивает
+    цену с уровнем.
+    """
     return OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT,
         side=position.side,
@@ -1104,6 +1137,7 @@ def _arm_order(position: Position, at: datetime, level: float) -> OrderRequest:
         ),
         order_id=take_order_id(position),
         price=level,
+        touch=_TOUCH_SIDE[(position.take.trailing, position.side)],
     )
 
 
