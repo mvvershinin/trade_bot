@@ -48,11 +48,12 @@ import dataclasses
 from collections.abc import Callable
 from typing import Any, Final
 
-from strategies.contracts import Description, Strategy
+from strategies.contracts import Description, Strategy, StrategySettings
 from strategies.ema_reverse import EmaReverse, EmaReverseSettings
 from strategies.ema_reverse import describe as describe_ema_reverse
 
 __all__ = [
+    "SettingsField",
     "StrategyEntry",
     "UnknownStrategy",
     "DEFAULT_ID",
@@ -73,14 +74,47 @@ class UnknownStrategy(LookupError):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class SettingsField:
+    """Одно поле настроек модуля: как зовётся, откуда берётся, как подписано.
+
+    ⚠️ **Одна таблица вместо трёх рукописных списков.** До 09.09.2026 те же
+    сведения лежали в трёх местах: пары «поле модуля → поле окна» здесь,
+    сборщик значений в `app/convert.py::_STRATEGY_FIELDS` и подписи полей
+    в `app/runs.py::_STRATEGY_TITLES`. Правые половины не сверяло ничто
+    (`D-100`): список здесь продуктовым кодом не читался вовсе, а настоящий
+    перевод делал сборщик. Поле, добавленное в один список и забытое
+    в другом, означало настройку, которая молча не доезжает до движка либо
+    молча не подписана в снимке прогона.
+
+    Три колонки — три читателя, и все три обязаны говорить об одном поле:
+    сборщик настроек, снимок прогона и проверка полноты.
+    """
+
+    #: Как поле зовётся у самого модуля — имя в его классе настроек.
+    name: str
+    #: Из какого поля **общих настроек программы** оно берётся. Внешнее имя,
+    #: а не своё: совпадать они не обязаны.
+    #:
+    #: ⚠️ Не `window`, хотя поле и показывается в окне настроек: слову «окно»
+    #: в этом слое занято торговым окном, и сторож
+    #: `test_the_module_does_not_speak_about_money_window_or_broker`
+    #: справедливо принял бы одно за другое. Понятие торгового окна в слое
+    #: стратегий не живёт вовсе (ARCHITECTURE.md §3).
+    outer: str
+    #: Подпись для человека — снимок настроек прогона и отчёты. Кириллица
+    #: здесь законна: это текст, а не имя (`CLAUDE.md` №6).
+    title: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class StrategyEntry:
     """Одна строка реестра: всё, что программа знает о торговом модуле.
 
     Поля — данные, а не поведение: по ним собирается модуль, подписывается
     список в окне и переводятся настройки. Запись неизменяема целиком,
-    включая таблицу полей (кортеж пар, а не словарь): общая таблица, которую
-    можно поправить из любого места, однажды будет поправлена из теста
-    и достанется соседям.
+    включая таблицу полей (кортеж записей, а не словарь): общая таблица,
+    которую можно поправить из любого места, однажды будет поправлена
+    из теста и достанется соседям.
     """
 
     #: Имя в настройках, в журнале и в базе прогонов. Только латиница: оно
@@ -94,9 +128,15 @@ class StrategyEntry:
     settings_type: type[Any]
     #: Сборка модуля из его настроек.
     factory: Callable[[Any], Strategy]
-    #: Соответствие «поле настроек модуля → поле общих настроек программы».
-    #: Кортеж пар, а не словарь: запись неизменяема целиком.
-    fields: tuple[tuple[str, str], ...]
+    #: Поля настроек модуля: имя у модуля, имя в окне, подпись для человека.
+    #: Кортеж, а не словарь: запись неизменяема целиком.
+    #:
+    #: ⚠️ Читается продуктовым кодом, а не только проверками: по нему
+    #: `app/convert.py` собирает настройки модуля из полей окна, а
+    #: `app/runs.py` подписывает их в снимке прогона. Второго такого списка
+    #: в программе быть не должно — именно расхождение двух списков и было
+    #: `D-100`.
+    fields: tuple[SettingsField, ...]
     #: Как модуль принимает решение — **сборка описания словами** по его
     #: настройкам, а не готовая строка.
     #:
@@ -141,15 +181,28 @@ class StrategyEntry:
         self._own(settings)
         return self.describe(settings)
 
-    def defaults(self) -> object:
+    def titles(self) -> dict[str, str]:
+        """«Поле модуля» → «подпись для человека». Снимок прогона читает это.
+
+        Словарь, а не кортеж: читатель ищет подпись по имени поля. Собирается
+        на каждый вызов из неизменяемой таблицы — общий словарь, который можно
+        поправить из любого места, однажды поправили бы из теста.
+        """
+        return {one.name: one.title for one in self.fields}
+
+    def defaults(self) -> StrategySettings:
         """Настройки модуля по умолчанию — его собственные, а не чужие.
 
         Тип ответа — `object`, а не `Any`: реестр не знает, какой класс
         настроек у модуля, и `Any` здесь означал бы «проверок больше нет»
         у **всех** вызывающих. Кому нужен конкретный тип, тот называет его
         у себя, а `build()` всё равно проверит принадлежность.
+
+        Тип ответа — **порт настроек**: сборке от них нужны подпись линии
+        и строки журнала, и больше ничего (`strategies/contracts.py`).
         """
-        return self.settings_type()
+        made: StrategySettings = self.settings_type()
+        return made
 
     def build(self, settings: object) -> Strategy:
         """Собрать модуль. Настройки чужого модуля — отказ вслух.
@@ -184,7 +237,7 @@ class StrategyEntry:
         завтра и забытое в таблице, молча получило бы умолчание вместо того,
         что выбрано в окне.
         """
-        named = {name for name, _ in self.fields}
+        named = {one.name for one in self.fields}
         known = {field.name for field in dataclasses.fields(self.settings_type)}
         return tuple(sorted(known - named))
 
@@ -196,7 +249,7 @@ class StrategyEntry:
         не там, где причина.
         """
         known = {field.name for field in dataclasses.fields(self.settings_type)}
-        return tuple(sorted({name for name, _ in self.fields} - known))
+        return tuple(sorted({one.name for one in self.fields} - known))
 
 
 #: Таблица модулей. Явные импорты, ни одного `importlib` — см. шапку файла.
@@ -213,11 +266,18 @@ _ENTRIES: Final[tuple[StrategyEntry, ...]] = (
         settings_type=EmaReverseSettings,
         factory=EmaReverse,
         fields=(
-            ("period", "average_period"),
-            ("kind", "average_kind"),
-            ("on_equal", "on_price_equals_average"),
-            ("threshold_percent", "threshold_percent"),
-            ("confirm_bars", "confirm_bars"),
+            SettingsField("period", "average_period", "Период средней"),
+            SettingsField("kind", "average_kind", "Тип средней"),
+            SettingsField(
+                "on_equal", "on_price_equals_average",
+                "Закрытие ровно на средней",
+            ),
+            SettingsField(
+                "threshold_percent", "threshold_percent", "Порог пересечения, %",
+            ),
+            SettingsField(
+                "confirm_bars", "confirm_bars", "Подтверждение сигнала, свечей",
+            ),
         ),
         describe=describe_ema_reverse,
     ),

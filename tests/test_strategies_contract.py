@@ -46,6 +46,7 @@ from strategies import (
     EmaReverse,
     Intent,
     OnPriceEqualsAverage,  # noqa: F401 — берётся через globals()[...] ниже
+    SettingsField,
     Strategy,
     StrategyEntry,
     check_bar,
@@ -963,7 +964,7 @@ def _stand_in_entry(factory: type, title: str) -> StrategyEntry:
         title=title,
         settings_type=StandInSettings,
         factory=factory,
-        fields=(("period", "average_period"),),
+        fields=(SettingsField("period", "average_period", "Период средней"),),
         describe=_stand_in_description,
     )
 

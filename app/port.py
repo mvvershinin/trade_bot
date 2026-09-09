@@ -68,7 +68,6 @@ from market import (
     is_synthetic,
     warmup_bars,
 )
-from strategies import EmaReverse
 from ui.models import (
     BacktestOptions,
     BacktestRequest,
@@ -1158,7 +1157,7 @@ class HistoryPort(TerminalPort):
 
         Строки изменений собираются из **трёх** источников, и это не мелочь:
         движок (`EngineSettings.changes_from`) и торговый модуль
-        (`EmaReverseSettings.changes_from`) знают только свои поля, а пять
+        (`StrategySettings.changes_from`) знают только свои поля, а пять
         полей окна не принадлежат ни одному из них — инструмент, размер свечи
         и три поля предохранителей. Пока их строки писал только движок, смена
         инструмента давала в журнал «Значения совпали с прежними», после чего
@@ -1173,7 +1172,11 @@ class HistoryPort(TerminalPort):
             fresh = convert.engine_settings(settings, self._mode, self._engine_settings)
             convert.timeframe_of(settings.timeframe)
             convert.instrument_of(settings.instrument)
-            module = convert.strategy_settings(settings)
+            # Настройки алгоритма собираются здесь ради **проверки**: отказ
+            # обязан случиться до того, как новые значения станут текущими.
+            # Сами они пересобираются там, где нужны, — в живом ходе и в
+            # прогоне (`_watcher`, `_replay`).
+            convert.strategy_settings(settings)
         except convert.SettingsRefused as refusal:
             self._refuse("Настройки не приняты", str(refusal))
             return
@@ -1191,24 +1194,11 @@ class HistoryPort(TerminalPort):
 
         changes = convert.window_changes(self._values, settings)
         changes += fresh.changes_from(self._engine_settings)
-        rule_changed = module.changes_from(convert.strategy_settings(self._values))
-        changes += rule_changed
-        # ⚠️ Смена самого алгоритма меняет правило целиком, а его настройки
-        # при этом могут совпасть до поля: `changes_from` тогда пуст, и строки
-        # с новым правилом не было бы ровно в том случае, когда она нужнее
-        # всего. Имя алгоритма своей строкой в журнал уже попало
-        # (`convert._WINDOW_TOLD`), но имя — это «что поменялось»,
-        # а не «во что оно превратилось».
-        if rule_changed or self._values.strategy_id != settings.strategy_id:
-            # ⚠️ Одной строкой мало: «Период средней: 15 → 20» говорит, что
-            # поменяли, и не говорит, каким стало **правило**. Через месяц
-            # разбирают именно правило — «почему в тот день робот повёл себя
-            # иначе», — а восстанавливать его из чисел по памяти некому.
-            # Строка собрана из той же таблицы утверждений, что и решения
-            # модуля, поэтому разойтись с ними не может.
-            changes.append(
-                f"Правило теперь читается так — {convert.rule_headline_of(module)}"
-            )
+        # ⚠️ Строки про правило собирает `convert`, а не порт: сравнивать
+        # настройки алгоритма можно только с настройками **того же** алгоритма,
+        # а при смене самого алгоритма прежние принадлежат другому классу.
+        # Порт этого различить не может — он не знает, какие бывают алгоритмы.
+        changes += convert.rule_changes(self._values, settings)
         guards = convert.guard_changes(self._values, settings)
         self._values = settings
         self._engine_settings = fresh
@@ -2750,19 +2740,24 @@ class HistoryPort(TerminalPort):
         как прерванный, — так же, как прогон по истории.
         """
         module = convert.strategy_settings(frame.values)
+        algorithm = convert.chosen_algorithm(frame.values)
         record = RunConditions(
             origin=convert.stored_origin(_WATCH_ORIGIN),
             symbol=symbol,
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=convert.strategy_title(frame.values),
+            algorithm=algorithm,
             app_version=version(),
             days=self._days,
             until=self._until,
         ).record(candles)
         observer = LiveObserver(
-            strategy=EmaReverse(module),
+            # ⚠️ Модуль собирает **реестр** по выбранной записи, а не порт
+            # по имени класса: имени алгоритма в этом файле нет вовсе,
+            # иначе окно показывало бы второй алгоритм, а решения считал бы
+            # первый (миниплан `strategy-modules-switchable.md`, З2).
+            strategy=algorithm.build(module),
             settings=frame.engine,
             say=self.note,
             costs=convert.run_costs(frame.values),
@@ -2840,13 +2835,14 @@ class HistoryPort(TerminalPort):
         (ARCHITECTURE.md §1), и тем более не различает, записывают ли его.
         """
         module = convert.strategy_settings(frame.values)
+        algorithm = convert.chosen_algorithm(frame.values)
         conditions = RunConditions(
             origin=convert.stored_origin(_ORIGIN),
             symbol=symbol,
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=convert.strategy_title(frame.values),
+            algorithm=algorithm,
             app_version=version(),
             days=self._days,
             until=self._until,
@@ -2854,7 +2850,7 @@ class HistoryPort(TerminalPort):
         async with self._runs.around(conditions.record(candles)) as entry:
             run = await replay(
                 candles,
-                EmaReverse(module),
+                algorithm.build(module),
                 frame.engine,
                 # Издержки прогона задаются в окне: проскальзывание меняет цену
                 # каждого исполнения, а значит все деньги отчёта. Умолчание —
@@ -3395,7 +3391,7 @@ class HistoryPort(TerminalPort):
             settings_text=settings_text(
                 self._engine_settings,
                 convert.strategy_settings(self._values),
-                strategy_title=convert.strategy_title(self._values),
+                algorithm=convert.chosen_algorithm(self._values),
             ),
         ))
 

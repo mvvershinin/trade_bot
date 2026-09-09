@@ -52,6 +52,7 @@ from strategies.contracts import (
     FactKind,
     Intent,
     Strategy,
+    StrategySettings,
     check_bar,
 )
 from strategies.ema_reverse import (
@@ -60,13 +61,23 @@ from strategies.ema_reverse import (
     EmaReverseSettings,
     OnPriceEqualsAverage,
 )
-from strategies.registry import DEFAULT_ID, StrategyEntry, UnknownStrategy
+from strategies.registry import (
+    DEFAULT_ID,
+    SettingsField,
+    StrategyEntry,
+    UnknownStrategy,
+)
 
 __all__ = [
     "Bar",
     "Intent",
     "Decision",
     "Strategy",
+    # Порт настроек модуля: подпись линии и строки журнала «было → стало».
+    # Сборка типизирует им свои поля вместо класса настроек алгоритма №1 —
+    # иначе она знает, каким правилом торгует (миниплан
+    # `strategy-modules-switchable.md`, З2).
+    "StrategySettings",
     # Описание правила словами: таблица утверждений (`Claim`), факты о самом
     # модуле (`Fact`) и три отрисовки из них (`Description`). Собирает описание
     # сам модуль — текст принадлежит тому, кто его посчитал; `app/` только
@@ -89,6 +100,9 @@ __all__ = [
     # пакета не говорят, чего именно они ищут.
     "registry",
     "StrategyEntry",
+    # Одно поле настроек модуля: имя у модуля, имя в окне, подпись
+    # для человека. Одна таблица вместо трёх рукописных списков (`D-100`).
+    "SettingsField",
     "UnknownStrategy",
     "DEFAULT_ID",
 ]

@@ -327,7 +327,7 @@ def test_the_field_table_covers_every_setting_of_the_module(
         f"таблица полей модуля {entry.id} называет несуществующие настройки: "
         f"{entry.stray_fields()}"
     )
-    names = [name for name, _ in entry.fields]
+    names = [one.name for one in entry.fields]
     assert len(set(names)) == len(names), f"поле названо дважды: {names}"
 
 
@@ -342,8 +342,8 @@ def test_the_field_table_names_real_fields_of_the_window(entry: StrategyEntry) -
     import ui.models
 
     missing = [
-        outer for _, outer in entry.fields
-        if not hasattr(ui.models.Settings(), outer)
+        one.outer for one in entry.fields
+        if not hasattr(ui.models.Settings(), one.outer)
     ]
     assert not missing, (
         f"таблица полей модуля {entry.id} называет поля общих настроек, "
@@ -359,7 +359,13 @@ def test_the_gap_check_is_not_blind(entry: StrategyEntry) -> None:
         "из таблицы убрано поле, а разрыв не найден — проверка полноты мертва"
     )
     invented = dataclasses.replace(
-        entry, fields=(*entry.fields, ("нет_такой_настройки", "average_period"))
+        entry,
+        fields=(
+            *entry.fields,
+            registry.SettingsField(
+                "нет_такой_настройки", "average_period", "Выдуманная настройка"
+            ),
+        ),
     )
     assert invented.stray_fields() == ("нет_такой_настройки",)
 

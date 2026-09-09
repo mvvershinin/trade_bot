@@ -478,7 +478,14 @@ def test_the_strategy_settings_are_assembled_field_by_field() -> None:
         average_period=9, average_kind=AverageKind.SMA,
         on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_SHORT,
     )
+    from strategies import EmaReverseSettings
+
     module = convert.strategy_settings(values)
+    # ⚠️ Сужение — часть проверки, а не поклон системе типов. Сборщик
+    # объявлен через порт настроек и класс алгоритма не называет; убедиться,
+    # что он собрал настройки **выбранного** алгоритма, а не какие-нибудь, —
+    # ровно то, ради чего проверка и стоит.
+    assert isinstance(module, EmaReverseSettings)
     assert module.period == 9
     assert module.kind is StrategyAverageKind.SMA
     assert module.on_equal.value == "short"
@@ -501,6 +508,7 @@ def test_a_switched_off_filter_gives_the_module_exactly_its_own_defaults() -> No
         filter_enabled=False, threshold_percent=0.4, confirm_bars=5
     )
     produced = convert.strategy_settings(values)
+    assert isinstance(produced, EmaReverseSettings)
     default = EmaReverseSettings(
         period=values.average_period,
         kind=StrategyAverageKind.EMA,
@@ -514,9 +522,12 @@ def test_a_switched_off_filter_gives_the_module_exactly_its_own_defaults() -> No
 
 def test_a_switched_on_filter_carries_both_numbers_to_the_module() -> None:
     """Включённая галочка отдаёт модулю то, что стоит в полях."""
+    from strategies import EmaReverseSettings
+
     produced = convert.strategy_settings(
         Settings(filter_enabled=True, threshold_percent=0.04, confirm_bars=3)
     )
+    assert isinstance(produced, EmaReverseSettings)
     assert produced.threshold_percent == pytest.approx(0.04)
     assert produced.confirm_bars == 3
 

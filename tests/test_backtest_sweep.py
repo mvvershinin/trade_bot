@@ -24,10 +24,12 @@ from backtest.report import Row, Verdict, block_report, forward, study
 from backtest.split import Fold, Period
 from backtest.sweep import (
     AVERAGE_PERIODS,
+    GRID_STRATEGY_ID,
     TAKE_PERCENTS,
     WINDOW_DURATIONS,
     WINDOW_STARTS,
     Block,
+    ForeignStrategy,
     Ground,
     Money,
     Point,
@@ -35,13 +37,14 @@ from backtest.sweep import (
     blocks,
     full_cross,
     lay_out,
+    refuse_foreign_strategy,
     sweep,
     trading_mode,
     trials_shown,
 )
 from backtest.table import THOUSANDS, both_columns_filled, money, plural, render
 from engine import EngineSettings, ExitReason, Side, TradingWindow
-from strategies import EmaReverseSettings
+from strategies import EmaReverseSettings, registry
 from tests.engine_helpers import MSK, candle
 
 TUNING = Period(date(2026, 6, 1), date(2026, 6, 30))
@@ -505,3 +508,73 @@ def test_a_row_outside_the_grid_gets_no_verdict_instead_of_a_bad_one() -> None:
     assert report.rows[0].verdict.stable is None
     assert report.rows[0].verdict.word == "—"
     assert report.rows[1].verdict.stable is None
+
+
+# ---------------------------------------------------------------------------
+# Сетка объявляет, под какой алгоритм она написана (ловушка 14 миниплана)
+# ---------------------------------------------------------------------------
+
+
+def test_the_grid_names_an_algorithm_that_really_exists() -> None:
+    """Объявленное имя есть в реестре, и это не `DEFAULT_ID`.
+
+    ⚠️ Литерал, а не `registry.DEFAULT_ID`, — намеренно: умолчание однажды
+    сменят, и сетка тогда молча объявила бы себя написанной под алгоритм,
+    полей которого она не знает. Проверка стережёт обе стороны: имя
+    настоящее и оно именно то, чьё поле сетка меняет.
+    """
+    entry = registry.find(GRID_STRATEGY_ID)
+    assert entry.settings_type is EmaReverseSettings
+    replaced = {name for name, _ in _GRID_REPLACES}
+    known = {one.name for one in entry.fields}
+    assert replaced <= known, (
+        f"сетка меняет поля, которых у алгоритма нет: {replaced - known}"
+    )
+
+
+#: Какие поля настроек алгоритма меняет сетка — и где это написано.
+#: Список короткий намеренно: он и есть вся привязка перебора к алгоритму.
+_GRID_REPLACES = (("period", "backtest/sweep.py::_average_and_take_points"),)
+
+
+def test_the_grid_really_uses_the_field_it_declares() -> None:
+    """Канарейка: сетка действительно меняет объявленное поле.
+
+    Без неё проверка выше зеленела бы и на списке, оторванном от кода:
+    объявили `period`, а сетка перебирает что-то другое.
+    """
+    ground = _ground()
+    periods = {
+        point.strategy.period
+        for block in blocks(ground) for point in block.points
+    }
+    assert len(periods) > 1, "сетка не перебирает период средней вовсе"
+
+
+def test_a_foreign_algorithm_is_refused_with_a_reason_a_human_can_read() -> None:
+    """Отказ называет обе стороны и говорит, что перебора не будет.
+
+    Молчаливый перебор чужих полей показал бы владельцу счёта настоящие
+    числа, к выбранному правилу отношения не имеющие, — и он поставил бы
+    по ним настройки.
+    """
+    with pytest.raises(ForeignStrategy) as refusal:
+        refuse_foreign_strategy("atr_channel", EmaReverseSettings())
+    said = str(refusal.value)
+    assert "atr_channel" in said
+    assert registry.find(GRID_STRATEGY_ID).title in said
+    assert "не запущен" in said
+
+
+def test_the_ground_of_the_sweep_refuses_foreign_settings() -> None:
+    """Отказ живёт в модели данных: чужое не попадает в условия перебора."""
+    class SettingsOfSomeoneElse:
+        period = 15
+
+    with pytest.raises(ForeignStrategy):
+        Ground(
+            engine=EngineSettings(),
+            # Подставные настройки и есть предмет проверки: отказ обязан
+            # случиться на них, а не на правильном классе.
+            strategy=SettingsOfSomeoneElse(),  # type: ignore[arg-type]
+        )

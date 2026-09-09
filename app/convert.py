@@ -39,7 +39,10 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+import enum
+import functools
+import typing
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
@@ -64,10 +67,7 @@ from market import DecisionLevel as StoredDecisionLevel
 from market import DecisionRecord, StoredDecision, StoredTrade, Timeframe, TradeRecord, bar_start
 from market import RunOrigin as StoredRunOrigin
 from market import TradeSide as StoredTradeSide
-from strategies import AverageKind as StrategyAverageKind
-from strategies import EmaReverseSettings
-from strategies import OnPriceEqualsAverage as StrategyOnEqual
-from strategies import registry
+from strategies import StrategySettings, registry
 from ui.backend import SettingsDiff
 from ui.formatting import (
     fmt_datetime,
@@ -81,7 +81,6 @@ from ui.formatting import (
 from ui.models import (
     AfterTakeProfit,
     AlgorithmOption,
-    AverageKind,
     BacktestReport,
     BacktestRequest,
     Candle,
@@ -92,7 +91,6 @@ from ui.models import (
     Marker,
     MarkerKind,
     Mode,
-    OnPriceEqualsAverage,
     ReversalMoment,
     RunAssumption,
     RunOrigin,
@@ -116,7 +114,9 @@ __all__ = [
     "strategy_rule",
     "rule_of",
     "rule_headline_of",
+    "rule_changes",
     "algorithms",
+    "chosen_algorithm",
     "strategy_title",
     "run_costs",
     "window_changes",
@@ -210,17 +210,6 @@ _MODES: dict[Mode, EngineMode] = {
 _REVERSALS: dict[ReversalMoment, Reversal] = {
     ReversalMoment.NEXT_BAR: Reversal.THROUGH_BAR,
     ReversalMoment.SAME_BAR: Reversal.SAME_BAR,
-}
-
-_AVERAGES: dict[AverageKind, StrategyAverageKind] = {
-    AverageKind.EMA: StrategyAverageKind.EMA,
-    AverageKind.SMA: StrategyAverageKind.SMA,
-}
-
-_ON_EQUAL: dict[OnPriceEqualsAverage, StrategyOnEqual] = {
-    OnPriceEqualsAverage.LIKE_PROTOTYPE: StrategyOnEqual.LIKE_PROTOTYPE,
-    OnPriceEqualsAverage.TREAT_AS_LONG: StrategyOnEqual.TREAT_AS_LONG,
-    OnPriceEqualsAverage.TREAT_AS_SHORT: StrategyOnEqual.TREAT_AS_SHORT,
 }
 
 _SIDES: dict[EngineSide, Side] = {
@@ -493,100 +482,226 @@ def engine_settings(
     return EngineSettings(**fields)
 
 
-#: Откуда торговый модуль берёт каждое своё поле. **Таблица, а не пятёрка
-#: строк в конструкторе**, и это не вкус: 05.09.2026 у `EmaReverseSettings`
-#: появились `threshold_percent` и `confirm_bars` (фильтр против пилы),
-#: а сборщик перечислял поля руками — то есть любое «Применить» из окна
-#: возвращало фильтр в «выключено», и в журнале изменений этого не было
-#: (`D-029`). Умолчание совпадало с «выключено», поэтому дефект был невидим
-#: и стал бы виден деньгами в день, когда фильтр включат.
-#:
-#: Таблица чинит не этот случай, а класс случаев: поле, заведённое завтра
-#: и здесь не названное, ловится проверкой полноты ниже — при импорте,
-#: у разработчика, а не у владельца счёта.
-_STRATEGY_FIELDS: dict[str, Callable[[Settings], object]] = {
-    "period": lambda values: values.average_period,
-    "kind": lambda values: _AVERAGES[values.average_kind],
-    "on_equal": lambda values: _ON_EQUAL[values.on_price_equals_average],
-    "threshold_percent": lambda values: values.threshold_percent,
-    "confirm_bars": lambda values: values.confirm_bars,
-}
-
-
-#: Что уходит модулю, когда галочка «Фильтр против пилы» снята.
+#: Что уходит модулю, когда галочка «Фильтр против пилы» снята. Имена —
+#: **полей окна**, а не полей модуля: снятая галочка отменяет то, что стоит
+#: в полях окна, а как эти поля зовутся у модуля — дело модуля.
 #:
 #: Таблица, а не два `if` внутри сборщика, и причина та же, по которой
 #: таблицей стал сам сборщик: третье поле фильтра, заведённое завтра, здесь
 #: не окажется — и снятая галочка перестанет означать «выключено» ровно
 #: в том поле, о котором забыли. Полноту стережёт `_filter_off_gap`.
 #:
-#: ⚠️ Значения обязаны совпадать с умолчаниями `EmaReverseSettings`, и это
-#: проверяется тестом, а не обещанием: на выключенном фильтре стоит сверка
-#: с прототипом (127 сделок из 127), а у прототипа фильтра нет вовсе.
+#: ⚠️ Значения обязаны совпадать с умолчаниями модуля, и это проверяется
+#: тестом, а не обещанием: на выключенном фильтре стоит сверка с прототипом
+#: (127 сделок из 127), а у прототипа фильтра нет вовсе.
 _FILTER_OFF: dict[str, object] = {
     "threshold_percent": 0.0,
     "confirm_bars": 1,
 }
 
 
-def _strategy_gap() -> tuple[str, ...]:
-    """Поля торгового модуля, которых нет в таблице выше. Пусто — таблица полна."""
-    known = {field.name for field in dataclasses.fields(EmaReverseSettings)}
-    return tuple(sorted(known - set(_STRATEGY_FIELDS)))
-
-
 def _filter_off_gap() -> tuple[str, ...]:
-    """Поля выключенного фильтра, которых нет в сборщике. Пусто — согласовано."""
-    return tuple(sorted(set(_FILTER_OFF) - set(_STRATEGY_FIELDS)))
+    """Поля выключенного фильтра, которых у окна нет. Пусто — согласовано.
+
+    Опечатка в таблице выше не отняла бы настройку, а завела бы
+    несуществующее поле окна — и снятая галочка молча перестала бы
+    что-либо выключать.
+    """
+    known = {field.name for field in dataclasses.fields(Settings)}
+    return tuple(sorted(set(_FILTER_OFF) - known))
 
 
-#: Считается один раз, при импорте: набор полей класса за время работы
+#: Считается один раз, при импорте: набор полей окна за время работы
 #: не меняется, а платить за проверку на каждом прогоне незачем.
-_STRATEGY_GAP: tuple[str, ...] = _strategy_gap()
 _FILTER_OFF_GAP: tuple[str, ...] = _filter_off_gap()
 
 
-def strategy_settings(values: Settings) -> EmaReverseSettings:
-    """Настройки окна → настройки торгового модуля. По таблице `_STRATEGY_FIELDS`.
+@functools.lru_cache(maxsize=None)
+def _module_types(entry: registry.StrategyEntry) -> Mapping[str, Any]:
+    """Объявленные типы полей настроек алгоритма. Считается раз на запись.
 
-    ⚠️ Поле модуля, которого нет в таблице, — **отказ вслух**, а не тихое
+    Нужны, чтобы перевести значение поля окна в значение поля модуля, не зная
+    имён его классов: тип поля называет сам модуль, а сборка только читает
+    объявление. `get_type_hints`, а не `dataclasses.fields`, — у второго
+    в `.type` лежит строка, потому что модули объявляют
+    `from __future__ import annotations`.
+    """
+    return typing.get_type_hints(entry.settings_type)
+
+
+def _module_value(value: object, wanted: object, *, said: str) -> object:
+    """Значение поля окна → значение поля модуля. Мост между двумя слоями.
+
+    Перечислений в программе два комплекта: свои у окна (`ui/models.py`)
+    и свои у торговых модулей. Так и задумано — `ui/` торговые слои
+    не импортирует и импортировать не будет (ARCHITECTURE.md §2), — но значит,
+    между ними нужен мост, и он живёт здесь: `strategies/` про окно не знает,
+    `ui/` про модули не знает, а сборка знает про обоих.
+
+    ⚠️ **Мост по имени элемента, а не таблицей пар.** Таблица пар
+    (`AverageKind.EMA → StrategyAverageKind.EMA`) требует, чтобы сборка
+    называла классы модуля по имени, — то есть ровно того, от чего эта работа
+    избавляется. Перечисление второго алгоритма в такую таблицу никто бы
+    не дописал, и его настройка **молча** не доехала бы до движка: окно
+    показывало бы «Простая (SMA)», а робот считал бы EMA.
+
+    Правило «имена элементов совпадают» держит сторож, параметризованный
+    по реестру (`tests/test_strategies_registry.py`), — то есть второй
+    алгоритм получает эту проверку даром. Несовпадение здесь — **отказ
+    вслух**, а не умолчание: умолчание означало бы торговлю с параметром,
+    которого владелец счёта не выбирал.
+    """
+    if not (isinstance(wanted, type) and issubclass(wanted, enum.Enum)):
+        return value
+    if not isinstance(value, enum.Enum):
+        raise SettingsRefused(
+            f"настройка «{said}» окна не перечисление ({value!r}), а торговый "
+            "алгоритм ждёт выбор из списка. Обновите программу целиком."
+        )
+    try:
+        return wanted[value.name]
+    except KeyError:
+        raise SettingsRefused(
+            f"выбранное в окне значение настройки «{said}» — {value.name} — "
+            "торговому алгоритму неизвестно. Так бывает, когда окно и алгоритм "
+            "собраны из разных версий программы: работать так нельзя, робот "
+            "торговал бы не тем, что выбрано. Обновите программу целиком."
+        ) from None
+
+
+def _window_gap(entry: registry.StrategyEntry) -> tuple[str, ...]:
+    """Поля окна, которых алгоритм просит, а окна у них нет. Пусто — сходится.
+
+    Третья сторона той же сверки: `settings_gap` и `stray_fields` реестра
+    сверяют таблицу полей с самим алгоритмом, а эта — с окном. Без неё
+    алгоритм, просящий поле `momentum_period`, получил бы `AttributeError`
+    в середине сборки настроек, а не отказ с объяснением.
+    """
+    known = {field.name for field in dataclasses.fields(Settings)}
+    return tuple(sorted({one.outer for one in entry.fields} - known))
+
+
+#: Чем настройки алгоритма могут оказаться несобираемыми — таблицей, а не
+#: тремя `if` подряд. Каждая строка: проверка и фраза с двумя подстановками.
+#:
+#: ⚠️ Порядок значим и потому стал данными: сначала сверяется таблица полей
+#: с самим алгоритмом (обе стороны), потом с окном. Обратный порядок называл
+#: бы человеку окно виноватым там, где несогласована сама таблица.
+_ALGORITHM_CHECKS: Final[
+    tuple[tuple[Callable[[registry.StrategyEntry], tuple[str, ...]], str], ...]
+] = (
+    (
+        registry.StrategyEntry.settings_gap,
+        "у торгового алгоритма «{title}» есть настройки, которых таблица "
+        "полей не называет — {names}. Работать так нельзя: алгоритм получил "
+        "бы умолчания вместо того, что выбрано в окне.",
+    ),
+    (
+        registry.StrategyEntry.stray_fields,
+        "таблица полей торгового алгоритма «{title}» называет настройки, "
+        "которых у него нет — {names}. Работать так нельзя: выбранное в окне "
+        "уходило бы в никуда.",
+    ),
+    (
+        _window_gap,
+        "торговому алгоритму «{title}» нужны поля настроек, которых окно "
+        "не показывает — {names}. Работать так нельзя: алгоритм получил бы "
+        "умолчания вместо того, что выбрано в окне.",
+    ),
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _algorithm_trouble(entry: registry.StrategyEntry) -> str:
+    """Почему настройки этого алгоритма собрать нельзя. Пусто — можно.
+
+    Считается один раз на запись реестра: таблица полей и набор полей окна
+    за время работы не меняются, а `strategy_settings` зовётся на каждой
+    свече живого хода.
+    """
+    for probe, phrase in _ALGORITHM_CHECKS:
+        names = probe(entry)
+        if names:
+            return (
+                phrase.format(title=entry.title, names=", ".join(names))
+                + " Обновите программу целиком."
+            )
+    return ""
+
+
+def chosen_algorithm(values: Settings) -> registry.StrategyEntry:
+    """Запись выбранного алгоритма — или отказ вслух. Молчание здесь дороже.
+
+    Два отказа, и оба про разное.
+
+    **Незнакомое имя.** Файл настроек или шаблон сделаны более новой сборкой,
+    в которой этот алгоритм есть. Подставить умолчание значило бы торговать
+    правилом, которого владелец счёта не выбирал, при исправном виде окна.
+
+    **Знакомое имя, но настройки не собираются.** Таблица полей алгоритма
+    разошлась с ним самим или с окном — разбор в `_ALGORITHM_CHECKS`.
+
+    ⚠️ Отказ ставится **на запись реестра, а не на класс настроек**, и это
+    правка `D-098`. Прежняя редакция сверяла `entry.settings_type` с классом
+    настроек алгоритма №1: второй алгоритм, **переиспользующий** тот же класс
+    настроек — а он самый вероятный второй, — прошёл бы молча и получил бы
+    настройки, собранные по чужой таблице полей.
+    """
+    try:
+        entry = registry.find(values.strategy_id)
+    except registry.UnknownStrategy as trouble:
+        raise SettingsRefused(str(trouble)) from trouble
+    trouble_said = _algorithm_trouble(entry)
+    if trouble_said:
+        raise SettingsRefused(trouble_said)
+    return entry
+
+
+def strategy_settings(values: Settings) -> StrategySettings:
+    """Настройки окна → настройки выбранного алгоритма. По таблице реестра.
+
+    ⚠️ **Имени класса настроек здесь нет и быть не должно.** Поля берутся
+    по таблице записи реестра (`StrategyEntry.fields`): алгоритм называет
+    своё поле, поле окна, из которого оно берётся, и подпись для человека.
+    До 09.09.2026 таблица стояла здесь и перечисляла поля алгоритма №1 —
+    то есть сборка знала, каким правилом торгует, и при выборе второго
+    алгоритма собрала бы настройки первого.
+
+    ⚠️ Поле алгоритма, которого нет в таблице, — **отказ вслух**, а не тихое
     умолчание. Тихое умолчание здесь означает торговлю с настройками, которых
-    владелец счёта не выбирал: ровно это делал прежний сборщик с фильтром
-    против пилы. Отказ роняет применение настроек, а не программу, — его
-    ловит `HistoryPort.apply_settings` и показывает фразой.
+    владелец счёта не выбирал: ровно это делал сборщик с фильтром против пилы
+    (`D-029`). Отказ роняет применение настроек, а не программу, — его ловит
+    `HistoryPort.apply_settings` и показывает фразой.
 
     ⚠️ **Снятая галочка фильтра сильнее полей.** При `filter_enabled=False`
-    порог и подтверждение подменяются умолчаниями модуля (`_FILTER_OFF`),
-    а не тем, что осталось в полях окна. Это не молчаливая подмена, которая
-    в этом модуле запрещена: подменяется значение выключенной настройки,
-    выключатель стоит рядом с полями на экране, а строка про его переключение
-    уходит в журнал (`_WINDOW_TOLD`). Обратное — уважать поля при снятой
-    галочке — означало бы выключатель, который ничего не выключает.
+    порог и подтверждение берутся из `_FILTER_OFF`, а не из полей окна.
+    Это не молчаливая подмена, которая в этом модуле запрещена: подменяется
+    значение выключенной настройки, выключатель стоит рядом с полями
+    на экране, а строка про его переключение уходит в журнал (`_WINDOW_TOLD`).
+    Обратное — уважать поля при снятой галочке — означало бы выключатель,
+    который ничего не выключает.
     """
-    if _STRATEGY_GAP:
-        raise SettingsRefused(
-            "Программа собрана несогласованно: у торгового модуля есть "
-            f"настройки, которых окно не передаёт — {', '.join(_STRATEGY_GAP)}. "
-            "Работать так нельзя: модуль получил бы умолчания вместо того, "
-            "что выбрано в окне. Обновите программу целиком."
-        )
     if _FILTER_OFF_GAP:
         raise SettingsRefused(
             "Программа собрана несогласованно: выключенный фильтр против пилы "
-            f"называет поля, которых у сборщика нет — {', '.join(_FILTER_OFF_GAP)}. "
+            f"называет поля, которых у окна нет — {', '.join(_FILTER_OFF_GAP)}. "
             "Работать так нельзя: снятая галочка перестала бы означать "
             "«выключено». Обновите программу целиком."
         )
-    _the_chosen_algorithm(values)
+    entry = chosen_algorithm(values)
+    wanted = _module_types(entry)
     # `Any` здесь честнее любой хитрости: значения полей разного типа, и
-    # соответствие имени типу проверяет сам `EmaReverseSettings` в своём
-    # `__post_init__` — громко и с фразой (`strategies/ema_reverse.py`).
-    fields: dict[str, Any] = {
-        name: take(values) for name, take in _STRATEGY_FIELDS.items()
-    }
-    if not values.filter_enabled:
-        fields.update(_FILTER_OFF)
-    return EmaReverseSettings(**fields)
+    # соответствие имени типу проверяет сам алгоритм в своём `__post_init__` —
+    # громко и с фразой (`strategies/ema_reverse.py`).
+    fields: dict[str, Any] = {}
+    for one in entry.fields:
+        off = not values.filter_enabled and one.outer in _FILTER_OFF
+        raw = _FILTER_OFF[one.outer] if off else getattr(values, one.outer)
+        fields[one.name] = _module_value(
+            raw, wanted.get(one.name), said=one.title
+        )
+    made: StrategySettings = entry.settings_type(**fields)
+    return made
 
 
 # ---------------------------------------------------------------------------
@@ -605,41 +720,10 @@ def strategy_settings(values: Settings) -> EmaReverseSettings:
 # они не могут (`strategies/contracts.py`, `Description`).
 
 
-def _the_chosen_algorithm(values: Settings) -> registry.StrategyEntry:
-    """Запись выбранного алгоритма — или отказ вслух. Молчание здесь дороже.
-
-    Два отказа, и оба про разное.
-
-    **Незнакомое имя.** Файл настроек или шаблон сделаны более новой сборкой,
-    в которой этот алгоритм есть. Подставить умолчание значило бы торговать
-    правилом, которого владелец счёта не выбирал, при исправном виде окна.
-
-    **Знакомое имя, но чужой класс настроек.** Сборщик выше собирает настройки
-    **одного** алгоритма — того, чьи поля показывает окно (ловушка 14 миниплана
-    `strategy-modules-switchable.md`: перебор и сборка настроек пока привязаны
-    к алгоритму №1). Второй алгоритм, добавленный в реестр без правки этой
-    таблицы, молча получил бы чужие настройки: часть полей совпала бы
-    по именам, часть нет. Отказ здесь — это тот самый день, когда трапу
-    полагается сработать.
-    """
-    try:
-        entry = registry.find(values.strategy_id)
-    except registry.UnknownStrategy as trouble:
-        raise SettingsRefused(str(trouble)) from trouble
-    if entry.settings_type is not EmaReverseSettings:
-        raise SettingsRefused(
-            f"выбран торговый алгоритм «{entry.title}», а собирать для него "
-            "настройки программа пока не умеет: окно показывает поля алгоритма "
-            f"«{registry.default_entry().title}». Выберите его в окне «Торговый "
-            "алгоритм» либо обновите программу целиком."
-        )
-    return entry
-
-
 def strategy_title(values: Settings) -> str:
     """Название выбранного алгоритма для человека. Незнакомое имя — как есть.
 
-    Отказа здесь нет намеренно, в отличие от `_the_chosen_algorithm`: подпись
+    Отказа здесь нет намеренно, в отличие от `chosen_algorithm`: подпись
     нужна журналу и снимку прогона, а строка журнала, роняющая запись, лишает
     разбора **и** того случая, ради которого её читают.
     """
@@ -786,19 +870,25 @@ def _algorithm_details(
     return said
 
 
-def rule_of(module: EmaReverseSettings) -> str:
-    """Правило торгового модуля словами, абзацами, с нынешними числами.
+def rule_of(entry: registry.StrategyEntry, module: object) -> str:
+    """Правило выбранного алгоритма словами, абзацами, с нынешними числами.
 
-    Настройки **модуля** на входе, а не окна: то же описание нужно снимку
+    ⚠️ Описание берётся у **поданной записи**, а не у `default_entry()`, и это
+    правка `D-098`. Прежняя редакция всегда спрашивала алгоритм по умолчанию:
+    при выбранном втором алгоритме снимок прогона и журнал решений
+    рассказывали бы правило первого — молча и убедительно.
+
+    Настройки **алгоритма** на входе, а не окна: то же описание нужно снимку
     настроек прогона (`app/runs.py::settings_text`), а туда доезжают уже
-    переведённые настройки, окна там нет.
+    переведённые настройки, окна там нет. Чужие настройки запись отвергает
+    сама (`StrategyEntry._own`).
     """
-    return registry.default_entry().description(module).full()
+    return entry.description(module).full()
 
 
-def rule_headline_of(module: EmaReverseSettings) -> str:
+def rule_headline_of(entry: registry.StrategyEntry, module: object) -> str:
     """То же правило одной строкой — для журнала решений."""
-    return registry.default_entry().description(module).headline()
+    return entry.description(module).headline()
 
 
 def strategy_rule(values: Settings) -> str:
@@ -810,7 +900,32 @@ def strategy_rule(values: Settings) -> str:
     сейчас нет. Дорисовывать его в окне значило бы завести вторую сборку
     настроек модуля рядом с этой — и разошлись бы они молча.
     """
-    return rule_of(strategy_settings(values))
+    return rule_of(chosen_algorithm(values), strategy_settings(values))
+
+
+def rule_changes(previous: Settings, now: Settings) -> list[str]:
+    """Что сказать журналу про правило: строки «было → стало» и новое правило.
+
+    ⚠️ **Строки изменений составляет сам алгоритм**, и только по однородному:
+    `changes_from` принимает настройки того же алгоритма. При смене самого
+    алгоритма прежние настройки принадлежат другому классу, и сравнивать их
+    поле в поле нельзя — «период средней 15 → 15» про два разных правила
+    было бы неправдой, а падение здесь лишило бы журнал строки ровно в тот
+    день, когда её читают.
+
+    ⚠️ Строка «правило теперь читается так» ставится и тогда, когда настройки
+    совпали до поля: у двух алгоритмов настройки бывают одинаковыми по полям
+    и разными по смыслу. Имя алгоритма своей строкой в журнал уже попало
+    (`_WINDOW_TOLD`), но имя — это «что поменялось», а не «во что оно
+    превратилось»: через месяц разбирают именно правило.
+    """
+    entry = chosen_algorithm(now)
+    module = strategy_settings(now)
+    same = previous.strategy_id == now.strategy_id
+    said = module.changes_from(strategy_settings(previous)) if same else []
+    if said or not same:
+        said.append(f"Правило теперь читается так — {rule_headline_of(entry, module)}")
+    return said
 
 
 def run_costs(values: Settings) -> Costs:
@@ -997,12 +1112,30 @@ _TOLD_BY_ENGINE: frozenset[str] = frozenset({
     "calendar",
 })
 
-#: Поля окна, о которых расскажет **торговый модуль**
-#: (`EmaReverseSettings.changes_from`).
-_TOLD_BY_STRATEGY: frozenset[str] = frozenset({
-    "average_period", "average_kind", "on_price_equals_average",
-    "threshold_percent", "confirm_bars",
-})
+def _told_by_strategy() -> frozenset[str]:
+    """Поля окна, о которых расскажет сам алгоритм (`changes_from`).
+
+    ⚠️ Считается **по таблицам реестра**, а не перечисляется руками. Пять имён
+    здесь были шестым списком тех же полей: список алгоритма, сборщик
+    настроек, подписи снимка прогона, этот — и правые половины не сверяло
+    ничто (`D-100`). Поле, добавленное алгоритму и забытое здесь, ловится
+    теперь по построению.
+
+    ⚠️ Берётся объединение по **всем** записям реестра, а не по выбранной,
+    и цена названа вслух: поле, которое читает только второй алгоритм,
+    при выбранном первом считается «рассказанным», хотя строки в журнале
+    не будет — менять его при выбранном первом бессмысленно, робот его
+    не читает. Правильный ответ на это — настройки алгоритма отдельным
+    набором (§7.6 миниплана `strategy-modules-switchable.md`), а не список
+    руками: список руками врал бы так же и вдобавок молча.
+    """
+    return frozenset(
+        one.outer for entry in registry.entries() for one in entry.fields
+    )
+
+
+#: Считается один раз, при импорте: реестр за время работы не меняется.
+_TOLD_BY_STRATEGY: Final[frozenset[str]] = _told_by_strategy()
 
 
 def _as_confirm(value: object) -> str:
@@ -1073,7 +1206,7 @@ def window_changes(previous: Settings, now: Settings) -> list[str]:
 
     Инструмент, размер свечи, глубина показа, шаг цены, проскальзывание
     и каталог лога не существуют ни в `EngineSettings`, ни
-    в `EmaReverseSettings`. Пока строки не было, смена инструмента давала
+    в настройках алгоритма. Пока строки не было, смена инструмента давала
     в журнал «Значения совпали с прежними», после чего программа показывала
     другой инструмент.
 
@@ -1201,13 +1334,24 @@ def side_of(side: EngineSide) -> Side:
 
 
 def average_label(values: Settings) -> str:
-    """Подпись линии средней: `EMA(15) — линия торгового модуля`.
+    """Подпись линии на графике: `EMA(15) — линия торгового модуля`.
 
-    Короткое имя берётся у слоя стратегий, а не пишется здесь: как называется
-    средняя, знает тот, кто её считает.
+    ⚠️ Подпись собирает **сам алгоритм** (`StrategySettings.label`), а не
+    сборка: как называется линия, знает тот, кто её считает. Прежняя редакция
+    складывала её здесь из полей окна и короткого имени средней — то есть
+    сборка знала, что алгоритм считает именно среднюю. Алгоритм, рисующий
+    не среднюю, подписал бы линию «EMA(15)» и не упал бы.
+
+    Пустая подпись — законный ответ: у алгоритма без линии подписывать нечего,
+    и окно её тогда не показывает. Отказ собрать настройки подписью тоже
+    не является: график рисуется и без неё, а причина отказа человеку уже
+    сказана окном настроек, и второй раз в углу графика она не нужна.
     """
-    short = _AVERAGES[values.average_kind].short_label
-    return f"{short}({values.average_period}) — линия торгового модуля"
+    try:
+        short = strategy_settings(values).label
+    except (SettingsRefused, ValueError):
+        return ""
+    return f"{short} — линия торгового модуля" if short else ""
 
 
 def mode_of(mode: EngineMode) -> Mode:

@@ -293,3 +293,39 @@ def test_the_examples_file_holds_exactly_what_was_written():
         for place, recipe in enumerate(recipes()[:3], start=1)
     )
     assert len({one.name for one in made}) == len(made)
+
+
+# ---------------------------------------------------------------------------
+# Перебор чужому алгоритму отказывает фразой, а не трассировкой
+# ---------------------------------------------------------------------------
+
+
+def test_a_foreign_algorithm_stops_the_sweep_with_words_and_a_return_code(
+    monkeypatch, capsys
+) -> None:
+    """`python3 -m app.leaders` при чужом алгоритме говорит причину и уходит.
+
+    ⚠️ Трассировка в консоль здесь была бы тем самым молчанием, которое
+    дороже поломки (`CLAUDE.md` №13): человек видит стену Python и не видит
+    ответа на свой вопрос «почему не подобралось».
+
+    Мутация, обязанная ронять проверку: убрать `except ForeignStrategy`
+    из `app/leaders.py::main` — тогда отказ вылетит трассировкой,
+    а код возврата станет 1 от самого интерпретатора.
+    """
+    from app import leaders as app_leaders
+    from backtest.sweep import ForeignStrategy
+
+    async def refuse(_args) -> int:
+        raise ForeignStrategy(
+            "сетка перебора написана под торговый алгоритм «Реверс по "
+            "скользящей средней» (ema_reverse), а выбран «second». "
+            "Перебор не запущен."
+        )
+
+    monkeypatch.setattr(app_leaders, "work", refuse)
+    code = app_leaders.main(["--db", "нет.sqlite3"])
+    said = capsys.readouterr().err
+    assert code == 2, f"отказ вернул код {code}, а не отдельный код отказа"
+    assert "Перебор не запущен" in said, "отказ не доехал до человека"
+    assert "second" in said, "отказ не называет, какой алгоритм выбран"

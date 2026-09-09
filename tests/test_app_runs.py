@@ -33,7 +33,6 @@ from app.port import HistoryPort
 from app.runs import (
     _COSTS_TITLES,
     _ENGINE_TITLES,
-    _STRATEGY_TITLES,
     RUNS_KEPT,
     RUNS_SHOWN,
     RunConditions,
@@ -104,7 +103,7 @@ def _conditions(*, days: int = 30, until: datetime | None = None) -> RunConditio
         timeframe="5 минут",
         engine=EngineSettings(mode=Mode.REVERSE, commission_per_side=14.0),
         strategy=EmaReverseSettings(),
-        strategy_title=EmaReverse.title,
+        algorithm=registry.default_entry(),
         app_version="1.2.3",
         days=days,
         until=until,
@@ -222,7 +221,12 @@ def test_the_port_writes_no_decisions_and_no_trades_and_that_holds_the_limit(
     ("titles", "kind"),
     [
         (_ENGINE_TITLES, EngineSettings),
-        (_STRATEGY_TITLES, EmaReverseSettings),
+        # ⚠️ Подписи полей торгового алгоритма живут не в `app/runs.py`,
+        # а в записи реестра: свой список в сборке был бы второй правдой
+        # и разошёлся бы с алгоритмом молча (`D-100`). Проверка от этого
+        # не ослабла — она берёт таблицу оттуда, где та теперь лежит,
+        # и точно так же падает на поле, заведённом завтра и не подписанном.
+        (registry.default_entry().titles(), EmaReverseSettings),
         (_COSTS_TITLES, Costs),
     ],
     ids=["движок", "торговый модуль", "издержки"],
@@ -260,7 +264,9 @@ def test_a_setting_added_tomorrow_lands_in_the_snapshot_by_itself() -> None:
     # Подставной класс завтрашних настроек — не `EngineSettings`, и приведение
     # здесь именно про это: снимок обязан сниматься с любого набора полей.
     tomorrow = cast(EngineSettings, SettingsOfTomorrow())
-    text = settings_text(tomorrow, EmaReverseSettings(), strategy_title="проба")
+    text = settings_text(
+        tomorrow, EmaReverseSettings(), algorithm=registry.default_entry()
+    )
     assert "daily_loss_limit_rub: 25000" in text, (
         "поле, у которого нет подписи, выпало из снимка целиком — "
         "значит снимок собирается списком, а не обходом полей"
@@ -321,8 +327,10 @@ def test_changing_any_engine_setting_changes_the_snapshot(name: str) -> None:
     """
     base = EngineSettings()
     other = base.replace(**{name: _ANOTHER_ENGINE[name]})
-    assert settings_text(base, EmaReverseSettings(), strategy_title="x") != settings_text(
-        other, EmaReverseSettings(), strategy_title="x"
+    assert settings_text(
+        base, EmaReverseSettings(), algorithm=registry.default_entry()
+    ) != settings_text(
+        other, EmaReverseSettings(), algorithm=registry.default_entry()
     ), f"настройка `{name}` не видна в снимке: два разных прогона запишутся одинаково"
 
 
@@ -332,8 +340,10 @@ def test_changing_any_strategy_setting_changes_the_snapshot(name: str) -> None:
     base = EmaReverseSettings()
     other = base.replace(**{name: _ANOTHER_STRATEGY[name]})
     engine = EngineSettings()
-    assert settings_text(engine, base, strategy_title="x") != settings_text(
-        engine, other, strategy_title="x"
+    assert settings_text(
+        engine, base, algorithm=registry.default_entry()
+    ) != settings_text(
+        engine, other, algorithm=registry.default_entry()
     ), f"настройка модуля `{name}` не видна в снимке"
 
 
@@ -348,7 +358,7 @@ def test_the_snapshot_says_what_the_robot_did_with_those_numbers() -> None:
     из `app/runs.py::settings_text`.
     """
     text = settings_text(
-        EngineSettings(), EmaReverseSettings(), strategy_title="Реверс"
+        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry()
     )
     assert "Правило робота словами:" in text, "снимок не называет правило вовсе"
     assert "Закрытие выше EMA(15) — робот хочет быть в лонге." in text, (
@@ -365,7 +375,7 @@ def test_the_rule_in_the_snapshot_follows_the_settings() -> None:
     """
     engine = EngineSettings()
     twenty = settings_text(
-        engine, EmaReverseSettings(period=20), strategy_title="Реверс"
+        engine, EmaReverseSettings(period=20), algorithm=registry.default_entry()
     )
     assert "Закрытие выше EMA(20) — робот хочет быть в лонге." in twenty
     assert "EMA(15)" not in twenty
@@ -380,7 +390,7 @@ def test_the_rule_does_not_leak_into_the_marks_of_the_snapshot() -> None:
     в чужих записях, то есть перестала бы узнавать свои прогоны.
     """
     text = settings_text(
-        EngineSettings(), EmaReverseSettings(), strategy_title="Реверс"
+        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry()
     )
     marks = snapshot_marks(text)
     assert set(marks) == (
