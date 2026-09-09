@@ -54,20 +54,23 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, time, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 from backtest.execution import Costs
 from backtest.history import Deal, deal_results, replay, summarise
 from backtest.overfitting import Shape
 from backtest.split import Period
 from engine import EngineSettings, Mode, Reversal, TradingWindow, in_moscow
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import EmaReverseSettings, registry
 
 if TYPE_CHECKING:
     from backtest.history import Summary
 
 __all__ = [
     "BLOCKS",
+    "GRID_STRATEGY_ID",
+    "ForeignStrategy",
+    "refuse_foreign_strategy",
     "TAKE_PERCENTS",
     "WINDOW_DURATIONS",
     "WINDOW_STARTS",
@@ -83,6 +86,76 @@ __all__ = [
     "lay_out",
     "sweep",
 ]
+
+#: Под какой торговый алгоритм написана эта сетка. **Литерал, а не
+#: `registry.DEFAULT_ID`**: умолчание однажды сменят, и сетка тогда молча
+#: объявила бы себя написанной под алгоритм, полей которого она не знает.
+#:
+#: Сетка перебирает `period` настроек алгоритма и поля движка (окно, тейк,
+#: момент переворота). Первое — имя поля **конкретного** алгоритма: у второго
+#: алгоритма период средней может называться иначе, значить иное или
+#: отсутствовать вовсе. Отсюда и объявление: сетка знает, чья она.
+GRID_STRATEGY_ID: Final[str] = "ema_reverse"
+
+
+class ForeignStrategy(ValueError):
+    """Перебор запрошен для алгоритма, под который сетка не написана.
+
+    Отдельный класс, а не `ValueError` вообще: наверху его переводят
+    в человеческий отказ, и ловить его широким `except ValueError` вместе
+    с любым другим негодным числом нельзя.
+    """
+
+
+def refuse_foreign_strategy(
+    strategy_id: str, settings: object
+) -> EmaReverseSettings:
+    """Сетка написана под этот алгоритм — или отказ вслух. Ловушка 14.
+
+    ⚠️ **Молчание здесь стоит дороже всего в этом файле.** Перебор без этой
+    проверки честно перебрал бы поля алгоритма №1 при выбранном втором
+    и показал бы результат как «ваши лидеры»: числа настоящие, таблица
+    красивая, к выбранному правилу отношения не имеет. Владелец счёта
+    поставил бы по ней настройки — и торговал бы по подбору, сделанному
+    для другого правила.
+
+    Проверяется **имя**, а не класс настроек, и это не придирка: два
+    алгоритма вправе делить один класс настроек (`D-098`), а сетка после
+    перебора собирает **модуль** — по имени `GRID_STRATEGY_ID`. Совпадение
+    классов при разных именах означало бы перебор настроек одного алгоритма
+    с прогоном другого.
+
+    Возвращает **те же** настройки, суженные до типа, который сетка умеет
+    менять: сужение на границе, а не `cast` внутри. Слой сборки поднимается
+    выше портом (`StrategySettings`) и класс алгоритма назвать не может —
+    называет его тот, кто под этот класс написан.
+
+    :raises ForeignStrategy: выбран не тот алгоритм либо настройки не его.
+    """
+    entry = registry.find(GRID_STRATEGY_ID)
+    if strategy_id != entry.id:
+        raise ForeignStrategy(
+            f"сетка перебора написана под торговый алгоритм «{entry.title}» "
+            f"({entry.id}), а выбран «{strategy_id}». Перебор не запущен: "
+            "он перебирал бы поля чужого алгоритма и показал бы результат "
+            "как ваш. Подбора параметров для этого алгоритма в программе "
+            "пока нет — выберите «{title}» либо подбирайте вручную.".format(
+                title=entry.title
+            )
+        )
+    if not isinstance(settings, EmaReverseSettings):
+        raise ForeignStrategy(
+            f"сетка перебора написана под настройки алгоритма «{entry.title}» "
+            f"({EmaReverseSettings.__name__}), а поданы "
+            f"{type(settings).__name__}. Перебор не запущен."
+        )
+    return settings
+
+
+def grid_strategy() -> registry.StrategyEntry:
+    """Запись алгоритма, под который написана сетка. Отсутствие — отказ вслух."""
+    return registry.find(GRID_STRATEGY_ID)
+
 
 #: Период средней — три цифры ТЗ §8, рядом.
 AVERAGE_PERIODS = (9, 15, 20)
@@ -228,6 +301,19 @@ class Ground:
     engine: EngineSettings
     strategy: EmaReverseSettings = field(default_factory=EmaReverseSettings)
     costs: Costs = field(default_factory=Costs)
+    #: Имя алгоритма, чьи настройки лежат в `strategy`. Отдельным полем,
+    #: а не выведенное из класса настроек: два алгоритма вправе делить один
+    #: класс настроек, а сетка после перебора собирает **модуль** по имени.
+    strategy_id: str = GRID_STRATEGY_ID
+
+    def __post_init__(self) -> None:
+        """Условия перебора согласованы с сеткой — или отказ вслух.
+
+        Проверка стоит в **модели данных**, а не в проводке: через это поле
+        настройки алгоритма ходят по всему перебору, и перехватывать их
+        в каждой двери означало бы забыть одну.
+        """
+        refuse_foreign_strategy(self.strategy_id, self.strategy)
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +552,11 @@ async def sweep(
     for number, point in enumerate(points, start=1):
         run = await replay(
             candles,
-            EmaReverse(point.strategy),
+            # Алгоритм собирает **реестр** по имени, под которое написана
+            # сетка, а не сборка по имени класса: перебор, объявивший себя
+            # написанным под один алгоритм и гоняющий другой, — это ровно
+            # тот молчаливый обман, против которого стоит `ForeignStrategy`.
+            grid_strategy().build(point.strategy),
             replace(point.engine, commission_per_side=costs.per_side),
             costs=costs,
         )

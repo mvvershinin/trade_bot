@@ -28,12 +28,11 @@ import pytest
 
 os.environ.setdefault("QT_API", "pyside6")  # до первого импорта qasync
 
-from app import convert
+from app import convert, runs
 from app.port import HistoryPort
 from app.runs import (
     _COSTS_TITLES,
     _ENGINE_TITLES,
-    _STRATEGY_TITLES,
     RUNS_KEPT,
     RUNS_SHOWN,
     RunConditions,
@@ -41,6 +40,7 @@ from app.runs import (
     result_note,
     settings_text,
     show_runs,
+    snapshot_marks,
 )
 from backtest import Costs
 from engine import DayMarks, EngineSettings, Mode, PartialCandles, Reversal, TradingWindow
@@ -57,7 +57,13 @@ from market import (
     build_bars,
 )
 from market.journal import SECRET_MASK, redact
-from strategies import AverageKind, EmaReverse, EmaReverseSettings, OnPriceEqualsAverage
+from strategies import (
+    AverageKind,
+    EmaReverse,
+    EmaReverseSettings,
+    OnPriceEqualsAverage,
+    registry,
+)
 from ui.models import RunOrigin as WindowOrigin
 from ui.models import Settings
 
@@ -97,7 +103,7 @@ def _conditions(*, days: int = 30, until: datetime | None = None) -> RunConditio
         timeframe="5 минут",
         engine=EngineSettings(mode=Mode.REVERSE, commission_per_side=14.0),
         strategy=EmaReverseSettings(),
-        strategy_title=EmaReverse.title,
+        algorithm=registry.default_entry(),
         app_version="1.2.3",
         days=days,
         until=until,
@@ -215,7 +221,12 @@ def test_the_port_writes_no_decisions_and_no_trades_and_that_holds_the_limit(
     ("titles", "kind"),
     [
         (_ENGINE_TITLES, EngineSettings),
-        (_STRATEGY_TITLES, EmaReverseSettings),
+        # ⚠️ Подписи полей торгового алгоритма живут не в `app/runs.py`,
+        # а в записи реестра: свой список в сборке был бы второй правдой
+        # и разошёлся бы с алгоритмом молча (`D-100`). Проверка от этого
+        # не ослабла — она берёт таблицу оттуда, где та теперь лежит,
+        # и точно так же падает на поле, заведённом завтра и не подписанном.
+        (registry.default_entry().titles(), EmaReverseSettings),
         (_COSTS_TITLES, Costs),
     ],
     ids=["движок", "торговый модуль", "издержки"],
@@ -253,7 +264,9 @@ def test_a_setting_added_tomorrow_lands_in_the_snapshot_by_itself() -> None:
     # Подставной класс завтрашних настроек — не `EngineSettings`, и приведение
     # здесь именно про это: снимок обязан сниматься с любого набора полей.
     tomorrow = cast(EngineSettings, SettingsOfTomorrow())
-    text = settings_text(tomorrow, EmaReverseSettings(), strategy_title="проба")
+    text = settings_text(
+        tomorrow, EmaReverseSettings(), algorithm=registry.default_entry()
+    )
     assert "daily_loss_limit_rub: 25000" in text, (
         "поле, у которого нет подписи, выпало из снимка целиком — "
         "значит снимок собирается списком, а не обходом полей"
@@ -314,8 +327,10 @@ def test_changing_any_engine_setting_changes_the_snapshot(name: str) -> None:
     """
     base = EngineSettings()
     other = base.replace(**{name: _ANOTHER_ENGINE[name]})
-    assert settings_text(base, EmaReverseSettings(), strategy_title="x") != settings_text(
-        other, EmaReverseSettings(), strategy_title="x"
+    assert settings_text(
+        base, EmaReverseSettings(), algorithm=registry.default_entry()
+    ) != settings_text(
+        other, EmaReverseSettings(), algorithm=registry.default_entry()
     ), f"настройка `{name}` не видна в снимке: два разных прогона запишутся одинаково"
 
 
@@ -325,9 +340,68 @@ def test_changing_any_strategy_setting_changes_the_snapshot(name: str) -> None:
     base = EmaReverseSettings()
     other = base.replace(**{name: _ANOTHER_STRATEGY[name]})
     engine = EngineSettings()
-    assert settings_text(engine, base, strategy_title="x") != settings_text(
-        engine, other, strategy_title="x"
+    assert settings_text(
+        engine, base, algorithm=registry.default_entry()
+    ) != settings_text(
+        engine, other, algorithm=registry.default_entry()
     ), f"настройка модуля `{name}` не видна в снимке"
+
+
+def test_the_snapshot_says_what_the_robot_did_with_those_numbers() -> None:
+    """Снимок прогона несёт не только значения полей, но и **правило словами**.
+
+    Список значений отвечает на вопрос «чем гнали» наполовину: «период 15,
+    порог 0» не говорит, что робот с ними делал. Разбирают прогон через месяц
+    и разбирают именно правило.
+
+    Мутация, обязанная ронять проверку: убрать сборку правила
+    из `app/runs.py::settings_text`.
+    """
+    text = settings_text(
+        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry()
+    )
+    assert "Правило робота словами:" in text, "снимок не называет правило вовсе"
+    assert "Закрытие выше EMA(15) — робот хочет быть в лонге." in text, (
+        "правило записано без утверждений — читать в нём нечего"
+    )
+    assert "EMA(20)" not in text, "в снимке чужие числа"
+
+
+def test_the_rule_in_the_snapshot_follows_the_settings() -> None:
+    """Правило в снимке пересчитывается, а не написано один раз навсегда.
+
+    Записанное однажды и не следящее за настройками, оно было бы хуже
+    отсутствующего: разбор прогона опирался бы на правило чужого прогона.
+    """
+    engine = EngineSettings()
+    twenty = settings_text(
+        engine, EmaReverseSettings(period=20), algorithm=registry.default_entry()
+    )
+    assert "Закрытие выше EMA(20) — робот хочет быть в лонге." in twenty
+    assert "EMA(15)" not in twenty
+
+
+def test_the_rule_does_not_leak_into_the_marks_of_the_snapshot() -> None:
+    """Абзацы правила — не поля снимка, и читатель их полем не считает.
+
+    `snapshot_marks` считает подписью поля всё, что начинается с отступа
+    и содержит «: ». Отступ в абзаце описания превратил бы предложение
+    в поле — и сверка набора с прогоном (`_made_with`) искала бы это «поле»
+    в чужих записях, то есть перестала бы узнавать свои прогоны.
+    """
+    text = settings_text(
+        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry()
+    )
+    marks = snapshot_marks(text)
+    assert set(marks) == (
+        {title for title in marks if not title.startswith("•")}
+    ), "строка описания попала в подписи полей снимка"
+    assert len(marks) == len(fields(EngineSettings)) + len(
+        fields(EmaReverseSettings)
+    ), (
+        "число подписей снимка изменилось: описание правила перестало быть "
+        f"текстом и стало полем. Подписи: {sorted(marks)}"
+    )
 
 
 def test_the_costs_the_money_was_counted_on_are_written_next_to_it() -> None:
@@ -670,3 +744,37 @@ def test_a_field_of_the_record_is_never_left_empty() -> None:
     for field in dataclasses.fields(SessionRecord):
         value = getattr(record, field.name)
         assert value not in ("", None), f"колонка `{field.name}` осталась пустой"
+
+
+# ---------------------------------------------------------------------------
+# Выбранный алгоритм в снимке прогона
+# ---------------------------------------------------------------------------
+
+
+def test_the_snapshot_names_the_algorithm_that_was_chosen() -> None:
+    """Снимок называет **выбранный** алгоритм, а не тот, который был первым.
+
+    Через месяц разбирают по снимку, чем гнали прогон. Название, вписанное
+    константой на месте вызова, осталось бы прежним после смены алгоритма —
+    и снимок называл бы не то, чем считали.
+
+    Мутация, обязанная ронять проверку: вернуть в `snapshot_of` константу
+    вместо `convert.strategy_title(values)`.
+    """
+    text = runs.snapshot_of(Settings())
+    assert f"Торговый алгоритм: {registry.default_entry().title}" in text, (
+        "снимок не называет выбранный алгоритм"
+    )
+
+
+def test_the_snapshot_title_comes_from_the_registry_by_the_chosen_name() -> None:
+    """Название берётся у реестра по имени из настроек, а не пишется в `app/`.
+
+    ⚠️ Незнакомое имя показывается как есть — и это не мягкость: снимок пишут
+    в базу, и запись, упавшая из-за незнакомого имени, унесла бы с собой
+    условия прогона целиком.
+    """
+    assert convert.strategy_title(Settings()) == registry.default_entry().title
+    assert convert.strategy_title(
+        Settings().replace(strategy_id="atr_channel")
+    ) == "atr_channel"

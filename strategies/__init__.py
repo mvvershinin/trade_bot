@@ -26,15 +26,46 @@
 * решение по незакрытой свече;
 * появление объёма, комиссии, окна, тейка или брокера в любом виде;
 * средняя, посчитанная не по закрытиям или не по всему поданному ряду.
+
+Какие модули существуют — знает `strategies/registry.py`
+--------------------------------------------------------
+Модуль сменный, и выбор живёт в настройках (ТЗ §4.8). Список того, из чего
+выбирают, лежит **одной таблицей** в `strategies/registry.py`: запись на модуль,
+в ней `id`, название, класс настроек, сборка, соответствие полей общим
+настройкам программы и описание правила словами. Больше нигде в программе
+имён торговых модулей быть не должно — движок работает через порт `Strategy`.
+
+⛔ Реестр собирается **явными импортами**. `importlib`, обход пакета `pkgutil`
+и точки входа здесь запрещены: Nuitka линкует то, что видит статически,
+и собранная программа получила бы пустой список модулей при полностью зелёном
+прогоне тестов из исходников.
 """
 
+from strategies import registry
 from strategies.average import AverageKind, MovingAverage, average_series
-from strategies.contracts import Bar, Decision, Intent, Strategy, check_bar
+from strategies.contracts import (
+    Bar,
+    Claim,
+    Decision,
+    Description,
+    Fact,
+    FactKind,
+    Intent,
+    Strategy,
+    StrategySettings,
+    check_bar,
+)
 from strategies.ema_reverse import (
     DEFAULT_PERIOD,
     EmaReverse,
     EmaReverseSettings,
     OnPriceEqualsAverage,
+)
+from strategies.registry import (
+    DEFAULT_ID,
+    SettingsField,
+    StrategyEntry,
+    UnknownStrategy,
 )
 
 __all__ = [
@@ -42,6 +73,20 @@ __all__ = [
     "Intent",
     "Decision",
     "Strategy",
+    # Порт настроек модуля: подпись линии и строки журнала «было → стало».
+    # Сборка типизирует им свои поля вместо класса настроек алгоритма №1 —
+    # иначе она знает, каким правилом торгует (миниплан
+    # `strategy-modules-switchable.md`, З2).
+    "StrategySettings",
+    # Описание правила словами: таблица утверждений (`Claim`), факты о самом
+    # модуле (`Fact`) и три отрисовки из них (`Description`). Собирает описание
+    # сам модуль — текст принадлежит тому, кто его посчитал; `app/` только
+    # перекладывает готовую строку в окно. Исполняются `claims` и `facts`;
+    # `lead` и `notes` — проза, и названы прозой (замер 09.09.2026).
+    "Claim",
+    "Fact",
+    "FactKind",
+    "Description",
     "check_bar",
     "AverageKind",
     "MovingAverage",
@@ -50,4 +95,14 @@ __all__ = [
     "EmaReverseSettings",
     "OnPriceEqualsAverage",
     "DEFAULT_PERIOD",
+    # Реестр берётся модулем целиком (`registry.find(...)`, `registry.entries()`),
+    # а не россыпью коротких имён: `find` и `entries` в общем пространстве имён
+    # пакета не говорят, чего именно они ищут.
+    "registry",
+    "StrategyEntry",
+    # Одно поле настроек модуля: имя у модуля, имя в окне, подпись
+    # для человека. Одна таблица вместо трёх рукописных списков (`D-100`).
+    "SettingsField",
+    "UnknownStrategy",
+    "DEFAULT_ID",
 ]

@@ -62,6 +62,7 @@ from ui.formatting import MSK, fmt_time
 from ui.history_dialog import HistoryDialog
 from ui.journals import JournalTabs
 from ui.models import (
+    AlgorithmOption,
     BacktestOptions,
     BacktestReport,
     Candle,
@@ -425,6 +426,10 @@ class MainWindow(QMainWindow):
         self._settings = settings or Settings()
         self._sanitize = sanitize
         self._state = RobotState()
+        #: Каталог торговых алгоритмов и открытое окно настроек — разбор обоих
+        #: в `_on_algorithms` и `open_settings`.
+        self._algorithms: tuple[AlgorithmOption, ...] = ()
+        self._settings_dialog: SettingsDialog | None = None
         #: Окно собрано целиком. Сторож для `changeEvent`: событие палитры
         #: приходит и в середине сборки, а `apply_theme()` трогает график
         #: и журналы — их в этот момент ещё нет.
@@ -434,17 +439,7 @@ class MainWindow(QMainWindow):
         self.resize(1360, 900)
 
         self.status_panel = StatusPanel()
-        # Порядок плашек — порядок срочности. Остановка сверху: пока робот
-        # остановлен, всё остальное вторично.
-        self.halt_banner = _Banner()
-        self.stuck_banner = _Banner()
-        self.token_banner = _Banner()
-        self.mode_banner = _Banner()
-        #: Плашка «показан прогон на истории». Живые свечи на закреплённый
-        #: отрезок не приходят вовсе, и без этой строки застывший график
-        #: неотличим от потерянной связи (`app/port.py::_Span`).
-        self.history_banner = _Banner(on_close=self.show_recent_data,
-                                      close_hint=UNPIN_HINT)
+        self._build_banners()
         #: Полоска идущего прогона. `None` — прогон не запрашивали.
         self._progress: QProgressDialog | None = None
         self.chart = ChartPanel()
@@ -492,6 +487,22 @@ class MainWindow(QMainWindow):
         self._tick()
         # Последняя строка сборки — и именно её проверяет `changeEvent`.
         self._ready = True
+
+    def _build_banners(self) -> None:
+        """Пять плашек над графиком. Порядок объявления — порядок срочности.
+
+        Остановка сверху: пока робот остановлен, всё остальное вторично.
+        Порядок на экране задаётся раскладкой ниже и повторяет этот.
+        """
+        self.halt_banner = _Banner()
+        self.stuck_banner = _Banner()
+        self.token_banner = _Banner()
+        self.mode_banner = _Banner()
+        #: Плашка «показан прогон на истории». Живые свечи на закреплённый
+        #: отрезок не приходят вовсе, и без этой строки застывший график
+        #: неотличим от потерянной связи (`app/port.py::_Span`).
+        self.history_banner = _Banner(on_close=self.show_recent_data,
+                                      close_hint=UNPIN_HINT)
 
     # --------------------------------------------------------------- сборка
 
@@ -723,6 +734,7 @@ class MainWindow(QMainWindow):
         port.decisions_replaced.connect(self.journals.set_decisions)
         port.decision_appended.connect(self.journals.append_decision)
         port.settings_applied.connect(self._on_settings_echo)
+        port.algorithms_changed.connect(self._on_algorithms)
         port.failed.connect(self.show_error)
         port.stuck_changed.connect(self.show_stuck)
         port.busy_changed.connect(self._on_busy)
@@ -1093,11 +1105,52 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def open_settings(self) -> None:
+        """Окно настроек. Каталог алгоритмов едет в него вместе с полями.
+
+        ⚠️ **Первая строка — просьба к порту, и без неё окно врёт.** Каталог
+        торговых алгоритмов окно посчитать не может (ARCHITECTURE.md §2:
+        `ui/` не импортирует `strategies/`), он приходит готовым от торговой
+        части. До 09.09.2026 приходил он **только** в ответ на «Применить»:
+        `request_settings` был написан ровно под этот случай, снабжён
+        докстрокой и покрыт проверкой — и не вызывался из продуктового кода
+        ни разу. Человек, открывший настройки сразу после запуска, видел
+        `ema_reverse` вместо «Реверс по скользящей средней», пустой список
+        выбора и указание выбрать из него.
+
+        Почему просьба стоит здесь, а не в `__init__`
+        ---------------------------------------------
+        Здесь она отвечает на **действие человека**, и это не вкус. Порт,
+        не подключённый к движку, отвечает на любую команду фразой «команда
+        не выполнена» (`TerminalPort._not_connected`) — она уходит в строку
+        состояния. Сказанная в ответ на «Настройки», она правдива; сказанная
+        при сборке окна, она называет командой то, чего человек не делал,
+        и садится на строку состояния каждого снимка экрана и каждой
+        проверки интерфейса.
+
+        Второй довод — свежесть. Каталог считается по **применённым** числам
+        (`app/convert.py::algorithms`), и спрошенный при каждом открытии он
+        не может отстать от движка. Спрошенный однажды при сборке — может.
+
+        ⚠️ Ссылка на открытое окно держится, пока оно открыто, и не ради
+        удобства: «Применить» уходит движку, движок отвечает новым каталогом
+        с пересчитанным описанием, и обновить его на экране некому, если окно
+        потеряно. Человек поменял бы период, нажал «Применить» и читал бы
+        в «Подробнее» описание прежнего правила — то есть окно врало бы ровно
+        в том месте, ради которого заведено. Эта же ссылка страхует порт,
+        отвечающий не сразу: каталог, приехавший уже после `exec()`, попадёт
+        в открытое окно тем же путём, что и ответ на «Применить».
+        """
+        # ⚠️ До создания окна, а не после: ответ синхронного порта приходит
+        # внутри этого вызова, и `self._algorithms` ниже обязан быть уже им.
+        self.port.request_settings()
         dialog = SettingsDialog(self._settings, self)
         dialog.settings_changed.connect(self._on_settings_changed)
+        dialog.set_algorithms(self._algorithms)
+        self._settings_dialog = dialog
         try:
             dialog.exec()
         finally:
+            self._settings_dialog = None
             # ⚠️ Без этого диалог живёт до конца работы программы: родителем
             # ему назначено окно, а окно не закрывается. Каждое открытие
             # настроек оставляло за собой ещё одну копию — вместе с полями,
@@ -1500,6 +1553,23 @@ class MainWindow(QMainWindow):
 
     def _on_settings_echo(self, settings: Settings) -> None:
         self._settings = settings
+
+    def _on_algorithms(self, options: tuple[AlgorithmOption, ...]) -> None:
+        """Каталог торговых алгоритмов — от торговой части через порт.
+
+        Хранится здесь, потому что порт отвечает **событием**, а не возвратом
+        значения: просьба уходит из `open_settings`, ответ приходит сюда,
+        и держать его между этими двумя моментами больше некому. Приходит он
+        и сам собой — после каждого «Применить», с описанием, пересчитанным
+        по новым числам.
+
+        Пустой кортеж означает «ещё не приходило», и окно настроек скажет
+        об этом само, а не покажет пустое место
+        (`ui/settings_dialog.py::CATALOGUE_NOT_ARRIVED`).
+        """
+        self._algorithms = tuple(options)
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_algorithms(self._algorithms)
 
     def settings(self) -> Settings:
         return self._settings

@@ -35,8 +35,11 @@
 Поля **не перечисляются руками**. Снимок собирается обходом
 `dataclasses.fields()`, поэтому настройка, заведённая завтра, попадает
 в запись сама — даже если про неё здесь не вспомнили. Таблицы
-`_ENGINE_TITLES`, `_STRATEGY_TITLES` и `_COSTS_TITLES` дают полям человеческие
-подписи и на полноту записи не влияют: поля без подписи пишутся своим именем.
+`_ENGINE_TITLES` и `_COSTS_TITLES` дают полям человеческие подписи
+и на полноту записи не влияют: поля без подписи пишутся своим именем.
+Подписи полей торгового алгоритма приходят от **него самого** — таблицей
+записи реестра (`StrategyEntry.titles()`): свой список здесь был бы второй
+правдой и разошёлся бы с алгоритмом молча (`D-100`).
 Полнота подписей стережётся тестом (`tests/test_app_runs.py`), полнота
 самой записи — устройством обхода, и её ломает только замена обхода
 на список.
@@ -82,7 +85,7 @@ from market import (
     default_db_path,
     userdata_dir,
 )
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import StrategySettings, registry
 from ui import backend
 from ui.backend import RunStats, TemplateRun
 from ui.formatting import fmt_datetime, fmt_money, fmt_share
@@ -251,15 +254,6 @@ _ENGINE_TITLES: Mapping[str, str] = {
     "free_funds_reserve_percent": "Минимальный запас свободных средств, %",
 }
 
-#: Подписи полей `strategies.EmaReverseSettings`.
-_STRATEGY_TITLES: Mapping[str, str] = {
-    "period": "Период средней",
-    "kind": "Тип средней",
-    "on_equal": "Закрытие ровно на средней",
-    "threshold_percent": "Порог пересечения, %",
-    "confirm_bars": "Подтверждение сигнала, свечей",
-}
-
 #: Подписи полей `backtest.Costs`. Издержки записываются рядом с деньгами,
 #: а не рядом с настройками: `HistoryRun.costs` — то, на чём деньги
 #: посчитаны, и два прогона с разными издержками дают **один и тот же
@@ -273,16 +267,47 @@ _COSTS_TITLES: Mapping[str, str] = {
 
 
 def settings_text(
-    engine: EngineSettings, strategy: EmaReverseSettings, *, strategy_title: str
+    engine: EngineSettings,
+    strategy: StrategySettings,
+    *,
+    algorithm: registry.StrategyEntry,
 ) -> str:
-    """Снимок настроек прогона: движок целиком и торговый модуль целиком.
+    """Снимок настроек прогона: движок целиком, модуль целиком и его правило.
 
     Текст, а не набор полей: колонка `settings` заведена под человеческий
     снимок и разбирается глазами, а не программой (`market.SessionRecord`).
     Набор полей поменяется, прочитанная фраза останется верной.
+
+    ⚠️ **Правило словами обязано быть здесь, а не только в окне.** Снимок —
+    единственное место, по которому через месяц разбирают, чем гнали прогон;
+    список значений полей на этот вопрос отвечает наполовину — «период 15,
+    порог 0» не говорит, что робот с ними делал. Числа и правило, собранное
+    из тех же чисел, расходятся невозможным образом: описание строится
+    из той же таблицы утверждений, что и решения модуля.
+
+    ⚠️ Доводом приходит **запись реестра целиком**, а не одно название,
+    и это не мелочь. Из неё берутся все три вещи, которые в снимке зависят
+    от алгоритма: название, подписи его полей и правило словами. Пока
+    название приходило строкой, а подписи и правило брались у алгоритма
+    по умолчанию, снимок при выбранном втором алгоритме назвал бы его
+    по имени и описал бы первым — молча (`D-098`).
+
+    Чужие настройки запись отвергает сама (`StrategyEntry._own`): пара
+    «запись и настройки» собирается в одном месте (`app/convert.py`),
+    и разойтись ей негде.
+
+    ⚠️ Абзацы правила пишутся **без отступа** намеренно: `snapshot_marks`
+    считает подписью поля всё, что начинается с отступа и содержит «: ».
+    Отступ здесь превратил бы предложение описания в поле снимка, и сверка
+    набора с прогоном (`_made_with`) стала бы искать это «поле» в чужих
+    записях.
     """
     lines = _block("Настройки движка", engine, _ENGINE_TITLES)
-    lines += _block(f"Торговый модуль: {strategy_title}", strategy, _STRATEGY_TITLES)
+    lines += _block(
+        f"Торговый алгоритм: {algorithm.title}", strategy, algorithm.titles()
+    )
+    lines += ["", "Правило робота словами:"]
+    lines += convert.rule_of(algorithm, strategy).splitlines()
     return "\n".join(lines)
 
 
@@ -364,8 +389,12 @@ class RunConditions:
     symbol: str
     timeframe: str
     engine: EngineSettings
-    strategy: EmaReverseSettings
-    strategy_title: str
+    #: Настройки алгоритма — **портом**, а не классом алгоритма №1: условия
+    #: прогона не знают, каким правилом он считан, и знать не должны.
+    strategy: StrategySettings
+    #: Запись реестра выбранного алгоритма: название для колонки журнала,
+    #: подписи полей и правило словами для снимка настроек.
+    algorithm: registry.StrategyEntry
     app_version: str
     #: Ключ `--days`: сколько последних календарных дней взято. 0 — вся история.
     days: int = 0
@@ -385,9 +414,9 @@ class RunConditions:
             origin=self.origin,
             symbol=self.symbol,
             timeframe=self.timeframe,
-            strategy=self.strategy_title,
+            strategy=self.algorithm.title,
             settings=settings_text(
-                self.engine, self.strategy, strategy_title=self.strategy_title
+                self.engine, self.strategy, algorithm=self.algorithm
             ),
             app_version=self.app_version,
             note=period_note(
@@ -554,7 +583,9 @@ def snapshot_of(values: Settings) -> str:
     """
     engine = convert.engine_settings(values, _SNAPSHOT_MODE)
     module = convert.strategy_settings(values)
-    return settings_text(engine, module, strategy_title=EmaReverse.title)
+    return settings_text(
+        engine, module, algorithm=convert.chosen_algorithm(values)
+    )
 
 
 def snapshot_marks(text: str) -> dict[str, str]:
@@ -735,7 +766,7 @@ def session_lines(session: JournalSession) -> list[str]:
         f"{_STEP}Начат:   {fmt_datetime(session.started_at)} МСК",
         f"{_STEP}Окончен: {ended}",
         f"{_STEP}Инструмент: {session.symbol or '—'}, {session.timeframe or '—'}",
-        f"{_STEP}Торговый модуль: {session.strategy or '—'}",
+        f"{_STEP}Торговый алгоритм: {session.strategy or '—'}",
         f"{_STEP}Версия программы: {session.app_version or '—'}",
     ]
     if session.note:
