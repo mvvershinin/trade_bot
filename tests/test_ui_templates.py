@@ -1077,7 +1077,7 @@ def test_the_examples_folder_travels_with_the_build() -> None:
     """
     from tools import build
 
-    argv = build.command(with_web=False, jobs=1)
+    argv = build.command(jobs=1)
     assert f"--include-data-dir={build.EXAMPLES}={build.EXAMPLES}" in argv, (
         "папка примеров не едет в поставку"
     )

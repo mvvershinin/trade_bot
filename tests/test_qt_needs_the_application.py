@@ -359,15 +359,49 @@ def test_a_dotted_call_through_an_imported_module_is_recognised() -> None:
     )
 
 
-def test_a_widget_imported_from_a_neighbouring_test_module_is_recognised() -> None:
-    """`from test_ui_chart import Probe`, где `Probe` — наследник виджета.
+def test_a_widget_imported_from_a_neighbouring_test_module_is_recognised(
+    tmp_path, monkeypatch
+) -> None:
+    """Виджет, объявленный в одном тестовом модуле и взятый в другом.
 
-    Виджет, объявленный в одном тестовом модуле и построенный в другом,
-    роняет процесс так же, как любой другой.
+    Такой виджет роняет процесс так же, как любой другой, — значит, разбор
+    обязан дотягиваться до соседа.
+
+    ⚠️ Проверка идёт на **подсунутой** паре файлов, а не на дереве.
+    До 09.09.2026 живым примером была связка `test_ui_chart_gaps.py` →
+    `from test_ui_chart import Probe`, где `Probe` — подставной веб-график.
+    Веб-график удалён (решение 0056), `Probe` вместе с ним, и других
+    межфайловых виджетов в дереве не осталось: проверка, опиравшаяся
+    на живой пример, упала бы, хотя разбор исправен. Ровно та же поправка,
+    что и у канарейки изоляции графика, — и по той же причине: сторож
+    обязан проверять **зоркость разбора**, а не наличие подопытного.
     """
-    names = widget_names(TESTS / "test_ui_chart_gaps.py")
-    assert "Probe" in names, (
+    import sys
+
+    (tmp_path / "test_planted_home.py").write_text(
+        "from PySide6.QtWidgets import QWidget\n\n\nclass PlantedProbe(QWidget):\n    pass\n",
+        encoding="utf-8",
+    )
+    borrower = tmp_path / "test_planted_borrower.py"
+    borrower.write_text(
+        "from test_planted_home import PlantedProbe\n\n\n"
+        "def test_builds_it():\n    PlantedProbe()\n",
+        encoding="utf-8",
+    )
+    # Сосед ищется в `TESTS`, поэтому на время проверки каталогом тестов
+    # становится подсунутый. Иначе пару файлов пришлось бы класть в дерево.
+    monkeypatch.setattr(sys.modules[__name__], "TESTS", tmp_path)
+
+    names = widget_names(borrower)
+    assert "PlantedProbe" in names, (
         "виджет, взятый из соседнего тестового модуля, не разрешился"
+    )
+
+    # И обратно: без перехода к соседу имя не находится. Иначе проверка выше
+    # зеленела бы от чего угодно, что просто названо в файле.
+    assert "PlantedProbe" not in widget_names(borrower, follow=False), (
+        "имя соседа нашлось без перехода к нему — разбор считает виджетом "
+        "любое импортированное имя"
     )
 
 

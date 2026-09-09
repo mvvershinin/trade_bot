@@ -94,17 +94,21 @@ ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parent.parent
 #: файла оставило бы в отказе указание на несуществующее место.
 THRESHOLD_FILE: Final[str] = "tests/test_lint_ratchet.py"
 
-#: Порог `ruff`. Замер 09.09.2026 на ветке `fix/lint-ratchet-slack`:
-#: `ruff check . --output-format=json`, длина массива — 572; та же цифра
-#: в строке `Found 572 errors.` обычного вывода.
-#: Было 575 (замер 07.09.2026) — три находки починены попутно между датами.
-KNOWN_RUFF_FINDINGS: Final[int] = 572
+#: Порог `ruff`. Замер 09.09.2026 после удаления веб-графика (решение 0056):
+#: `ruff check . --output-format=json`, длина массива — 548; та же цифра
+#: в строке `Found 548 errors.` обычного вывода.
+#: Было 572 тем же утром, 575 — 07.09.2026. Минус 24 — это не уборка, а вычет:
+#: удалены `ui/chart/web_surface.py` (608 строк) и его проверки в двух
+#: тестовых файлах, находки ушли вместе с кодом. Ни одна не подавлена.
+KNOWN_RUFF_FINDINGS: Final[int] = 548
 
-#: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 58 files`,
-#: одинаково при тёплом кэше, холодном и с `--no-incremental`.
+#: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 57 files`.
 #: Было 191 (замер 08.09.2026): число подняли под находку «Cannot find
 #: implementation or library stub for module "helpers"» от общего помощника
 #: `tests/helpers.py`; на 09.09 она не воспроизводится, запас снят.
+#: ⚠️ Удаление веб-графика в тот же день **не изменило это число** — файлов
+#: стало на один меньше (58 → 57), находок столько же: в `web_surface.py`
+#: их не было ни одной.
 KNOWN_MYPY_FINDINGS: Final[int] = 190
 
 
