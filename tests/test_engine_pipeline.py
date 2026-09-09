@@ -37,7 +37,8 @@ from engine import (
     exit_signal,
     process_closed_candle,
 )
-from strategies import Intent
+from strategies import EmaReverseSettings, FactKind, Intent
+from strategies.ema_reverse import describe
 from tests.engine_helpers import MSK, bar, decision, position
 
 WINDOW = TradingWindow(time(10, 5), time(11, 0))
@@ -312,6 +313,44 @@ def test_outside_the_window_the_position_is_closed_to_cash() -> None:
     outcome = run(state, intent=Intent.LONG, when=OUTSIDE)
     assert [order.exit_reason for order in outcome.orders] == [ExitReason.WINDOW_END]
     assert outcome.last_step is Step.WINDOW
+
+
+def test_the_engine_cancels_an_intent_as_the_module_promises() -> None:
+    """Оговорка модуля «общие настройки могут отменить намерение» — исполняется.
+
+    Описание торгового модуля кончается фразой про то, что войдёт ли робот
+    на самом деле, решают общие настройки. Это утверждение про **движок**,
+    и сам модуль исполнить его не может: слой стратегий про `engine/` не знает
+    (ARCHITECTURE.md §2). Поэтому факт объявлен модулем
+    (`FactKind.ENGINE_MAY_OVERRIDE`), а исполняется здесь — передача записана
+    в `tests/test_strategies_description.py::DELEGATED_FACTS` и сверяется
+    списком.
+
+    Исполняется буквально: движку подаётся намерение «лонг» из пустой позиции,
+    и ровно одна общая настройка — торговое окно — отменяет его. Ни одной
+    рыночной заявки не подаётся.
+
+    Мутация, обязанная ронять проверку: убрать из описания фразу «может
+    отменить любое намерение» (`_BOUNDARY_NOTE` → «ни одна общая настройка
+    намерение не отменит»). 09.09.2026 такая подмена проходила молча
+    (`B-041`).
+    """
+    outcome = run(intent=Intent.LONG, when=OUTSIDE)
+    assert market_orders(outcome) == [], (
+        "намерение «лонг» вне торгового окна дошло до заявки — тогда фраза "
+        "описания про общие настройки была бы неправдой"
+    )
+    assert outcome.last_step is Step.WINDOW
+
+    fact = describe(EmaReverseSettings()).fact(FactKind.ENGINE_MAY_OVERRIDE)
+    assert fact is not None, (
+        "модуль перестал объявлять факт про общие настройки — описание "
+        "правила читалось бы как полное правило поведения робота"
+    )
+    assert fact.answer in fact.text, (
+        f"факт про общие настройки отвечает «{fact.answer}», а в его тексте "
+        f"этого нет: «{fact.text}»"
+    )
 
 
 def test_with_closing_at_the_window_end_switched_off_only_the_signal_closes() -> None:

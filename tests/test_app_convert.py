@@ -944,7 +944,7 @@ def test_the_catalogue_carries_the_algorithms_own_words() -> None:
     assert chosen.id == values.strategy_id
     entry = registry.find(chosen.id)
     assert chosen.title == entry.title
-    assert chosen.summary == entry.summary
+    assert chosen.summary == entry.summary(convert.strategy_settings(values))
     assert chosen.details == convert.strategy_rule(values)
 
 
@@ -960,6 +960,76 @@ def test_the_catalogue_shows_the_numbers_that_are_applied() -> None:
     assert not any(sign.isdigit() for sign in chosen.summary), (
         "правило одной фразой обязано читаться без чисел: оно показывается "
         "до всякого «Применить»"
+    )
+
+
+def test_the_summary_of_the_chosen_algorithm_follows_the_applied_settings() -> None:
+    """Правило одной фразой считается по вашим настройкам, а не по умолчаниям.
+
+    ⚠️ Чисел в этой отрисовке нет — и на этом держался дефект. Довод «`brief()`
+    цифр не содержит, значит от настроек не зависит» неверен: включённый порог
+    меняет **формулировку**. Владелец счёта, поставивший фильтр против пилы,
+    читал «закрытие выше средней», а на деле нужно несколько закрытий подряд
+    за полосой — и на вкладке, и в окне выбора (`B-039`).
+
+    Мутация, обязанная ронять проверку: собирать `summary` из умолчаний
+    алгоритма вместо применённых настроек.
+    """
+    values = Settings().replace(
+        filter_enabled=True, threshold_percent=0.04, confirm_bars=3
+    )
+    chosen = next(item for item in convert.algorithms(values) if item.chosen)
+    entry = registry.find(chosen.id)
+    assert chosen.summary == entry.summary(convert.strategy_settings(values)), (
+        "краткое правило выбранного алгоритма собрано не из применённых настроек"
+    )
+    assert "подряд" in chosen.summary, (
+        "подтверждение сигнала включено, а правило одной фразой говорит про "
+        f"одно закрытие: «{chosen.summary}»"
+    )
+    assert "полосы" in chosen.summary, (
+        "порог включён, а правило одной фразой говорит про саму среднюю: "
+        f"«{chosen.summary}»"
+    )
+    assert chosen.summary != entry.summary(entry.defaults()), (
+        "правило с фильтром совпало с правилом без фильтра — значит считается "
+        "по умолчаниям"
+    )
+
+
+def test_an_algorithm_that_is_not_chosen_says_whose_numbers_it_shows() -> None:
+    """У невыбранного числа свои, и строка списка обязана сказать это.
+
+    Показывать умолчания чужого алгоритма честно — его полей в окне нет,
+    брать неоткуда. Молчать об этом нельзя: правило читается как «вот что
+    будет у меня». До 09.09.2026 оговорка стояла только над подробным
+    описанием (`ui/algorithm_dialog.py::details_preamble`), а строка списка
+    и подсказка на вкладке молчали.
+
+    ⚠️ Ветка «алгоритм не выбран» при одной записи в реестре достижима
+    единственным честным способом: в настройках стоит имя, которого в этой
+    сборке нет, — файл настроек от более новой сборки. Подстраивать реестр
+    ради проверки нельзя, подделка досталась бы соседям (`D-078`).
+    """
+    values = Settings().replace(strategy_id="atr_channel")
+    catalogue = convert.algorithms(values)
+    assert catalogue, "каталог пуст — проверять нечего"
+    assert not any(item.chosen for item in catalogue), (
+        "в настройках стоит алгоритм, которого в сборке нет, — выбранным "
+        "не может оказаться ни один"
+    )
+    for option in catalogue:
+        assert "умолчаниями" in option.summary, (
+            f"алгоритм «{option.id}» не выбран, а строка списка не говорит, "
+            f"что числа в нём не ваши: «{option.summary}»"
+        )
+
+
+def test_the_summary_of_the_chosen_algorithm_carries_no_disclaimer() -> None:
+    """У выбранного числа ваши — оговорка про умолчания читалась бы как отказ."""
+    chosen = next(item for item in convert.algorithms(Settings()) if item.chosen)
+    assert "умолчаниями" not in chosen.summary, (
+        f"строка выбранного алгоритма говорит про чужие числа: «{chosen.summary}»"
     )
 
 
