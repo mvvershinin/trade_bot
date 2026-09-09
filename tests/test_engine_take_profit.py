@@ -1828,6 +1828,109 @@ def test_a_level_restored_after_a_cancel_does_not_start_over() -> None:
     )
 
 
+#: Профиль скользящего тейка, названный владельцем счёта 10.09.2026 для
+#: тестового прогона: порог включения 0,4 %, отступ 0,05 %, шаг подтяжки
+#: 0,01 %. Отдельной константой, а не числами внутри теста: на этих же
+#: значениях считан замер, и разойтись они не должны.
+OWNERS_TRAILING = WORKING.replace(
+    trailing_take_profit=True, trailing_start_percent=0.4,
+    trailing_offset_percent=0.05, trailing_step_percent=0.01,
+)
+
+#: Ломаная движения **в пользу позиции**, долями цены входа. Одна на обе
+#: стороны: для лонга цена идёт вверх, для шорта — вниз, а механизм обязан
+#: быть зеркальным. Внутри есть три отката (0,45 → 0,38, 0,60 → 0,52,
+#: 0,75 → 0,68) и обвал в конце — именно на них ловится уехавший назад
+#: уровень.
+_PROFIT_PATH = (
+    0.0020, 0.0041, 0.0045, 0.0038, 0.0060, 0.0052, 0.0075, 0.0068, 0.0090,
+    0.0005,
+)
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_the_owners_trailing_profile_moves_only_towards_profit(side: Side) -> None:
+    """**Скользящий тейк «в обе стороны»** на числах владельца счёта.
+
+    Проверяется не «работает вообще», а три утверждения сразу, и все три —
+    на одной ломаной, зеркально для лонга и для шорта:
+
+    * **вершина** равна бегущему экстремуму закрытий в пользу позиции;
+    * **уровень никогда не едет назад** — приёмочное правило ТЗ §9;
+    * **уровень стоит по прибыльную сторону** от цены входа и по правильную
+      сторону от вершины: ниже неё у лонга, **выше** у шорта. Перепутанный
+      знак закрывал бы шорт по цене, которую рынок уже прошёл, и ломаной
+      для лонга это не видно вовсе.
+
+    ⚠️ Порог 0,4 % при отступе 0,05 % и шаге 0,01 % — не те числа, на которых
+    механизм проверялся раньше (0,5 / 0,2 / 0,05). Мелкий шаг подтяжки делает
+    движение уровня частым, а мелкий отступ ставит его близко к цене: если
+    где-то знак или сравнение держались на крупных числах, здесь это видно.
+    """
+    sign = 1 if side is Side.LONG else -1
+    walk = [1 + sign * move for move in _PROFIT_PATH]
+    steps = _walk(side, walk, OWNERS_TRAILING)
+
+    running: float | None = None
+    previous: float | None = None
+    moved = 0
+    for index, step in enumerate(steps):
+        if step["peak"] is None:
+            assert step["level"] is None, "уровень есть, а вершины нет"
+            continue
+        close = step["close"]
+        running = close if running is None else (
+            close if sign * (close - running) > 0 else running
+        )
+        assert step["peak"] == running, (
+            f"шаг {index}: вершина {step['peak']} против бегущего экстремума "
+            f"{running} — монотонность вершины нарушена"
+        )
+        assert step["level"] is not None
+        target = round_level(
+            step["peak"] - sign * step["peak"] * 0.05 / 100
+        )
+        assert sign * (step["level"] - target) <= 0, (
+            f"шаг {index}: уровень {step['level']} обогнал расчёт от вершины "
+            f"{target}"
+        )
+        assert sign * (step["level"] - step["peak"]) < 0, (
+            f"шаг {index}: уровень {step['level']} стоит не с той стороны "
+            f"от вершины {step['peak']}"
+        )
+        assert sign * (step["level"] - PRICE) > 0, (
+            f"шаг {index}: уровень {step['level']} по убыточную сторону "
+            f"от цены входа {PRICE}"
+        )
+        if previous is not None:
+            assert sign * (step["level"] - previous) >= 0, (
+                f"шаг {index}: уровень поехал назад {previous} → {step['level']}"
+            )
+            if step["level"] != previous:
+                moved += 1
+                assert step["level"] == target, (
+                    f"шаг {index}: уровень сдвинулся не на расчёт от вершины"
+                )
+        previous = step["level"]
+
+    assert previous is not None, "уровень так и не появился — проверять нечего"
+    assert moved >= 2, "уровень не двигался — ломаная ничего не проверила"
+
+
+def test_the_owners_trailing_profile_is_accepted_by_the_settings() -> None:
+    """Числа владельца счёта настройки принимают, а порог ниже отступа — нет.
+
+    Порог 0,4 % при отступе 0,05 % проходит проверку парности; обратное
+    сочетание отвергается, потому что уровень встал бы по убыточную сторону
+    от цены входа и «фиксация прибыли» оказалась бы стоп-лоссом.
+    """
+    assert OWNERS_TRAILING.trailing_start_percent == 0.4
+    assert OWNERS_TRAILING.trailing_offset_percent == 0.05
+    assert OWNERS_TRAILING.trailing_step_percent == 0.01
+    with pytest.raises(ValueError, match="порог включения"):
+        OWNERS_TRAILING.replace(trailing_start_percent=0.04)
+
+
 def test_for_a_short_the_level_sits_above_the_best_price() -> None:
     """Ниже лучшей цены для лонга, **выше** для шорта.
 

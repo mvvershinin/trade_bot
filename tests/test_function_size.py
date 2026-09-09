@@ -59,7 +59,7 @@ LAYERS = ("engine", "market", "backtest", "broker", "strategies", "ui", "app")
 #: помощника, задающих диапазон и знаки после запятой данными, а не пятёркой
 #: вызовов на каждое поле.
 KNOWN: dict[str, int] = {
-    "engine/pipeline.py::process_closed_candle": 285,
+    "engine/pipeline.py::process_closed_candle": 265,
     "market/sync.py::sync_minutes": 137,
     "broker/token_store.py::TokenStore.load": 136,
     "broker/token_store.py::TokenStore.save": 134,

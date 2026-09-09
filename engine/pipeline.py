@@ -693,31 +693,15 @@ def process_closed_candle(
         )
 
     # ---- шаг 7: снимок не пуст → закрытие по сигналу средней ---------------
+    # Внешняя проверка — по снимку (позиция в состоянии «закрывается» из него
+    # не исчезает), внутренняя — по ТЕКУЩЕМУ состоянию, и она внутри шага.
     steps.append(Step.CLOSE_BY_SIGNAL)
+    held = ""
     if snapshot is not None:
-        # Внешняя проверка — по снимку (позиция в состоянии «закрывается»
-        # из него не исчезает), внутренняя — по ТЕКУЩЕМУ состоянию: повторную
-        # заявку на выход закрывающаяся позиция не получает, а закрытой
-        # позиции заявка не нужна вовсе. Так же устроен прототип: логика
-        # выхода сама перечитывает список и фильтрует его по состоянию.
-        current = working.position
-        if (
-            current is not None
-            and current.is_open
-            and exit_signal(current.side, decision.intent)
-        ):
-            intent = (
-                f"{decision.reason} — обратный сигнал. Закрываем "
-                f"{current.side.label.lower()}"
-            )
-            working = _exit(
-                orders, working, current, closes_at, ExitReason.SIGNAL,
-                intent, armed_before,
-            )
-            writer.action(
-                f"Выход из {current.side.label.lower()}а по обратному сигналу",
-                orders[-1].reason, key=orders[-1].order_id, intent=intent,
-            )
+        working, held = _step_close_by_signal(
+            working, decision, closes_at, orders, writer,
+            settings=settings, armed_before=armed_before,
+        )
 
     # ---- шаг 8: режим «только закрытие» ------------------------------------
     steps.append(Step.CLOSE_ONLY)
@@ -780,7 +764,7 @@ def process_closed_candle(
     # движка.
     steps.append(Step.OPEN)
     working = _step_open(
-        working, snapshot, decision, closes_at, orders, writer, settings
+        working, snapshot, decision, closes_at, orders, writer, settings, held
     )
 
     return _done(
@@ -1369,6 +1353,123 @@ def _exit(
     return _submitted(orders, state, _close_order(position, at, reason, text))
 
 
+def _step_close_by_signal(
+    state: EngineState,
+    decision: Decision,
+    closes_at: datetime,
+    orders: list[OrderRequest],
+    writer: "_Journal",
+    *,
+    settings: EngineSettings,
+    armed_before: bool,
+) -> tuple[EngineState, str]:
+    """Шаг 7 целиком: выход из позиции по обратному сигналу средней.
+
+    ⚠️ Два последних довода — **только по имени**, и это не стиль. `settings`
+    и `armed_before` стоят седьмым и шестым в ряду однотипных объектов, а
+    `armed_before` — голое булево: перепутанный слот здесь означает снятие
+    тейка, которого не было, либо его несняние перед выходом (решение 0008,
+    пункт 3). Тем же доводом закрыта парная проверка порога и отступа
+    скользящего тейка (`EngineSettings._check_trailing_pair`).
+
+    Отдельной функцией — по той же причине, что шаг 10 (`_step_open`)
+    и дневной лимит: шаг перестал быть тремя строками, а разбор свечи и без
+    того самая длинная функция проекта. Внешнюю проверку «снимок не пуст»
+    делает вызывающий; здесь — внутренняя, по ТЕКУЩЕМУ состоянию: повторную
+    заявку на выход закрывающаяся позиция не получает, а закрытой позиции
+    заявка не нужна вовсе. Так же устроен прототип: логика выхода сама
+    перечитывает список и фильтрует его по состоянию.
+
+    Возвращает состояние и **объяснение задержки**. Пустая строка — задержки
+    не было; непустую читает шаг 10, чтобы не написать рядом «сигнала на выход
+    нет» — сигнал на этой свече как раз был.
+    """
+    current = state.position
+    if current is None or not current.is_open:
+        return state, ""
+    if not exit_signal(current.side, decision.intent):
+        return state, ""
+    held = _held_by_costs(current, decision, settings)
+    if held is not None:
+        # Строка пишется здесь, а не только на шаге 10: до шага 10 разбор
+        # может и не дойти (режим «только закрытие», «стоп после тейка»),
+        # а решение придержать позицию принято уже сейчас. Ключ у обеих
+        # строк один, поэтому вторая гасится дедупликацией `_Journal.quiet`.
+        writer.quiet(*held)
+        return state, held[2]
+    intent = (
+        f"{decision.reason} — обратный сигнал. Закрываем "
+        f"{current.side.label.lower()}"
+    )
+    state = _exit(
+        orders, state, current, closes_at, ExitReason.SIGNAL, intent, armed_before,
+    )
+    writer.action(
+        f"Выход из {current.side.label.lower()}а по обратному сигналу",
+        orders[-1].reason, key=orders[-1].order_id, intent=intent,
+    )
+    return state, ""
+
+
+def _held_by_costs(
+    position: Position, decision: Decision, settings: EngineSettings
+) -> tuple[str, str, str] | None:
+    """Обратный сигнал есть, а прибыль издержек не окупает — ключ, событие, причина.
+
+    `None` — правило молчит, и выход идёт как обычно. Молчит оно в четырёх
+    случаях, и каждый назван вслух:
+
+    * **порог выключен** (`min_exit_profit_sides == 0`) — умолчание программы.
+      Тогда эта функция не меняет ни одной сделки, и сверка с прототипом
+      остаётся 127 из 127;
+    * **режим «только закрытие»** — команда «сворачиваемся» сильнее
+      арифметики: удерживать позицию ради 28 ₽ в этом режиме значило бы
+      не выполнить прямую волю владельца счёта;
+    * **прибыли нет** — позиция в нуле или в минусе. Обратный сигнал здесь
+      единственный способ выйти (стопа у стратегии нет), и порог к нему
+      не применяется **никогда**. Правило про «прибыль есть, но мелкая»,
+      а не про удержание убытка;
+    * **прибыль доросла** — выше порога, выходим.
+
+    ⚠️ Прибыль меряется **по закрытию свечи**, а исполнится выход по открытию
+    следующей (`PROTOTYPE.md` §2). Другой цены у робота в момент решения нет,
+    и порог поэтому оценочный: цена успеет уйти. Это свойство правила,
+    а не погрешность расчёта, и оно названо здесь, чтобы не искаться потом
+    в расхождении «прибыль была 30 ₽, а сделка дала 12 ₽».
+
+    ⚠️ Тариф здесь уже не может быть `None`: `EngineSettings` отвергает
+    непустой порог без тарифа. Проверка оставлена — она типовая для `mypy`
+    и заодно держит инвариант, если отказ настроек однажды ослабят.
+    """
+    if settings.min_exit_profit_sides <= 0 or settings.commission_per_side is None:
+        return None
+    if settings.mode is Mode.CLOSE_ONLY:
+        return None
+    profit = target_profit(
+        position.entry_price, decision.close, position.volume,
+        position.side_sign, ruble_per_point=settings.ruble_per_point,
+    )
+    floor = (
+        settings.min_exit_profit_sides * settings.commission_per_side * position.volume
+    )
+    if not 0.0 < profit < floor:
+        return None
+    return (
+        f"hold-costs:{position.side.value}",
+        "Выход отложен: прибыль не окупает комиссию",
+        (
+            f"{decision.reason} — обратный сигнал. Но {position.side.label.lower()} "
+            f"даёт по закрытию свечи всего {money(profit)}, а порог выхода "
+            f"{money(floor)}: это {percent(settings.min_exit_profit_sides)} "
+            f"комиссии по {money(settings.commission_per_side)} за контракт "
+            f"на сторону при объёме {_volume(position.volume)}. Позиция "
+            "остаётся: выйдем на первой свече, где обратный сигнал ещё стоит, "
+            "а прибыль дорастёт. Конец окна, нерабочий день и дневной лимит "
+            "убытка порог не задерживает — там выходим в любом случае"
+        ),
+    )
+
+
 def _daily_loss_guard(
     state: EngineState,
     bar: object,
@@ -1474,6 +1575,7 @@ def _step_open(
     orders: list[OrderRequest],
     writer: "_Journal",
     settings: EngineSettings,
+    held: str = "",
 ) -> EngineState:
     """Шаг 10 целиком: можно ли входить, какой стороной и каким объёмом.
 
@@ -1481,13 +1583,20 @@ def _step_open(
     сторона → пускают ли предохранители. Спросить про предохранители раньше
     стороны значило бы объяснять молчание потолком объёма там, где сигнала
     не было вовсе.
+
+    :param held: объяснение шага 7, почему выход отложен порогом издержек.
+        Пустая строка — не отложен. Без него рядом со строкой «выход отложен»
+        встала бы строка «сигнала на выход нет», и журнал сказал бы про одну
+        свечу две противоположные вещи.
     """
     blind = unchecked_guards(state, settings, closes_at)
     if not _may_enter(snapshot, state, orders, settings):
         if not orders:
             # Заявку на этой свече не подавали — журнал обязан сказать почему.
             # Если подавали, строка уже написана действием.
-            writer.quiet(*_with_blind(_no_entry_now(state, decision), blind, settings))
+            writer.quiet(
+                *_with_blind(_no_entry_now(state, decision, held), blind, settings)
+            )
         return state
     side = _entry_side(decision, settings)
     if side is None:
@@ -2019,14 +2128,29 @@ def _no_entry(decision: Decision, settings: EngineSettings) -> tuple[str, str, s
     return ("no-signal", "Сигнала нет", f"{decision.reason} — вне рынка")
 
 
-def _holding(position: Position, decision: Decision) -> tuple[str, str, str]:
-    """Позиция держится: сигнала на выход не было."""
+def _holding(
+    position: Position, decision: Decision, held: str = ""
+) -> tuple[str, str, str]:
+    """Позиция держится: сигнала на выход не было — или он был и отложен.
+
+    ⚠️ Второй случай обязан отличаться от первого дословно. Строка «сигнала
+    на выход нет» на свече, где сигнал был и его придержал порог издержек, —
+    это неправда в журнале решений, по которому потом объясняют сделки.
+    Ключ здесь тот же, что у строки шага 7, поэтому вторая строка гасится
+    дедупликацией и владелец счёта видит объяснение ровно один раз.
+    """
     if not position.is_open:
         return (
             "closing",
             "Ждём исполнения выхода",
             "Заявка на выход подана на прошлой свече, сделки ещё не было. "
             "Вход в обратную сторону — не раньше, чем позиция закроется",
+        )
+    if held:
+        return (
+            f"hold-costs:{position.side.value}",
+            "Выход отложен: прибыль не окупает комиссию",
+            held,
         )
     return (
         f"hold:{position.side.value}",
@@ -2035,8 +2159,13 @@ def _holding(position: Position, decision: Decision) -> tuple[str, str, str]:
     )
 
 
-def _no_entry_now(state: EngineState, decision: Decision) -> tuple[str, str, str]:
-    """Шаг 10 входа не дал, а заявок на этой свече не было — почему."""
+def _no_entry_now(
+    state: EngineState, decision: Decision, held: str = ""
+) -> tuple[str, str, str]:
+    """Шаг 10 входа не дал, а заявок на этой свече не было — почему.
+
+    :param held: объяснение шага 7, почему выход отложен порогом издержек.
+    """
     entry = state.entry_in_flight()
     if entry is not None and state.position is None:
         return (
@@ -2048,7 +2177,7 @@ def _no_entry_now(state: EngineState, decision: Decision) -> tuple[str, str, str
             "на счёте",
         )
     if state.position is not None:
-        return _holding(state.position, decision)
+        return _holding(state.position, decision, held)
     return (
         "left-the-market",
         "Входа на этой свече нет",

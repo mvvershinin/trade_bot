@@ -291,6 +291,7 @@ _ANOTHER_ENGINE: dict[str, object] = {
     "trailing_offset_percent": 0.3,
     "trailing_step_percent": 0.07,
     "stop_after_take_profit": False,
+    "min_exit_profit_sides": 2.0,
     "partial_candles": PartialCandles.SKIP,
     "commission_per_side": 7.0,
     "ruble_per_point": 2.0,
@@ -324,8 +325,14 @@ def test_changing_any_engine_setting_changes_the_snapshot(name: str) -> None:
     Это и есть повторимость, выраженная проверяемо. Поле, выпавшее из снимка,
     делает две разные настройки неотличимыми в базе — ровно тот случай,
     когда числа владельца счёта не воспроизводятся, а объяснить это нечем.
+
+    ⚠️ Тариф комиссии стоит **в основе**, а не только в изменении: порог
+    выхода по обратному сигналу без тарифа настройки отвергают, и без этой
+    строки поле нельзя было бы поменять поодиночке. На остальные поля
+    основа с тарифом не влияет — сравниваются два снимка, и тариф в обоих
+    одинаков.
     """
-    base = EngineSettings()
+    base = EngineSettings(commission_per_side=14.0)
     other = base.replace(**{name: _ANOTHER_ENGINE[name]})
     assert settings_text(
         base, EmaReverseSettings(), algorithm=registry.default_entry()

@@ -237,6 +237,10 @@ _ENGINE_TITLES: Mapping[str, str] = {
     "trailing_offset_percent": "Скользящий тейк, отступ, %",
     "trailing_step_percent": "Скользящий тейк, шаг подтяжки, %",
     "stop_after_take_profit": "Стоп на день после тейка",
+    # Порога нет в окне настроек (прямые слова владельца счёта 10.09.2026),
+    # но в снимок прогона он обязан попасть: он меняет список сделок, и два
+    # прогона с одинаковыми на вид настройками дадут разные деньги.
+    "min_exit_profit_sides": "Порог выхода по обратному сигналу, комиссий",
     "partial_candles": "Неполные свечи",
     "commission_per_side": "Комиссия за контракт на сторону, ₽",
     "ruble_per_point": "Рублей в пункте цены",
@@ -549,6 +553,9 @@ _UNCONTROLLED_TITLES: frozenset[str] = frozenset(
         "partial_candles",
         "close_wait_bars",
         "exchange_days",
+        # Порог выхода по обратному сигналу поля в окне не имеет и берётся
+        # у прежних настроек — тот же случай, что `close_wait_bars`.
+        "min_exit_profit_sides",
     )
 )
 

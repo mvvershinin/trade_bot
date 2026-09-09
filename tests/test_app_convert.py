@@ -274,6 +274,10 @@ def test_every_engine_field_has_a_source() -> None:
     from_the_window |= {
         "volume_cap", "daily_loss_limit_percent", "free_funds_reserve_percent",
     }
+    # ⚠️ Порог выхода по обратному сигналу поля в окне не имеет и иметь пока
+    # не должен — прямые слова владельца счёта 10.09.2026. Берётся у прежних
+    # настроек: умолчание молча выключило бы правило, включённое из кода.
+    from_the_previous |= {"min_exit_profit_sides"}
     every_field = {field.name for field in fields(EngineSettings)}
     named = from_the_window | from_the_previous
     assert every_field == named, (
