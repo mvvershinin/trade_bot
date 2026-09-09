@@ -136,12 +136,11 @@ def refuse_foreign_strategy(
     if strategy_id != entry.id:
         raise ForeignStrategy(
             f"сетка перебора написана под торговый алгоритм «{entry.title}» "
-            f"({entry.id}), а выбран «{strategy_id}». Перебор не запущен: "
-            "он перебирал бы поля чужого алгоритма и показал бы результат "
-            "как ваш. Подбора параметров для этого алгоритма в программе "
-            "пока нет — выберите «{title}» либо подбирайте вручную.".format(
-                title=entry.title
-            )
+            f"({entry.id}), а выбран {_named(strategy_id)}. Перебор "
+            "не запущен: он перебирал бы поля чужого алгоритма и показал бы "
+            "результат как ваш. Подбора параметров для этого алгоритма "
+            f"в программе пока нет — выберите «{entry.title}» либо "
+            "подбирайте вручную."
         )
     if not isinstance(settings, EmaReverseSettings):
         raise ForeignStrategy(
@@ -150,6 +149,22 @@ def refuse_foreign_strategy(
             f"{type(settings).__name__}. Перебор не запущен."
         )
     return settings
+
+
+def _named(strategy_id: str) -> str:
+    """Алгоритм для человека: название и `id`, если он реестру знаком.
+
+    ⚠️ Отказ обязан называть то, что человек **видел в окне**, а видел он
+    название. Одного `id` мало: до 09.09.2026 в отказе стояло «а выбран
+    "ma_crossing"» — строка, которой в окне нет ни на одной вкладке, и
+    сопоставлять её с выбранным алгоритмом человеку пришлось бы самому.
+    Незнакомый `id` показывается как есть: подставлять ему выдуманное
+    название было бы хуже молчания.
+    """
+    try:
+        return f"«{registry.find(strategy_id).title}» ({strategy_id})"
+    except registry.UnknownStrategy:
+        return f"«{strategy_id}»"
 
 
 def grid_strategy() -> registry.StrategyEntry:

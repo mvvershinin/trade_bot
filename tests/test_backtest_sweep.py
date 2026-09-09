@@ -566,6 +566,32 @@ def test_a_foreign_algorithm_is_refused_with_a_reason_a_human_can_read() -> None
     assert "не запущен" in said
 
 
+def test_the_second_algorithm_of_the_build_is_refused_by_its_own_name() -> None:
+    """Настоящий второй алгоритм реестра отвергается, и назван так, как в окне.
+
+    ⚠️ Проверка на **настоящей** записи реестра, а не на выдуманном имени:
+    выдуманное отвергается уже потому, что реестр его не знает, а второй
+    алгоритм существует, делит с первым класс настроек и отличается только
+    именем. Ровно на нём отказ и обязан сработать — иначе перебор перебрал
+    бы поля первого и показал бы лидеров как «ваши» (решение 0057).
+
+    Мутация, обязанная ронять проверку: сверять класс настроек вместо
+    имени. Класс у них общий, и отказа не случилось бы.
+    """
+    others = [entry for entry in registry.entries() if entry.id != GRID_STRATEGY_ID]
+    assert others, "в сборке один алгоритм — отказывать нечему, проверка вакуумна"
+    for entry in others:
+        with pytest.raises(ForeignStrategy) as refusal:
+            refuse_foreign_strategy(entry.id, entry.defaults())
+        said = str(refusal.value)
+        assert entry.title in said, (
+            "отказ не называет алгоритм так, как он подписан в окне: " + said
+        )
+        assert entry.id in said, "отказ не называет id выбранного алгоритма"
+        assert registry.find(GRID_STRATEGY_ID).title in said
+        assert "не запущен" in said
+
+
 def test_the_ground_of_the_sweep_refuses_foreign_settings() -> None:
     """Отказ живёт в модели данных: чужое не попадает в условия перебора."""
     class SettingsOfSomeoneElse:

@@ -51,6 +51,7 @@ from strategies.contracts import (
     Fact,
     FactKind,
     Intent,
+    Sample,
     Strategy,
     StrategySettings,
     check_bar,
@@ -61,6 +62,7 @@ from strategies.ema_reverse import (
     EmaReverseSettings,
     OnPriceEqualsAverage,
 )
+from strategies.ma_crossing import MaCrossing
 from strategies.registry import (
     DEFAULT_ID,
     SettingsField,
@@ -84,6 +86,10 @@ __all__ = [
     # перекладывает готовую строку в окно. Исполняются `claims` и `facts`;
     # `lead` и `notes` — проза, и названы прозой (замер 09.09.2026).
     "Claim",
+    # Свеча-образец под утверждение: четыре цены. Была одна цена — закрытие,
+    # и на модуле, который смотрит на тени, механизм исполнения описания
+    # выродился бы молча (`strategies/contracts.py`, `Sample`).
+    "Sample",
     "Fact",
     "FactKind",
     "Description",
@@ -95,6 +101,9 @@ __all__ = [
     "EmaReverseSettings",
     "OnPriceEqualsAverage",
     "DEFAULT_PERIOD",
+    # Алгоритм №2: сигнал в момент пересечения свечи со средней. Настройки
+    # у него общие с №1, а правило другое — разбор в `ma_crossing.py`.
+    "MaCrossing",
     # Реестр берётся модулем целиком (`registry.find(...)`, `registry.entries()`),
     # а не россыпью коротких имён: `find` и `entries` в общем пространстве имён
     # пакета не говорят, чего именно они ищут.

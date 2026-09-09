@@ -51,6 +51,8 @@ from typing import Any, Final
 from strategies.contracts import Description, Strategy, StrategySettings
 from strategies.ema_reverse import EmaReverse, EmaReverseSettings
 from strategies.ema_reverse import describe as describe_ema_reverse
+from strategies.ma_crossing import MaCrossing
+from strategies.ma_crossing import describe as describe_ma_crossing
 
 __all__ = [
     "SettingsField",
@@ -252,34 +254,60 @@ class StrategyEntry:
         return tuple(sorted({one.name for one in self.fields} - known))
 
 
+#: Поля настроек `EmaReverseSettings` — **одна таблица на оба алгоритма,
+#: которые этим классом настроек пользуются**.
+#:
+#: ⚠️ Общая, а не скопированная, и это не экономия строк. Таблица говорит,
+#: из какого поля окна берётся каждое поле настроек; две копии рядом
+#: означали бы, что одно и то же поле окна доезжает у двух алгоритмов
+#: в разные поля — молча и с исправным видом окна. Ровно этот класс дефекта
+#: и есть ловушка №2 миниплана `strategy-modules-switchable.md`. Что копии
+#: не завелись, стережёт `tests/test_strategies_registry.py`.
+#:
+#: ⚠️ Таблица полна по классу настроек, а не по тому, что алгоритм читает:
+#: «Тестовый скользящий» не читает `on_equal` и `confirm_bars` вовсе
+#: (разбор в `strategies/ma_crossing.py`), но поля у его настроек есть,
+#: и умолчать о них здесь нельзя — проверка полноты `settings_gap()`
+#: сверяет таблицу с классом. Что алгоритм поля не читает, он говорит сам,
+#: в описании правила словами.
+_MOVING_AVERAGE_FIELDS: Final[tuple[SettingsField, ...]] = (
+    SettingsField("period", "average_period", "Период средней"),
+    SettingsField("kind", "average_kind", "Тип средней"),
+    SettingsField(
+        "on_equal", "on_price_equals_average",
+        "Закрытие ровно на средней",
+    ),
+    SettingsField(
+        "threshold_percent", "threshold_percent", "Порог пересечения, %",
+    ),
+    SettingsField(
+        "confirm_bars", "confirm_bars", "Подтверждение сигнала, свечей",
+    ),
+)
+
 #: Таблица модулей. Явные импорты, ни одного `importlib` — см. шапку файла.
 #:
-#: ⚠️ Записей сегодня одна, и это нормальный вид, а не заготовка: владелец
-#: счёта 08.09.2026 — «текущий алгоритм пока оставляем как по умолчанию».
-#: Реестр на одну запись — удобное место спрятать дефект «работает только для
-#: первого», поэтому механизм проверяется поддельным модулем в тестах,
-#: а не наличием второй строки здесь.
+#: ⚠️ Вторая запись заведена 09.09.2026 по просьбе владельца счёта:
+#: «попробуй тестово алгоритм второй… в списке назови тестовый скользящий —
+#: проверим». Умолчание при этом **не меняется** — это его же прямое
+#: решение. Механизм по-прежнему проверяется и поддельным модулем в тестах:
+#: подделка ломается нарочно, а настоящий второй алгоритм ломать нельзя.
 _ENTRIES: Final[tuple[StrategyEntry, ...]] = (
     StrategyEntry(
         id="ema_reverse",
         title=EmaReverse.title,
         settings_type=EmaReverseSettings,
         factory=EmaReverse,
-        fields=(
-            SettingsField("period", "average_period", "Период средней"),
-            SettingsField("kind", "average_kind", "Тип средней"),
-            SettingsField(
-                "on_equal", "on_price_equals_average",
-                "Закрытие ровно на средней",
-            ),
-            SettingsField(
-                "threshold_percent", "threshold_percent", "Порог пересечения, %",
-            ),
-            SettingsField(
-                "confirm_bars", "confirm_bars", "Подтверждение сигнала, свечей",
-            ),
-        ),
+        fields=_MOVING_AVERAGE_FIELDS,
         describe=describe_ema_reverse,
+    ),
+    StrategyEntry(
+        id="ma_crossing",
+        title=MaCrossing.title,
+        settings_type=EmaReverseSettings,
+        factory=MaCrossing,
+        fields=_MOVING_AVERAGE_FIELDS,
+        describe=describe_ma_crossing,
     ),
 )
 

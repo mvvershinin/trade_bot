@@ -78,6 +78,7 @@ from strategies import (
     Fact,
     FactKind,
     Intent,
+    Sample,
     Strategy,
     StrategyEntry,
     registry,
@@ -97,9 +98,18 @@ START = datetime(2026, 6, 19, 9, 0)
 #: сломанному модулю крутить прогон бесконечно.
 WARMUP_LIMIT = 1000
 
-#: Слова, которыми описание называет место закрытия, и что каждое из них
-#: обещает про образец: `+1` — образец **выше** средней, `−1` — ниже,
-#: `0` — на ней самой либо внутри мёртвой полосы вокруг неё.
+#: Слова, которыми описание говорит о свече-образце, и что каждое обещает.
+#: Тройка: **измерение**, слово, знак.
+#:
+#: Три измерения, потому что алгоритмы говорят о разном, а проверять надо
+#: одинаково строго:
+#:
+#: * `close` — где **закрытие** образца относительно средней: «выше» `+1`,
+#:   «ниже» `−1`, «ровно на» и «внутри полосы» — `0`;
+#: * `touch` — лежит ли средняя **внутри размаха** свечи: «задела» `+1`,
+#:   «прошла мимо» `−1`;
+#: * `slope` — куда **средняя пошла** после этой свечи: «вверх» `+1`,
+#:   «вниз» `−1`, «не изменилась» `0`.
 #:
 #: ⚠️ Этот словарь — **независимая** сторона проверки, и в этом весь смысл.
 #: Пока слово брали из той же таблицы модуля, что и знак, подмена «выше» ↔
@@ -107,20 +117,41 @@ WARMUP_LIMIT = 1000
 #: модуль на той же свече отвечает тем же. В окне вставало бы «Закрытие ниже
 #: EMA(15) — робот хочет быть в лонге» при зелёном прогоне (`B-040`).
 #:
+#: ⚠️ Измерений стало три 09.09.2026, вместе с алгоритмом №2. Одного `close`
+#: хватало ровно до тех пор, пока все алгоритмы решали по закрытию: алгоритм,
+#: который смотрит на тени и на наклон линии, вынужден был бы либо молчать
+#: об этом в описании, либо назвать место закрытия — то есть **соврать
+#: в понятных словах**, оставшись зелёным. Слово без измерения непроверяемо.
+#:
 #: ⚠️ Слова здесь на русском, потому что проверяется **текст для человека**;
 #: имена в коде по-прежнему латиницей (`CLAUDE.md` §6).
-WHERE_WORDS: tuple[tuple[str, int], ...] = (
-    ("выше", 1),
-    ("ниже", -1),
-    ("ровно на", 0),
-    ("внутри полосы", 0),
+CLAIM_WORDS: tuple[tuple[str, str, int], ...] = (
+    ("close", "выше", 1),
+    ("close", "ниже", -1),
+    ("close", "ровно на", 0),
+    ("close", "внутри полосы", 0),
+    ("touch", "задела", 1),
+    ("touch", "прошла мимо", -1),
+    ("slope", "вверх", 1),
+    ("slope", "вниз", -1),
+    ("slope", "не изменилась", 0),
 )
 
-#: Насколько мелким бывает «сколь угодно мелкое» пересечение средней в опыте
-#: с фильтром против пилы. Доля от цены, а не пункты: полоса задаётся
-#: процентом. 1e−6 от 285 000 — это 0,285, на четыре порядка выше шума
-#: `float` и на два порядка ниже самой узкой полосы, какую можно поставить
-#: в окне.
+#: Во сколько раз ужимается образец утверждения в опыте «сколь угодно мелкое
+#: пересечение средней» (факт про фильтр против пилы).
+#:
+#: ⚠️ Доля **от образца самого модуля**, а не от цены. Образец строит модуль,
+#: и только он знает, какой формы свеча его правилу удовлетворяет: у одного
+#: это закрытие над средней, у другого — тень, дотянувшаяся до линии.
+#: Придвинутый к средней, образец сохраняет форму и теряет размер — то есть
+#: становится ровно тем, что обещает текст при выключенном фильтре: «сигналом
+#: считается любое пересечение, каким бы мелким оно ни было». Прежняя
+#: редакция строила свечу сама (`close = average * (1 + 1e−6)`), то есть
+#: молча считала, что решение принимается по закрытию.
+#:
+#: 1e−6 от отхода образца (у алгоритма №1 это 2 % цены) даёт при цене
+#: 285 000 около 0,006 — на восемь порядков выше шума `float` и на два
+#: порядка ниже самой узкой полосы, какую можно поставить в окне.
 HAIR_CROSSING = 1e-6
 
 #: Насколько двигают цену в опыте «по каким ценам считается средняя».
@@ -250,7 +281,30 @@ def warm_up(module: Strategy) -> tuple[float, datetime]:
     )
 
 
-def execute(entry: StrategyEntry, settings: object, claim: Claim) -> Decision:
+@dataclasses.dataclass(frozen=True, slots=True)
+class Executed:
+    """Что дало исполнение утверждения — всё, что нужно для сверки со словами.
+
+    Три поля, и все три нужны разным проверкам: решение (намерение и
+    причина), образец последней свечи и средняя **до** неё. Последняя пара
+    и позволяет посчитать машиной то, о чём говорят слова: где закрытие
+    относительно линии, задела ли свеча линию размахом и куда линия после
+    свечи пошла.
+    """
+
+    decision: Decision
+    sample: Sample
+    average_before: float
+
+
+def bar_of(sample: Sample, moment: datetime) -> Bar:
+    """Свеча-образец во времени: время ставит проверка, цены — модуль."""
+    return Bar(
+        moment, sample.open, sample.high, sample.low, sample.close
+    )
+
+
+def execute(entry: StrategyEntry, settings: object, claim: Claim) -> Executed:
     """Исполнить одно утверждение и вернуть решение модуля целиком.
 
     Свечи строятся по `claim.probe` от **текущей** средней на каждом шаге:
@@ -258,24 +312,29 @@ def execute(entry: StrategyEntry, settings: object, claim: Claim) -> Decision:
     образец, посчитанный один раз в начале, к последней свече мог бы уже
     не удовлетворять отношению.
 
-    ⚠️ Возвращается решение, а не одно намерение: проверке нужна ещё
-    и **причина** — строка журнала обязана называть сторону тем же словом,
-    что описание. Два рукописных перечисления «выше/ниже» рядом уже стояли,
-    и разошлись бы они молча (`B-040`).
+    ⚠️ Возвращается не одно намерение: проверке нужна ещё и **причина** —
+    строка журнала обязана называть сторону тем же словом, что описание
+    (`B-040`), — и обе средние вокруг последней свечи, иначе слово
+    «вверх» сверять не с чем.
     """
     module = entry.build(settings)
     average, moment = warm_up(module)
     decision: Decision | None = None
+    sample: Sample | None = None
+    before = average
     for step in range(max(claim.bars, 1)):
-        close = claim.probe(average)
+        sample = claim.probe(average)
+        before = average
         moment += STEP
-        decision = module.on_closed_bar(Bar(moment, close, close, close, close))
+        decision = module.on_closed_bar(bar_of(sample, moment))
         assert decision.average is not None, (
             f"средняя пропала на свече {step + 1} утверждения «{claim.detail}»"
         )
         average = float(decision.average)
-    assert decision is not None, "утверждение не исполнено ни одной свечой"
-    return decision
+    assert decision is not None and sample is not None, (
+        "утверждение не исполнено ни одной свечой"
+    )
+    return Executed(decision=decision, sample=sample, average_before=before)
 
 
 def says_word(text: str, word: str) -> bool:
@@ -287,35 +346,64 @@ def says_word(text: str, word: str) -> bool:
     return re.search(rf"(?<!\w){re.escape(word)}(?!\w)", text) is not None
 
 
-def where_sign(text: str, *, about: str) -> int:
-    """Что текст обещает про место закрытия: `+1`, `−1` или `0`.
+def text_signs(text: str, *, about: str) -> dict[str, int]:
+    """Что текст обещает про образец — по измерению на каждое сказанное слово.
 
-    Слово обязано быть ровно одно по смыслу: текст, не сказавший ни одного
-    известного слова, ничего человеку не обещает — и подмена «ровно на» →
-    «далеко от» прошла бы молча. Текст, сказавший сразу два разных, обещает
-    противоположное сам себе.
+    Пустой ответ невозможен: текст, не сказавший ни одного известного слова,
+    ничего человеку не обещает — и подмена «ровно на» → «далеко от» прошла бы
+    молча. Два разных слова одного измерения — тоже отказ: текст обещает
+    взаимоисключающее.
+
+    ⚠️ Измерения, о которых текст молчит, в ответ не попадают, и это
+    осознанно: алгоритм вправе не говорить про наклон средней, если его
+    правило про наклон ничего не знает. Требовать все три значило бы
+    заставить модуль №1 рассуждать о тенях, которых он не читает.
     """
-    found = sorted({sign for word, sign in WHERE_WORDS if says_word(text, word)})
-    vocabulary = ", ".join(f"«{word}»" for word, _sign in WHERE_WORDS)
+    found: dict[str, int] = {}
+    said: dict[str, str] = {}
+    for dimension, word, sign in CLAIM_WORDS:
+        if not says_word(text, word):
+            continue
+        if dimension in found and found[dimension] != sign:
+            raise AssertionError(
+                f"{about}: «{text}» говорит про {dimension} сразу двумя "
+                f"словами — «{said[dimension]}» и «{word}». Человеку обещано "
+                "взаимоисключающее"
+            )
+        found[dimension] = sign
+        said[dimension] = word
+    vocabulary = ", ".join(f"«{word}»" for _dimension, word, _sign in CLAIM_WORDS)
     assert found, (
-        f"{about}: «{text}» не называет место закрытия ни одним известным "
-        f"словом. Проверка знает {vocabulary}; если модуль говорит иначе — "
-        "допишите слово в `WHERE_WORDS` вместе со знаком, а не оставляйте "
-        "фразу без проверки"
+        f"{about}: «{text}» не говорит про свечу ни одним известным словом. "
+        f"Проверка знает {vocabulary}; если алгоритм говорит иначе — "
+        "допишите слово в `CLAIM_WORDS` вместе с измерением и знаком, "
+        "а не оставляйте фразу без проверки"
     )
-    assert len(found) == 1, (
-        f"{about}: «{text}» называет сразу несколько мест закрытия {found} — "
-        "человеку обещано взаимоисключающее"
-    )
-    return found[0]
+    return found
 
 
-def probe_sign(claim: Claim, average: float) -> int:
-    """Где на самом деле лежит образец утверждения относительно средней."""
-    close = claim.probe(average)
-    if close > average:
+def sample_signs(done: Executed) -> dict[str, int]:
+    """То же самое, посчитанное машиной по образцу и по ответу модуля.
+
+    Правая сторона сверки, и она **независима от слов**: где закрытие
+    относительно линии, лежит ли линия внутри размаха свечи и куда линия
+    после этой свечи пошла. Ни одно из трёх чисел не берётся из описания.
+    """
+    average = done.average_before
+    after = done.decision.average
+    assert after is not None, "модуль не отдал среднюю — сверять наклон нечем"
+    return {
+        "close": _sign(done.sample.close - average),
+        "touch": 1 if done.sample.low <= average <= done.sample.high else -1,
+        "slope": _sign(float(after) - average),
+    }
+
+
+def _sign(value: float) -> int:
+    """Знак числа: `+1`, `−1` или `0`."""
+    if value > 0:
         return 1
-    if close < average:
+    if value < 0:
         return -1
     return 0
 
@@ -345,7 +433,7 @@ def test_every_claim_of_the_description_is_true_of_the_module(
         "исполнять нечего, и проверка была бы вакуумной"
     )
     for claim in description.claims:
-        got = execute(entry, settings, claim).intent
+        got = execute(entry, settings, claim).decision.intent
         assert got is claim.intent, (
             f"описание модуля {entry.id} ({name}) врёт: обещано «{claim.detail} "
             f"— {claim.intent.in_words}», а модуль на такой свече ответил "
@@ -366,7 +454,8 @@ def test_the_execution_check_is_not_blind() -> None:
     caught: list[str] = []
     for claim in honest.claims:
         upside_down = dataclasses.replace(claim, intent=_flipped(claim.intent))
-        if execute(entry, settings, upside_down).intent is not upside_down.intent:
+        got = execute(entry, settings, upside_down).decision.intent
+        if got is not upside_down.intent:
             caught.append(claim.detail)
     # Два, а не три: `NONE` переворачивать нечем, и оно остаётся собой.
     assert len(caught) == 2, (
@@ -404,20 +493,20 @@ def test_the_direction_word_of_every_claim_matches_its_probe(
     `strategies/ema_reverse.py::_SIDES`; поменять слова в `_relation`;
     заменить подпись равенства «ровно на» на «далеко от».
     """
-    module = entry.build(settings)
-    average, _moment = warm_up(module)
     for claim in entry.description(settings).claims:
-        real = probe_sign(claim, average)
+        done = execute(entry, settings, claim)
+        real = sample_signs(done)
         for rendering, text in (
             ("без чисел", claim.relation), ("с числами", claim.detail)
         ):
             about = f"модуль {entry.id} ({name}), утверждение {rendering}"
-            assert where_sign(text, about=about) == real, (
-                f"{about}: текст «{text}» говорит про одно место закрытия, "
-                f"а образец утверждения лежит по другую сторону средней "
-                f"({claim.probe(average)} при средней {average}). Человек "
-                "читает слово, а робот сравнивает по знаку"
-            )
+            for dimension, promised in text_signs(text, about=about).items():
+                assert promised == real[dimension], (
+                    f"{about}: текст «{text}» обещает про {dimension} знак "
+                    f"{promised}, а образец даёт {real[dimension]} "
+                    f"(средняя {done.average_before}, свеча {done.sample}). "
+                    "Человек читает слово, а робот сравнивает по знаку"
+                )
 
 
 @pytest.mark.parametrize(("entry", "name", "settings"), CASES, ids=CASE_IDS)
@@ -435,14 +524,17 @@ def test_the_reason_names_the_side_with_the_same_word_as_the_description(
     `"выше" if side is Intent.LONG else "ниже"` с переставленными словами.
     """
     for claim in entry.description(settings).claims:
-        decision = execute(entry, settings, claim)
+        decision = execute(entry, settings, claim).decision
         about = f"модуль {entry.id} ({name}), утверждение «{claim.detail}»"
-        promised = where_sign(claim.detail, about=about)
+        promised = text_signs(claim.detail, about=about)
         assert decision.reason, f"{about}: решение пришло без причины"
-        assert where_sign(decision.reason, about=f"{about}, причина") == promised, (
-            f"{about}: описание обещает одно место закрытия, а журнал решений "
-            f"называет другое — «{decision.reason}»"
-        )
+        said = text_signs(decision.reason, about=f"{about}, причина")
+        for dimension, sign in promised.items():
+            assert said.get(dimension) == sign, (
+                f"{about}: описание обещает про {dimension} знак {sign}, "
+                f"а журнал решений говорит {said.get(dimension)} — "
+                f"«{decision.reason}»"
+            )
 
 
 @pytest.mark.parametrize(("entry", "name", "settings"), CASES, ids=CASE_IDS)
@@ -462,14 +554,12 @@ def test_the_lead_names_every_direction_the_module_knows(
     на что робот смотрит, а не перечисляет все исходы.
     """
     description = entry.description(settings)
-    module = entry.build(settings)
-    average, _moment = warm_up(module)
     directions = {
         word
         for claim in description.claims
-        for word, sign in WHERE_WORDS
+        for dimension, word, sign in CLAIM_WORDS
         if sign != 0 and says_word(claim.relation, word)
-        and sign == probe_sign(claim, average)
+        and sign == sample_signs(execute(entry, settings, claim))[dimension]
     }
     assert directions, (
         f"у модуля {entry.id} ({name}) в таблице нет ни одного направления — "
@@ -634,17 +724,58 @@ def check_restart(entry: StrategyEntry, settings: object, fact: Fact) -> None:
     )
 
 
+def hairline(sample: Sample, average: float) -> Sample:
+    """Тот же образец, придвинутый к средней вплотную. Форма та же, размер нет.
+
+    ⚠️ Форма образца принадлежит модулю, и трогать её нельзя: у одного
+    правило про закрытие над линией, у другого — про тень, дотянувшуюся
+    до линии. Ужимаем **расстояния до средней**, каждое своё, — получается
+    ровно то, что обещает текст при выключенном фильтре: «пересечение,
+    каким бы мелким оно ни было».
+    """
+    def near(price: float) -> float:
+        return average + (price - average) * HAIR_CROSSING
+
+    return Sample(
+        open=near(sample.open), high=near(sample.high),
+        low=near(sample.low), close=near(sample.close),
+    )
+
+
+def directional(entry: StrategyEntry, settings: object) -> Claim:
+    """Первое утверждение описания, у которого есть сторона. Нет — отказ.
+
+    Опыт с мелким пересечением ставится по образцу самого модуля, и брать
+    его надо у направленного утверждения: у «ни входа, ни выхода» образец
+    сигналом не бывает по построению, и опыт выродился бы в тавтологию.
+    """
+    for claim in entry.description(settings).claims:
+        if claim.intent is not Intent.NONE:
+            return claim
+    raise AssertionError(
+        f"у модуля {entry.id} нет ни одного утверждения со стороной — "
+        "мелкое пересечение подать нечем, факт про фильтр не исполняется"
+    )
+
+
 def check_saw_filter(entry: StrategyEntry, settings: object, fact: Fact) -> None:
     """Сколь угодно мелкое пересечение средней: сигнал или тишина.
 
     Опыт ровно тот, который обещан текстом при выключенном фильтре:
     «сигналом считается любое пересечение средней, каким бы мелким оно
     ни было». Включённый фильтр обязан на такой свече промолчать.
+
+    ⚠️ Свеча строится **из образца модуля**, придвинутого к средней, а не
+    сочиняется здесь по закрытию. Сочинённая здесь, она проверяла бы
+    не фильтр, а совпадение чужого правила с нашим представлением о нём:
+    алгоритму, который решает по теням, свеча без размаха не даёт сигнала
+    ни при каком фильтре — и «фильтр включён» оказалось бы правдой всегда.
     """
     module = entry.build(settings)
     average, moment = warm_up(module)
-    close = average * (1 + HAIR_CROSSING)
-    decision = module.on_closed_bar(Bar(moment + STEP, close, close, close, close))
+    claim = directional(entry, settings)
+    hair = hairline(claim.probe(average), average)
+    decision = module.on_closed_bar(bar_of(hair, moment + STEP))
     filtered = decision.intent is Intent.NONE
     assert fact.answer == FILTER_ANSWERS[filtered], (
         f"модуль {entry.id} говорит, что фильтр против пилы {fact.answer}, "
@@ -858,7 +989,7 @@ def test_the_completeness_check_is_not_blind() -> None:
                 relation="закрытие выше средней",
                 detail="закрытие выше средней",
                 intent=Intent.LONG,
-                probe=lambda average: average + 1.0,
+                probe=lambda average: Sample.flat(average + 1.0),
             ),
         ),
     ))

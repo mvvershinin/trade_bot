@@ -46,6 +46,7 @@ from strategies import (
     EmaReverse,
     Intent,
     OnPriceEqualsAverage,  # noqa: F401 — берётся через globals()[...] ниже
+    Sample,
     SettingsField,
     Strategy,
     StrategyEntry,
@@ -939,19 +940,23 @@ def _stand_in_description(settings: StandInSettings) -> Description:
                 relation="закрытие выше средней",
                 detail=f"закрытие выше {label}",
                 intent=Intent.LONG,
-                probe=lambda average: average + max(abs(average) * 0.02, 0.02),
+                probe=lambda average: Sample.flat(
+                    average + max(abs(average) * 0.02, 0.02)
+                ),
             ),
             Claim(
                 relation="закрытие ниже средней",
                 detail=f"закрытие ниже {label}",
                 intent=Intent.SHORT,
-                probe=lambda average: average - max(abs(average) * 0.02, 0.02),
+                probe=lambda average: Sample.flat(
+                    average - max(abs(average) * 0.02, 0.02)
+                ),
             ),
             Claim(
                 relation="закрытие ровно на средней",
                 detail=f"закрытие ровно на {label}",
                 intent=Intent.NONE,
-                probe=lambda average: average,
+                probe=Sample.flat,
             ),
         ),
     )

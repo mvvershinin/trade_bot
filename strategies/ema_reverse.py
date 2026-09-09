@@ -108,6 +108,7 @@ from strategies.contracts import (
     Fact,
     FactKind,
     Intent,
+    Sample,
     check_bar,
 )
 
@@ -691,23 +692,29 @@ _PROBE_REACH: Final[float] = 4.0
 _PROBE_LIFT: Final[float] = 0.02
 
 
-def _probe(settings: EmaReverseSettings, sign: float) -> Callable[[float], float]:
-    """Закрытие, которое заведомо по нужную сторону полосы. По значению средней.
+def _probe(settings: EmaReverseSettings, sign: float) -> Callable[[float], Sample]:
+    """Свеча, которая заведомо по нужную сторону полосы. По значению средней.
 
     Нужно ровно для одного: чтобы описание правила можно было **исполнить** —
     построить свечу, удовлетворяющую заявленному отношению, подать её модулю
     и сверить намерение с заявленным (`strategies/contracts.py`, `Claim`).
     Арифметику полосы знает только модуль, поэтому образец строит он.
+
+    ⚠️ Образец **без теней** (`Sample.flat`), и это утверждение о модуле,
+    а не удобство: максимум и минимум свечи в его правило не входят вовсе,
+    поэтому свеча-образец у него вырождена в одну цену. Модуль, который
+    на тени смотрит, объявит образец с размахом — и его описание будет
+    исполняться на свече той формы, которую он на самом деле разбирает.
     """
 
-    def probe(average: float) -> float:
+    def probe(average: float) -> Sample:
         # `average * (порог / 100)` — то же выражение, что в `_side`, и это
         # важно: сравнение идёт по нему, а не по «примерно такому же».
         edge = average * (settings.threshold_percent / 100.0)
         beyond = max(
             _PROBE_REACH * abs(edge), abs(average) * _PROBE_LIFT, _PROBE_LIFT
         )
-        return average + sign * (abs(edge) + beyond)
+        return Sample.flat(average + sign * (abs(edge) + beyond))
 
     return probe
 
@@ -754,7 +761,7 @@ def _middle_claim(settings: EmaReverseSettings) -> Claim:
                 f"вокруг {label}"
             ),
             intent=Intent.NONE,
-            probe=lambda average: average,
+            probe=Sample.flat,
         )
     return Claim(
         relation="закрытие ровно на средней",
@@ -762,7 +769,7 @@ def _middle_claim(settings: EmaReverseSettings) -> Claim:
         # Из той же таблицы, по которой модуль и решает (`_ON_EQUAL`):
         # второе перечисление разъехалось бы с первым молча.
         intent=_ON_EQUAL[settings.on_equal][0],
-        probe=lambda average: average,
+        probe=Sample.flat,
     )
 
 

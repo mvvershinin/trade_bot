@@ -1062,3 +1062,57 @@ def test_the_catalogue_does_not_fall_over_a_refusal() -> None:
     assert "умолчаниями" in catalogue[0].details, (
         "не сказано, что числа в показанном правиле не принадлежат человеку"
     )
+
+
+def test_choosing_another_algorithm_changes_what_decides() -> None:
+    """Выбрали второй алгоритм — решает второй, а не первый под его именем.
+
+    ⚠️ Проверяется **поведением**, а не именем класса. Имя совпало бы и
+    у сборки, которая показывает второй алгоритм и считает первым: их
+    настройки — один класс, названия берутся из реестра, и всё выглядело бы
+    исправно. Различает их одна свеча: она стоит целиком выше средней,
+    линии не касаясь. Алгоритм №1 отвечает на неё «хочу быть в лонге»
+    (он смотрит на закрытие), алгоритм №2 молчит (он ищет пересечение).
+
+    Мутация, обязанная ронять проверку: собрать модуль
+    по `registry.default_entry()` вместо выбранного.
+    """
+    flat = [Candle(
+        time=datetime(2026, 6, 19, 10, 0, tzinfo=MSK) + timedelta(minutes=5 * step),
+        open=100.0, high=100.0, low=100.0, close=100.0, volume=1.0,
+        timeframe=Timeframe(5),
+    ) for step in range(15)]
+    above = Candle(
+        time=datetime(2026, 6, 19, 11, 15, tzinfo=MSK),
+        open=101.0, high=101.5, low=100.6, close=101.0, volume=1.0,
+        timeframe=Timeframe(5),
+    )
+
+    def decide(strategy_id: str):
+        values = Settings().replace(strategy_id=strategy_id)
+        module = convert.chosen_algorithm(values).build(
+            convert.strategy_settings(values)
+        )
+        for candle in [*flat, above]:
+            decision = module.on_closed_bar(_as_bar(candle))
+        return decision
+
+    assert decide("ema_reverse").intent.name == "LONG"
+    assert decide("ma_crossing").intent.name == "NONE", (
+        "выбран второй алгоритм, а решение принял первый"
+    )
+
+
+def _as_bar(candle: Candle):
+    """Свеча слоя данных → свеча торгового модуля. Как это делает движок.
+
+    Перекладка явная и здесь тоже: у свечи слоя данных `time` — это НАЧАЛО,
+    а модуль ждёт время ЗАКРЫТИЯ (ARCHITECTURE.md §2).
+    """
+    from strategies import Bar
+
+    return Bar(
+        closes_at=candle.close_time,
+        open=candle.open, high=candle.high, low=candle.low,
+        close=candle.close, volume=candle.volume,
+    )
