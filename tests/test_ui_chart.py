@@ -24,6 +24,8 @@ from typing import cast
 import pytest
 import synthetic
 
+from ui.models import ChartData, LinePoint
+
 # -------------------------------------------------------------- ось графика
 
 def test_the_painter_surface_lays_candles_out_by_their_axis_mark(qapp) -> None:
@@ -94,6 +96,136 @@ def test_a_moment_of_a_candle_lands_on_that_candles_place_not_the_next_one(qapp)
     finally:
         surface.deleteLater()
         qapp.processEvents()
+
+
+def _shot(qapp, data, average):
+    """Картинка графика: только свечи и заданная средняя.
+
+    Метки, уровни, затенение и пунктир сделок убраны намеренно — они рисуются
+    своими цветами, и разбирать, чей это пиксель, пришлось бы по оттенку.
+    Размер окна тот же при любом вызове: раскладка по оси зависит от свечей,
+    а они одни и те же, поэтому два снимка сравнимы столбец в столбец.
+    """
+    from PySide6.QtGui import QImage
+
+    from ui.chart.painter_surface import PainterChartSurface
+    from ui.theme import LIGHT
+
+    bare = ChartData(
+        instrument=data.instrument,
+        timeframe=data.timeframe,
+        candles=data.candles,
+        average=average,
+        average_label=data.average_label,
+    )
+    surface = PainterChartSurface()
+    try:
+        surface.set_theme(LIGHT)
+        surface.show_chart(bare)
+        surface.resize(1000, 420)
+        image = QImage(1000, 420, QImage.Format.Format_RGB32)
+        surface.render(image)
+    finally:
+        surface.deleteLater()
+        qapp.processEvents()
+    return image
+
+
+def _columns_of(image, *colours: str) -> list[int]:
+    """Столбцы картинки, в которых встречается любой из названных цветов.
+
+    Смотрим именно цвет, а не «не фон»: сетка, подписи и пунктир тоже не фон,
+    и по ним одну линию от другой не отличить. Допуск в 24 — на сглаживание
+    краёв: перо средней шириной 1,8 пикселя рисуется с полутонами.
+    """
+    from PySide6.QtGui import QColor
+
+    wanted = [QColor(one) for one in colours]
+    found = []
+    for x in range(image.width()):
+        for y in range(image.height()):
+            pixel = QColor(image.pixel(x, y))
+            if any(
+                max(abs(pixel.red() - c.red()),
+                    abs(pixel.green() - c.green()),
+                    abs(pixel.blue() - c.blue())) <= 24
+                for c in wanted
+            ):
+                found.append(x)
+                break
+    return found
+
+
+def _clusters(columns: list[int]) -> list[tuple[int, int]]:
+    """Столбцы, идущие подряд, — это одна свеча."""
+    runs: list[tuple[int, int]] = []
+    for x in columns:
+        if runs and x - runs[-1][1] <= 2:
+            runs[-1] = (runs[-1][0], x)
+        else:
+            runs.append((x, x))
+    return runs
+
+
+def _middle(run: tuple[int, int]) -> float:
+    return (run[0] + run[1]) / 2
+
+
+def test_the_average_line_is_drawn_over_the_candles_it_belongs_to(qapp) -> None:
+    """Линия средней нарисована над своими свечами, а не над соседними.
+
+    ⚠️ Проверка заведена 09.09.2026 при удалении веб-графика (решение 0056),
+    и завела её **дыра, найденная мутацией**. Сдвиг средней на бар
+    (`_index_of_time(point.time) + 1.0` в `_draw_average`) проходил полный
+    прогон зелёным. Единственная проверка «средняя стоит на своей свече»
+    в проекте была написана на **веб-отрисовку** — ту, что не запускалась
+    ни разу; на отрисовке, которую видит владелец счёта, средняя
+    не проверялась ничем.
+
+    Дыра не создана удалением: она существовала с 04.09.2026, удаление
+    её только сделало видимой. Проверки по `_index_of_time` сдвиг именно
+    средней не ловят — в `_draw_average` своя строка.
+
+    Читаются **пиксели**, а не индексы: мутация сидела внутри рисования,
+    и проверка, спрашивающая место у `_index_of_time`, осталась бы зелёной.
+
+    Свечи меряются на **отдельной картинке, без средней**. Иначе синяя линия,
+    проходя по телу свечи, разрезает её столбцы надвое, и проверка падает
+    не там, где сломано: замер 09.09.2026 на той же мутации — 13 «свечей»
+    вместо 12, при исправном сравнении краёв.
+    """
+    from ui.theme import LIGHT
+
+    #: На каких свечах ряда задана средняя. Числа записаны здесь, а не взяты
+    #: у графика: ожидание, посчитанное проверяемым кодом, верно при любой
+    #: его поломке. Всего две точки — чтобы у линии были свои края.
+    first_place, last_place = 2, 9
+
+    data = synthetic.chart_data(12)
+    candles = data.candles
+    line = (
+        LinePoint(time=candles[first_place].opens_at, value=candles[first_place].close),
+        LinePoint(time=candles[last_place].opens_at, value=candles[last_place].close),
+    )
+
+    bodies = _clusters(_columns_of(_shot(qapp, data, ()), LIGHT.bull, LIGHT.bear))
+    assert len(bodies) == len(candles), (
+        f"свечей нарисовано {len(bodies)}, а в ряду {len(candles)}: "
+        "картинка не та, на которой проверяют среднюю"
+    )
+    drawn = _columns_of(_shot(qapp, data, line), LIGHT.average)
+    assert drawn, "линия средней не нарисована вовсе"
+
+    step = _middle(bodies[1]) - _middle(bodies[0])
+    edges = (("левый", first_place, min(drawn)), ("правый", last_place, max(drawn)))
+    for name, place, edge in edges:
+        centre = _middle(bodies[place])
+        assert abs(edge - centre) <= step / 2, (
+            f"{name} край средней стоит на {edge}, а свеча {place}, на которой "
+            f"её значение посчитано, — на {centre}: расхождение "
+            f"{abs(edge - centre) / step:.1f} свечи. Линия средней и свечи "
+            "размечены по-разному, и человек сравнивает цену не с той свечой"
+        )
 
 
 def test_the_time_axis_is_signed_with_the_openings_of_the_candles(qapp) -> None:
