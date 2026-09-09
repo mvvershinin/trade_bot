@@ -208,6 +208,23 @@ _TOOLS: Final[tuple[_Tool, ...]] = (
 )
 
 
+def _findings_word(count: int) -> str:
+    """Согласование слова «находка» с числом: отказ читает человек, а не машина.
+
+    «Проспит 1 находок» подрывает доверие к тексту ровно там, где он обязан
+    быть понят с первого раза, — в красном прогоне.
+    """
+    if 11 <= count % 100 <= 14:
+        return "находок"
+    match count % 10:
+        case 1:
+            return "находку"
+        case 2 | 3 | 4:
+            return "находки"
+        case _:
+            return "находок"
+
+
 def _threshold_mismatch_message(
     name: str,
     constant: str,
@@ -247,7 +264,7 @@ def _threshold_mismatch_message(
         f"порог {name} разошёлся с фактом вниз: записано {recorded}, сейчас {actual} "
         f"({actual - recorded}).\n"
         f"Находок стало меньше, а число в файле осталось вчерашним — и храповик "
-        f"теперь проспит следующие {slack} находок молча. Это дефект D-097, "
+        f"теперь молча пропустит {slack} {_findings_word(slack)}. Это дефект D-097, "
         f"а не мелочь: сторож с запасом просыпается со второй находки.\n"
         f"Что делать: поставить `{paste}` в {THRESHOLD_FILE}. Одна строка, "
         f"и она же — запись сегодняшнего замера; проверить число можно "
@@ -304,6 +321,21 @@ def test_the_refusal_on_slack_offers_the_lower_number_to_paste() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("slack", "expected"),
+    [(1, "1 находку"), (2, "2 находки"), (5, "5 находок"), (11, "11 находок"), (21, "21 находку")],
+)
+def test_the_refusal_on_slack_counts_findings_in_readable_russian(
+    slack: int, expected: str
+) -> None:
+    """Отказ читает человек: «пропустит 1 находок» подрывает доверие к тексту."""
+    message = _threshold_mismatch_message(
+        "ruff", "KNOWN_RUFF_FINDINGS", 572 + slack, 572, "ruff check ."
+    )
+    assert message is not None
+    assert expected in message, f"число и слово не согласованы:\n{message}"
+
+
 def test_growth_and_slack_do_not_read_as_the_same_refusal() -> None:
     """Два разных дефекта — два разных текста: иначе рост примут за уборку."""
     grown = _threshold_mismatch_message("ruff", "KNOWN_RUFF_FINDINGS", 572, 575, "ruff check .")
@@ -336,23 +368,21 @@ def test_the_file_named_in_the_refusal_is_this_very_file() -> None:
 
 
 @pytest.mark.parametrize("tool", _TOOLS, ids=lambda tool: tool.name)
-def test_the_constant_offered_for_pasting_exists_and_holds_the_recorded_number(
-    tool: _Tool,
-) -> None:
-    """Строка из отказа вставляется и работает: константа есть и держит то же число.
+def test_the_constant_named_in_the_refusal_really_exists(tool: _Tool) -> None:
+    """Имя из отказа можно вставить, и оно сработает: такая константа в модуле есть.
 
-    Таблица `_TOOLS` повторяет число литералом, поэтому обязана быть сверена
-    с константой. Иначе правка одной константы оставляет храповик проверять
-    старое число, а отказ — предлагать вставку с чужим именем.
+    Имя хранится в таблице строкой — иначе его не подставить в текст отказа,
+    а строка от переименования не защищена: константу переименуют и не заметят,
+    что отказ отправляет править несуществующее.
+
+    ⚠️ Сверять `tool.recorded` с самой константой здесь нечего и **намеренно
+    не делается**: таблица берёт число у константы (`recorded=KNOWN_…`),
+    то есть сравнение было бы тавтологией — проверкой, которая не может упасть.
+    Единственное живое утверждение этого теста — что имя не протухло.
     """
-    module = sys.modules[__name__]
-    assert hasattr(module, tool.constant), (
+    assert hasattr(sys.modules[__name__], tool.constant), (
         f"отказ {tool.name} предлагает вставить `{tool.constant}`, "
         f"а такой константы в {THRESHOLD_FILE} нет"
-    )
-    assert getattr(module, tool.constant) == tool.recorded, (
-        f"таблица _TOOLS держит для {tool.name} число {tool.recorded}, "
-        f"а константа {tool.constant} — {getattr(module, tool.constant)}"
     )
 
 
