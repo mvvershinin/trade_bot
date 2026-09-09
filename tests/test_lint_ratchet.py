@@ -1,31 +1,76 @@
 """Храповик против роста находок `ruff` и `mypy` — не разовая уборка.
 
-Замер 07.09.2026 (задача «CI на GitHub», `.docs/packaging/packaging-expert-ci-…`):
-`ruff` — 575 находок, `mypy` — 190. Это разобранный остаток с известными
-причинами (см. `pyproject.toml`, комментарии у `[tool.ruff]`/`[tool.mypy]`),
-а не мусор, и делать CI красным с первого дня хуже, чем не делать вовсе:
-на красный перестают смотреть через неделю.
+Замер 07.09.2026 (задача «CI на GitHub», `.docs/packaging/packaging-expert-ci-…`)
+завёл эту проверку: делать CI красным с первого дня хуже, чем не делать вовсе —
+на красный перестают смотреть через неделю. Находки — разобранный остаток
+с известными причинами (см. комментарии у `[tool.ruff]`/`[tool.mypy]`
+в `pyproject.toml`), а не мусор.
 
 Приём тот же, что в `tests/test_function_size.py` — **не второй способ**.
-Отличие одно: там список поимённый (функция → строки), здесь порог один
-на инструмент (находок на весь проект), потому что у `ruff`/`mypy` нет
-устойчивого «имени находки», по которому можно было бы вести список так же,
-как по имени функции — одна и та же ошибка типа сдвигается на другую строку
-от одной правки в соседнем месте файла.
+Отличие одно: там список поимённый (функция → строки), здесь число одно
+на инструмент, потому что у `ruff`/`mypy` нет устойчивого «имени находки»:
+одна и та же ошибка типа сдвигается на другую строку от правки в соседнем
+месте файла.
 
-Из этого отличия следует ассиметрия правил, и она — часть задачи, а не
-недосмотр: прогон падает, если находок стало **больше** порога, и проходит
-молча, если находок стало меньше или столько же. Требовать точного совпадения
-(как для длины функции) было бы неверно: любая случайная попутная починка
-одной находки в другом файле немедленно ломала бы этот тест до тех пор,
-пока кто-то руками не поправит число — трение без пользы. Обратная сторона:
-числа `KNOWN_*` ниже не сползают вниз сами и требуют ручного пересмотра,
-когда разбор долга продвинется, — иначе храповик держит вчерашний уровень
-вместо сегодняшнего.
+## Число — это запись замера, а не бюджет с запасом
 
-Отдельно от храповика в CI есть два **справочных** шага (`ruff`/`mypy` без
-проверки кода возврата) — они показывают текущий список находок в логе.
-Годится ли число — решает этот тест, а не то, красный или зелёный тот шаг.
+Порог обязан **равняться** сегодняшнему факту. Разошлось в любую сторону —
+запись протухла, и прогон об этом говорит.
+
+⚠️ Читающему, которому эта строгость мешает и хочется вернуть «не больше чем»:
+именно «не больше чем» здесь и стояло до 09.09.2026, и именно оно породило
+`D-097`. Ассиметрия выглядела разумно — падать на росте, молчать на снижении, —
+а стоила ровно того, ради чего храповик ставили. Два живых примера на день
+правки, оба без злого умысла и оба из обычного хода работы:
+
+* `ruff`: порог 575 записан 07.09, находок к 09.09 — 572. Три штуки починили
+  попутно, число не тронули. Храповик спал бы на трёх следующих находках;
+* `mypy`: порог подняли 190 → 191 08.09 под находку от общего помощника
+  `tests/helpers.py`, а к 09.09 она не воспроизводится. Спал бы на одной.
+
+Первая новая находка — самая дешёвая в починке (автор ещё помнит, что писал)
+и самая важная в поимке. Сторож, который её пропускает и просыпается на второй,
+не сторож. Лечится это не внимательностью — её и не хватило дважды за двое
+суток, — а тем, что расхождение вниз тоже роняет прогон.
+
+## Чем за это заплачено, честно
+
+Трение выросло, и вот где именно.
+
+1. **Попутная починка чужой находки роняет прогон**, пока не поправишь число.
+   Цена — одна строка, и отказ печатает её готовой к вставке (`KNOWN_… = N`),
+   вместе с путём файла. Гадать не приходится ни секунды.
+2. **Исполнителя посреди работы это не трогает.** Обе проверки числа помечены
+   `@pytest.mark.slow`, а повседневный цикл — `pytest -m "not slow"`
+   (`CLAUDE.md`, `.docs/TESTING.md`). Храповик срабатывает на полном прогоне
+   и в CI, то есть в момент фиксации куска — там, где число обязано быть правдой,
+   а не черновиком.
+3. **Лазейка осталась и стала явной.** Осознанный рост по-прежнему узаконивается
+   поднятием числа — но ровно до сегодняшнего факта и с объяснением рядом,
+   как и было задумано с самого начала. Запрещено не поднимать, а **оставлять
+   выше факта**: запас и есть спящий сторож.
+
+Переключателя вроде `RATCHET_ALLOW_SLACK=1` здесь нет намеренно. Тихий
+выключатель воспроизвёл бы `D-097` в чистом виде: его ставят на день, а живёт
+он месяц, и никто не видит. Правка числа видна в diff и в ревью — это и есть
+нужный тормоз.
+
+## Устройство
+
+Инструментов два, и всё, чем они отличаются, — данные: имя, имя константы,
+записанное число, команда для человека, способ сосчитать. Поэтому таблица
+`_TOOLS` плюс один параметризованный тест, а не две почти одинаковые функции
+(правило 9 `CLAUDE.md`). Третий инструмент — одна строка таблицы.
+
+Текст отказа собирает отдельная чистая функция `_threshold_mismatch_message`,
+и её проверяют быстрые тесты на выдуманных числах. Так сделано ради правила 13
+(«молчание — самостоятельный дефект»): проверка «прогон упал» остаётся зелёной
+и когда отказ не назвал ни одного числа, — а такой отказ бесполезен ровно тогда,
+когда он нужен.
+
+Отдельно от храповика в CI есть два **справочных** шага (`ruff`/`mypy`
+с `continue-on-error`) — они показывают список находок в логе. Годится ли
+число, решает этот тест, а не цвет того шага.
 """
 
 from __future__ import annotations
@@ -36,28 +81,31 @@ import pathlib
 import re
 import subprocess
 import sys
-from typing import Final
+from collections.abc import Callable
+from typing import Final, NamedTuple
 
 import pytest
 
 ROOT: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parent.parent
 
-#: Порог `ruff`. Замер 07.09.2026: `ruff check . --output-format=json`,
-#: длина массива — 575. Совпадает с числом из `Found 575 errors.` в обычном
-#: выводе и с записью в `.docs/TESTING.md`/`CLAUDE.md` на ту же дату.
-KNOWN_RUFF_FINDINGS: Final[int] = 575
+#: Путь, который называет отказ. Не подразумевается «сам догадаешься», а
+#: печатается: человек читает отказ в логе CI, где текущего каталога не видно.
+#: Что путь ведёт именно сюда, проверяет отдельный тест — иначе переименование
+#: файла оставило бы в отказе указание на несуществующее место.
+THRESHOLD_FILE: Final[str] = "tests/test_lint_ratchet.py"
 
-#: Порог `mypy`. Замер 08.09.2026: строка `Found 191 errors in 58 files`.
-#:
-#: ⚠️ Поднят с 190 на 191 осознанно, и вот чем именно. Новый файл проверок
-#: `tests/test_ui_algorithm_dialog.py` берёт общую уборку окон Qt из
-#: `tests/helpers.py`, а `mypy` этот модуль не разрешает: `tests/` не лежит
-#: у него в путях поиска. Находка одна и та же на весь проект —
-#: «Cannot find implementation or library stub for module "helpers"», — и она
-#: прибавляется по одной на каждый файл проверок, который берёт общий
-#: помощник. Отказаться от него значило бы переписать уборку Qt в третий раз;
-#: расхождение таких копий уже стоило проекту окон, живущих между тестами.
-KNOWN_MYPY_FINDINGS: Final[int] = 191
+#: Порог `ruff`. Замер 09.09.2026 на ветке `fix/lint-ratchet-slack`:
+#: `ruff check . --output-format=json`, длина массива — 572; та же цифра
+#: в строке `Found 572 errors.` обычного вывода.
+#: Было 575 (замер 07.09.2026) — три находки починены попутно между датами.
+KNOWN_RUFF_FINDINGS: Final[int] = 572
+
+#: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 58 files`,
+#: одинаково при тёплом кэше, холодном и с `--no-incremental`.
+#: Было 191 (замер 08.09.2026): число подняли под находку «Cannot find
+#: implementation or library stub for module "helpers"» от общего помощника
+#: `tests/helpers.py`; на 09.09 она не воспроизводится, запас снят.
+KNOWN_MYPY_FINDINGS: Final[int] = 190
 
 
 def _tool_is_installed(module: str) -> bool:
@@ -127,27 +175,213 @@ def _mypy_finding_count() -> int:
     return int(match.group(1))
 
 
-@pytest.mark.slow
-def test_ruff_findings_have_not_grown_past_the_recorded_threshold() -> None:
-    """Новых находок `ruff` сверх порога не появилось."""
-    if not _tool_is_installed("ruff"):
-        pytest.skip("ruff не установлен — окружение собрано без группы lint, порог не проверен")
-    actual = _ruff_finding_count()
-    assert actual <= KNOWN_RUFF_FINDINGS, (
-        f"находок ruff стало больше: было {KNOWN_RUFF_FINDINGS}, стало {actual} "
-        f"(+{actual - KNOWN_RUFF_FINDINGS}). Почини новую находку либо, если рост "
-        "осознан, подними KNOWN_RUFF_FINDINGS в этом файле с объяснением — но не молча"
+class _Tool(NamedTuple):
+    """Инструмент под храповиком: всё, чем они отличаются, — данные.
+
+    `constant` хранится строкой, потому что попадает в текст отказа готовым
+    присваиванием; что такая константа в модуле действительно есть и держит
+    именно `recorded`, проверяет отдельный тест.
+    """
+
+    name: str
+    constant: str
+    recorded: int
+    show_command: str
+    count_findings: Callable[[], int]
+
+
+_TOOLS: Final[tuple[_Tool, ...]] = (
+    _Tool(
+        name="ruff",
+        constant="KNOWN_RUFF_FINDINGS",
+        recorded=KNOWN_RUFF_FINDINGS,
+        show_command=".venv/bin/ruff check .",
+        count_findings=_ruff_finding_count,
+    ),
+    _Tool(
+        name="mypy",
+        constant="KNOWN_MYPY_FINDINGS",
+        recorded=KNOWN_MYPY_FINDINGS,
+        show_command=".venv/bin/mypy",
+        count_findings=_mypy_finding_count,
+    ),
+)
+
+
+def _threshold_mismatch_message(
+    name: str,
+    constant: str,
+    recorded: int,
+    actual: int,
+    show_command: str,
+) -> str | None:
+    """Текст отказа, если запись разошлась с фактом, иначе `None`.
+
+    Вынесено из теста отдельной функцией не ради красоты: отказ, не назвавший
+    чисел, роняет прогон ровно так же, как отказ полезный, — и проверка
+    «прогон упал» этой разницы не видит (правило 13). Здесь же числа
+    проверяются быстрыми тестами на выдуманных величинах, без запуска
+    инструментов.
+
+    Оба направления расхождения — дефект, но лечатся по-разному, поэтому
+    и текста два: рост требует решения (починить или узаконить), зазор
+    требует одной правки числа.
+    """
+    if actual == recorded:
+        return None
+    paste = f"{constant} = {actual}"
+    if actual > recorded:
+        grew_by = actual - recorded
+        return (
+            f"находок {name} стало больше: записано {recorded}, сейчас {actual} "
+            f"(+{grew_by}).\n"
+            f"Что делать — одно из двух:\n"
+            f"  1) починить новые находки, список даёт `{show_command}`;\n"
+            f"  2) если рост осознан — поставить `{paste}` в {THRESHOLD_FILE} "
+            f"и рядом написать, чем именно он вызван.\n"
+            f"Ставить число больше {actual} нельзя: запас пропустит следующую "
+            f"находку молча — это дефект D-097, за который проверку и переделали."
+        )
+    slack = recorded - actual
+    return (
+        f"порог {name} разошёлся с фактом вниз: записано {recorded}, сейчас {actual} "
+        f"({actual - recorded}).\n"
+        f"Находок стало меньше, а число в файле осталось вчерашним — и храповик "
+        f"теперь проспит следующие {slack} находок молча. Это дефект D-097, "
+        f"а не мелочь: сторож с запасом просыпается со второй находки.\n"
+        f"Что делать: поставить `{paste}` в {THRESHOLD_FILE}. Одна строка, "
+        f"и она же — запись сегодняшнего замера; проверить число можно "
+        f"командой `{show_command}`."
     )
 
 
-@pytest.mark.slow
-def test_mypy_findings_have_not_grown_past_the_recorded_threshold() -> None:
-    """Новых находок `mypy` сверх порога не появилось."""
-    if not _tool_is_installed("mypy"):
-        pytest.skip("mypy не установлен — окружение собрано без группы lint, порог не проверен")
-    actual = _mypy_finding_count()
-    assert actual <= KNOWN_MYPY_FINDINGS, (
-        f"находок mypy стало больше: было {KNOWN_MYPY_FINDINGS}, стало {actual} "
-        f"(+{actual - KNOWN_MYPY_FINDINGS}). Почини новую находку либо, если рост "
-        "осознан, подними KNOWN_MYPY_FINDINGS в этом файле с объяснением — но не молча"
+# --------------------------------------------------------------------------
+# Быстрые проверки текста отказа. Вход выдуманный, инструменты не запускаются,
+# каждый тест работает в одиночку (правило 14).
+# --------------------------------------------------------------------------
+
+
+def test_a_threshold_equal_to_the_fact_is_not_a_refusal() -> None:
+    """Совпало — отказа нет: храповик не мешает, пока запись верна."""
+    assert (
+        _threshold_mismatch_message("ruff", "KNOWN_RUFF_FINDINGS", 572, 572, "ruff check .") is None
     )
+
+
+def test_the_refusal_on_growth_names_how_much_it_grew() -> None:
+    """Выросло — отказ называет обе величины и разницу, а не просто «не сошлось»."""
+    message = _threshold_mismatch_message("mypy", "KNOWN_MYPY_FINDINGS", 190, 193, "mypy")
+    assert message is not None
+    assert "190" in message, f"в отказе нет записанного числа:\n{message}"
+    assert "193" in message, f"в отказе нет сегодняшнего числа:\n{message}"
+    assert "+3" in message, f"в отказе не сказано, на сколько выросло:\n{message}"
+
+
+def test_the_refusal_on_growth_offers_the_line_to_paste() -> None:
+    """Рост можно узаконить — и отказ даёт готовую строку, а не совет «поднимите»."""
+    message = _threshold_mismatch_message("mypy", "KNOWN_MYPY_FINDINGS", 190, 193, "mypy")
+    assert message is not None
+    assert "KNOWN_MYPY_FINDINGS = 193" in message, (
+        f"отказ не даёт готового присваивания с сегодняшним числом:\n{message}"
+    )
+
+
+def test_the_refusal_on_slack_says_how_many_findings_the_guard_would_sleep_through() -> None:
+    """Порог выше факта — отказ называет цену зазора: сколько находок пройдёт молча."""
+    message = _threshold_mismatch_message("ruff", "KNOWN_RUFF_FINDINGS", 575, 572, "ruff check .")
+    assert message is not None
+    assert "575" in message, f"в отказе нет записанного числа:\n{message}"
+    assert "572" in message, f"в отказе нет сегодняшнего числа:\n{message}"
+    assert "3" in message, f"в отказе не сказано, сколько находок проспит сторож:\n{message}"
+
+
+def test_the_refusal_on_slack_offers_the_lower_number_to_paste() -> None:
+    """Зазор чинится одной строкой, и эта строка написана в отказе целиком."""
+    message = _threshold_mismatch_message("ruff", "KNOWN_RUFF_FINDINGS", 575, 572, "ruff check .")
+    assert message is not None
+    assert "KNOWN_RUFF_FINDINGS = 572" in message, (
+        f"отказ не даёт готового присваивания с сегодняшним числом:\n{message}"
+    )
+
+
+def test_growth_and_slack_do_not_read_as_the_same_refusal() -> None:
+    """Два разных дефекта — два разных текста: иначе рост примут за уборку."""
+    grown = _threshold_mismatch_message("ruff", "KNOWN_RUFF_FINDINGS", 572, 575, "ruff check .")
+    slack = _threshold_mismatch_message("ruff", "KNOWN_RUFF_FINDINGS", 575, 572, "ruff check .")
+    assert grown is not None
+    assert slack is not None
+    assert grown != slack
+    assert "стало больше" in grown, f"рост не назван ростом:\n{grown}"
+    assert "вниз" in slack, f"зазор не назван зазором:\n{slack}"
+
+
+@pytest.mark.parametrize("actual", [569, 575])
+def test_every_refusal_names_the_file_where_the_number_lives(actual: int) -> None:
+    """Отказ читают в логе CI, где текущего каталога не видно, — путь нужен явно."""
+    message = _threshold_mismatch_message(
+        "ruff", "KNOWN_RUFF_FINDINGS", 572, actual, "ruff check ."
+    )
+    assert message is not None
+    assert THRESHOLD_FILE in message, f"отказ не говорит, какой файл править:\n{message}"
+
+
+def test_the_file_named_in_the_refusal_is_this_very_file() -> None:
+    """Указание в отказе ведёт туда, где действительно лежат числа.
+
+    Ловит переименование или переезд файла: без этого отказ продолжал бы
+    отправлять человека по несуществующему пути, и заметили бы это только
+    в момент, когда прогон уже красный.
+    """
+    assert (ROOT / THRESHOLD_FILE).resolve() == pathlib.Path(__file__).resolve()
+
+
+@pytest.mark.parametrize("tool", _TOOLS, ids=lambda tool: tool.name)
+def test_the_constant_offered_for_pasting_exists_and_holds_the_recorded_number(
+    tool: _Tool,
+) -> None:
+    """Строка из отказа вставляется и работает: константа есть и держит то же число.
+
+    Таблица `_TOOLS` повторяет число литералом, поэтому обязана быть сверена
+    с константой. Иначе правка одной константы оставляет храповик проверять
+    старое число, а отказ — предлагать вставку с чужим именем.
+    """
+    module = sys.modules[__name__]
+    assert hasattr(module, tool.constant), (
+        f"отказ {tool.name} предлагает вставить `{tool.constant}`, "
+        f"а такой константы в {THRESHOLD_FILE} нет"
+    )
+    assert getattr(module, tool.constant) == tool.recorded, (
+        f"таблица _TOOLS держит для {tool.name} число {tool.recorded}, "
+        f"а константа {tool.constant} — {getattr(module, tool.constant)}"
+    )
+
+
+def test_the_ratchet_watches_both_tools_and_names_them_apart() -> None:
+    """Инструмента два, и каждый со своим числом: таблица не выродилась в один."""
+    assert [tool.name for tool in _TOOLS] == ["ruff", "mypy"]
+    assert len({tool.constant for tool in _TOOLS}) == len(_TOOLS)
+
+
+# --------------------------------------------------------------------------
+# Сам замер. Запускает инструменты подпроцессом — отсюда `slow`.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("tool", _TOOLS, ids=lambda tool: tool.name)
+def test_the_recorded_threshold_still_equals_todays_finding_count(tool: _Tool) -> None:
+    """Число в файле описывает сегодняшнее дерево — ни больше, ни меньше.
+
+    Больше — появилась новая находка и её никто не заметил. Меньше — запись
+    протухла, и храповик держит вчерашний уровень, пропуская первые находки
+    молча (`D-097`). Оба случая роняют прогон, потому что оба означают,
+    что записанному числу верить нельзя.
+    """
+    if not _tool_is_installed(tool.name):
+        pytest.skip(
+            f"{tool.name} не установлен — окружение собрано без группы lint, порог не проверен"
+        )
+    problem = _threshold_mismatch_message(
+        tool.name, tool.constant, tool.recorded, tool.count_findings(), tool.show_command
+    )
+    assert problem is None, problem
