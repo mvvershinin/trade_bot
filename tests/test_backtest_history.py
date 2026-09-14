@@ -23,6 +23,7 @@ from engine import (
     DayMarks,
     EngineSettings,
     ExitReason,
+    LevelTouch,
     Mode,
     OrderAction,
     OrderRequest,
@@ -150,7 +151,8 @@ def test_a_triggered_level_is_written_down_as_a_calculation_too() -> None:
         await executor.submit(_order(OrderAction.OPEN, Side.LONG, placed_at))
         await executor.fills_at(replace(candle(10, 10), open=100.0))
         await executor.submit(_order(
-            OrderAction.ARM_TAKE_PROFIT, Side.LONG, placed_at, price=100.5,
+            OrderAction.ARM_TAKE_PROFIT, Side.LONG, placed_at,
+            price=100.5, touch=LevelTouch.RISE,
         ))
         return await executor.fills_at(
             replace(candle(10, 15), open=100.2, high=101.0, low=99.0, close=100.2)

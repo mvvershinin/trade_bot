@@ -310,6 +310,13 @@ _SETTINGS_CHANGE_CASES: list[tuple[dict, str]] = [
     ({"trailing_offset_percent": 0.3}, "Скользящий тейк, отступ, %: 0,2 → 0,3"),
     ({"trailing_step_percent": 0.1}, "Скользящий тейк, шаг подтяжки, %: 0,05 → 0,1"),
     ({"stop_after_take_profit": False}, "Стоп на день после тейка: да → нет"),
+    # ⚠️ Поля в окне у порога нет намеренно, и строка тем важнее: включить
+    # его может только тот, кто соберёт `EngineSettings` сам, — а он меняет
+    # список сделок. Тариф здесь обязателен: порог без тарифа отвергается.
+    (
+        {"min_exit_profit_sides": 2.0, "commission_per_side": 14.0},
+        "Порог выхода по обратному сигналу: нет → 2 комиссии",
+    ),
     ({"partial_candles": PartialCandles.SKIP}, "Неполные свечи: Принимать"),
     # Три предохранителя по деньгам. Умолчание у всех — «выключено», поэтому
     # в строке журнала стоит «нет → …»: владелец счёта обязан видеть, что
@@ -357,11 +364,18 @@ def test_every_settings_field_has_a_change_case() -> None:
 def test_every_changed_setting_names_both_values(
     changes: dict, expected: str
 ) -> None:
-    """Каждая настройка, меняющаяся на ходу, попадает в журнал своей строкой."""
+    """Каждая настройка, меняющаяся на ходу, попадает в журнал своей строкой.
+
+    ⚠️ Проверяется «строка на каждое изменённое поле», а не «ровно одна
+    строка»: у порога выхода по обратному сигналу настройки **отвергают**
+    непустое значение без тарифа комиссии, поэтому его случай меняет два поля
+    сразу. Инвариант при этом тот же и той же силы — забытое поле даёт строк
+    меньше, чем изменений, и прогон падает.
+    """
     before = EngineSettings(mode=Mode.REVERSE, window=WINDOW)
     lines = before.replace(**changes).changes_from(before)
-    assert len(lines) == 1, lines
-    assert expected in lines[0]
+    assert len(lines) == len(changes), lines
+    assert any(expected in line for line in lines), lines
 
 
 def test_a_changed_setting_does_not_touch_the_open_position() -> None:

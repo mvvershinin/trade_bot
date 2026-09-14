@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import re
 from collections.abc import Callable, Sequence
 from datetime import date, datetime, time, timedelta
 from urllib.parse import parse_qs, urlparse
@@ -55,6 +56,7 @@ from ui.history_dialog import (
     fill_note,
 )
 from ui.models import (
+    DecisionRow,
     HistoryFacts,
     HistoryLoadOutcome,
     HistoryLoadRequest,
@@ -68,6 +70,26 @@ from helpers import finish_what_is_left, settle_qt
 from market_helpers import FakeTransport, iss_body, minute, no_sleep
 
 TODAY = date(2026, 9, 6)
+
+
+def noon_of(day: date) -> Callable[[], datetime]:
+    """Часы, у которых «сейчас» — всегда полдень названного дня.
+
+    ⚠️ Так этот файл выглядит после `B-049`. До 14.09.2026 порт брал «сейчас»
+    системными часами (`datetime.now(MSK)`), а подставная биржа отвечала
+    свечами вокруг `TODAY` — дня, когда проверки писали. Восемь дней спустя
+    отрезок загрузки («последние N дней, считая сегодняшний») уехал правее
+    всех подставных данных, загрузчику стало нечего просить, и четыре
+    проверки покраснели сами по себе, ничего не сломавшись в программе.
+    Сторож, который так умеет, стережёт календарь машины, а не кнопку:
+    настоящую поломку он к тому же дню уже не отличил бы от своей.
+
+    Полдень, а не полночь: день целиком лежит по одну сторону от «сейчас»,
+    и проверке не приходится держать в уме, что половина её данных —
+    из будущего.
+    """
+    moment = datetime.combine(day, time(12, 0), MSK)
+    return lambda: moment
 
 
 @pytest.fixture(autouse=True)
@@ -1063,14 +1085,22 @@ class Heard:
         port.decision_appended.connect(self.notes.append)
 
 
-def _run(loop, database: pathlib.Path, handler, work) -> tuple[HistoryPort, Heard]:
-    """Поднять порт на подставной бирже и выполнить работу в цикле событий."""
+def _run(
+    loop, database: pathlib.Path, handler, work, *, today: date = TODAY
+) -> tuple[HistoryPort, Heard]:
+    """Поднять порт на подставной бирже и выполнить работу в цикле событий.
+
+    `today` — день, который порт считает сегодняшним. От него он отсчитывает
+    отрезок загрузки, и потому названный день обязан совпадать с тем, вокруг
+    которого построены ответы подставной биржи. Системные часы машины сюда
+    не попадают вовсе — разбор у `noon_of`.
+    """
 
     async def main() -> tuple[HistoryPort, Heard]:
         client = IssClient(FakeTransport(handler), sleep=no_sleep, pause=0)
         async with MarketWorker(database, iss=client) as worker:
             port = HistoryPort(worker, values=Settings(instrument="MXU6"),
-                               days=0, sanitize=redact)
+                               days=0, sanitize=redact, clock=noon_of(today))
             heard = Heard(port)
             try:
                 await work(port, worker)
@@ -1104,7 +1134,9 @@ def bare_folder(tmp_path: pathlib.Path) -> pathlib.Path:
     return place / "candles.sqlite3"
 
 
-def _run_as_main(loop, database: pathlib.Path, handler, work):
+def _run_as_main(
+    loop, database: pathlib.Path, handler, work, *, today: date = TODAY
+):
     """То же, что `_run`, но поток данных собран **как в `app/main.py`**.
 
     Разница ровно одна и она в этом вся: `open()` зовётся только тогда,
@@ -1118,7 +1150,7 @@ def _run_as_main(loop, database: pathlib.Path, handler, work):
         if database.exists():
             await worker.open()
         port = HistoryPort(worker, values=Settings(instrument="MXU6"),
-                           days=0, sanitize=redact)
+                           days=0, sanitize=redact, clock=noon_of(today))
         heard = Heard(port)
         try:
             await work(port, worker)
@@ -1157,6 +1189,124 @@ def test_the_button_makes_the_base_out_of_nothing(loop, bare_folder) -> None:
         assert store.coverage("MXU6").count > 0, "свечей в базе так и не появилось"
     assert heard.finished, "порт не сказал, чем кончилась загрузка"
     assert heard.finished[-1].ok, heard.finished[-1].trouble
+
+
+@pytest.mark.parametrize(
+    "today",
+    [date(2024, 1, 15), TODAY, date(2031, 6, 2)],
+    ids=["seven-years-back", "the-day-this-was-written", "five-years-ahead"],
+)
+def test_the_button_works_on_any_day_of_the_calendar(loop, tmp_path, today) -> None:
+    """Стережёт `B-049`: кнопка не зависит от того, какое сегодня число.
+
+    Тот же путь, что и в проверке выше, прогоняется трижды — в позапрошлом
+    году, в день, когда это писалось, и через пять лет. Подставная биржа
+    каждый раз построена вокруг **названного** дня, а не вокруг сегодняшнего,
+    и результат обязан быть одинаковым.
+
+    Стережётся тем самым не загрузка (её стерегут соседи), а то, чем
+    `B-049` был на самом деле: **порт берёт «сейчас» оттуда, откуда ему
+    дали, а не из часов машины**. Стоит вернуть в `_load_history` прямое
+    `datetime.now(MSK)` — и отрезок загрузки поедет к настоящему сегодня,
+    разойдясь с подставными данными на годы: крайние дни краснеют сразу
+    и краснеть не перестанут.
+
+    ⚠️ Три дня, а не один: проверка с единственным днём, случайно
+    совпавшим с сегодняшним, зеленела бы и на системных часах.
+    """
+    path = tmp_path / f"any-day-{today:%Y%m%d}.sqlite3"
+    day = today - timedelta(days=3)
+    handler = exchange(alive_borders(today), [iss_body(session(day, 300))])
+
+    async def work(port, worker) -> None:
+        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        await _settle(port)
+
+    port, heard = _run(loop, path, handler, work, today=today)
+
+    with CandleStore(path) as store:
+        assert store.coverage("MXU6").count > 0, (
+            f"свечей в базе нет, хотя биржа их отдавала: сегодня {today}"
+        )
+    assert heard.finished, "порт не сказал, чем кончилась загрузка"
+    assert heard.finished[-1].ok, heard.finished[-1].trouble
+
+
+def test_the_port_takes_its_today_from_the_clock_it_was_given(loop, tmp_path) -> None:
+    """Названный день доезжает до границ запроса, ушедшего на биржу.
+
+    Проверка выше говорит «свечи доехали», эта — **откуда порт взял правую
+    границу**. Разница существенная: первая упадёт и от поломки загрузки,
+    вторая — только от часов. Просьба «последние 5 дней» при `сегодня`
+    = 02.06.2031 обязана превратиться в отрезок, кончающийся 02.06.2031,
+    и ни в какой другой.
+
+    ⚠️ Глубина подставной биржи нарочно **шире** названного дня: минутки
+    заявлены на месяц вперёд. Иначе сравнивать нечего — слой данных подрезает
+    просьбу под глубину биржи (`market/history.py`: `min(until, border.end)`),
+    и правая граница получалась бы равной `far` при любых часах, потому что
+    обе стороны сравнения приходили бы из одного и того же `far`. Мутация
+    «правая граница = сегодня + 10 дней» первую редакцию проходила молча.
+
+    Заодно названо правило, которое иначе нигде не проверено: порт **не просит
+    дни правее сегодняшнего**, даже когда у биржи они есть.
+    """
+    far = date(2031, 6, 2)
+    path = tmp_path / "borders.sqlite3"
+    deeper = far + timedelta(days=30)
+    handler, asked = picky_exchange(alive_borders(deeper), session(far - timedelta(days=1), 60))
+
+    async def work(port, worker) -> None:
+        port.load_history(HistoryLoadRequest(symbol="MXU6", days=5))
+        await _settle(port)
+
+    _run(loop, path, handler, work, today=far)
+
+    assert asked, "к бирже не ушло ни одного запроса — проверка вакуумна"
+    right = max(until for _, until in asked)
+    left = min(since for since, _ in asked)
+    assert deeper > far, "глубина биржи не шире названного дня — сравнивать нечего"
+    assert right == far, (
+        f"правая граница отрезка не сегодняшний день: {right}. "
+        f"Биржа заявляла минутки по {deeper}, значит взялась она из часов"
+    )
+    assert left == far - timedelta(days=4), (
+        f"левая граница посчитана не от названного дня: {left}"
+    )
+
+
+def test_every_line_of_the_journal_is_stamped_by_the_ports_own_clock(loop, tmp_path) -> None:
+    """Часы порта — одни на всё, что он датирует, а не только на отрезок загрузки.
+
+    Довод `clock` заведён ради границ загрузки, но время порт ставит и в журнал
+    решений (`note`). Мутация «журнал вернули на `datetime.now(MSK)`» 14.09.2026
+    прошла молча по **всему** набору, все 3939 проверок: строка «Загрузка
+    истории начата 29.05.2031 — 02.06.2031» встала бы в журнале под сегодняшним
+    числом машины, и порядок событий в журнале разошёлся бы с их содержанием.
+
+    Сторож смотрит на **все** строки, а не на последнюю: довод, применённый
+    в одном месте из нескольких, — это ровно то, чем был `B-049`.
+
+    ⚠️ Третье место, где порт ставит время, этой проверкой не закрыто: отметка
+    остановки (`_save_halt`) живёт в торговой части порта, и сторож ей нужен
+    там же (`D-107`).
+    """
+    far = date(2031, 6, 2)
+    day = far - timedelta(days=3)
+    handler = exchange(alive_borders(far), [iss_body(session(day, 300))])
+
+    async def work(port, worker) -> None:
+        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        await _settle(port)
+
+    port, heard = _run(loop, tmp_path / "stamps.sqlite3", handler, work, today=far)
+
+    stamped = {row.time.date() for row in heard.notes if isinstance(row, DecisionRow)}
+    assert stamped, "порт не написал в журнал ни строки — проверка вакуумна"
+    assert stamped == {far}, (
+        f"журнал датирован не часами порта ({far:%d.%m.%Y}), а чем-то ещё: "
+        f"{sorted(stamped)}"
+    )
 
 
 def test_the_dialog_reads_the_base_that_does_not_exist_yet(loop, bare_folder) -> None:
@@ -1239,13 +1389,25 @@ def test_the_load_runs_outside_the_event_loop(loop, empty_database) -> None:
 
 
 def test_the_progress_reaches_the_window(loop, empty_database) -> None:
-    """Ход работы виден: без него ожидание неотличимо от поломки.
+    """Ход работы виден **и говорит правду**: сколько свечей и докуда дошли.
 
     Владелец счёта уже принимал закрытую биржу за поломку программы
     и потерял на этом полчаса (`B-022`).
+
+    ⚠️ Проверяются числа, а не наличие подписи. Прежняя редакция требовала
+    «0 ≤ доля ≤ 100» — верно всегда — и слово «свечей» в подписи. Сигнал
+    с вечными нулями («Загружено 0 свечей», 0 %) проходил её молча, а полоска,
+    которая никуда не едет, для человека неотличима от замершей программы,
+    то есть ровно от той беды, ради которой её и поставили.
+
+    Числа берутся **снаружи**, из фикстуры и просьбы, а не из порта:
+    шестьдесят минуток отдала подставная биржа; половина — это три дня
+    от левой границы отрезка в шесть дней (просили «последние 7», считая
+    сегодняшний), а данные лежат на третьем дне от левого края.
     """
     day = TODAY - timedelta(days=3)
-    handler = exchange(alive_borders(TODAY), [iss_body(session(day))])
+    minutes = session(day)
+    handler = exchange(alive_borders(TODAY), [iss_body(minutes)])
 
     async def work(port, worker) -> None:
         port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
@@ -1253,9 +1415,25 @@ def test_the_progress_reaches_the_window(loop, empty_database) -> None:
 
     port, heard = _run(loop, empty_database, handler, work)
     assert heard.progress, "ход загрузки в окно не приходил ни разу"
-    percent, said = heard.progress[-1]
-    assert 0 <= percent <= 100
-    assert "свечей" in said, f"в подписи хода нет числа свечей: {said!r}"
+    percents = [percent for percent, _ in heard.progress]
+    lines = [said for _, said in heard.progress]
+    counted = [
+        int(found.group(1))
+        for found in (re.search(r"Загружено (\d+) свечей", said) for said in lines)
+        if found is not None
+    ]
+    assert counted, f"в подписи хода нет числа свечей: {lines}"
+    assert max(counted) == len(minutes), (
+        f"ход работы назвал не то число свечей, что отдала биржа "
+        f"({len(minutes)}): {lines}"
+    )
+    assert max(percents) == 50, (
+        f"доля считается не по датам отрезка: три дня из шести — половина, "
+        f"а пришло {percents}"
+    )
+    assert any(f"{day:%d.%m.%Y}" in said for said in lines), (
+        f"ход работы не говорит, до какого дня дошла загрузка: {lines}"
+    )
 
 
 def test_a_refusal_names_the_reason_in_words(loop, empty_database) -> None:

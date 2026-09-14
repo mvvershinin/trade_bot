@@ -78,10 +78,10 @@ from backtest.leaders import (
     study,
     summary_text,
 )
+from backtest.sweep import ForeignStrategy
 from market.journal import RunOrigin
 from market.paths import default_db_path
 from market.storage import CandleStore
-from strategies import EmaReverse
 from ui.formatting import MSK
 from ui.models import AfterTakeProfit, Mode, ReversalMoment, Settings
 from ui.templates import EXAMPLES_DIR_NAME, TEMPLATES_FILE_NAME, Library, Template
@@ -248,7 +248,7 @@ def record(
         timeframe=timeframe,
         engine=convert.engine_settings(values, Mode.REVERSE),
         strategy=convert.strategy_settings(values),
-        strategy_title=EmaReverse.title,
+        algorithm=convert.chosen_algorithm(values),
         app_version=version(),
     )
     written: list[int] = []
@@ -454,6 +454,7 @@ async def work(args: argparse.Namespace) -> int:
             copy, args.symbol,
             engine=convert.engine_settings(base, Mode.REVERSE),
             strategy=convert.strategy_settings(base),
+            strategy_id=base.strategy_id,
             days=days_of(bars),
             costs=Costs(
                 commission_per_side=args.commission,
@@ -484,8 +485,19 @@ async def work(args: argparse.Namespace) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Точка входа. Возвращает код возврата процесса."""
-    return asyncio.run(work(arguments(argv)))
+    """Точка входа. Возвращает код возврата процесса.
+
+    ⚠️ Отказ перебора — **фраза и код возврата**, а не трассировка. Сетка
+    написана под один торговый алгоритм и объявляет это сама
+    (`backtest/sweep.py::GRID_STRATEGY_ID`); выбран другой — подбирать
+    нечего, и сказать это надо словами. Трассировка в консоль здесь была бы
+    тем самым молчанием, которое дороже поломки (`CLAUDE.md` №13).
+    """
+    try:
+        return asyncio.run(work(arguments(argv)))
+    except ForeignStrategy as refusal:
+        print(f"Перебор не запущен: {refusal}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

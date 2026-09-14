@@ -1,4 +1,4 @@
-"""Пропуск во времени виден как пропуск — на обеих отрисовках (`B-005`).
+"""Пропуск во времени виден как пропуск (`B-005`).
 
 Что здесь стережётся, одной фразой: **час без данных занимает на оси столько
 же места, сколько занял бы час свечей, и ни одна свеча не встаёт вплотную
@@ -18,14 +18,12 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import pytest
 
-from test_ui_chart import Probe
 from ui.chart.timeline import Timeline
 from ui.formatting import MSK
 from ui.models import Candle, ChartData, Layer, Marker, MarkerKind
@@ -165,7 +163,7 @@ def test_a_broken_step_cannot_blow_the_axis_up() -> None:
     )
 
 
-# ------------------------------------------- запасная отрисовка: до пикселей
+# ----------------------------------------------------- отрисовка: до пикселей
 
 def _painted(surface, width: int = 1000, height: int = 420):
     """Снимок нарисованного графика."""
@@ -216,10 +214,6 @@ def _clusters(columns: list[int]) -> list[tuple[int, int]]:
 def _middle(run: tuple[int, int]) -> float:
     return (run[0] + run[1]) / 2
 
-
-@pytest.fixture()
-def probe(qapp) -> Probe:
-    return Probe()
 
 
 @pytest.fixture()
@@ -424,113 +418,6 @@ def test_the_price_axis_survives_a_man_who_scrolled_into_the_hole(surface) -> No
     )
 
 
-# ------------------------------------------------ основная отрисовка: веб
-
-def _sent(scripts: list[str], call: str) -> list[dict]:
-    """Первый довод последнего вызова `call`, разобранный из JavaScript."""
-    script = next(s for s in reversed(scripts) if s.startswith(call))
-    payload, _ = json.JSONDecoder().raw_decode(script[len(call):])
-    return payload if isinstance(payload, list) else [payload]
-
-
-def test_the_web_surface_sends_the_hole_to_the_page_as_empty_places(probe) -> None:
-    """В страницу уходят пустые места, а не одни свечи.
-
-    Отрисовщиков два (`ui/chart/factory.py`), и веб — основной вариант ТЗ.
-    Шкала времени у библиотеки порядковая: свечи ложатся подряд независимо
-    от своих отметок, и разрыв показывается только элементом с одним полем
-    `time` и без цен («whitespace data»). Правка одной отрисовки оставила бы
-    вторую со склейкой — на `B-008` это уже случилось.
-    """
-    probe.show_chart(_chart(HOLE))
-    items = _sent(probe.scripts, "terminal.setCandles(")
-
-    assert len(items) == 18, f"в страницу ушло {len(items)} мест вместо 18"
-    empty = [item for item in items if "close" not in item]
-    assert len(empty) == 12, (
-        f"пустых мест ушло {len(empty)} вместо 12 — час пропуска "
-        "библиотека нарисует встык"
-    )
-    assert all(set(item) == {"time"} for item in empty), (
-        f"пустое место ушло не пустым: {empty[0]}"
-    )
-    assert [item["time"] for item in items] == sorted(item["time"] for item in items), (
-        "ряд ушёл в страницу не по возрастанию времени — библиотека его отвергнет"
-    )
-
-
-def test_the_web_surface_fills_the_hole_before_a_live_candle(probe) -> None:
-    """Живая свеча после обрыва: сначала пустые места, потом сама свеча.
-
-    Порядок важен: `update` у библиотеки принимает только время не раньше
-    последнего, и свеча, отправленная первой, закрыла бы дорогу пустым местам.
-    """
-    probe.show_chart(_chart(SOLID[:3]))
-    probe.scripts.clear()
-
-    probe.append_candle(_candle(_at(14, 15)))
-
-    calls = [s.split("(")[0] for s in probe.scripts]
-    assert calls == ["terminal.fillGap", "terminal.updateCandle"], (
-        f"порядок вызовов {calls}: пустые места не отправлены либо отправлены после свечи"
-    )
-    empty = _sent(probe.scripts, "terminal.fillGap(")
-    assert len(empty) == 12, f"пустых мест отправлено {len(empty)} вместо 12"
-    assert all(set(item) == {"time"} for item in empty), "пустое место ушло не пустым"
-
-
-def test_a_solid_live_candle_sends_no_empty_places(probe) -> None:
-    """Без пропуска пустые места не шлются: проверка выше не вакуумна."""
-    probe.show_chart(_chart(SOLID[:3]))
-    probe.scripts.clear()
-
-    probe.append_candle(_candle(_at(13, 15)))
-
-    assert [s.split("(")[0] for s in probe.scripts] == ["terminal.updateCandle"], (
-        "в непрерывный ряд отправлены пустые места"
-    )
-
-
-def test_the_page_knows_how_to_put_an_empty_place_on_the_axis() -> None:
-    """В самой странице есть, чем показать пустое место.
-
-    Проверка по тексту страницы: она не исполняется ни в одном прогоне, пока
-    рядом нет вендорного файла библиотеки. Ручной прогон это **не заменяет** —
-    он записан пунктом 5 в заголовке `ui/chart/web_surface.py`.
-    """
-    from ui.chart.web_surface import PAGE
-
-    assert "fillGap" in PAGE, "странице нечем принять пустые места пропуска"
-
-
-def test_the_hole_does_not_move_the_candles_off_their_own_marks(probe) -> None:
-    """Свечи по краям пропуска остаются на своих отметках, а не съезжают.
-
-    Парная к `B-008`: лечение склейки не должно сдвинуть сам ряд. Отметки
-    строятся из часа и минуты мимо кода графика.
-    """
-    probe.show_chart(_chart(HOLE))
-    items = _sent(probe.scripts, "terminal.setCandles(")
-    with_price = [item["time"] for item in items if "close" in item]
-
-    assert with_price == [
-        int(_at(13, 0).timestamp()), int(_at(13, 5).timestamp()), int(_at(13, 10).timestamp()),
-        int(_at(14, 15).timestamp()), int(_at(14, 20).timestamp()), int(_at(14, 25).timestamp()),
-    ], "свечи уехали со своих отметок вместе с починкой пропуска"
-
-
-def test_the_empty_places_carry_the_times_that_are_missing(probe) -> None:
-    """Пустые места стоят на тех самых минутах, которых нет в данных."""
-    probe.show_chart(_chart(HOLE))
-    items = _sent(probe.scripts, "terminal.setCandles(")
-    empty = [item["time"] for item in items if "close" not in item]
-
-    assert empty == [
-        int((_at(13, 10) + timedelta(minutes=5 * step)).timestamp())
-        for step in range(1, 13)
-    ], "пустые места встали не на пропущенные пятиминутки"
-
-
 # ------------------------------- наивное время и пояс машины владельца счёта
 
 #: Места, на которых стоят шесть свечей ряда `HOLE`: три до часового пропуска
@@ -596,29 +483,3 @@ def test_a_naive_time_lands_on_its_own_candle_on_a_machine_outside_moscow(
             f"на её времени — на месте {found}: на машине не в Москве всё, "
             "что нарисовано поверх свечей, уехало на разницу поясов"
         )
-
-
-def test_the_web_surface_sends_naive_candles_on_the_marks_of_its_own_axis(
-    probe, machine_outside_moscow
-) -> None:
-    """Свечи, метки и средняя уезжают в страницу на отметках своей же оси.
-
-    В веб-графике ряд собирается из двух источников сразу: пустые места берут
-    отметку у оси (`Timeline.stamps`), свечи и метки считали её сами. Разойдясь
-    на пояс машины, они дают ряд, в котором пропуск стоит в одном месте,
-    а свечи — в другом; на странице это выглядит как обычный график.
-    """
-    naive = _naive(HOLE)
-    mark = Marker(time=naive[3].opens_at, price=naive[3].close, kind=MarkerKind.ENTRY_LONG)
-    probe.show_chart(_chart(naive, markers=(mark,)))
-
-    line = Timeline(naive)
-    sent = [int(item["time"]) for item in _sent(probe.scripts, "terminal.setCandles(")]
-    assert sent == [int(stamp) for stamp in line.stamps], (
-        "свечи и пустые места пропуска уехали в страницу на разных отметках"
-    )
-    marks = [int(item["time"]) for item in _sent(probe.scripts, "terminal.setMarkers(")]
-    assert marks == [int(line.stamps[15])], (
-        f"метка сделки уехала на отметку {marks}, а её свеча стоит на месте 15 "
-        f"с отметкой {int(line.stamps[15])}"
-    )

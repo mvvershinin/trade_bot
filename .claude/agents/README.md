@@ -3,7 +3,7 @@
 Мульти-агентная разработка настольной программы для автоматической торговли
 на Московской бирже через API брокера БКС.
 
-**Стек:** Python 3.12 · PySide6 (Qt 6) · TradingView Lightweight Charts · SQLite ·
+**Стек:** Python 3.12 · PySide6 (Qt 6) · график — `QPainter`, без сторонних библиотек · SQLite ·
 httpx/websockets · pandas · Nuitka standalone (запасной путь сборки — PyInstaller;
 отменена связка «PyInstaller + установщик Inno Setup», [решение 0001](../../.docs/decisions/0001-packaging-nuitka-portable.md))
 **ТЗ:** [`.docs/SPEC.md`](../../.docs/SPEC.md) · **Домен:** [`.docs/DOMAIN.md`](../../.docs/DOMAIN.md)

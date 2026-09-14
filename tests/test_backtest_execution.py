@@ -41,6 +41,7 @@ from engine import (
     ExecutionRefused,
     ExitReason,
     Fill,
+    LevelTouch,
     MarketCandle,
     OrderAction,
     OrderRequest,
@@ -69,17 +70,29 @@ def order(
     )
 
 
-def arm(level: float, side: Side = Side.LONG, at: datetime = DECIDED_AT) -> OrderRequest:
+def arm(
+    level: float,
+    side: Side = Side.LONG,
+    at: datetime = DECIDED_AT,
+    *,
+    touch: LevelTouch = LevelTouch.RISE,
+) -> OrderRequest:
     """Вооружение уровня. Имя **устойчиво**: оно не зависит от момента подачи.
 
     Так его вычисляет движок (`engine.take_order_id` — из позиции), и ровно
     на этом стоит правило «вооружить — это состояние»: повторное вооружение
     называет тот же уровень и заменяет прежний.
+
+    ⚠️ `touch` — **постоянная по умолчанию, а не вывод из стороны позиции.**
+    Оснастка, выводящая сторону касания сама, вернула бы внутрь тестов ровно
+    то правило, из которого вырос `B-046`, и сделала бы их слепыми к нему.
+    Все четыре сочетания стороны и касания законны: у лонга неподвижный тейк
+    это `RISE`, а скользящий стоп — `FALL`, у шорта наоборот.
     """
     return OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=side, volume=1.0,
         submitted_at=at, reason="сторожим уровень",
-        order_id=f"take:{side.value}", price=level,
+        order_id=f"take:{side.value}", price=level, touch=touch,
     )
 
 
@@ -199,13 +212,18 @@ def test_the_level_is_hit_by_a_touch_not_by_a_break() -> None:
 
 
 def test_a_short_level_is_guarded_by_the_low() -> None:
-    """У шорта уровень ниже входа и сторожится по `low`."""
+    """Касание `FALL` сторожится по `low`: неподвижный тейк шорта — этот случай.
+
+    ⚠️ Сторожит его **сторона касания**, а не сторона позиции: до 10.09.2026
+    исполнитель выводил одно из другого, и на скользящем уровне вывод был
+    неверен (`B-046`). Здесь сторона касания названа заявкой, как в жизни.
+    """
     model = ExecutionModel()
     run(
         model,
         order(OrderAction.OPEN, Side.SHORT),
         replace(candle(10, 10), open=100.0),
-        arm(99.5, Side.SHORT),
+        arm(99.5, Side.SHORT, touch=LevelTouch.FALL),
     )
     above, below = run(
         model,

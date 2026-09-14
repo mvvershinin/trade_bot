@@ -81,6 +81,7 @@ class TerminalPort(QObject):
     decisions_replaced = Signal(object)   # tuple[DecisionRow, ...]
     decision_appended = Signal(object)    # DecisionRow
     settings_applied = Signal(object)     # Settings — эхо движка, а не наше
+    algorithms_changed = Signal(object)   # tuple[AlgorithmOption, ...] — каталог
     busy_changed = Signal(bool, str)      # идёт длинная операция, что именно
     progress_changed = Signal(int, str)   # 0…100, подпись
     failed = Signal(str)                  # человеческая фраза, не код ошибки
@@ -163,7 +164,20 @@ class TerminalPort(QObject):
         self._not_connected("Применение настроек")
 
     def request_settings(self) -> None:
-        """Попросить текущие настройки. Ответ придёт сигналом `settings_applied`."""
+        """Попросить текущие настройки.
+
+        Ответ приходит **двумя** сигналами: `settings_applied` — значения
+        полей, `algorithms_changed` — каталог торговых алгоритмов: название,
+        правило одной фразой и правило абзацами. Второй нужен потому, что
+        правило считает сам алгоритм, а окно торговых слоёв не импортирует
+        (ARCHITECTURE.md §2): текст принадлежит тому, кто его посчитал,
+        окно его только показывает.
+
+        ⚠️ Каталог, а не одна строка правила. Кнопка «Подробнее» в окне
+        выбора обязана показать описание **любого** алгоритма из списка,
+        в том числе ещё не выбранного, — иначе прочитать, что он делает,
+        можно было бы только выбрав его, то есть уже поменяв настройку.
+        """
         self._not_connected("Чтение настроек")
 
     def request_chart(self, instrument: str, timeframe: str) -> None:

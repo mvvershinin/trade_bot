@@ -690,7 +690,9 @@ def test_the_mode_does_not_break_the_match(tmp_path) -> None:
         session = store.open_journal_session(SessionRecord(
             origin=RunOrigin.BACKTEST, symbol=values.instrument,
             timeframe=values.timeframe, strategy="EMA-разворот",
-            settings=runs.settings_text(engine, module, strategy_title="EMA-разворот"),
+            settings=runs.settings_text(
+                engine, module, algorithm=convert.chosen_algorithm(values)
+            ),
             note="MXU6, 5 минут: свечей 10, с 01.08.2026 10:05 по 02.08.2026 18:45 МСК.",
         ))
         store.finish_journal_session(session.id, note="Сделок 3, переворотов 1, свечей 10.")
@@ -1077,7 +1079,7 @@ def test_the_examples_folder_travels_with_the_build() -> None:
     """
     from tools import build
 
-    argv = build.command(with_web=False, jobs=1)
+    argv = build.command(jobs=1)
     assert f"--include-data-dir={build.EXAMPLES}={build.EXAMPLES}" in argv, (
         "папка примеров не едет в поставку"
     )

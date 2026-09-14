@@ -33,7 +33,8 @@ import asyncio
 import os
 import pathlib
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
+from typing import TypeVar
 
 import pytest
 
@@ -146,9 +147,20 @@ async def _wedge(port: HistoryPort) -> asyncio.Task[None]:
     return task
 
 
-def _drive(loop, work: Callable[[], object]) -> None:
-    """Прокрутить корутину на цикле qasync — как это делает программа."""
-    loop.run_until_complete(work())
+#: Что вернула корутина проверки. Обычно — текст, увиденный в окне.
+_Seen = TypeVar("_Seen")
+
+
+def _drive(
+    loop: asyncio.AbstractEventLoop, work: Callable[[], Coroutine[object, object, _Seen]]
+) -> _Seen:
+    """Прокрутить корутину на цикле qasync — как это делает программа.
+
+    Возвращает то, что вернула корутина. Нужно это ровно затем, чтобы
+    проверка смотрела на состояние окна **изнутри** прогона, пока оно ещё
+    то самое, а не пересматривала окно после — разбор в `_shown`.
+    """
+    return loop.run_until_complete(work())
 
 
 async def _until(shown: Callable[[], bool], *, what: str) -> None:
@@ -170,6 +182,38 @@ async def _until(shown: Callable[[], bool], *, what: str) -> None:
             return
         await asyncio.sleep(0.005)
     raise AssertionError(f"не дождались: {what}")
+
+
+async def _shown(bench: Bench) -> str:
+    """Дождаться плашки о застревании и вернуть текст, **который в ней был**.
+
+    Вернуть, а не оставить проверке дочитать самой, — в этом вся разница,
+    и вот чем ошибались обе проверки ниже. Они делали так: дождаться плашки
+    внутри корутины, снять задачу-затычку, выйти из цикла — и только потом
+    посмотреть на текст. К этому моменту текста могло уже не быть, причём
+    **по делу**: затычка снята, работа кончилась, сторож порта проснулся
+    и честно убрал сообщение. Убирать его — его обязанность, и она отдельно
+    стережётся (`test_the_notice_goes_away_when_the_work_finishes`).
+    Проверка читала пустую плашку и падала словами «не сказано, чем работу
+    остановить: ''» — то есть обвиняла окно в молчании ровно там, где окно
+    сказало всё и вовремя.
+
+    Замер 09.09.2026, полный прогон `-n auto`, шесть одинаковых тел в общей
+    очереди: 27,33 мс — плашка показана, 27,35 мс — затычка снята, 28,08 мс —
+    в окно пришла пустая строка, 28,10 мс — проверка прочла плашку. Попасть
+    надо в зазор **0,75 мс**: в одиночку сторож не попал в него ни разу
+    за десять заходов, под нагрузкой попал в одном теле из шести.
+
+    ⚠️ Ждать здесь **появления** плашки, а не нужных слов в ней. Ожидание
+    того же, что проверяет `assert`, сделало бы проверку тавтологией:
+    выброшенный из `_stuck_words` совет дал бы не красное «совета нет»,
+    а невнятное «не дождались», и это при том, что сообщение в окне есть.
+    """
+    await _until(
+        lambda: bench.window.stuck_banner.isVisibleTo(bench.window),
+        what="плашка о застревании не появилась",
+    )
+    return bench.window.stuck_banner.text()
 
 
 # =========================================================================
@@ -272,18 +316,15 @@ def test_a_task_that_never_finishes_says_so_by_itself(benches, loop) -> None:
     """
     bench = benches()
 
-    async def work() -> None:
+    async def work() -> str:
         task = await _wedge(bench.port)
         # Никаких команд: человек просто ждёт, а окно обязано заговорить само.
-        await _until(
-            lambda: bench.window.stuck_banner.isVisibleTo(bench.window),
-            what="окно промолчало о застрявшей работе",
-        )
+        # Текст снимается здесь же, пока работа ещё висит: почему — в `_shown`.
+        text = await _shown(bench)
         task.cancel()
+        return text
 
-    _drive(loop, work)
-
-    text = bench.window.stuck_banner.text()
+    text = _drive(loop, work)
     assert "прогон робота по истории" in text, f"не названа сама работа: {text!r}"
     assert "идёт уже" in text, f"не сказано, сколько она идёт: {text!r}"
 
@@ -298,17 +339,14 @@ def test_the_notice_says_what_the_person_can_do(benches, loop) -> None:
     """
     bench = benches()
 
-    async def work() -> None:
+    async def work() -> str:
         task = await _wedge(bench.port)
-        await _until(
-            lambda: bool(bench.window.stuck_banner.text()),
-            what="плашка о застревании не появилась",
-        )
+        # Текст снимается до снятия затычки, а не после: почему — в `_shown`.
+        text = await _shown(bench)
         task.cancel()
+        return text
 
-    _drive(loop, work)
-
-    text = bench.window.stuck_banner.text()
+    text = _drive(loop, work)
     assert "«Отменить»" in text, f"не сказано, чем работу остановить: {text!r}"
     assert "закройте программу" in text.lower(), (
         f"не сказано, что делать, если отмена не помогла: {text!r}"

@@ -1,189 +1,41 @@
-"""График за своим интерфейсом: смена темы не стирает содержимое.
+"""Отрисовка графика: ось, масштаб человека и живая свеча.
 
-Файл заведён под один дефект, найденный ревью 31.08.2026 и **сегодня
-не стреляющий**. `WebChartSurface.set_theme()` звал `_reload()`: синхронное
-чтение ~250 КБ библиотеки с диска и `setHtml` заново. После перезагрузки
-страница пуста — свечи, метки и уровни ей больше никто не подаёт: `_pending`
-очищается на первой загрузке, а повторной подачи нет ни в `set_theme`,
-ни в `_on_loaded`. График восстанавливался только следующим полным
-`chart_replaced`.
+Что здесь стережётся, одной фразой: **свеча, метка, точка средней и подпись
+на оси считаются в четырёх разных местах и обязаны встать на одну и ту же
+отметку** — открытие свечи. Разъезд этих четырёх и есть `B-008`: владелец
+счёта сравнил с терминалом брокера и увидел свечу 12:55 на 13:00.
 
-Не стреляет это потому, что `is_available()` отказывает, пока рядом нет
-вендорного файла библиотеки, и веб-график вообще не создаётся. Включит дефект
-не правка `ui/chart/`, а **выкладка библиотеки** — и там про него не вспомнят.
-Поэтому проверка написана заранее и работает без QtWebEngine: она обходит
-конструктор, который тянет и виджет, и файл с диска.
+Второе — приближение человека переживает перерисовку (`B-009`): отмотал
+историю назад, пришла живая свеча, график не прыгнул к правому краю.
+
+⚠️ До 09.09.2026 половина файла проверяла веб-отрисовку — ту, что никогда
+не запускалась: файла библиотеки не было ни в репозитории, ни на диске,
+`is_available()` всегда отвечала отказом. Вместе с ней удалены и её проверки
+(решение 0056). Ничего из перечисленного выше при этом не осталось
+без сторожа: у `PainterChartSurface` на каждое своя проверка ниже,
+и они идут **до пикселей**, а не до вызова.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import replace
-from datetime import datetime
 from typing import cast
 
 import pytest
 import synthetic
 
-from ui.chart.timeline import Timeline
-from ui.chart.web_surface import WebChartSurface
-from ui.formatting import MSK
-from ui.models import (
-    Candle,
-    ChartData,
-    Layer,
-    LevelKind,
-    LinePoint,
-    Marker,
-    MarkerKind,
-    PriceLevel,
-)
-from ui.theme import DARK, LIGHT
+from ui.models import ChartData, LinePoint
 
+# -------------------------------------------------------------- ось графика
 
-class Probe(WebChartSurface):
-    """Веб-график без веб-движка: записывает вызовы вместо их отправки.
+def test_the_painter_surface_lays_candles_out_by_their_axis_mark(qapp) -> None:
+    """Свечи стоят на отметках открытия — на всех трёх путях подачи.
 
-    Конструктор родителя намеренно не вызывается — он поднимает
-    `QWebEngineView` и читает библиотеку с диска, а ни того, ни другого
-    в прогоне нет. Проверяются настоящие `set_theme`, `set_levels`
-    и `_push_markers`, а не их пересказ.
-    """
-
-    def __init__(self) -> None:  # родитель намеренно не зовётся
-        self.scripts: list[str] = []
-        self.reloads = 0
-        self._theme = LIGHT
-        self._ready = True
-        self._pending = []
-        self._visible = {Layer.PLAN: True, Layer.FACT: True}
-        self._markers = {Layer.PLAN: [], Layer.FACT: []}
-        self._levels = []
-        self._following = True
-        self._line = Timeline()
-        self._chart_id = None
-
-    def _run(self, script: str) -> None:
-        self.scripts.append(script)
-
-    def _reload(self) -> None:
-        self.reloads += 1
-
-
-@pytest.fixture()
-def probe(qapp) -> Probe:
-    return Probe()
-
-
-def test_changing_the_theme_does_not_reload_the_page(probe) -> None:
-    """Смена темы не перезагружает страницу — и потому ничего не стирает."""
-    probe.set_theme(DARK)
-    assert probe.reloads == 0, (
-        "смена темы перезагрузила страницу: содержимое графика стёрто, "
-        "а повторной подачи свечей нет"
-    )
-    assert any("terminal.setTheme(" in script for script in probe.scripts), (
-        "цвета не переданы в страницу вовсе"
-    )
-
-
-def test_the_new_colours_actually_reach_the_page(probe) -> None:
-    """В странице оказываются цвета новой темы, а не старой."""
-    probe.set_theme(DARK)
-    payload = next(
-        json.loads(script[len("terminal.setTheme("):-1])
-        for script in probe.scripts
-        if script.startswith("terminal.setTheme(")
-    )
-    assert payload["background"] == DARK.background
-    assert payload["bull"] == DARK.bull
-    assert payload["bear"] == DARK.bear
-    assert payload["average"] == DARK.average
-    assert payload["grid"] == DARK.grid
-    assert payload["text"] == DARK.text
-
-
-def test_markers_and_levels_are_repainted_by_hand(probe) -> None:
-    """Цвет меток и уровней считается в Python — страница их сама не перекрасит.
-
-    `Theme.marker_color` и `Theme.level_color` живут в `ui/theme.py`, и после
-    смены темы страница о них ничего не знает. Если их не подать заново,
-    метки останутся в цветах прежней темы — на тёмном фоне это ровно та
-    неразличимость лонга и шорта, ради которой тема вообще заведена.
-    """
-    data = synthetic.chart_data(count=40)
-    probe.show_chart(data)
-    probe.set_levels([PriceLevel(285_000.0, LevelKind.TAKE, "Тейк")])
-    probe.scripts.clear()
-
-    probe.set_theme(DARK)
-    joined = "\n".join(probe.scripts)
-    assert "terminal.setMarkers(" in joined, "метки не переданы заново"
-    assert "terminal.addLevel(" in joined, "уровни не переданы заново"
-    assert DARK.level_take in joined, "уровень остался в цвете прежней темы"
-    assert DARK.long in joined or DARK.short in joined or DARK.plan in joined, (
-        "метки остались в цветах прежней темы"
-    )
-
-
-def test_the_levels_are_remembered_between_pushes(probe) -> None:
-    """Уровни держатся в объекте: иначе перекрашивать было бы нечего."""
-    levels = [
-        PriceLevel(285_000.0, LevelKind.TAKE, "Тейк"),
-        PriceLevel(284_000.0, LevelKind.TRAILING, "Скользящий тейк"),
-    ]
-    probe.set_levels(levels)
-    assert len(probe._levels) == 2
-
-    probe.scripts.clear()
-    probe._push_levels()
-    joined = "\n".join(probe.scripts)
-    assert joined.count("terminal.addLevel(") == 2
-    assert "terminal.clearLevels()" in joined, (
-        "уровни добавляются поверх прежних — на графике их станет вдвое больше"
-    )
-
-
-def test_the_page_knows_how_to_change_colours_without_reloading() -> None:
-    """В самой странице есть, чем менять цвета: иначе вызов уходил бы в пустоту.
-
-    Проверка по тексту страницы, а не по её работе: страница не исполняется
-    ни в одном прогоне, пока рядом нет вендорного файла. Это не заменяет
-    ручной прогон при выкладке библиотеки — он записан в заголовке
-    `ui/chart/web_surface.py`.
-    """
-    from ui.chart.web_surface import PAGE
-
-    assert "setTheme:" in PAGE, "у страницы нет способа сменить цвета на ходу"
-    for call in ("chart.applyOptions", "candles.applyOptions", "average.applyOptions"):
-        assert call in PAGE, f"смена цветов не доходит до {call}"
-
-
-def test_the_probe_is_not_lying_about_the_real_class(probe) -> None:
-    """Канарейка: подставка зовёт настоящий код, а не свой собственный.
-
-    Если `set_theme` переедет в другое место или сменит имя, подставка
-    продолжит «проходить» проверку, ничего не проверяя.
-    """
-    assert type(probe).set_theme is WebChartSurface.set_theme
-    assert type(probe).set_levels is WebChartSurface.set_levels
-    assert type(probe)._push_markers is WebChartSurface._push_markers
-    assert WebChartSurface.is_available()[0] is False, (
-        "вендорный файл появился — веб-график пора прогнать вручную, "
-        "как записано в заголовке ui/chart/web_surface.py"
-    )
-
-
-# ----------------------------------------------------- ось запасного графика
-
-def test_the_fallback_surface_lays_candles_out_by_their_axis_mark(qapp) -> None:
-    """Запасной отрисовщик размечает ось теми же отметками, что и веб.
-
-    Отрисовщиков два (`ui/chart/factory.py`), и правка одного молча оставляет
-    другой со старым соглашением: на машине владельца счёта тогда починится
-    не то, что он видит. Здесь проверяется именно запасной — по нему
-    до 04.09.2026 не было ни одного теста, и переименование поля прошло бы
-    мимо него до первого падения на отказе веб-графика.
+    Путей три: полный набор (`show_chart`), добавление закрытой свечи
+    (`append_candle`) и уточнение последней (`update_last_candle`), — и перевод
+    времени в каждом свой. Проверка идёт по самой оси (`Timeline.stamps`),
+    а не по картинке: сдвиг на бар остаётся законной отметкой и по картинке
+    отличается на несколько пикселей, а числом — сразу.
     """
     from ui.chart.painter_surface import PainterChartSurface
 
@@ -193,7 +45,7 @@ def test_the_fallback_surface_lays_candles_out_by_their_axis_mark(qapp) -> None:
         surface.show_chart(data)
         marks = list(surface._line.stamps)  # noqa: SLF001 — ось и есть предмет проверки
         assert marks == [candle.opens_at.timestamp() for candle in data.candles], (
-            "запасной отрисовщик ставит свечи не по отметкам оси"
+            "свечи встали не на отметки своих открытий — весь график сдвинут"
         )
 
         extra = data.candles[-1]
@@ -207,131 +59,14 @@ def test_the_fallback_surface_lays_candles_out_by_their_axis_mark(qapp) -> None:
         qapp.processEvents()
 
 
-# ------------------------------------------------ ось основного графика (веб)
-
-WINDOW_DAY = datetime(2026, 6, 19, tzinfo=MSK)
-
-
-def _at(hour: int, minute: int) -> datetime:
-    """Момент московского дня фикстуры. Пояс явный, наивных времён здесь нет."""
-    return WINDOW_DAY.replace(hour=hour, minute=minute)
-
-
-def _stamp(hour: int, minute: int) -> int:
-    """Отметка оси в секундах эпохи — считается мимо кода графика.
-
-    Ожидаемая сторона строится из часа и минуты, а не из свечи, которую
-    отдали графику: иначе проверка пересказала бы реализацию и осталась бы
-    зелёной при любом одинаковом сдвиге всех рядов сразу.
-    """
-    return int(_at(hour, minute).timestamp())
-
-
-def _times_sent(probe: Probe, call: str) -> list[int]:
-    """Отметки оси, ушедшие в страницу последним вызовом `call`.
-
-    Набор свечей и ряд средней приходят списком, одиночная свеча — словарём;
-    и то и другое приводится к списку отметок, потому что предмет проверки
-    один — где ряд встал на оси.
-
-    Разбирается **первый** довод вызова, а не всё до закрывающей скобки:
-    у `setCandles` их с 04.09.2026 два — данные и признак «тот же график».
-    """
-    script = next(s for s in reversed(probe.scripts) if s.startswith(call))
-    payload, _ = json.JSONDecoder().raw_decode(script[len(call):])
-    items = payload if isinstance(payload, list) else [payload]
-    return [int(item["time"]) for item in items]
-
-
-def _chart_around_thirteen() -> ChartData:
-    """Четыре пятиминутки 12:45–13:05 и по одному ряду каждого вида.
-
-    Числа взяты из записи B-008: владелец счёта сравнил с терминалом брокера
-    крупную свечу 12:55–13:00 и увидел её у нас на 13:00.
-    """
-    candles = tuple(
-        Candle(opens_at=_at(12, minute), open=100.0, high=101.0,
-               low=99.0, close=100.5, volume=7.0)
-        for minute in (45, 50, 55)
-    ) + (Candle(opens_at=_at(13, 0), open=100.5, high=102.0,
-                low=100.0, close=101.5, volume=8.0),)
-    return ChartData(
-        instrument="MXU6",
-        timeframe="5 минут",
-        candles=candles,
-        average=(LinePoint(time=_at(12, 55), value=100.25),),
-        average_label="EMA(15)",
-        markers=(
-            Marker(_at(12, 55), 100.5, MarkerKind.ENTRY_LONG, Layer.PLAN, "Расчёт"),
-            Marker(_at(13, 0), 100.6, MarkerKind.ENTRY_LONG, Layer.FACT, "Лонг"),
-        ),
-    )
-
-
-def test_the_web_surface_sends_every_series_on_the_axis_of_the_candles(probe) -> None:
-    """В страницу уходят отметки **открытия**, и все ряды на одной оси.
-
-    Это последний перевод времени перед библиотекой рисования: `_candle`,
-    `set_average` и `_push_markers` переводят `datetime` в секунды эпохи,
-    и дальше отвечает уже не Python. До 04.09.2026 по этому месту не было
-    ни одной проверки — прибавка одного бара во всех трёх местах проходила
-    полный прогон зелёной (мутация +300 секунд, замер 04.09.2026), хотя
-    веб-график и есть то, что владелец счёта видит на своей машине.
-
-    ⚠️ Проверка абсолютная, а не «время попало в набор отметок». Закрытие
-    бара численно равно открытию следующего, поэтому сдвинутый на бар ряд
-    тоже попадает на законную отметку оси — просто на чужую, и членством
-    в наборе это не ловится.
-    """
-    probe.show_chart(_chart_around_thirteen())
-
-    assert _times_sent(probe, "terminal.setCandles(") == [
-        _stamp(12, 45), _stamp(12, 50), _stamp(12, 55), _stamp(13, 0)
-    ], "свечи ушли в страницу не на отметках открытия — весь график сдвинут"
-
-    assert _times_sent(probe, "terminal.setAverage(") == [_stamp(12, 55)], (
-        "точка средней ушла в страницу не на своей свече"
-    )
-
-    markers = _times_sent(probe, "terminal.setMarkers(")
-    assert markers == [_stamp(12, 55), _stamp(13, 0)], (
-        "метки ушли в страницу не на своих свечах"
-    )
-    assert markers[1] - markers[0] == 300, (
-        "расчёт и факт встали на одну свечу — наложение слоёв перестало "
-        "отвечать на вопрос «факт правее по времени или нет»"
-    )
-
-
-def test_a_candle_added_one_by_one_keeps_the_same_axis_mark(probe) -> None:
-    """Свеча, доехавшая по одной, стоит там же, где стояла бы в полном наборе.
-
-    Путей в страницу три — полный набор, добавление и обновление последней, —
-    и перевод времени в каждом свой. Живая свеча ходит вторым и третьим
-    (`B-009`), то есть ровно теми, что не проверялись.
-    """
-    fresh = Candle(opens_at=_at(13, 0), open=100.5, high=102.0,
-                   low=100.0, close=101.5, volume=8.0)
-
-    probe.append_candle(fresh)
-    assert _times_sent(probe, "terminal.updateCandle(") == [_stamp(13, 0)], (
-        "добавленная свеча встала не на отметку своего открытия"
-    )
-
-    probe.update_last_candle(replace(fresh, close=101.0))
-    assert _times_sent(probe, "terminal.updateCandle(") == [_stamp(13, 0)], (
-        "обновление последней свечи переставило её на соседнюю отметку"
-    )
-
-
-# ------------------------------------------ ось запасного графика: что поверх
+# ----------------------------------------------------- ось графика: что поверх
 
 def test_a_moment_of_a_candle_lands_on_that_candles_place_not_the_next_one(qapp) -> None:
     """Метка на времени свечи рисуется над этой свечой, а не над соседней.
 
-    Метки сделок, линии «вход → выход» и полосы затенения ставятся на запасном
-    графике подбором места по оси (`_index_of_time`): готового времени
-    у библиотеки здесь нет, есть только список отметок свечей. Сдвиг
+    Метки сделок, линии «вход → выход» и полосы затенения ставятся подбором
+    места по оси (`_index_of_time`): готового времени у отрисовщика нет,
+    есть только список отметок свечей. Сдвиг
     в этом подборе переставляет ВСЁ, что нарисовано поверх свечей, оставив
     сами свечи на месте, — то есть даёт ровно ту картинку, из-за которой
     заведён B-008, и при этом ни одна проверка свечей не краснеет
@@ -361,6 +96,136 @@ def test_a_moment_of_a_candle_lands_on_that_candles_place_not_the_next_one(qapp)
     finally:
         surface.deleteLater()
         qapp.processEvents()
+
+
+def _shot(qapp, data, average):
+    """Картинка графика: только свечи и заданная средняя.
+
+    Метки, уровни, затенение и пунктир сделок убраны намеренно — они рисуются
+    своими цветами, и разбирать, чей это пиксель, пришлось бы по оттенку.
+    Размер окна тот же при любом вызове: раскладка по оси зависит от свечей,
+    а они одни и те же, поэтому два снимка сравнимы столбец в столбец.
+    """
+    from PySide6.QtGui import QImage
+
+    from ui.chart.painter_surface import PainterChartSurface
+    from ui.theme import LIGHT
+
+    bare = ChartData(
+        instrument=data.instrument,
+        timeframe=data.timeframe,
+        candles=data.candles,
+        average=average,
+        average_label=data.average_label,
+    )
+    surface = PainterChartSurface()
+    try:
+        surface.set_theme(LIGHT)
+        surface.show_chart(bare)
+        surface.resize(1000, 420)
+        image = QImage(1000, 420, QImage.Format.Format_RGB32)
+        surface.render(image)
+    finally:
+        surface.deleteLater()
+        qapp.processEvents()
+    return image
+
+
+def _columns_of(image, *colours: str) -> list[int]:
+    """Столбцы картинки, в которых встречается любой из названных цветов.
+
+    Смотрим именно цвет, а не «не фон»: сетка, подписи и пунктир тоже не фон,
+    и по ним одну линию от другой не отличить. Допуск в 24 — на сглаживание
+    краёв: перо средней шириной 1,8 пикселя рисуется с полутонами.
+    """
+    from PySide6.QtGui import QColor
+
+    wanted = [QColor(one) for one in colours]
+    found = []
+    for x in range(image.width()):
+        for y in range(image.height()):
+            pixel = QColor(image.pixel(x, y))
+            if any(
+                max(abs(pixel.red() - c.red()),
+                    abs(pixel.green() - c.green()),
+                    abs(pixel.blue() - c.blue())) <= 24
+                for c in wanted
+            ):
+                found.append(x)
+                break
+    return found
+
+
+def _clusters(columns: list[int]) -> list[tuple[int, int]]:
+    """Столбцы, идущие подряд, — это одна свеча."""
+    runs: list[tuple[int, int]] = []
+    for x in columns:
+        if runs and x - runs[-1][1] <= 2:
+            runs[-1] = (runs[-1][0], x)
+        else:
+            runs.append((x, x))
+    return runs
+
+
+def _middle(run: tuple[int, int]) -> float:
+    return (run[0] + run[1]) / 2
+
+
+def test_the_average_line_is_drawn_over_the_candles_it_belongs_to(qapp) -> None:
+    """Линия средней нарисована над своими свечами, а не над соседними.
+
+    ⚠️ Проверка заведена 09.09.2026 при удалении веб-графика (решение 0056),
+    и завела её **дыра, найденная мутацией**. Сдвиг средней на бар
+    (`_index_of_time(point.time) + 1.0` в `_draw_average`) проходил полный
+    прогон зелёным. Единственная проверка «средняя стоит на своей свече»
+    в проекте была написана на **веб-отрисовку** — ту, что не запускалась
+    ни разу; на отрисовке, которую видит владелец счёта, средняя
+    не проверялась ничем.
+
+    Дыра не создана удалением: она существовала с 04.09.2026, удаление
+    её только сделало видимой. Проверки по `_index_of_time` сдвиг именно
+    средней не ловят — в `_draw_average` своя строка.
+
+    Читаются **пиксели**, а не индексы: мутация сидела внутри рисования,
+    и проверка, спрашивающая место у `_index_of_time`, осталась бы зелёной.
+
+    Свечи меряются на **отдельной картинке, без средней**. Иначе синяя линия,
+    проходя по телу свечи, разрезает её столбцы надвое, и проверка падает
+    не там, где сломано: замер 09.09.2026 на той же мутации — 13 «свечей»
+    вместо 12, при исправном сравнении краёв.
+    """
+    from ui.theme import LIGHT
+
+    #: На каких свечах ряда задана средняя. Числа записаны здесь, а не взяты
+    #: у графика: ожидание, посчитанное проверяемым кодом, верно при любой
+    #: его поломке. Всего две точки — чтобы у линии были свои края.
+    first_place, last_place = 2, 9
+
+    data = synthetic.chart_data(12)
+    candles = data.candles
+    line = (
+        LinePoint(time=candles[first_place].opens_at, value=candles[first_place].close),
+        LinePoint(time=candles[last_place].opens_at, value=candles[last_place].close),
+    )
+
+    bodies = _clusters(_columns_of(_shot(qapp, data, ()), LIGHT.bull, LIGHT.bear))
+    assert len(bodies) == len(candles), (
+        f"свечей нарисовано {len(bodies)}, а в ряду {len(candles)}: "
+        "картинка не та, на которой проверяют среднюю"
+    )
+    drawn = _columns_of(_shot(qapp, data, line), LIGHT.average)
+    assert drawn, "линия средней не нарисована вовсе"
+
+    step = _middle(bodies[1]) - _middle(bodies[0])
+    edges = (("левый", first_place, min(drawn)), ("правый", last_place, max(drawn)))
+    for name, place, edge in edges:
+        centre = _middle(bodies[place])
+        assert abs(edge - centre) <= step / 2, (
+            f"{name} край средней стоит на {edge}, а свеча {place}, на которой "
+            f"её значение посчитано, — на {centre}: расхождение "
+            f"{abs(edge - centre) / step:.1f} свечи. Линия средней и свечи "
+            "размечены по-разному, и человек сравнивает цену не с той свечой"
+        )
 
 
 def test_the_time_axis_is_signed_with_the_openings_of_the_candles(qapp) -> None:
@@ -438,7 +303,7 @@ def _zoomed(surface, *, span: int, follow: bool, right_shift: float = 0.0):
     surface._view.follow = follow  # noqa: SLF001 — то же
 
 
-def test_the_fallback_surface_keeps_the_zoom_of_a_man_who_scrolled_back(qapp) -> None:
+def test_the_painter_surface_keeps_the_zoom_of_a_man_who_scrolled_back(qapp) -> None:
     """Отмотал назад и приблизил — перерисовка оставляет его там же.
 
     Живая свеча приходит раз в минуту, и до 04.09.2026 каждая из них
@@ -479,7 +344,7 @@ def test_the_fallback_surface_keeps_the_zoom_of_a_man_who_scrolled_back(qapp) ->
         qapp.processEvents()
 
 
-def test_the_fallback_surface_moves_on_for_a_man_standing_at_the_right_edge(qapp) -> None:
+def test_the_painter_surface_moves_on_for_a_man_standing_at_the_right_edge(qapp) -> None:
     """Стоял у правого края — новую свечу видит, и с тем же приближением.
 
     Слежение — режим, а не место: правый край обязан переехать на новую
@@ -509,7 +374,7 @@ def test_the_fallback_surface_moves_on_for_a_man_standing_at_the_right_edge(qapp
 
 
 @pytest.mark.parametrize("changed", [{"instrument": "SiU6"}, {"timeframe": "1 минута"}])
-def test_the_fallback_surface_resets_the_view_when_the_chart_itself_changed(
+def test_the_painter_surface_resets_the_view_when_the_chart_itself_changed(
     qapp, changed
 ) -> None:
     """Сменился инструмент или размер свечи — вид сбрасывается, и это верно.
@@ -538,59 +403,6 @@ def test_the_fallback_surface_resets_the_view_when_the_chart_itself_changed(
         qapp.processEvents()
 
 
-def test_the_web_surface_tells_the_page_whether_the_chart_is_the_same_one(probe) -> None:
-    """Веб-поверхность говорит странице, сбрасывать ли вид, — и говорит правду.
-
-    Отрисовщиков два, и по умолчанию работает **веб** (`ui/chart/factory.py`,
-    `ORDER`). Правка одного запасного оставила бы владельца счёта ровно с тем
-    же сбросом масштаба, что и был: у `B-008` это уже случилось.
-    """
-    first = synthetic.chart_data(40)
-
-    probe.show_chart(first)
-    assert _keep_flag(probe) is False, (
-        "первый набор свечей пришёл с просьбой сохранить вид: сохранять нечего"
-    )
-
-    probe.show_chart(first)
-    assert _keep_flag(probe) is True, (
-        "тот же график перерисован со сбросом вида — приближение человека "
-        "не переживёт ни одной живой свечи"
-    )
-
-    probe.show_chart(replace(first, timeframe="1 минута"))
-    assert _keep_flag(probe) is False, "смена размера свечи не сбросила вид"
-
-    probe.show_chart(replace(first, timeframe="1 минута", instrument="SiU6"))
-    assert _keep_flag(probe) is False, "смена инструмента не сбросила вид"
-
-
-def _keep_flag(probe: Probe) -> bool:
-    """Второй довод последнего `setCandles`: сохранять ли вид страницы."""
-    call = "terminal.setCandles("
-    script = next(s for s in reversed(probe.scripts) if s.startswith(call))
-    decoder = json.JSONDecoder()
-    _, end = decoder.raw_decode(script[len(call):])
-    rest = script[len(call) + end:].lstrip(", ").rstrip(")")
-    flag = json.loads(rest)
-    assert isinstance(flag, bool), f"признак «тот же график» не булев: {rest!r}"
-    return flag
-
-
-def test_the_page_knows_how_to_keep_the_view_across_a_full_redraw() -> None:
-    """В самой странице есть, чем сохранить вид: иначе признак уходит в пустоту.
-
-    Проверка по тексту страницы, а не по её работе: страница не исполняется
-    ни в одном прогоне, пока рядом нет вендорного файла библиотеки. Это
-    **не заменяет** ручной прогон при её выкладке — он записан в заголовке
-    `ui/chart/web_surface.py`, и сохранение вида в этот список входит.
-    """
-    from ui.chart.web_surface import PAGE
-
-    assert "getVisibleLogicalRange" in PAGE, "страница не снимает вид перед заменой"
-    assert "setVisibleLogicalRange" in PAGE, "страница не возвращает вид после замены"
-
-
 # ------------- живая свеча доезжает до самого графика, а не до края правки
 #
 # Три проверки ниже добавлены проходом сторожей 04.09.2026. Правка `B-009`
@@ -601,7 +413,7 @@ def test_the_page_knows_how_to_keep_the_view_across_a_full_redraw() -> None:
 # оставался зелёным. График при этом переставал показывать живую свечу вовсе.
 
 
-def test_the_fallback_surface_really_puts_a_live_candle_on_the_chart(qapp) -> None:
+def test_the_painter_surface_really_puts_a_live_candle_on_the_chart(qapp) -> None:
     """Прибавленная свеча появляется на графике, а уточнённая — меняется.
 
     Проверка **новой** свечой, а не последней из набора: с последней «ряд
@@ -642,7 +454,7 @@ def test_the_fallback_surface_really_puts_a_live_candle_on_the_chart(qapp) -> No
         qapp.processEvents()
 
 
-def test_the_fallback_surface_carries_a_watching_man_onto_the_live_candle(qapp) -> None:
+def test_the_painter_surface_carries_a_watching_man_onto_the_live_candle(qapp) -> None:
     """Стоящий у правого края видит прибавленную свечу, отмотавший — не сдвинут.
 
     Это вторая половина того же «слежение — режим, а не место», что и при

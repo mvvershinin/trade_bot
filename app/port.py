@@ -68,7 +68,6 @@ from market import (
     is_synthetic,
     warmup_bars,
 )
-from strategies import EmaReverse
 from ui.models import (
     BacktestOptions,
     BacktestRequest,
@@ -806,6 +805,15 @@ class _Stuck:
         return cls(tick=min(STUCK_TICK, max(after / 4, 0.005)), after=after)
 
 
+def moscow_now() -> datetime:
+    """Рабочие часы порта: системное время, приведённое к московскому.
+
+    Отдельной функцией, а не выражением на месте, ровно ради довода
+    `clock` ниже: подменяемым может быть только то, у чего есть имя.
+    """
+    return datetime.now(MSK)
+
+
 class HistoryPort(TerminalPort):
     """Окно ↔ прогон по истории.
 
@@ -833,6 +841,18 @@ class HistoryPort(TerminalPort):
         (`_Stuck.watching`), вторым доводом не заводится: срок и шаг
         осмысленны только вместе, а разъехавшись — дают сторожа, который
         просыпается реже, чем истекает его собственный срок.
+    :param clock: откуда порт берёт «сейчас». Умолчание — системные часы
+        в московском времени, и на работе программы довод не сказывается
+        никак. Существует он по той же причине, что `redraw_gap`: отрезок
+        загрузки считается **от сегодняшнего дня** (`_load_span`), и проверка,
+        которая не может назвать этот день сама, проверяет календарь машины,
+        а не программу. Так и вышло: четыре сторожа кнопки загрузки, зелёные
+        06.09.2026, покраснели 14.09.2026 сами по себе — данные подставной
+        биржи уехали за левую границу отрезка (`B-049`).
+
+        ⚠️ Это **значение**, а не режим: порт получает момент времени и не
+        узнаёт, кто его дал. Довод вида «мы под тестом» был бы нарушением
+        первого железного правила.
     """
 
     def __init__(
@@ -847,8 +867,10 @@ class HistoryPort(TerminalPort):
         sanitize: Sanitize,
         redraw_gap: float = REDRAW_GAP,
         stuck_after: float | None = None,
+        clock: Callable[[], datetime] = moscow_now,
     ) -> None:
         super().__init__(parent)
+        self._clock = clock
         self._worker = worker
         self._sanitize = sanitize
         self._values = values or Settings()
@@ -1158,7 +1180,7 @@ class HistoryPort(TerminalPort):
 
         Строки изменений собираются из **трёх** источников, и это не мелочь:
         движок (`EngineSettings.changes_from`) и торговый модуль
-        (`EmaReverseSettings.changes_from`) знают только свои поля, а пять
+        (`StrategySettings.changes_from`) знают только свои поля, а пять
         полей окна не принадлежат ни одному из них — инструмент, размер свечи
         и три поля предохранителей. Пока их строки писал только движок, смена
         инструмента давала в журнал «Значения совпали с прежними», после чего
@@ -1173,7 +1195,11 @@ class HistoryPort(TerminalPort):
             fresh = convert.engine_settings(settings, self._mode, self._engine_settings)
             convert.timeframe_of(settings.timeframe)
             convert.instrument_of(settings.instrument)
-            module = convert.strategy_settings(settings)
+            # Настройки алгоритма собираются здесь ради **проверки**: отказ
+            # обязан случиться до того, как новые значения станут текущими.
+            # Сами они пересобираются там, где нужны, — в живом ходе и в
+            # прогоне (`_watcher`, `_replay`).
+            convert.strategy_settings(settings)
         except convert.SettingsRefused as refusal:
             self._refuse("Настройки не приняты", str(refusal))
             return
@@ -1191,7 +1217,11 @@ class HistoryPort(TerminalPort):
 
         changes = convert.window_changes(self._values, settings)
         changes += fresh.changes_from(self._engine_settings)
-        changes += module.changes_from(convert.strategy_settings(self._values))
+        # ⚠️ Строки про правило собирает `convert`, а не порт: сравнивать
+        # настройки алгоритма можно только с настройками **того же** алгоритма,
+        # а при смене самого алгоритма прежние принадлежат другому классу.
+        # Порт этого различить не может — он не знает, какие бывают алгоритмы.
+        changes += convert.rule_changes(self._values, settings)
         guards = convert.guard_changes(self._values, settings)
         self._values = settings
         self._engine_settings = fresh
@@ -1202,6 +1232,7 @@ class HistoryPort(TerminalPort):
             # знает, на что подписан сейчас, а порт этого не знает.
             self._retarget(convert.instrument_of(settings.instrument))
         self._send(self.settings_applied, settings)
+        self._send(self.algorithms_changed, convert.algorithms(settings))
         if guards:
             self.note(
                 "Предохранители изменены",
@@ -1217,7 +1248,16 @@ class HistoryPort(TerminalPort):
         self._apply("Настройки изменены", reason)
 
     def request_settings(self) -> None:
+        """Текущие настройки и текущее правило робота словами.
+
+        Два сигнала, а не один: правило `ui/` посчитать не может — окно
+        не импортирует торговые слои (ARCHITECTURE.md §2). Отправляется оно
+        **вместе** с настройками и здесь, и при их применении: окно, спросившее
+        настройки при открытии, иначе показывало бы поля без объяснения,
+        что робот с ними делает, до первого «Применить».
+        """
         self._send(self.settings_applied, self._values)
+        self._send(self.algorithms_changed, convert.algorithms(self._values))
 
     def request_chart(self, instrument: str, timeframe: str) -> None:
         self.apply_settings(self._values.replace(instrument=instrument, timeframe=timeframe))
@@ -1491,7 +1531,7 @@ class HistoryPort(TerminalPort):
     async def _load_history(self, request: HistoryLoadRequest) -> None:
         """Снять отметки (если просили заново), загрузить, рассказать итог."""
         symbol = request.symbol
-        since, until = _load_span(request, now=datetime.now(MSK))
+        since, until = _load_span(request, now=self._clock())
         self.note("Загрузка истории начата", _load_lead(request, since, until))
         try:
             if request.replace:
@@ -1634,7 +1674,7 @@ class HistoryPort(TerminalPort):
         Торговых причин здесь нет — они приходят из `engine/`.
         """
         row = DecisionRow(
-            time=datetime.now(MSK),
+            time=self._clock(),
             event=event,
             reason=reason,
             level=level,
@@ -2358,7 +2398,7 @@ class HistoryPort(TerminalPort):
         она уже стоит в памяти порта, — но о нём говорится вслух
         (`_save_halt`): молчаливо потерянный предохранитель это `D-043`.
         """
-        self._halt.marks[reason] = _Mark(kind=kind, at=datetime.now(MSK))
+        self._halt.marks[reason] = _Mark(kind=kind, at=self._clock())
         self._write_halt(
             _HaltWrite(cause=HaltRecord(kind=kind, reason=reason, event=event))
         )
@@ -2688,6 +2728,12 @@ class HistoryPort(TerminalPort):
         return (
             symbol,
             frame.values.timeframe,
+            # ⚠️ Имя алгоритма — отдельной частью ключа, а не через настройки
+            # модуля: у двух алгоритмов настройки бывают одинаковыми по полям
+            # и разными по смыслу. Без него окно показывало бы новый алгоритм,
+            # а решения считал бы прежний (ловушка 7 миниплана
+            # `strategy-modules-switchable.md`).
+            frame.values.strategy_id,
             frame.engine,
             convert.strategy_settings(frame.values),
             convert.run_costs(frame.values),
@@ -2717,19 +2763,24 @@ class HistoryPort(TerminalPort):
         как прерванный, — так же, как прогон по истории.
         """
         module = convert.strategy_settings(frame.values)
+        algorithm = convert.chosen_algorithm(frame.values)
         record = RunConditions(
             origin=convert.stored_origin(_WATCH_ORIGIN),
             symbol=symbol,
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=EmaReverse.title,
+            algorithm=algorithm,
             app_version=version(),
             days=self._days,
             until=self._until,
         ).record(candles)
         observer = LiveObserver(
-            strategy=EmaReverse(module),
+            # ⚠️ Модуль собирает **реестр** по выбранной записи, а не порт
+            # по имени класса: имени алгоритма в этом файле нет вовсе,
+            # иначе окно показывало бы второй алгоритм, а решения считал бы
+            # первый (миниплан `strategy-modules-switchable.md`, З2).
+            strategy=algorithm.build(module),
             settings=frame.engine,
             say=self.note,
             costs=convert.run_costs(frame.values),
@@ -2807,13 +2858,14 @@ class HistoryPort(TerminalPort):
         (ARCHITECTURE.md §1), и тем более не различает, записывают ли его.
         """
         module = convert.strategy_settings(frame.values)
+        algorithm = convert.chosen_algorithm(frame.values)
         conditions = RunConditions(
             origin=convert.stored_origin(_ORIGIN),
             symbol=symbol,
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=EmaReverse.title,
+            algorithm=algorithm,
             app_version=version(),
             days=self._days,
             until=self._until,
@@ -2821,7 +2873,7 @@ class HistoryPort(TerminalPort):
         async with self._runs.around(conditions.record(candles)) as entry:
             run = await replay(
                 candles,
-                EmaReverse(module),
+                algorithm.build(module),
                 frame.engine,
                 # Издержки прогона задаются в окне: проскальзывание меняет цену
                 # каждого исполнения, а значит все деньги отчёта. Умолчание —
@@ -3362,7 +3414,7 @@ class HistoryPort(TerminalPort):
             settings_text=settings_text(
                 self._engine_settings,
                 convert.strategy_settings(self._values),
-                strategy_title=EmaReverse.title,
+                algorithm=convert.chosen_algorithm(self._values),
             ),
         ))
 

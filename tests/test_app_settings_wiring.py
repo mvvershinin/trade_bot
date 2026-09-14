@@ -253,8 +253,11 @@ def test_the_saw_filter_is_not_reset_by_applying_settings() -> None:
     до модуля доходят его умолчания. Без галочки этот тест проверял бы
     ровно обратное тому, ради чего написан.
     """
+    from strategies import EmaReverseSettings
+
     values = Settings(filter_enabled=True, threshold_percent=0.4, confirm_bars=3)
     module = convert.strategy_settings(values)
+    assert isinstance(module, EmaReverseSettings)
     assert module.threshold_percent == pytest.approx(0.4), (
         "порог фильтра сброшен в «выключено» при переводе настроек"
     )
@@ -262,20 +265,28 @@ def test_the_saw_filter_is_not_reset_by_applying_settings() -> None:
 
 
 def test_a_new_field_of_the_strategy_cannot_be_forgotten() -> None:
-    """Поле торгового модуля, не названное в таблице, — отказ вслух.
+    """Поле торгового алгоритма, не названное в таблице, — отказ вслух.
 
     Проверка на механизм, а не на сегодняшний список полей: пустой список
     расхождений и есть утверждение «таблица полна».
+
+    ⚠️ Таблица переехала из `app/convert.py` в запись реестра
+    (`StrategyEntry.fields`) — сборка больше не знает, какие поля бывают
+    у алгоритма. Проверка от этого стала сильнее, а не слабее: она идёт
+    **по всем** записям реестра, то есть второй алгоритм получает её даром.
     """
-    import dataclasses
+    from strategies import registry
 
-    from strategies import EmaReverseSettings
-
-    known = {field.name for field in dataclasses.fields(EmaReverseSettings)}
-    assert known == set(convert._STRATEGY_FIELDS), (  # noqa: SLF001 — проверяется
-        # именно внутренняя таблица: она и есть то, что забывают пополнить
-        "таблица перевода настроек торгового модуля разошлась с самим модулем"
-    )
+    for entry in registry.entries():
+        assert entry.settings_gap() == (), (
+            f"у алгоритма «{entry.title}» есть настройки, которых таблица "
+            f"полей не называет: {entry.settings_gap()}. Они молча получили "
+            "бы умолчания вместо выбранного в окне"
+        )
+        assert entry.stray_fields() == (), (
+            f"таблица полей алгоритма «{entry.title}» называет настройки, "
+            f"которых у него нет: {entry.stray_fields()}"
+        )
 
 
 def test_a_new_field_of_the_engine_cannot_be_forgotten() -> None:

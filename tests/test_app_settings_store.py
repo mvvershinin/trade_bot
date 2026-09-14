@@ -21,6 +21,7 @@ from datetime import date, time
 import pytest
 
 from app.settings_store import FORMAT_VERSION, SETTINGS_FILE_NAME, SettingsStore
+from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     AverageKind,
@@ -40,6 +41,17 @@ DIFFERENT = Settings(
     timeframe="15 минут",
     depth_days=45,
     history_depth_days=120,
+    # ⚠️ Второй алгоритм сборки, а при одном — тот же самый. Набор значений
+    # этого поля **закрыт**: чтение отвергает имя, которого нет в реестре
+    # (`SettingsStore._known_algorithm`), и подставить сюда выдуманное значит
+    # проверять не перезапуск, а отказ. Отказ проверяется отдельно.
+    strategy_id=(
+        next(
+            (name for name in registry.known_ids()
+             if name != Settings().strategy_id),
+            Settings().strategy_id,
+        )
+    ),
     average_period=21,
     average_kind=AverageKind.SMA,
     filter_enabled=True,
@@ -100,10 +112,51 @@ def test_the_sample_differs_from_the_defaults_in_every_field() -> None:
     """
     default = Settings()
     same = [name for name in _names() if getattr(DIFFERENT, name) == getattr(default, name)]
+    # ⚠️ Поимённое исключение с причиной, а не «пропустить всё, что не сошлось».
+    # У имени алгоритма набор значений закрыт реестром, и сегодня в нём одно
+    # имя: отличающегося значения не существует. Как только появится второй
+    # алгоритм, исключение исчезнет само — проверка снова станет полной.
+    if len(registry.known_ids()) == 1:
+        same = [name for name in same if name != "strategy_id"]
     assert not same, (
         "поля образца совпали с умолчанием, и проверка сохранения их не видит: "
         + ", ".join(same)
     )
+
+
+def test_an_unknown_algorithm_in_the_file_is_replaced_out_loud(
+    store: SettingsStore,
+) -> None:
+    """Файл более новой сборки: алгоритм заменён на умолчание, и об этом сказано.
+
+    Отказать здесь не на что опереть — прежних настроек в момент запуска
+    не существует, программа только открывается. Но подменить **правило
+    принятия решений** молча нельзя: строка обязана уйти в `troubles`, то есть
+    дойти до журнала решений предупреждением (правило 13 `CLAUDE.md`).
+
+    Мутация, обязанная ронять проверку: вернуть значение как есть.
+    """
+    assert store.save(Settings().replace(strategy_id="atr_channel")) == ""
+    read = SettingsStore(store.path.parent).load()
+    assert read.values.strategy_id == registry.DEFAULT_ID, (
+        "незнакомый алгоритм оставлен в настройках — робот работать им не сможет"
+    )
+    assert any("atr_channel" in trouble for trouble in read.troubles), (
+        "подмена алгоритма прошла молча"
+    )
+    assert not read.notes, "оговорка ушла не в тот список: её могут не показать"
+
+
+def test_a_known_algorithm_in_the_file_is_left_alone(store: SettingsStore) -> None:
+    """Канарейка предыдущей проверки: знакомое имя не трогается и не ворчит.
+
+    Без неё проверка зеленела бы на подмене, которая срабатывает **всегда**,
+    то есть на программе, которая никогда не читает выбор человека.
+    """
+    assert store.save(Settings().replace(strategy_id=registry.DEFAULT_ID)) == ""
+    read = SettingsStore(store.path.parent).load()
+    assert read.values.strategy_id == registry.DEFAULT_ID
+    assert read.troubles == ()
 
 
 def test_settings_survive_a_restart_field_by_field(store: SettingsStore) -> None:
@@ -322,6 +375,11 @@ def test_the_written_file_is_readable_text() -> None:
 #: подбирались вечером и цифры в них — деньги, а не пример.
 #:
 #: Секретов в файле нет ни одного: настройки — это периоды, проценты и время.
+#:
+#: ⚠️ Поля, заведённые **после** снимка, дописываются сюда с умолчанием
+#: (`strategy_id` — 08.09.2026). Иначе проверка «перезапись не портит файл»
+#: падала бы на каждом новом поле и сообщала бы не о формате, а о том, что
+#: полей стало больше, — а это и так видно по другим сторожам.
 OWNER_FILE = """{
   "format_version": 1,
   "settings": {
@@ -351,6 +409,7 @@ OWNER_FILE = """{
     "ruble_per_point": 1.0,
     "ruble_per_point_source": "биржей — карточка MXU6",
     "slippage_steps": 1.0,
+    "strategy_id": "ema_reverse",
     "take_profit_enabled": true,
     "take_profit_pct": 0.2,
     "threshold_percent": 0.4,

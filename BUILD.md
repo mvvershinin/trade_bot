@@ -82,9 +82,13 @@ uv sync --locked --all-groups
 
 ```bash
 .venv/bin/python tools/build.py            обычная сборка
-.venv/bin/python tools/build.py --with-web плюс QtWebEngine (веб-график)
 .venv/bin/python tools/build.py --dry-run  только показать команду, не собирать
 ```
+
+⚠️ Ключа `--with-web` больше нет: веб-график удалён 09.09.2026
+([`решение 0056`](.docs/decisions/0056-the-web-chart-is-removed.md)). На вес поставки
+это не повлияло — QtWebEngine и раньше в неё не попадал: обычная сборка исключала его
+явно, а ключ был единственным способом его туда пустить.
 
 Результат — `build/main.dist/`, внутри исполняемый файл `Terminal`.
 

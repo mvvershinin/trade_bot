@@ -49,6 +49,7 @@ from engine import (
     ExitReason,
     Fill,
     JournalLevel,
+    LevelTouch,
     Mode,
     OrderAction,
     OrderRequest,
@@ -66,6 +67,7 @@ from engine import (
     order_words,
     take_order_id,
 )
+from engine.pipeline import _arm_order
 from strategies import Intent
 from tests.engine_helpers import (
     ListSource,
@@ -154,14 +156,14 @@ def guarding(position, *, at: tuple[int, int] = (10, 5)) -> OrderRequest:
     уровень сторожится, его заявка лежит в `pending` всё время позиции.
     Тесты отказов, собранные с пустым полётом, проверяют не то и пропускают
     ровно те находки, ради которых написаны.
+
+    ⚠️ Заявка собирается **производственным** `_arm_order`, а не руками.
+    Своя сборка означала бы вторую копию таблицы стороны касания в оснастке,
+    и тесты стали бы слепы ровно к той ошибке, из которой вырос `B-046`.
     """
     level = position.take_profit
     assert level is not None, "позиция без уровня — вооружать нечего"
-    return OrderRequest(
-        action=OrderAction.ARM_TAKE_PROFIT, side=position.side,
-        volume=position.volume, submitted_at=bar(*at).closes_at,
-        reason="сторожим уровень", order_id=take_order_id(position), price=level,
-    )
+    return _arm_order(position, bar(*at).closes_at, level)
 
 
 def guarded_state(position, **rest) -> EngineState:
@@ -738,11 +740,8 @@ def test_a_deal_by_a_level_that_is_no_longer_in_flight_halts_the_robot() -> None
     """
     level = fixed_level(PRICE, 1, 0.5)
     assert level is not None
-    arm = OrderRequest(
-        action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
-        submitted_at=bar(10, 5).closes_at, reason="сторожим",
-        order_id=take_order_id(armed()), price=level,
-    )
+    arm = guarding(armed())
+    assert arm.price == level, "оснастка вооружает не тот уровень"
     lines: list = []
     engine = Engine(
         ScriptedStrategy([decision(Intent.SHORT, close=PRICE)] * 3),
@@ -1461,7 +1460,7 @@ def test_the_take_profit_date_is_taken_from_the_time_of_the_deal() -> None:
     order = OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
-        order_id="take:long:тест", price=level,
+        order_id="take:long:тест", price=level, touch=LevelTouch.RISE,
     )
     engine = Engine(
         ScriptedStrategy([]), WORKING,
@@ -1500,10 +1499,10 @@ def test_the_trailing_take_counts_as_the_same_event_for_the_stop_rule() -> None:
         step_percent=0.05, peak=PRICE * 1.01, level=PRICE * 1.008,
     )
     moving = replace(armed(plan=plan, level=PRICE * 1.008), take=plan)
-    order = OrderRequest(
-        action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
-        submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
-        order_id=take_order_id(moving), price=plan.level,
+    order = guarding(moving, at=INSIDE)
+    assert order.touch is LevelTouch.FALL, (
+        "скользящий уровень лонга стоит ПОЗАДИ рынка — до него откатываются "
+        "сверху, а не дорастают снизу (B-046)"
     )
     engine = Engine(
         ScriptedStrategy([]), WORKING.replace(trailing_take_profit=True),
@@ -1828,6 +1827,145 @@ def test_a_level_restored_after_a_cancel_does_not_start_over() -> None:
     )
 
 
+#: Профиль скользящего тейка, названный владельцем счёта 10.09.2026 для
+#: тестового прогона: порог включения 0,4 %, отступ 0,05 %, шаг подтяжки
+#: 0,01 %. Отдельной константой, а не числами внутри теста: на этих же
+#: значениях считан замер, и разойтись они не должны.
+OWNERS_TRAILING = WORKING.replace(
+    trailing_take_profit=True, trailing_start_percent=0.4,
+    trailing_offset_percent=0.05, trailing_step_percent=0.01,
+)
+
+#: Ломаная движения **в пользу позиции**, долями цены входа. Одна на обе
+#: стороны: для лонга цена идёт вверх, для шорта — вниз, а механизм обязан
+#: быть зеркальным. Внутри есть три отката (0,45 → 0,38, 0,60 → 0,52,
+#: 0,75 → 0,68) и обвал в конце — именно на них ловится уехавший назад
+#: уровень.
+_PROFIT_PATH = (
+    0.0020, 0.0041, 0.0045, 0.0038, 0.0060, 0.0052, 0.0075, 0.0068, 0.0090,
+    0.0005,
+)
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_the_owners_trailing_profile_moves_only_towards_profit(side: Side) -> None:
+    """**Скользящий тейк «в обе стороны»** на числах владельца счёта.
+
+    Проверяется не «работает вообще», а три утверждения сразу, и все три —
+    на одной ломаной, зеркально для лонга и для шорта:
+
+    * **вершина** равна бегущему экстремуму закрытий в пользу позиции;
+    * **уровень никогда не едет назад** — приёмочное правило ТЗ §9;
+    * **уровень стоит по прибыльную сторону** от цены входа и по правильную
+      сторону от вершины: ниже неё у лонга, **выше** у шорта. Перепутанный
+      знак закрывал бы шорт по цене, которую рынок уже прошёл, и ломаной
+      для лонга это не видно вовсе.
+
+    ⚠️ Порог 0,4 % при отступе 0,05 % и шаге 0,01 % — не те числа, на которых
+    механизм проверялся раньше (0,5 / 0,2 / 0,05). Мелкий шаг подтяжки делает
+    движение уровня частым, а мелкий отступ ставит его близко к цене: если
+    где-то знак или сравнение держались на крупных числах, здесь это видно.
+    """
+    sign = 1 if side is Side.LONG else -1
+    walk = [1 + sign * move for move in _PROFIT_PATH]
+    steps = _walk(side, walk, OWNERS_TRAILING)
+
+    running: float | None = None
+    previous: float | None = None
+    moved = 0
+    for index, step in enumerate(steps):
+        if step["peak"] is None:
+            assert step["level"] is None, "уровень есть, а вершины нет"
+            continue
+        close = step["close"]
+        running = close if running is None else (
+            close if sign * (close - running) > 0 else running
+        )
+        assert step["peak"] == running, (
+            f"шаг {index}: вершина {step['peak']} против бегущего экстремума "
+            f"{running} — монотонность вершины нарушена"
+        )
+        assert step["level"] is not None
+        target = round_level(
+            step["peak"] - sign * step["peak"] * 0.05 / 100
+        )
+        assert sign * (step["level"] - target) <= 0, (
+            f"шаг {index}: уровень {step['level']} обогнал расчёт от вершины "
+            f"{target}"
+        )
+        assert sign * (step["level"] - step["peak"]) < 0, (
+            f"шаг {index}: уровень {step['level']} стоит не с той стороны "
+            f"от вершины {step['peak']}"
+        )
+        assert sign * (step["level"] - PRICE) > 0, (
+            f"шаг {index}: уровень {step['level']} по убыточную сторону "
+            f"от цены входа {PRICE}"
+        )
+        if previous is not None:
+            assert sign * (step["level"] - previous) >= 0, (
+                f"шаг {index}: уровень поехал назад {previous} → {step['level']}"
+            )
+            if step["level"] != previous:
+                moved += 1
+                assert step["level"] == target, (
+                    f"шаг {index}: уровень сдвинулся не на расчёт от вершины"
+                )
+        previous = step["level"]
+
+    assert previous is not None, "уровень так и не появился — проверять нечего"
+    assert moved >= 2, "уровень не двигался — ломаная ничего не проверила"
+
+
+@pytest.mark.parametrize("side", [Side.LONG, Side.SHORT])
+def test_the_owners_profile_refuses_to_slide_back(side: Side) -> None:
+    """Второй механизм приёмочного правила — уже на числах владельца счёта.
+
+    Монотонная вершина сама по себе запрет «уровень не едет назад»
+    не обеспечивает: на обычной ломаной откат просто недостижим, и проверка
+    прошлого теста осталась бы зелёной на движке без запрета. Здесь состояние
+    собрано руками: расчёт от вершины лежит **позади** уже стоящего уровня,
+    и откат при этом **больше шага подтяжки** 0,01 % — то есть сравнение
+    по модулю его бы пропустило.
+
+    ⚠️ Шаг 0,01 % от цены около 210 000 — это 21 пункт. Откат в 500 пунктов
+    берётся именно поэтому: он заведомо больше шага, и мутация `abs(gain)`
+    роняет проверку. На прежних числах (шаг 0,05 %) то же самое проверялось
+    отдельно; здесь важно, что мелкий шаг ничего не ослабил.
+    """
+    sign = 1 if side is Side.LONG else -1
+    peak = PRICE * (1 + sign * 0.009)
+    target = round_level(peak - sign * peak * 0.05 / 100)
+    # Уровень уже ушёл дальше расчёта от вершины — «назад» для него это
+    # движение к цене входа.
+    ahead = target + sign * 500
+    plan = TakeProfit(
+        percent=0.5, trailing=True, start_percent=0.4, offset_percent=0.05,
+        step_percent=0.01, peak=peak, level=ahead,
+    )
+    # Закрытие хуже вершины: вершина не двигается, расчёт от неё тянет
+    # уровень назад.
+    kept = plan.advance(PRICE, sign, PRICE * (1 + sign * 0.005))
+    assert kept.peak == peak, "вершина сдвинулась на откате"
+    assert kept.level == ahead, (
+        f"уровень поехал назад {ahead} → {kept.level}: запрет «не ехать "
+        "назад» на числах владельца счёта не работает"
+    )
+
+
+def test_the_owners_trailing_profile_is_accepted_by_the_settings() -> None:
+    """Числа владельца счёта настройки принимают, а порог ниже отступа — нет.
+
+    Порог 0,4 % при отступе 0,05 % проходит проверку парности; обратное
+    сочетание отвергается, потому что уровень встал бы по убыточную сторону
+    от цены входа и «фиксация прибыли» оказалась бы стоп-лоссом.
+    """
+    assert OWNERS_TRAILING.trailing_start_percent == 0.4
+    assert OWNERS_TRAILING.trailing_offset_percent == 0.05
+    assert OWNERS_TRAILING.trailing_step_percent == 0.01
+    with pytest.raises(ValueError, match="порог включения"):
+        OWNERS_TRAILING.replace(trailing_start_percent=0.04)
+
+
 def test_for_a_short_the_level_sits_above_the_best_price() -> None:
     """Ниже лучшей цены для лонга, **выше** для шорта.
 
@@ -2074,7 +2212,7 @@ def test_the_words_for_an_order_name_all_four_actions() -> None:
     arm = OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
-        order_id=take_order_id(guarded), price=211_050.0,
+        order_id=take_order_id(guarded), price=211_050.0, touch=LevelTouch.RISE,
     )
     cancel = OrderRequest(
         action=OrderAction.CANCEL_TAKE_PROFIT, side=Side.LONG, volume=1.0,
