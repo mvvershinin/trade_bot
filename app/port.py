@@ -805,6 +805,15 @@ class _Stuck:
         return cls(tick=min(STUCK_TICK, max(after / 4, 0.005)), after=after)
 
 
+def moscow_now() -> datetime:
+    """Рабочие часы порта: системное время, приведённое к московскому.
+
+    Отдельной функцией, а не выражением на месте, ровно ради довода
+    `clock` ниже: подменяемым может быть только то, у чего есть имя.
+    """
+    return datetime.now(MSK)
+
+
 class HistoryPort(TerminalPort):
     """Окно ↔ прогон по истории.
 
@@ -832,6 +841,18 @@ class HistoryPort(TerminalPort):
         (`_Stuck.watching`), вторым доводом не заводится: срок и шаг
         осмысленны только вместе, а разъехавшись — дают сторожа, который
         просыпается реже, чем истекает его собственный срок.
+    :param clock: откуда порт берёт «сейчас». Умолчание — системные часы
+        в московском времени, и на работе программы довод не сказывается
+        никак. Существует он по той же причине, что `redraw_gap`: отрезок
+        загрузки считается **от сегодняшнего дня** (`_load_span`), и проверка,
+        которая не может назвать этот день сама, проверяет календарь машины,
+        а не программу. Так и вышло: четыре сторожа кнопки загрузки, зелёные
+        06.09.2026, покраснели 14.09.2026 сами по себе — данные подставной
+        биржи уехали за левую границу отрезка (`B-049`).
+
+        ⚠️ Это **значение**, а не режим: порт получает момент времени и не
+        узнаёт, кто его дал. Довод вида «мы под тестом» был бы нарушением
+        первого железного правила.
     """
 
     def __init__(
@@ -846,8 +867,10 @@ class HistoryPort(TerminalPort):
         sanitize: Sanitize,
         redraw_gap: float = REDRAW_GAP,
         stuck_after: float | None = None,
+        clock: Callable[[], datetime] = moscow_now,
     ) -> None:
         super().__init__(parent)
+        self._clock = clock
         self._worker = worker
         self._sanitize = sanitize
         self._values = values or Settings()
@@ -1508,7 +1531,7 @@ class HistoryPort(TerminalPort):
     async def _load_history(self, request: HistoryLoadRequest) -> None:
         """Снять отметки (если просили заново), загрузить, рассказать итог."""
         symbol = request.symbol
-        since, until = _load_span(request, now=datetime.now(MSK))
+        since, until = _load_span(request, now=self._clock())
         self.note("Загрузка истории начата", _load_lead(request, since, until))
         try:
             if request.replace:
@@ -1651,7 +1674,7 @@ class HistoryPort(TerminalPort):
         Торговых причин здесь нет — они приходят из `engine/`.
         """
         row = DecisionRow(
-            time=datetime.now(MSK),
+            time=self._clock(),
             event=event,
             reason=reason,
             level=level,
@@ -2375,7 +2398,7 @@ class HistoryPort(TerminalPort):
         она уже стоит в памяти порта, — но о нём говорится вслух
         (`_save_halt`): молчаливо потерянный предохранитель это `D-043`.
         """
-        self._halt.marks[reason] = _Mark(kind=kind, at=datetime.now(MSK))
+        self._halt.marks[reason] = _Mark(kind=kind, at=self._clock())
         self._write_halt(
             _HaltWrite(cause=HaltRecord(kind=kind, reason=reason, event=event))
         )
