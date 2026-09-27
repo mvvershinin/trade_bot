@@ -1174,6 +1174,7 @@ def _entry_with(describe) -> StrategyEntry:
         settings_type=registry.default_entry().settings_type,
         factory=registry.default_entry().factory,
         fields=registry.default_entry().fields,
+        demands=registry.default_entry().demands,
         describe=describe,
     )
 

@@ -32,7 +32,14 @@ from decimal import Decimal
 
 import pytest
 
-from strategies import Bar, EmaReverse, EmaReverseSettings, Intent
+from strategies import (
+    Bar,
+    EmaReverse,
+    EmaReverseSettings,
+    Intent,
+    MaReverseAlways,
+    MaReverseAlwaysSettings,
+)
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DATASET = REPO / "reference/stand/install/data/Set_MoexFuturesMxu6/MXU6/Min5/MXU6.txt"
@@ -235,4 +242,55 @@ def test_binary_arithmetic_stays_far_from_the_decision_boundary(series, oracle, 
         f"расхождение двоичной и десятичной средней {drift} подобралось "
         f"к ближайшему подходу закрытия {approach}: знак сравнения может "
         "перевернуться, и список сделок разойдётся с прототипом"
+    )
+
+
+# --------------------------------------------------------------------------
+# Алгоритм №2 на том же наборе: та же арифметика, свеча в свечу
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def always_decisions(series):
+    """Решения алгоритма №2 на том же отрезке, свеча за свечой."""
+    strategy = MaReverseAlways(MaReverseAlwaysSettings(period=PERIOD))
+    return [
+        strategy.on_closed_bar(Bar(
+            closes_at=moment + STEP,
+            open=float(close), high=float(close), low=float(close),
+            close=float(close), volume=0.0,
+        ))
+        for moment, close in series
+    ]
+
+
+def test_the_second_algorithm_decides_exactly_as_the_first_on_the_reference(
+    series, decisions, always_decisions
+) -> None:
+    """«Реверс с постоянной позицией» на эталонном отрезке решает то же самое.
+
+    10 878 настоящих свечей, решение к решению: намерение, причина для журнала,
+    значение средней, счётчик свечей, прогрев и признак «свеча в обработку
+    не идёт». Это и есть доказательство того, что второй реализации правила
+    не завелось: сверкой с прототипом — 127 сделок из 127 — покрыт **один**
+    расчёт, и копия рядом расходилась бы с ним молча, на мелочи, которую
+    сверка не видит по построению.
+
+    ⚠️ Отличие алгоритма №2 — переворот в одной свече — живёт в настройках
+    движка, а не в правиле. Поток намерений от него не зависит вовсе, и
+    поэтому здесь обязано быть точное совпадение, а не «похоже».
+
+    Мутация, обязанная ронять проверку: любое изменение правила в наследнике
+    либо подмена одного из трёх прибитых значений в `widened()`.
+    """
+    assert len(always_decisions) == len(decisions) == len(series)
+    diverged = [
+        index for index, (one, other)
+        in enumerate(zip(decisions, always_decisions, strict=True))
+        if one != other
+    ]
+    assert not diverged, (
+        f"алгоритмы разошлись на {len(diverged)} свечах из {len(series)}; "
+        f"первая — №{diverged[0] + 1}, {series[diverged[0]][0]:%d.%m.%Y %H:%M}: "
+        f"{decisions[diverged[0]]} против {always_decisions[diverged[0]]}"
     )

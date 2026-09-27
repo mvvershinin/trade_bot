@@ -566,20 +566,46 @@ def test_a_foreign_algorithm_is_refused_with_a_reason_a_human_can_read() -> None
     assert "не запущен" in said
 
 
-def test_the_second_algorithm_of_the_build_is_refused_by_its_own_name() -> None:
-    """Настоящий второй алгоритм реестра отвергается, и назван так, как в окне.
+def test_an_algorithm_sharing_the_settings_class_is_refused_by_its_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Отказ идёт по **имени**, а не по классу настроек — класс может совпасть.
 
-    ⚠️ Проверка на **настоящей** записи реестра, а не на выдуманном имени:
-    выдуманное отвергается уже потому, что реестр его не знает, а второй
-    алгоритм существует, делит с первым класс настроек и отличается только
-    именем. Ровно на нём отказ и обязан сработать — иначе перебор перебрал
-    бы поля первого и показал бы лидеров как «ваши» (решение 0057).
+    ⚠️ Предмет проверки назван точно: алгоритм, у которого класс настроек
+    **тот же**, что у алгоритма сетки, и отличается он только именем.
+    Выдуманное имя отвергается уже потому, что реестр его не знает, — на нём
+    эта проверка была бы вакуумной. Отказ обязан случиться и здесь, иначе
+    перебор перебрал бы поля алгоритма сетки и показал бы лидеров как «ваши»
+    (решение 0057).
 
-    Мутация, обязанная ронять проверку: сверять класс настроек вместо
-    имени. Класс у них общий, и отказа не случилось бы.
+    Мутация, обязанная ронять проверку: сверять класс настроек вместо имени.
+    Класс общий, и отказа не случилось бы.
+
+    ⚠️ До 14.09.2026 эту роль играл настоящий второй алгоритм реестра
+    («Тестовый скользящий», `ma_crossing`). Он удалён решением владельца
+    счёта, и свойство «тот же класс настроек, другое имя» теперь ставится
+    подставной записью: свойство осталось предметом проверки, а не исчезло
+    вместе с модулем.
     """
+    twin = registry.StrategyEntry(
+        id="settings_twin",
+        title="Подставной с общим классом настроек",
+        settings_type=registry.find(GRID_STRATEGY_ID).settings_type,
+        factory=registry.find(GRID_STRATEGY_ID).factory,
+        fields=registry.find(GRID_STRATEGY_ID).fields,
+        demands=registry.find(GRID_STRATEGY_ID).demands,
+        describe=registry.find(GRID_STRATEGY_ID).describe,
+    )
+    monkeypatch.setattr(
+        registry, "_ENTRIES", (*registry.entries(), twin), raising=True
+    )
+
     others = [entry for entry in registry.entries() if entry.id != GRID_STRATEGY_ID]
     assert others, "в сборке один алгоритм — отказывать нечему, проверка вакуумна"
+    assert any(
+        entry.settings_type is registry.find(GRID_STRATEGY_ID).settings_type
+        for entry in others
+    ), "ни у одного чужого алгоритма нет общего класса настроек — мутация не ловится"
     for entry in others:
         with pytest.raises(ForeignStrategy) as refusal:
             refuse_foreign_strategy(entry.id, entry.defaults())

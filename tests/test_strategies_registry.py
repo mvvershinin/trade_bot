@@ -50,7 +50,9 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import enum
 import pathlib
+from typing import Any
 
 import pytest
 
@@ -246,7 +248,11 @@ def test_the_default_is_the_module_that_trades_today() -> None:
     entry = registry.default_entry()
     assert entry is registry.find(registry.DEFAULT_ID)
     assert entry.settings_type is EmaReverseSettings
-    assert isinstance(entry.build(entry.defaults()), EmaReverse), (
+    # ⚠️ `type(...) is`, а не `isinstance`: с 14.09.2026 у первого алгоритма
+    # есть наследник («Реверс с постоянной позицией»), и `isinstance` принял
+    # бы его за умолчание — то есть подмена `DEFAULT_ID` прошла бы наполовину
+    # молча, а сверка с прототипом идёт на архиве, которого в свежем клоне нет.
+    assert type(entry.build(entry.defaults())) is EmaReverse, (
         "умолчание реестра собирает не тот модуль, которым торгуют сегодня"
     )
 
@@ -258,7 +264,7 @@ def test_the_build_is_exactly_the_modules_it_declares() -> None:
     и первый в списке — не умолчание. Умолчание отдельным полем
     (`DEFAULT_ID`), и его стережёт проверка выше.
     """
-    assert registry.known_ids() == ("ema_reverse", "ma_crossing"), (
+    assert registry.known_ids() == ("ema_reverse", "ma_reverse_always"), (
         "состав реестра изменился. Это не запрет: впишите новый модуль сюда "
         "вместе с проверками, которые он обязан пройти"
     )
@@ -309,6 +315,94 @@ def test_ids_and_titles_are_unique() -> None:
     titles = [entry.title for entry in registry.entries()]
     assert len(set(ids)) == len(ids), f"повторяющийся id модуля: {ids}"
     assert len(set(titles)) == len(titles), f"повторяющееся название: {titles}"
+
+
+@pytest.mark.parametrize("entry", registry.entries(), ids=lambda item: item.id)
+def test_the_title_of_the_record_is_what_the_module_says_about_itself(
+    entry: StrategyEntry,
+) -> None:
+    """Название записи и название модуля — одна строка, а не две похожих.
+
+    ⚠️ Проверки на это не было вовсе до 14.09.2026, и дыра не теоретическая:
+    в реестре появился алгоритм, собранный из наследника первого. Запись
+    с `factory=EmaReverse` при собственном `title` прошла бы все прежние
+    проверки — уникальность названий и непустоту описания, — а в журнал
+    решений и в снимок прогона писала бы «Реверс по скользящей средней»
+    при выбранной в окне другой строке. Разобрать потом, каким правилом
+    шла торговля, было бы нечем.
+
+    Мутация, обязанная ронять проверку: `factory=EmaReverse` у записи,
+    чьё `title` от `EmaReverse.title` отличается.
+    """
+    built = entry.build(entry.defaults())
+    assert built.title == entry.title, (
+        f"запись реестра «{entry.id}» называется «{entry.title}», а собранный "
+        f"ею модуль говорит о себе «{built.title}». В окне будет одно, "
+        "в журнале другое"
+    )
+    assert entry.description(entry.defaults()).title == entry.title, (
+        f"описание правила модуля «{entry.id}» озаглавлено не так, как запись"
+    )
+
+
+@pytest.mark.parametrize("entry", registry.entries(), ids=lambda item: item.id)
+def test_every_setting_of_the_module_gets_a_line_in_the_journal(
+    entry: StrategyEntry,
+) -> None:
+    """Сменили любое поле настроек — журнал сказал об этом строкой.
+
+    ТЗ §4.4 А: изменение настройки пишется с прежним и новым значением.
+    Строки составляет сам модуль (`changes_from`), и составляет их
+    перечислением полей руками — то есть поле, заведённое завтра и забытое
+    в перечислении, молча не попадёт в журнал. Владелец счёта поменял
+    параметр, по которому идут деньги, а в журнале этого нет.
+
+    Мутация, обязанная ронять проверку: убрать одну ветку из `changes_from`
+    любого из алгоритмов.
+    """
+    defaults = entry.defaults()
+    silent = [
+        field.name
+        for field in dataclasses.fields(entry.settings_type)
+        if not _another_value(defaults, field.name).changes_from(defaults)
+    ]
+    assert not silent, (
+        f"модуль {entry.id} меняет настройки {silent} молча — в журнале "
+        "решений этого изменения не будет"
+    )
+
+
+def _another_value(settings: Any, name: str) -> Any:  # noqa: ANN401 — разбор ниже
+    """Те же настройки с одним изменённым полем. Значение — заведомо другое.
+
+    Правило замены общее и про модуль ничего не знает: `bool` разбирается
+    раньше `int` (в Python `True` — целое), перечисление меняется на соседа,
+    число сдвигается. Тип, для которого правила нет, — отказ вслух:
+    молчаливый пропуск поля означал бы проверку, которая его не смотрит.
+
+    ⚠️ `Any` здесь по существу, а не от лени: реестр отдаёт настройки как
+    `object` — он не знает, какой у модуля класс, — а проверке нужен
+    датакласс, по полям которого она ходит. Признание этого одной строкой
+    честнее россыпи подавлений по файлу (тот же довод, что у
+    `tests/test_strategies_description.py::defaults_of`).
+    """
+    value = getattr(settings, name)
+    if isinstance(value, bool):
+        other: object = not value
+    elif isinstance(value, enum.Enum):
+        others = [item for item in type(value) if item is not value]
+        assert others, f"у перечисления {type(value).__name__} одно значение"
+        other = others[0]
+    elif isinstance(value, int):
+        other = value + 5
+    elif isinstance(value, float):
+        other = value + 0.04
+    else:
+        raise AssertionError(
+            f"проверка не знает, чем заменить значение поля {name} "
+            f"типа {type(value).__name__} — допишите правило"
+        )
+    return dataclasses.replace(settings, **{name: other})
 
 
 @pytest.mark.parametrize("entry", registry.entries(), ids=lambda item: item.id)
@@ -421,6 +515,17 @@ def test_modules_sharing_a_settings_class_share_its_field_table() -> None:
     ⚠️ Разные классы настроек, читающие одно и то же поле окна, — **норма**,
     а не нарушение: хранение настроек плоское, «Период средней» в окне один
     (`D-096`). Проверять там нечего.
+
+    ⚠️ **С 14.09.2026 на нынешнем составе реестра эта проверка пуста, и это
+    сказано здесь нарочно.** Записи две, классы настроек у них разные
+    (`EmaReverseSettings` и `MaReverseAlwaysSettings`), общей пары нет
+    ни одной — значит `_tables_that_disagree` не находит ничего при любом
+    состоянии таблиц. Мёртвой проверка от этого не стала: она падает на том,
+    ради чего заведена, — на **третьей** записи, делящей класс настроек
+    с первой и объявившей свою таблицу полей (проверено мутацией того же дня).
+    Подставлять сюда близнеца ради непустоты нельзя: его таблицу пишет этот
+    же файл, расходиться ей не с чем, и проверка стала бы согласием с самой
+    собой. Что сама сверка жива, стережёт канарейка ниже.
     """
     assert not _tables_that_disagree(registry.entries()), (
         "\n  ".join(["алгоритмы разошлись в таблице полей:",
@@ -433,11 +538,25 @@ def test_that_agreement_check_is_not_blind() -> None:
 
     Мутация ставится на **локальных** записях: настоящий реестр не трогается
     ни на одну проверку (`D-078`).
+
+    ⚠️ Пара для опыта строится **здесь**, а не берётся из реестра, и это
+    правка 14.09.2026. Прежняя редакция брала первую и последнюю настоящие
+    записи и требовала, чтобы они делили класс настроек: пока таких записей
+    было две с общим классом, канарейка работала, а при первом же алгоритме
+    со своим классом настроек она падала — не поймав ни одной подмены,
+    то есть сообщая о поломке там, где её нет. Проверяемое свойство
+    («две записи, делящие класс настроек, обязаны делить и таблицу полей»)
+    от состава реестра не зависит вовсе, и опираться на него незачем.
     """
-    first, second = registry.entries()[0], registry.entries()[-1]
-    assert first.settings_type is second.settings_type, (
-        "канарейка потеряла смысл: записи больше не делят класс настроек"
-    )
+    first = registry.default_entry()
+    second = dataclasses.replace(first, id=f"{first.id}_twin")
+    # ⚠️ Утверждения «записи делят класс настроек» здесь больше нет, и это
+    # правка 14.09.2026. При паре, построенной `replace` по одному полю `id`,
+    # оно тождественно истинно: подменить класс настроек `replace` тут нечем.
+    # Утверждение, которое не может не выполниться, читается как сторож
+    # и сторожем не является — а именно так извещатель об уснувшей проверке
+    # однажды уснул сам.
+    assert second.id != first.id, "пара для опыта не сложилась: это одна запись"
     swapped = dataclasses.replace(
         second,
         fields=(

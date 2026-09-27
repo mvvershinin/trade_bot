@@ -166,8 +166,9 @@ def test_defaults_match_the_agreed_numbers(dialog) -> None:
     assert values.window_start == time(10, 5)
     assert values.window_end == time(11, 0)
     assert values.volume == 1
-    assert values.daily_loss_limit_pct == pytest.approx(2.0)
-    assert values.free_funds_reserve_pct == pytest.approx(30.0)
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # assert values.daily_loss_limit_pct == pytest.approx(2.0)
+    # assert values.free_funds_reserve_pct == pytest.approx(30.0)
 
 
 def test_settings_survive_a_round_trip(dialog) -> None:
@@ -189,9 +190,10 @@ def test_settings_survive_a_round_trip(dialog) -> None:
         window_start=time(9, 45),
         window_end=time(12, 30),
         volume=3,
-        volume_cap=7,
-        daily_loss_limit_pct=1.5,
-        free_funds_reserve_pct=40.0,
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # volume_cap=7,
+        # daily_loss_limit_pct=1.5,
+        # free_funds_reserve_pct=40.0,
         commission_per_side_rub=14.0,
     )
     dialog.set_values(source)
@@ -224,8 +226,9 @@ def test_every_field_explains_itself_in_plain_russian(dialog) -> None:
         dialog.trailing_enabled, dialog.trailing_start, dialog.trailing_offset,
         dialog.trailing_step,
         dialog.window_start,
-        dialog.window_end, dialog.volume, dialog.volume_cap,
-        dialog.daily_loss_limit, dialog.free_funds_reserve, dialog.commission,
+        # ⚠️ Потолка объёма нет: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113).
+        dialog.window_end, dialog.volume,
+        dialog.commission,
     ]
     for field in fields:
         hint = field.toolTip()
@@ -235,22 +238,23 @@ def test_every_field_explains_itself_in_plain_russian(dialog) -> None:
         )
 
 
-def test_volume_cap_is_visible_next_to_volume(dialog) -> None:
-    """Включённый потолок виден рядом с полем объёма и ограничивает ввод."""
-    dialog.set_values(Settings(volume_cap_enabled=True, volume_cap=3))
-    assert dialog.volume.maximum() == 3
-    assert "3" in dialog.cap_note.text()
-
-
-def test_a_cap_that_is_off_does_not_pinch_the_volume_field(dialog) -> None:
-    """Снятая галочка потолка ввод объёма не ограничивает.
-
-    Иначе число, которое ничего не значит, продолжало бы зажимать поле —
-    и владелец счёта решал бы, что потолок работает.
-    """
-    dialog.set_values(Settings(volume_cap_enabled=False, volume_cap=3))
-    assert dialog.volume.maximum() > 3
-    assert not dialog.volume_cap.isEnabled()
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторожа потолка в окне.
+# def test_volume_cap_is_visible_next_to_volume(dialog) -> None:
+#     """Включённый потолок виден рядом с полем объёма и ограничивает ввод."""
+#     dialog.set_values(Settings(volume_cap_enabled=True, volume_cap=3))
+#     assert dialog.volume.maximum() == 3
+#     assert "3" in dialog.cap_note.text()
+#
+#
+# def test_a_cap_that_is_off_does_not_pinch_the_volume_field(dialog) -> None:
+#     """Снятая галочка потолка ввод объёма не ограничивает.
+#
+#     Иначе число, которое ничего не значит, продолжало бы зажимать поле —
+#     и владелец счёта решал бы, что потолок работает.
+#     """
+#     dialog.set_values(Settings(volume_cap_enabled=False, volume_cap=3))
+#     assert dialog.volume.maximum() > 3
+#     assert not dialog.volume_cap.isEnabled()
 
 
 #: Обороты, которыми окно обещает предохранитель в НАСТОЯЩЕМ времени.
@@ -267,119 +271,171 @@ PROMISES = (
     "входит уменьшенным",
 )
 
-#: Поле-галочка, поле-число и что должно быть сказано, пока галочка снята.
-GUARDS = (
-    ("volume_cap_enabled", "volume_cap", "потолка объёма нет"),
-    ("daily_loss_limit_enabled", "daily_loss_limit", "не следит"),
-    ("free_funds_reserve_enabled", "free_funds_reserve", "не следит"),
-)
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Таблица «галочка, число и что
+# сказано, пока галочка снята» опустела: галочек и чисел в окне больше нет.
+# #: Поле-галочка, поле-число и что должно быть сказано, пока галочка снята.
+# GUARDS = (
+#     ("volume_cap_enabled", "volume_cap", "потолка объёма нет"),
+#     ("daily_loss_limit_enabled", "daily_loss_limit", "не следит"),
+#     ("free_funds_reserve_enabled", "free_funds_reserve", "не следит"),
+# )
+#
+#
+# @pytest.mark.parametrize(("switch", "number", "expected"), GUARDS)
+# def test_a_guard_that_is_off_says_so_and_promises_nothing(
+#     dialog, switch: str, number: str, expected: str
+# ) -> None:
+#     """Выключенный предохранитель говорит, что защиты нет, и не обещает работы.
+#
+#     Обе половины обязательны. Без первой текст становится уклончивым
+#     и читается как «всё в порядке»; без второй окно обещает то, чего
+#     при снятой галочке не произойдёт.
+#     """
+#     dialog.set_values(Settings())
+#     assert not getattr(dialog, switch).isChecked(), "умолчание предохранителя изменилось"
+#     assert not getattr(dialog, number).isEnabled(), (
+#         "число выключенного предохранителя доступно для правки — выглядит рабочим"
+#     )
+#     said = (dialog.cap_note.text() + " " + dialog.guards_note.text()).lower()
+#     assert expected in said, f"не сказано, что защиты нет: {said!r}"
+#     for promise in PROMISES:
+#         assert promise not in said, (
+#             f"обещан предохранитель, который выключен: {promise!r}"
+#         )
 
 
-@pytest.mark.parametrize(("switch", "number", "expected"), GUARDS)
-def test_a_guard_that_is_off_says_so_and_promises_nothing(
-    dialog, switch: str, number: str, expected: str
-) -> None:
-    """Выключенный предохранитель говорит, что защиты нет, и не обещает работы.
+def test_the_window_says_out_loud_that_there_are_no_money_guards(dialog) -> None:
+    """Стережёт МОЛЧАНИЕ: вкладка «Деньги» обязана сказать, что защиты нет.
 
-    Обе половины обязательны. Без первой текст становится уклончивым
-    и читается как «всё в порядке»; без второй окно обещает то, чего
-    при снятой галочке не произойдёт.
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Поля трёх предохранителей
+    из окна исчезли, и это самая опасная точка всей правки: вкладка без полей
+    и без строки читается как «здесь всё в порядке». Человек, не нашедший
+    защиты, обязан прочитать, что её нет **намеренно** и что она вернётся.
+
+    Проверяется **четыре** вещи, и каждая ловит свою мутацию: строка непустая,
+    названы все три предохранителя, названо последствие («не остановится»),
+    названа недопустимость боя. Стереть любую из них — и окно снова молчит
+    наполовину.
     """
     dialog.set_values(Settings())
-    assert not getattr(dialog, switch).isChecked(), "умолчание предохранителя изменилось"
-    assert not getattr(dialog, number).isEnabled(), (
-        "число выключенного предохранителя доступно для правки — выглядит рабочим"
+    said = dialog.guards_note.text().lower()
+    assert said.strip(), "окно молчит о том, что предохранителей нет"
+    for guard in ("потолок объёма", "дневной лимит убытка", "запас свободных средств"):
+        assert guard in said, (
+            f"окно не назвало выключенный предохранитель «{guard}»: {said!r}"
+        )
+    assert "не остановится" in said, (
+        "названы имена, но не последствие: перечень без последствия "
+        "владельцу счёта ничего не говорит"
     )
-    said = (dialog.cap_note.text() + " " + dialog.guards_note.text()).lower()
-    assert expected in said, f"не сказано, что защиты нет: {said!r}"
+    assert "не допущена" in said, "не сказано, что к боевой торговле нельзя"
+    assert "bold" in dialog.guards_note.styleSheet(), (
+        "строка о том, что защиты нет, набрана обычным шрифтом"
+    )
+
+
+def test_the_window_promises_no_guard_it_cannot_keep(dialog) -> None:
+    """Стережёт ложное обещание: выключенная защита не обещает работы.
+
+    Оборот в настоящем времени («не подаётся», «закрывает позицию») снимает
+    настороженность там, где защиты нет вовсе, и это хуже её отсутствия.
+    Проверка осталась от прежней пары тестов и работает ровно так же:
+    по списку оборотов, а не «на глаз».
+    """
+    dialog.set_values(Settings())
+    said = dialog.guards_note.text().lower()
     for promise in PROMISES:
         assert promise not in said, (
-            f"обещан предохранитель, который выключен: {promise!r}"
+            f"обещан предохранитель, которого нет: {promise!r}"
         )
 
 
-@pytest.mark.parametrize(("switch", "number", "expected"), GUARDS)
-def test_a_guard_that_is_on_says_what_happens_when_it_fires(
-    dialog, switch: str, number: str, expected: str
-) -> None:
-    """Включённый предохранитель называет последствие, а не только факт.
-
-    «Лимит включён» само по себе не говорит, что робот закроет позицию
-    и не откроет новую до конца дня, — а это и есть то, за что владелец
-    счёта отвечает деньгами.
-    """
-    dialog.set_values(Settings().replace(**{switch: True}))
-    assert getattr(dialog, number).isEnabled()
-    hint = getattr(dialog, switch).toolTip().lower()
-    assert any(promise in hint for promise in PROMISES), (
-        f"включённый предохранитель не сказал, что сделает: {hint!r}"
-    )
-
-
-def test_the_two_guards_that_need_the_account_size_say_it_is_unknown(dialog) -> None:
-    """Дневной лимит и запас средств считать не от чего — и это сказано заранее.
-
-    Портфель у брокера программа пока не читает. Движок в этом случае
-    пишет «НЕ ПРОВЕРЕНО» в строку входа, но узнавать об этом из журнала
-    задним числом хуже, чем прочитать в настройках при включении.
-    """
-    dialog.set_values(Settings(daily_loss_limit_enabled=True))
-    note = dialog.guards_note.text()
-    # ⚠️ Через `and`, а не `or`. Первая редакция сверяла «НЕ ОТ ЧЕГО»
-    # ИЛИ «не знает размера» — и мутация, выбросившая первое, прошла
-    # незамеченной: осталось второе. Проверка «хоть что-нибудь из двух»
-    # стережёт ровно половину фразы, и неизвестно какую.
-    assert note.startswith("⚠️"), (
-        f"строка про слепой предохранитель не помечена тревогой: {note!r}"
-    )
-    assert "НЕ ОТ ЧЕГО" in note, note
-    assert "не знает размера" in note, note
-    assert "НЕ ПРОВЕРЕНО" in note, "не сказано, что робот напишет об этом в журнал"
-    assert "ЗАПРЕТИТ" in note, (
-        "не сказано про решение 0037: в бою слепой предохранитель вход запретит"
-    )
-    assert "bold" in dialog.guards_note.styleSheet(), (
-        "предупреждение о слепом предохранителе набрано обычным шрифтом"
-    )
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): включать нечего.
+# @pytest.mark.parametrize(("switch", "number", "expected"), GUARDS)
+# def test_a_guard_that_is_on_says_what_happens_when_it_fires(
+#     dialog, switch: str, number: str, expected: str
+# ) -> None:
+#     """Включённый предохранитель называет последствие, а не только факт.
+#
+#     «Лимит включён» само по себе не говорит, что робот закроет позицию
+#     и не откроет новую до конца дня, — а это и есть то, за что владелец
+#     счёта отвечает деньгами.
+#     """
+#     dialog.set_values(Settings().replace(**{switch: True}))
+#     assert getattr(dialog, number).isEnabled()
+#     hint = getattr(dialog, switch).toolTip().lower()
+#     assert any(promise in hint for promise in PROMISES), (
+#         f"включённый предохранитель не сказал, что сделает: {hint!r}"
+#     )
 
 
-def test_lowering_the_volume_clears_the_warning_by_itself(dialog) -> None:
-    """Красная строка про объём выше потолка гаснет, когда объём уменьшили.
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторож слепого предохранителя.
+# Включать нечего — слепнуть некому.
+# def test_the_two_guards_that_need_the_account_size_say_it_is_unknown(dialog) -> None:
+#     """Дневной лимит и запас средств считать не от чего — и это сказано заранее.
+#
+#     Портфель у брокера программа пока не читает. Движок в этом случае
+#     пишет «НЕ ПРОВЕРЕНО» в строку входа, но узнавать об этом из журнала
+#     задним числом хуже, чем прочитать в настройках при включении.
+#     """
+#     dialog.set_values(Settings(daily_loss_limit_enabled=True))
+#     note = dialog.guards_note.text()
+#     # ⚠️ Через `and`, а не `or`. Первая редакция сверяла «НЕ ОТ ЧЕГО»
+#     # ИЛИ «не знает размера» — и мутация, выбросившая первое, прошла
+#     # незамеченной: осталось второе. Проверка «хоть что-нибудь из двух»
+#     # стережёт ровно половину фразы, и неизвестно какую.
+#     assert note.startswith("⚠️"), (
+#         f"строка про слепой предохранитель не помечена тревогой: {note!r}"
+#     )
+#     assert "НЕ ОТ ЧЕГО" in note, note
+#     assert "не знает размера" in note, note
+#     assert "НЕ ПРОВЕРЕНО" in note, "не сказано, что робот напишет об этом в журнал"
+#     assert "ЗАПРЕТИТ" in note, (
+#         "не сказано про решение 0037: в бою слепой предохранитель вход запретит"
+#     )
+#     assert "bold" in dialog.guards_note.styleSheet(), (
+#         "предупреждение о слепом предохранителе набрано обычным шрифтом"
+#     )
 
-    ⚠️ Пересчёт **не вызывается руками** — в этом весь смысл проверки.
-    Соседний тест ниже дёргает `_sync_volume_cap()` сам, и потому не видел,
-    что поле объёма ни на что не подписано: владелец счёта уменьшал объём
-    до разрешённого, а строка оставалась и продолжала утверждать, что заявка
-    не пойдёт. Красное предупреждение про деньги, которое врёт, хуже
-    отсутствующего: рядом с ним ещё три таких строки.
-    """
-    dialog.set_values(Settings(volume_cap_enabled=True, volume_cap=5, volume=50))
-    assert "не будет" in dialog.cap_note.text().lower(), "не предупредил заранее"
 
-    dialog.volume.setValue(2)
-
-    note = dialog.cap_note.text().lower()
-    assert "не будет" not in note, f"строка соврала после правки объёма: {note!r}"
-    assert "потолок объёма: 5" in note, note
-
-
-def test_the_cap_note_says_the_order_will_not_be_sent(dialog) -> None:
-    """Строка под полем объёма — самое читаемое место, и она не должна врать."""
-    dialog.set_values(Settings(volume_cap_enabled=True, volume_cap=3, volume=1))
-    note = dialog.cap_note.text().lower()
-    assert "не подаётся" in note, note
-
-    dialog.volume.setMaximum(100)
-    dialog.volume.setValue(10)
-    dialog._sync_volume_cap()
-    above = dialog.cap_note.text().lower()
-    assert "выше потолка" in above
-    assert "не будет" in above, (
-        f"сказано, что объём выше потолка, но не сказано, что будет: {above!r}"
-    )
-    assert "поменьше" in above, (
-        "не сказано, что робот не подаст уменьшенную заявку, — а он не подаст"
-    )
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторожа строки под потолком.
+# def test_lowering_the_volume_clears_the_warning_by_itself(dialog) -> None:
+#     """Красная строка про объём выше потолка гаснет, когда объём уменьшили.
+#
+#     ⚠️ Пересчёт **не вызывается руками** — в этом весь смысл проверки.
+#     Соседний тест ниже дёргает `_sync_volume_cap()` сам, и потому не видел,
+#     что поле объёма ни на что не подписано: владелец счёта уменьшал объём
+#     до разрешённого, а строка оставалась и продолжала утверждать, что заявка
+#     не пойдёт. Красное предупреждение про деньги, которое врёт, хуже
+#     отсутствующего: рядом с ним ещё три таких строки.
+#     """
+#     dialog.set_values(Settings(volume_cap_enabled=True, volume_cap=5, volume=50))
+#     assert "не будет" in dialog.cap_note.text().lower(), "не предупредил заранее"
+#
+#     dialog.volume.setValue(2)
+#
+#     note = dialog.cap_note.text().lower()
+#     assert "не будет" not in note, f"строка соврала после правки объёма: {note!r}"
+#     assert "потолок объёма: 5" in note, note
+#
+#
+# def test_the_cap_note_says_the_order_will_not_be_sent(dialog) -> None:
+#     """Строка под полем объёма — самое читаемое место, и она не должна врать."""
+#     dialog.set_values(Settings(volume_cap_enabled=True, volume_cap=3, volume=1))
+#     note = dialog.cap_note.text().lower()
+#     assert "не подаётся" in note, note
+#
+#     dialog.volume.setMaximum(100)
+#     dialog.volume.setValue(10)
+#     dialog._sync_volume_cap()
+#     above = dialog.cap_note.text().lower()
+#     assert "выше потолка" in above
+#     assert "не будет" in above, (
+#         f"сказано, что объём выше потолка, но не сказано, что будет: {above!r}"
+#     )
+#     assert "поменьше" in above, (
+#         "не сказано, что робот не подаст уменьшенную заявку, — а он не подаст"
+#     )
 
 
 def test_take_profit_range_allows_zero(dialog) -> None:
@@ -511,63 +567,201 @@ def test_a_bad_combination_from_outside_is_shown_as_it_is(dialog) -> None:
 
 
 def test_the_offset_check_only_applies_when_trailing_is_on(dialog) -> None:
-    """Выключенный скользящий тейк своими числами ничего не запрещает."""
+    """Невыбранный скользящий уровень своими числами ничего не запрещает.
+
+    ⚠️ Способ не «снимается», а сменяется другим: у группы переключателей
+    выбран ровно один, и `setChecked(False)` на выбранном Qt игнорирует.
+    Прежняя редакция теста снимала галочку — сегодня это ничего не значит.
+    """
     dialog.trailing_enabled.setChecked(True)
     dialog.trailing_offset.setValue(1.0)
     dialog.trailing_start.setValue(0.5)
     assert dialog.take_error()
-    dialog.trailing_enabled.setChecked(False)
+    dialog.take_fixed.setChecked(True)
     assert dialog.take_error() == ""
     assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
 
 
-def test_the_check_does_not_depend_on_the_take_switch(dialog) -> None:
-    """Снятая галочка «Фиксировать прибыль» проверку не отменяет.
+def test_with_the_take_off_no_method_leaves_the_window_and_nothing_is_blocked(
+    dialog,
+) -> None:
+    """Снятая галочка — и наружу уходит «прибыль не фиксируется», без запретов.
 
-    Движок отвергает настройки по одному только «скользящий тейк включён»
-    (`EngineSettings.__post_init__`), не глядя на выключатель фиксации.
-    Если бы окно проверяло «и то и другое включено», сочетание «фиксация
-    выключена, скользящий включён, порог ≤ отступа» прошло бы через окно
-    и упало бы уже за ним — то есть ровно то, чего окно должно не допускать.
+    ⚠️ Правило перевернулось 15.09.2026 (решение 0060), и прежнее было верным
+    для своего времени: окно отдавало выбор способа как есть, движок получал
+    «скользящий включён» при выключенной фиксации и отвергал настройки
+    по одной этой паре чисел — поэтому окно и проверяло её независимо
+    от галочки. Теперь окно такого сочетания не отдаёт вовсе.
+
+    Стережётся здесь **запрет без предмета**: погашенные кнопки из-за чисел,
+    которые никуда не уходят, — состояние, в котором человек не понимает,
+    что чинить. Вердикты окна и движка при этом обязаны совпадать, и это
+    проверяется тут же, а не предполагается.
     """
+    from engine.settings import EngineSettings
+
     dialog.trailing_enabled.setChecked(True)
     dialog.trailing_offset.setValue(0.5)
     dialog.trailing_start.setValue(0.2)
     dialog.take_profit_enabled.setChecked(False)
-    assert dialog.take_error(), "снятая галочка отменила проверку"
-    assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+
+    values = dialog.values()
+    assert values.trailing_enabled is False, (
+        "окно отдало способ, которого не применяет: движок отвергнет настройки "
+        "из-за чисел, которых никто не читает"
+    )
+    assert dialog.take_error() == "", "запрет без предмета: наружу такого не уходит"
+    assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+    EngineSettings(
+        take_profit=values.take_profit_enabled,
+        take_profit_percent=values.take_profit_pct,
+        trailing_take_profit=values.trailing_enabled,
+        trailing_start_percent=values.trailing_start_pct,
+        trailing_offset_percent=values.trailing_offset_pct,
+    )
 
 
 def test_a_bad_combination_can_always_be_fixed(dialog) -> None:
-    """Из состояния «кнопки погашены» всегда есть выход руками.
+    """Из состояния «кнопки погашены» есть выход руками, и не один.
 
-    Ловушка была бы такой: поля скользящего тейка гаснут вслед за выключателем
-    фиксации прибыли, негодное сочетание остаётся в них, кнопки погашены,
-    а починить нечем. Поэтому поля живут по своему выключателю, а не по чужому.
+    Ловушка была бы такой: числа, которыми чинится запрет, недоступны,
+    а запрет держится. Её нет не по осторожности: доступность полей и сам
+    запрет считаются от ОДНОГО условия — «скользящий уровень применяется
+    сейчас». Пока запрет жив, живы и три выхода из него.
     """
-    dialog.trailing_enabled.setChecked(True)
-    dialog.trailing_offset.setValue(0.5)
-    dialog.trailing_start.setValue(0.2)
-    dialog.take_profit_enabled.setChecked(False)
+    ok = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
 
-    assert dialog.trailing_enabled.isEnabled(), "выключатель скользящего тейка погашен"
+    def spoil() -> None:
+        dialog.set_values(Settings(
+            take_profit_enabled=True, trailing_enabled=True,
+            trailing_start_pct=0.2, trailing_offset_pct=0.5,
+        ))
+        assert dialog.take_error(), "негодное сочетание объявлено годным"
+        assert not ok.isEnabled()
+
+    # Выход первый: поправить числа — они доступны, пока запрет жив.
+    spoil()
     for field in (dialog.trailing_start, dialog.trailing_offset):
         assert field.isEnabled(), "поле, которым чинится ошибка, недоступно"
-
     dialog.trailing_start.setValue(1.0)
-    assert dialog.take_error() == ""
-    assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+    assert dialog.take_error() == "" and ok.isEnabled()
+
+    # Выход второй: выбрать другой способ.
+    spoil()
+    assert dialog.take_fixed.isEnabled(), "второй способ недоступен"
+    dialog.take_fixed.setChecked(True)
+    assert dialog.take_error() == "" and ok.isEnabled()
+
+    # Выход третий: не фиксировать прибыль вовсе.
+    spoil()
+    assert dialog.take_profit_enabled.isEnabled(), "выключатель фиксации погашен"
+    dialog.take_profit_enabled.setChecked(False)
+    assert dialog.take_error() == "" and ok.isEnabled()
 
 
 def test_trailing_switched_on_without_the_take_is_said_to_do_nothing(dialog) -> None:
-    """Включённый переключатель, который ничего не делает, — обман.
+    """Выбранный способ, который не применяется, — обман, если об этом молчать.
 
-    Движок включает скользящий тейк только вместе с обычным
+    Движок включает скользящий уровень только вместе с фиксацией
     (`EngineSettings.plan()`: `trailing = take_profit and trailing_take_profit`).
+
+    ⚠️ Сочетание приходит **снаружи** — из файла прежней сборки и из
+    сохранённого набора. Сама программа его больше не записывает
+    (`SettingsDialog.values`), но прочитать обязана как есть и сказать словами,
+    а не подменить молча.
     """
-    dialog.trailing_enabled.setChecked(True)
-    dialog.take_profit_enabled.setChecked(False)
+    dialog.set_values(Settings(take_profit_enabled=False, trailing_enabled=True))
+    assert dialog.trailing_enabled.isChecked(), "пришедший выбор не показан"
     assert "тоже не работает" in dialog.take_note.text()
+    assert dialog.values().trailing_enabled is False
+
+
+def test_the_way_to_take_profit_is_a_choice_of_one_not_two_switches(dialog) -> None:
+    """Способ фиксации прибыли — выбор ОДНОГО из двух, а не две галочки.
+
+    Слова заказчика 15.09.2026: «это 2 разных способа фиксировать прибыль —
+    надо выбирать что мы применяем один или другой», «не И а ИЛИ мы выбираем
+    способ» (решение 0060). У позиции один уровень выхода.
+
+    ⚠️ Стережётся **молчание**: прежде окно принимало оба включёнными
+    и вид выбирала за человека арифметика движка (`trailing = take_profit
+    and trailing_take_profit`) — молча, без строки в журнале и без слова
+    в окне. Состояния «выбраны оба» в окне больше нет вовсе, и мутация,
+    возвращающая две независимые галочки, обязана ронять эту проверку.
+    """
+    assert dialog.take_fixed.isChecked() != dialog.trailing_enabled.isChecked(), (
+        "выбран не ровно один способ"
+    )
+
+    dialog.trailing_enabled.setChecked(True)
+    assert not dialog.take_fixed.isChecked(), "выбраны оба способа сразу"
+    assert dialog.values().trailing_enabled is True
+
+    dialog.take_fixed.setChecked(True)
+    assert not dialog.trailing_enabled.isChecked(), "выбраны оба способа сразу"
+    assert dialog.values().trailing_enabled is False
+
+    # Попытка включить оба руками ничего не меняет: у группы выбран один.
+    dialog.trailing_enabled.setChecked(True)
+    dialog.take_fixed.setChecked(True)
+    assert dialog.take_fixed.isChecked() != dialog.trailing_enabled.isChecked()
+
+
+def test_the_note_names_the_single_level_that_is_watched(dialog) -> None:
+    """Пояснение под полями называет, КАКОЙ уровень сторожится сейчас.
+
+    ⚠️ Стережётся молчание, а не оформление. Два способа на экране без слова
+    о том, что работает один, читаются как «работают оба» — а с ними рядом
+    четыре числа, из которых движок читает одно или три. Молчание здесь
+    равно поломке (`CLAUDE.md` №13).
+    """
+    dialog.take_profit_enabled.setChecked(True)
+    dialog.take_fixed.setChecked(True)
+    dialog.take_profit.setValue(0.7)
+    fixed_note = dialog.take_note.text()
+    assert "ОДИН уровень" in fixed_note, "не сказано, что уровень один"
+    assert "неподвижная цель" in fixed_note, "не назван сторожимый уровень"
+    assert "0,7" in fixed_note, "в пояснении нет числа, по которому уровень стоит"
+    assert "Скользящий уровень при этом не применяется" in fixed_note, (
+        "про второй способ не сказано, что он не работает"
+    )
+
+    dialog.trailing_enabled.setChecked(True)
+    dialog.trailing_start.setValue(1.0)
+    dialog.trailing_offset.setValue(0.3)
+    moving_note = dialog.take_note.text()
+    assert moving_note != fixed_note, "пояснение не зависит от выбранного способа"
+    assert "ОДИН уровень" in moving_note, "не сказано, что уровень один"
+    assert "скользящий" in moving_note, "не назван сторожимый уровень"
+    assert "Неподвижная цель при этом не используется" in moving_note, (
+        "про второй способ не сказано, что он не работает"
+    )
+    assert "1%" in moving_note and "0,3" in moving_note, (
+        "в пояснении нет чисел, по которым живёт уровень"
+    )
+
+
+def test_the_number_of_the_unused_method_is_not_shown_alive(dialog) -> None:
+    """Число способа, который сейчас не работает, недоступно для ввода.
+
+    Живое поле, которого движок не читает, — то же молчание: человек крутит
+    число и не узнаёт, что оно ни на что не влияет. Так сегодня живут три
+    поля сигнала у второго алгоритма (`D-107`), и повторять это у фиксации
+    прибыли нельзя.
+    """
+    dialog.take_profit_enabled.setChecked(True)
+    dialog.take_fixed.setChecked(True)
+    assert dialog.take_profit.isEnabled(), "число выбранного способа недоступно"
+    for field in (dialog.trailing_start, dialog.trailing_offset, dialog.trailing_step):
+        assert not field.isEnabled(), "живо число способа, который не применяется"
+
+    dialog.trailing_enabled.setChecked(True)
+    assert not dialog.take_profit.isEnabled(), (
+        "цель прибыли осталась живой при выбранном скользящем уровне — "
+        "движок её не читает"
+    )
+    for field in (dialog.trailing_start, dialog.trailing_offset, dialog.trailing_step):
+        assert field.isEnabled(), "число выбранного способа недоступно"
 
 
 #: Тариф из `DOMAIN.md` §5: биржевой сбор из карточки инструмента плюс 1 ₽
@@ -651,10 +845,11 @@ def test_an_unknown_timeframe_is_not_silently_replaced(dialog) -> None:
     )
 
 
-def test_a_zero_daily_limit_is_not_silently_raised(dialog) -> None:
-    """Ноль в дневном лимите не подрезается до 0,1 молча."""
-    dialog.set_values(Settings(daily_loss_limit_pct=0.0))
-    assert dialog.values().daily_loss_limit_pct == pytest.approx(0.0)
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def test_a_zero_daily_limit_is_not_silently_raised(dialog) -> None:
+#     """Ноль в дневном лимите не подрезается до 0,1 молча."""
+#     dialog.set_values(Settings(daily_loss_limit_pct=0.0))
+#     assert dialog.values().daily_loss_limit_pct == pytest.approx(0.0)
 
 
 def test_the_tightening_step_takes_part_in_the_recount(dialog) -> None:
@@ -676,7 +871,6 @@ def test_apply_reaches_the_subscriber(dialog) -> None:
     dialog.settings_changed.connect(received.append)
     dialog.average_period.setValue(20)
     dialog.take_profit.setValue(0.8)
-    dialog.volume_cap.setValue(4)
     dialog.volume.setValue(2)
     dialog.buttons.button(QDialogButtonBox.StandardButton.Apply).click()
 
@@ -699,7 +893,6 @@ def test_change_travels_from_window_to_engine(qapp, monkeypatch, make_window) ->
 
         def exec(self) -> int:
             self.average_period.setValue(9)
-            self.volume_cap.setValue(10)
             self.volume.setValue(4)
             self.buttons.button(QDialogButtonBox.StandardButton.Apply).click()
             return 1
@@ -1114,15 +1307,18 @@ def test_tab_order_follows_the_screen(dialog, qapp) -> None:
         dialog.filter_enabled, dialog.threshold_percent, dialog.confirm_bars,
         # «Вход и выход»
         dialog.reversal_moment, dialog.after_take_profit,
-        dialog.take_profit_enabled, dialog.take_profit,
-        dialog.trailing_enabled,
+        dialog.take_profit_enabled,
+        dialog.take_fixed, dialog.trailing_enabled,
+        dialog.take_profit,
         dialog.trailing_start, dialog.trailing_offset, dialog.trailing_step,
         # «Торговое окно»
         dialog.window_start, dialog.window_end, dialog.close_on_time_end,
         # «Деньги»
-        dialog.volume, dialog.volume_cap_enabled, dialog.volume_cap,
-        dialog.daily_loss_limit_enabled, dialog.daily_loss_limit,
-        dialog.free_funds_reserve_enabled, dialog.free_funds_reserve,
+        # ⚠️ Потолка объёма нет: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113).
+        dialog.volume,
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # dialog.daily_loss_limit_enabled, dialog.daily_loss_limit,
+        # dialog.free_funds_reserve_enabled, dialog.free_funds_reserve,
         dialog.commission, dialog.slippage_steps,
         # «Программа»
         dialog.log_directory,
@@ -1186,47 +1382,48 @@ def test_all_four_forks_are_settings_not_constants() -> None:
     assert defaults.on_price_equals_average is OnPriceEqualsAverage.LIKE_PROTOTYPE
 
 
-def test_volume_above_the_cap_is_shown_as_is_on_a_fresh_dialog(make_dialog) -> None:
-    """То же, но диалог создаётся с потолком, отличным от умолчания.
-
-    Прежняя версия теста брала готовую фикстуру, у которой потолок уже равнялся
-    тому, что ставил тест. `setValue` при совпадающем значении сигнала не шлёт,
-    пересчёт максимума не срабатывал, и подмена не проявлялась: тест проходил
-    и на сломанном коде. Совпадение чисел в фикстуре маскировало дефект.
-
-    Свежесть окна здесь и есть предмет проверки, поэтому берётся строитель,
-    а не готовое окно: каждое из трёх сочетаний попадает в конструктор,
-    а не в `setValue` поверх уже стоящего значения.
-    """
-    for volume, cap in ((10, 7), (10, 5), (50, 2)):
-        window = make_dialog(
-            Settings(volume=volume, volume_cap=cap, volume_cap_enabled=True)
-        )
-        assert window.values().volume == volume, (
-            f"окно подменило объём {volume} на {window.values().volume} "
-            f"при потолке {cap}"
-        )
-        assert str(cap) in window.cap_note.text()
-        assert "выше потолка" in window.cap_note.text()
-
-
-def test_volume_above_the_cap_is_shown_as_is(dialog) -> None:
-    """Окно показывает настоящий объём, а не подрезанный под потолок.
-
-    Прежде `set_values` ставил min(объём, потолок), и на «ОК» окно отправляло
-    уменьшенное значение как новую настройку — решение по деньгам, принятое
-    окном за владельца счёта и не попадающее в журнал решений.
-    """
-    source = Settings(volume=10, volume_cap=5)
-    dialog.set_values(source)
-    assert dialog.values().volume == 10, "окно молча подменило объём"
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторожа потолка объёма.
+# def test_volume_above_the_cap_is_shown_as_is_on_a_fresh_dialog(make_dialog) -> None:
+#     """То же, но диалог создаётся с потолком, отличным от умолчания.
+#
+#     Прежняя версия теста брала готовую фикстуру, у которой потолок уже равнялся
+#     тому, что ставил тест. `setValue` при совпадающем значении сигнала не шлёт,
+#     пересчёт максимума не срабатывал, и подмена не проявлялась: тест проходил
+#     и на сломанном коде. Совпадение чисел в фикстуре маскировало дефект.
+#
+#     Свежесть окна здесь и есть предмет проверки, поэтому берётся строитель,
+#     а не готовое окно: каждое из трёх сочетаний попадает в конструктор,
+#     а не в `setValue` поверх уже стоящего значения.
+#     """
+#     for volume, cap in ((10, 7), (10, 5), (50, 2)):
+#         window = make_dialog(
+#             Settings(volume=volume, volume_cap=cap, volume_cap_enabled=True)
+#         )
+#         assert window.values().volume == volume, (
+#             f"окно подменило объём {volume} на {window.values().volume} "
+#             f"при потолке {cap}"
+#         )
+#         assert str(cap) in window.cap_note.text()
+#         assert "выше потолка" in window.cap_note.text()
+#
+#
+# def test_volume_above_the_cap_is_shown_as_is(dialog) -> None:
+#     """Окно показывает настоящий объём, а не подрезанный под потолок.
+#
+#     Прежде `set_values` ставил min(объём, потолок), и на «ОК» окно отправляло
+#     уменьшенное значение как новую настройку — решение по деньгам, принятое
+#     окном за владельца счёта и не попадающее в журнал решений.
+#     """
+#     source = Settings(volume=10, volume_cap=5)
+#     dialog.set_values(source)
+#     assert dialog.values().volume == 10, "окно молча подменило объём"
 
 
 def test_the_alerts_follow_the_theme(dialog, qapp) -> None:
     """Строки тревоги перекрашиваются вместе с системной темой.
 
-    `cap_note` и `guards_note` берут цвет в момент создания, а `changeEvent`
-    у диалога не было: после переключения на тёмную они оставались красным
+    `guards_note` берёт цвет в момент создания, а `changeEvent`
+    у диалога не было: после переключения на тёмную он оставался красным
     светлой темы — 3,16:1 на тёмном фоне. Сведения при этом не терялись,
     но это строки про отсутствующие предохранители, и приглушать их нечем.
     """
@@ -1234,15 +1431,12 @@ def test_the_alerts_follow_the_theme(dialog, qapp) -> None:
 
     from ui.theme import DARK, LIGHT
 
-    # Тревожными эти строки становятся по состоянию: объём выше включённого
-    # потолка и включённый предохранитель, который нечем проверить.
-    dialog.set_values(Settings(
-        volume=10, volume_cap=3, volume_cap_enabled=True,
-        daily_loss_limit_enabled=True,
-    ))
+    # Тревожной строка становится по состоянию: включённый предохранитель,
+    # который нечем проверить.
+    dialog.set_values(Settings(volume=10))
     dialog.show()
     qapp.processEvents()
-    assert LIGHT.danger in dialog.cap_note.styleSheet()
+    assert LIGHT.danger in dialog.guards_note.styleSheet()
 
     original = QPalette(qapp.palette())
     try:
@@ -1251,7 +1445,6 @@ def test_the_alerts_follow_the_theme(dialog, qapp) -> None:
         qapp.setPalette(dark)
         qapp.processEvents()
         for label, name in (
-            (dialog.cap_note, "объём выше потолка"),
             (dialog.guards_note, "предохранитель нечем проверить"),
         ):
             assert DARK.danger in label.styleSheet(), (
@@ -1262,7 +1455,7 @@ def test_the_alerts_follow_the_theme(dialog, qapp) -> None:
         qapp.setPalette(original)
         qapp.processEvents()
 
-    assert LIGHT.danger in dialog.cap_note.styleSheet(), "тема не вернулась"
+    assert LIGHT.danger in dialog.guards_note.styleSheet(), "тема не вернулась"
 
 
 #: Порог контраста, ниже которого текст в окне настроек считается нечитаемым.
@@ -1856,6 +2049,26 @@ def test_every_field_of_the_settings_is_shown_somewhere_in_the_dialog(dialog) ->
     assert not lost, f"поля не пережили обмен через окно: {lost}"
 
 
+#: Поле, которому отличающегося от умолчания значения в образце не досталось,
+#: и тест, который проверяет его обмен отдельно.
+#:
+#: ⚠️ Список поимённый и **проверяемый**: названный тест обязан существовать
+#: в этом файле, а поле — действительно не иметь второго значения в образце.
+#: Тихо вычеркнуть поле из канарейки нельзя — так однажды отключилась проверка
+#: сохранения имени алгоритма (`tests/test_app_settings_store.py`, правка
+#: 14.09.2026), и мутация «подменять выбранное при каждом старте» не роняла
+#: ничего.
+#:
+#: Почему поле здесь вообще оказалось: `take_profit_enabled` и `trailing_enabled`
+#: выражают ОДИН выбор из трёх — не фиксируем, неподвижная цель, скользящий
+#: уровень (решение 0060). Умолчание — «неподвижная цель», то есть
+#: `(True, False)`; отличаться от него обоими полями значило бы взять
+#: `(False, True)`, а такого сочетания у настроек не бывает.
+_COVERED_APART = {
+    "take_profit_enabled": "test_the_take_switch_survives_the_exchange_on_its_own",
+}
+
+
 def test_the_sample_differs_from_the_defaults_in_every_field() -> None:
     """Канарейка проверки обмена: `SAMPLE` обязан отличаться каждым полем.
 
@@ -1871,9 +2084,29 @@ def test_the_sample_differs_from_the_defaults_in_every_field() -> None:
         for field in dataclasses.fields(Settings)
         if getattr(SAMPLE, field.name) == getattr(Settings(), field.name)
     ]
-    assert not same, (
-        f"поля совпали с умолчанием, и проверка обмена их не видит: {same}"
+    assert sorted(same) == sorted(_COVERED_APART), (
+        "поля совпали с умолчанием, и проверка обмена их не видит: "
+        f"{sorted(set(same) - set(_COVERED_APART))}; а названные исключением "
+        f"перестали совпадать: {sorted(set(_COVERED_APART) - set(same))}"
     )
+    missing = [name for name in _COVERED_APART.values() if name not in globals()]
+    assert not missing, (
+        "исключение ссылается на проверку, которой в этом файле нет: " + ", ".join(missing)
+    )
+
+
+def test_the_take_switch_survives_the_exchange_on_its_own(dialog) -> None:
+    """Выключенная фиксация прибыли переживает обмен через окно.
+
+    Отдельным тестом, потому что в общем образце этому полю не досталось
+    второго значения (`_COVERED_APART`). Проверяется то же самое: поле,
+    которое окно не читает, вернулось бы к умолчанию «фиксируем» —
+    и робот начал бы ставить уровень, которого человек не просил.
+    """
+    dialog.set_values(Settings(take_profit_enabled=False))
+    assert dialog.values().take_profit_enabled is False
+    dialog.set_values(Settings(take_profit_enabled=True))
+    assert dialog.values().take_profit_enabled is True
 
 
 #: Набор, отличающийся от умолчания **каждым** полем: иначе проверка обмена
@@ -1897,7 +2130,12 @@ SAMPLE = Settings(
     reversal_moment=ReversalMoment.SAME_BAR,
     after_take_profit=AfterTakeProfit.WAIT_FOR_SIGNAL,
     on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_LONG,
-    take_profit_enabled=False,
+    # ⚠️ Фиксация прибыли включена, хотя умолчание тоже «включена», и это
+    # вынужденно: пара «фиксация / способ» выражает ОДИН выбор из трёх,
+    # и сочетания «не фиксируем + скользящий уровень» у настроек не бывает
+    # (решение 0060). Отличаться от умолчания обоими полями сразу образец
+    # не может; второе поле проверяется отдельно — см. `_COVERED_APART`.
+    take_profit_enabled=True,
     take_profit_pct=1.25,
     trailing_enabled=True,
     trailing_start_pct=1.5,
@@ -1907,13 +2145,15 @@ SAMPLE = Settings(
     window_end=time(11, 30),
     close_on_time_end=False,
     volume=4,
-    volume_cap=9,
-    daily_loss_limit_pct=3.5,
-    free_funds_reserve_pct=12.5,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # volume_cap=9,
+    # daily_loss_limit_pct=3.5,
+    # free_funds_reserve_pct=12.5,
     commission_per_side_rub=None,
-    volume_cap_enabled=True,
-    daily_loss_limit_enabled=True,
-    free_funds_reserve_enabled=True,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # volume_cap_enabled=True,
+    # daily_loss_limit_enabled=True,
+    # free_funds_reserve_enabled=True,
     price_step=25.0,
     ruble_per_point=1.73774,
     ruble_per_point_source="биржа, RIU6, 04.09.2026 07:00",

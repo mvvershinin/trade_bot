@@ -1,4 +1,4 @@
-"""Сменные торговые модули; первый — реверс по скользящей средней.
+"""Сменные торговые модули; оба — реверс по скользящей средней.
 
 Модуль получает **закрытые** свечи и отдаёт **намерение**: лонг, шорт или ничего.
 Больше он не делает ничего и больше ничего не знает: ни объёма, ни денег,
@@ -62,7 +62,10 @@ from strategies.ema_reverse import (
     EmaReverseSettings,
     OnPriceEqualsAverage,
 )
-from strategies.ma_crossing import MaCrossing
+from strategies.ma_reverse_always import (
+    MaReverseAlways,
+    MaReverseAlwaysSettings,
+)
 from strategies.registry import (
     DEFAULT_ID,
     SettingsField,
@@ -101,9 +104,12 @@ __all__ = [
     "EmaReverseSettings",
     "OnPriceEqualsAverage",
     "DEFAULT_PERIOD",
-    # Алгоритм №2: сигнал в момент пересечения свечи со средней. Настройки
-    # у него общие с №1, а правило другое — разбор в `ma_crossing.py`.
-    "MaCrossing",
+    # Алгоритм №2: то же правило, своё название и узкие настройки — период
+    # и тип средней. Наследник первого, а не вторая реализация правила:
+    # сверкой с прототипом покрыт один расчёт, и копия рядом разошлась бы
+    # с ним молча (`strategies/ma_reverse_always.py`).
+    "MaReverseAlways",
+    "MaReverseAlwaysSettings",
     # Реестр берётся модулем целиком (`registry.find(...)`, `registry.entries()`),
     # а не россыпью коротких имён: `find` и `entries` в общем пространстве имён
     # пакета не говорят, чего именно они ищут.

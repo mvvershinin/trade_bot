@@ -687,44 +687,46 @@ def _guarded(candles, guards: dict, funds: AccountFunds | None = None):
     return executor.deals
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize(
-    "guards, funds, what",
-    [
-        ({"volume_cap": 0.5}, None, "потолок объёма ниже объёма сделки"),
-        (
-            {"daily_loss_limit_percent": 0.01},
-            _TIGHT_FUNDS,
-            "дневной лимит убытка 0,01% от счёта",
-        ),
-        (
-            {"free_funds_reserve_percent": 99.0},
-            _TIGHT_FUNDS,
-            "запас свободных средств 99%",
-        ),
-    ],
-    ids=["потолок", "лимит убытка", "запас средств"],
-)
-def test_the_parity_goes_red_if_a_money_guard_default_is_ever_moved(
-    candles, guards: dict, funds: AccountFunds | None, what: str
-) -> None:
-    """Сдвинутое умолчание предохранителя ломает сверку — значит она его стережёт.
-
-    Без этой проверки «предохранители выключены умолчанием» держалось бы
-    на честном слове: сверка сошлась бы и в том случае, если бы проверки
-    вовсе не работали. Здесь каждая включается заведомо срабатывающим
-    значением, и 127 сделок обязаны развалиться.
-
-    ⚠️ Сравниваются **сделки построчно**, а не их число: одинаковое
-    количество при разных сделках — это совпадение двух ошибок.
-    """
-    plain, _ = play(candles, WINDOW_OF_THE_127, False, 0.5)
-    assert len(plain) == 127
-    guarded = _guarded(candles, guards, funds)
-    assert five(guarded) != five(plain), (
-        f"{what} не изменил ни одной сделки из 127 — предохранитель "
-        "не работает либо сверка его не видит"
-    )
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторож умолчаний трёх
+# предохранителей — сверять больше нечего, включать нечего.
+# @pytest.mark.slow
+# @pytest.mark.parametrize(
+#     "guards, funds, what",
+#     [
+#         ({"volume_cap": 0.5}, None, "потолок объёма ниже объёма сделки"),
+#         (
+#             {"daily_loss_limit_percent": 0.01},
+#             _TIGHT_FUNDS,
+#             "дневной лимит убытка 0,01% от счёта",
+#         ),
+#         (
+#             {"free_funds_reserve_percent": 99.0},
+#             _TIGHT_FUNDS,
+#             "запас свободных средств 99%",
+#         ),
+#     ],
+#     ids=["потолок", "лимит убытка", "запас средств"],
+# )
+# def test_the_parity_goes_red_if_a_money_guard_default_is_ever_moved(
+#     candles, guards: dict, funds: AccountFunds | None, what: str
+# ) -> None:
+#     """Сдвинутое умолчание предохранителя ломает сверку — значит она его стережёт.
+#
+#     Без этой проверки «предохранители выключены умолчанием» держалось бы
+#     на честном слове: сверка сошлась бы и в том случае, если бы проверки
+#     вовсе не работали. Здесь каждая включается заведомо срабатывающим
+#     значением, и 127 сделок обязаны развалиться.
+#
+#     ⚠️ Сравниваются **сделки построчно**, а не их число: одинаковое
+#     количество при разных сделках — это совпадение двух ошибок.
+#     """
+#     plain, _ = play(candles, WINDOW_OF_THE_127, False, 0.5)
+#     assert len(plain) == 127
+#     guarded = _guarded(candles, guards, funds)
+#     assert five(guarded) != five(plain), (
+#         f"{what} не изменил ни одной сделки из 127 — предохранитель "
+#         "не работает либо сверка его не видит"
+#     )
 
 
 @pytest.mark.slow

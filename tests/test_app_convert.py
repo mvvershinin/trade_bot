@@ -26,7 +26,7 @@ from engine import DayMarks, TradingWindow
 from engine import window as engine_window
 from market import Candle, MSK, Timeframe
 from strategies import AverageKind as StrategyAverageKind
-from strategies import registry
+from strategies import Intent, registry
 from ui.models import (
     AfterTakeProfit,
     AverageKind,
@@ -267,13 +267,14 @@ def test_every_engine_field_has_a_source() -> None:
         # говорил с брокером; окно обязано их сохранить, а не стереть.
         "exchange_days",
     }
-    # Три предохранителя по деньгам. Проведены 05.09.2026 (`D-030`), но
-    # **через галочку**: числа доезжают до движка только при своём
-    # выключателе. Здесь они в «из окна» именно поэтому — источник у них
-    # окно, а не прежние настройки.
-    from_the_window |= {
-        "volume_cap", "daily_loss_limit_percent", "free_funds_reserve_percent",
-    }
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): предохранителей в настройках движка больше нет.
+    # # Три предохранителя по деньгам. Проведены 05.09.2026 (`D-030`), но
+    # # **через галочку**: числа доезжают до движка только при своём
+    # # выключателе. Здесь они в «из окна» именно поэтому — источник у них
+    # # окно, а не прежние настройки.
+    # from_the_window |= {
+    #     "volume_cap", "daily_loss_limit_percent", "free_funds_reserve_percent",
+    # }
     # ⚠️ Порог выхода по обратному сигналу поля в окне не имеет и иметь пока
     # не должен — прямые слова владельца счёта 10.09.2026. Берётся у прежних
     # настроек: умолчание молча выключило бы правило, включённое из кода.
@@ -286,89 +287,91 @@ def test_every_engine_field_has_a_source() -> None:
     )
 
 
-def test_the_guards_are_wired_but_switched_off_by_default() -> None:
-    """Проводка предохранителей ничего не включила сама по себе.
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторожа проводки трёх предохранителей из окна в движок.
+# def test_the_guards_are_wired_but_switched_off_by_default() -> None:
+#     """Проводка предохранителей ничего не включила сама по себе.
+#
+#     **Главное условие задачи `D-030`.** В окне стоят потолок 5 контрактов
+#     и дневной лимит 2 %; провести их «как есть» значило бы включить
+#     остановку торговли, которой владелец счёта не просил, и сломать сверку
+#     с прототипом — у неё предохранителей нет ни одного.
+#
+#     Проверяется сравнением с умолчанием движка целиком по трём полям,
+#     а не «примерно тем же»: цена ошибки здесь — другой список сделок.
+#     """
+#     default = EngineSettings()
+#     produced = convert.engine_settings(
+#         Settings(volume_cap=5, daily_loss_limit_pct=2.0, free_funds_reserve_pct=30.0),
+#         Mode.REVERSE,
+#     )
+#     assert produced.volume_cap is default.volume_cap is None
+#     assert produced.daily_loss_limit_percent == default.daily_loss_limit_percent == 0.0
+#     assert produced.free_funds_reserve_percent == default.free_funds_reserve_percent == 0.0
+#
+#
+# def test_a_switched_on_guard_reaches_the_engine() -> None:
+#     """Поставленная галочка доводит число до движка — иначе поле бутафория."""
+#     produced = convert.engine_settings(
+#         Settings(
+#             volume_cap_enabled=True, volume_cap=7,
+#             daily_loss_limit_enabled=True, daily_loss_limit_pct=3.5,
+#             free_funds_reserve_enabled=True, free_funds_reserve_pct=25.0,
+#         ),
+#         Mode.REVERSE,
+#     )
+#     assert produced.volume_cap == pytest.approx(7.0)
+#     assert produced.daily_loss_limit_percent == pytest.approx(3.5)
+#     assert produced.free_funds_reserve_percent == pytest.approx(25.0)
+#
+#
+# @pytest.mark.parametrize("switch", [
+#     "volume_cap_enabled", "daily_loss_limit_enabled", "free_funds_reserve_enabled",
+# ])
+# def test_each_guard_has_its_own_switch(switch: str) -> None:
+#     """Галочки не одна на троих: включение одного не включает остальных.
+#
+#     Иначе владелец счёта, поставивший потолок объёма, молча получил бы
+#     остановку торговли по дневному лимиту.
+#     """
+#     produced = convert.engine_settings(
+#         Settings().replace(**{switch: True}), Mode.REVERSE
+#     )
+#     default = EngineSettings()
+#     off = [
+#         name for name, value in (
+#             ("volume_cap", produced.volume_cap),
+#             ("daily_loss_limit_percent", produced.daily_loss_limit_percent),
+#             ("free_funds_reserve_percent", produced.free_funds_reserve_percent),
+#         )
+#         if value != getattr(default, name)
+#     ]
+#     assert len(off) == 1, (
+#         f"галочка «{switch}» включила не только своё: {off}"
+#     )
+#
+#
+# def test_the_off_value_of_every_guard_is_the_default_of_the_engine() -> None:
+#     """Таблица `_GUARDS` согласована с умолчаниями движка — по полю, а не на глаз.
+#
+#     Канарейка: тесты выше сравнивают **результат** перевода, этот — саму
+#     таблицу. Разъехавшись, они бы дали «выключено», которое что-то включает.
+#     """
+#     from app.convert import _GUARDS
+#
+#     default = EngineSettings()
+#     for engine_field, guard in _GUARDS.items():
+#         assert getattr(default, engine_field) == guard.off, (
+#             f"«выключено» для {engine_field} разошлось с умолчанием движка"
+#         )
 
-    **Главное условие задачи `D-030`.** В окне стоят потолок 5 контрактов
-    и дневной лимит 2 %; провести их «как есть» значило бы включить
-    остановку торговли, которой владелец счёта не просил, и сломать сверку
-    с прототипом — у неё предохранителей нет ни одного.
 
-    Проверяется сравнением с умолчанием движка целиком по трём полям,
-    а не «примерно тем же»: цена ошибки здесь — другой список сделок.
-    """
-    default = EngineSettings()
-    produced = convert.engine_settings(
-        Settings(volume_cap=5, daily_loss_limit_pct=2.0, free_funds_reserve_pct=30.0),
-        Mode.REVERSE,
-    )
-    assert produced.volume_cap is default.volume_cap is None
-    assert produced.daily_loss_limit_percent == default.daily_loss_limit_percent == 0.0
-    assert produced.free_funds_reserve_percent == default.free_funds_reserve_percent == 0.0
-
-
-def test_a_switched_on_guard_reaches_the_engine() -> None:
-    """Поставленная галочка доводит число до движка — иначе поле бутафория."""
-    produced = convert.engine_settings(
-        Settings(
-            volume_cap_enabled=True, volume_cap=7,
-            daily_loss_limit_enabled=True, daily_loss_limit_pct=3.5,
-            free_funds_reserve_enabled=True, free_funds_reserve_pct=25.0,
-        ),
-        Mode.REVERSE,
-    )
-    assert produced.volume_cap == pytest.approx(7.0)
-    assert produced.daily_loss_limit_percent == pytest.approx(3.5)
-    assert produced.free_funds_reserve_percent == pytest.approx(25.0)
-
-
-@pytest.mark.parametrize("switch", [
-    "volume_cap_enabled", "daily_loss_limit_enabled", "free_funds_reserve_enabled",
-])
-def test_each_guard_has_its_own_switch(switch: str) -> None:
-    """Галочки не одна на троих: включение одного не включает остальных.
-
-    Иначе владелец счёта, поставивший потолок объёма, молча получил бы
-    остановку торговли по дневному лимиту.
-    """
-    produced = convert.engine_settings(
-        Settings().replace(**{switch: True}), Mode.REVERSE
-    )
-    default = EngineSettings()
-    off = [
-        name for name, value in (
-            ("volume_cap", produced.volume_cap),
-            ("daily_loss_limit_percent", produced.daily_loss_limit_percent),
-            ("free_funds_reserve_percent", produced.free_funds_reserve_percent),
-        )
-        if value != getattr(default, name)
-    ]
-    assert len(off) == 1, (
-        f"галочка «{switch}» включила не только своё: {off}"
-    )
-
-
-def test_the_off_value_of_every_guard_is_the_default_of_the_engine() -> None:
-    """Таблица `_GUARDS` согласована с умолчаниями движка — по полю, а не на глаз.
-
-    Канарейка: тесты выше сравнивают **результат** перевода, этот — саму
-    таблицу. Разъехавшись, они бы дали «выключено», которое что-то включает.
-    """
-    from app.convert import _GUARDS
-
-    default = EngineSettings()
-    for engine_field, guard in _GUARDS.items():
-        assert getattr(default, engine_field) == guard.off, (
-            f"«выключено» для {engine_field} разошлось с умолчанием движка"
-        )
-
-
-def test_switching_a_guard_is_a_journal_line() -> None:
-    """Включение предохранителя называется словом, а не `True`/`False`."""
-    lines = convert.guard_changes(
-        Settings(), Settings(volume_cap_enabled=True)
-    )
-    assert lines == ["Потолок объёма: выключен → включён"], lines
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def test_switching_a_guard_is_a_journal_line() -> None:
+#     """Включение предохранителя называется словом, а не `True`/`False`."""
+#     lines = convert.guard_changes(
+#         Settings(), Settings(volume_cap_enabled=True)
+#     )
+#     assert lines == ["Потолок объёма: выключен → включён"], lines
 
 
 def test_fields_absent_from_the_window_are_taken_from_the_previous_settings() -> None:
@@ -1071,39 +1074,60 @@ def test_the_catalogue_does_not_fall_over_a_refusal() -> None:
 def test_choosing_another_algorithm_changes_what_decides() -> None:
     """Выбрали второй алгоритм — решает второй, а не первый под его именем.
 
-    ⚠️ Проверяется **поведением**, а не именем класса. Имя совпало бы и
-    у сборки, которая показывает второй алгоритм и считает первым: их
-    настройки — один класс, названия берутся из реестра, и всё выглядело бы
-    исправно. Различает их одна свеча: она стоит целиком выше средней,
-    линии не касаясь. Алгоритм №1 отвечает на неё «хочу быть в лонге»
-    (он смотрит на закрытие), алгоритм №2 молчит (он ищет пересечение).
+    ⚠️ Проверяется **поведением**, а не именем класса и не классом настроек.
+    Сборка, показывающая второй алгоритм и считающая первым, и там и там
+    выглядела бы исправно: названия и подписи берутся из реестра, а не из
+    того, чем считали.
+
+    ⚠️ **Правило у двух алгоритмов сборки одно и то же**, и различить их
+    намерением можно ровно в одном месте — фильтр против пилы. У алгоритма
+    №1 полоса вокруг средней берётся из окна, у алгоритма №2 её нет вовсе:
+    ноль прибит в `MaReverseAlwaysSettings.widened()`, потому что документ
+    заказчика такой настройки не знает. Окно с включённым фильтром и полосой
+    1 % даёт им на одной и той же свече **разные** решения: закрытие 100,5
+    при средней 100,06 лежит внутри полосы, и первый молчит, а второй хочет
+    лонг. Это единственное расхождение в сделках, какое между ними бывает.
+
+    ⚠️ До 14.09.2026 контраст стоял на удалённом `ma_crossing` и после его
+    удаления исчез: в теле остался один `assert` про алгоритм №1, а название
+    и докстринг продолжали обещать сравнение двух. Названная здесь мутация
+    такой тест уронить не могла.
 
     Мутация, обязанная ронять проверку: собрать модуль
     по `registry.default_entry()` вместо выбранного.
     """
+    # Полоса включена и широка: ровно она и разводит два алгоритма.
+    values = Settings().replace(filter_enabled=True, threshold_percent=1.0)
     flat = [Candle(
         time=datetime(2026, 6, 19, 10, 0, tzinfo=MSK) + timedelta(minutes=5 * step),
         open=100.0, high=100.0, low=100.0, close=100.0, volume=1.0,
         timeframe=Timeframe(5),
     ) for step in range(15)]
+    # Закрытие выше средней, но внутри однопроцентной полосы вокруг неё.
     above = Candle(
         time=datetime(2026, 6, 19, 11, 15, tzinfo=MSK),
-        open=101.0, high=101.5, low=100.6, close=101.0, volume=1.0,
+        open=100.5, high=100.5, low=100.5, close=100.5, volume=1.0,
         timeframe=Timeframe(5),
     )
 
     def decide(strategy_id: str):
-        values = Settings().replace(strategy_id=strategy_id)
-        module = convert.chosen_algorithm(values).build(
-            convert.strategy_settings(values)
+        chosen = values.replace(strategy_id=strategy_id)
+        module = convert.chosen_algorithm(chosen).build(
+            convert.strategy_settings(chosen)
         )
         for candle in [*flat, above]:
             decision = module.on_closed_bar(_as_bar(candle))
         return decision
 
-    assert decide("ema_reverse").intent.name == "LONG"
-    assert decide("ma_crossing").intent.name == "NONE", (
-        "выбран второй алгоритм, а решение принял первый"
+    first = decide("ema_reverse")
+    second = decide("ma_reverse_always")
+    assert first.intent is Intent.NONE, (
+        "алгоритм №1 с включённым фильтром обязан промолчать на пересечении "
+        f"слабее полосы, а он ответил «{first.reason}»"
+    )
+    assert second.intent is Intent.LONG, (
+        "решение принял первый алгоритм, хотя выбран второй: полосы вокруг "
+        f"средней у второго нет вовсе, а он ответил «{second.reason}»"
     )
 
 

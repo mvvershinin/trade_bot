@@ -75,7 +75,9 @@ from ui.formatting import (
     fmt_number,
     fmt_percent,
     fmt_price,
-    fmt_volume,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `fmt_volume` держал потолок
+    # объёма и других потребителей в этом файле не имеет.
+    # fmt_volume,
     to_msk,
 )
 from ui.models import (
@@ -117,6 +119,10 @@ __all__ = [
     "rule_changes",
     "algorithms",
     "chosen_algorithm",
+    # Требования алгоритма к общим настройкам программы: отказ на границе
+    # применения. Зовётся портом, а не из `engine_settings` — разбор в самой
+    # функции.
+    "check_demands",
     "strategy_title",
     "run_costs",
     "window_changes",
@@ -394,13 +400,15 @@ class _Guard:
 #: **предложением**, а не значением. Цифры называет владелец счёта
 #: (`CLAUDE.md`), и до того, как он их назвал, ни одна проверка не работает.
 _GUARDS: dict[str, _Guard] = {
-    "volume_cap": _Guard("volume_cap_enabled", "volume_cap", None),
-    "daily_loss_limit_percent": _Guard(
-        "daily_loss_limit_enabled", "daily_loss_limit_pct", 0.0
-    ),
-    "free_funds_reserve_percent": _Guard(
-        "free_funds_reserve_enabled", "free_funds_reserve_pct", 0.0
-    ),
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "volume_cap": _Guard("volume_cap_enabled", "volume_cap", None),
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "daily_loss_limit_percent": _Guard(
+    #     "daily_loss_limit_enabled", "daily_loss_limit_pct", 0.0
+    # ),
+    # "free_funds_reserve_percent": _Guard(
+    #     "free_funds_reserve_enabled", "free_funds_reserve_pct", 0.0
+    # ),
 }
 
 
@@ -587,6 +595,32 @@ def _window_gap(entry: registry.StrategyEntry) -> tuple[str, ...]:
     return tuple(sorted({one.outer for one in entry.fields} - known))
 
 
+def _demand_gap(entry: registry.StrategyEntry) -> tuple[str, ...]:
+    """Требования алгоритма, которые не на что положить. Пусто — сходится.
+
+    ⚠️ **Без этой сверки опечатка молча выключает требование целиком.**
+    Требование объявлено строками — иначе слой стратегий импортировал бы
+    движок (`strategies/registry.py::SettingsDemand`), — и строка, не попавшая
+    ни в одно поле окна, ни в один элемент перечисления, просто никогда
+    не совпадёт. Отказ не сработает ни разу, всё будет зелёным, а робот
+    станет торговать при настройке, при которой его название — ложь.
+
+    Сверяются обе стороны: поле есть у общих настроек программы, поле —
+    перечисление, и названный элемент у этого перечисления есть.
+    """
+    known = typing.get_type_hints(Settings)
+    broken: list[str] = []
+    for demand in entry.demands:
+        wanted = known.get(demand.outer)
+        if wanted is None:
+            broken.append(f"{demand.outer} (нет такой настройки)")
+        elif not (isinstance(wanted, type) and issubclass(wanted, enum.Enum)):
+            broken.append(f"{demand.outer} (настройка не выбор из списка)")
+        elif demand.value not in wanted.__members__:
+            broken.append(f"{demand.outer}.{demand.value} (нет такого значения)")
+    return tuple(broken)
+
+
 #: Чем настройки алгоритма могут оказаться несобираемыми — таблицей, а не
 #: тремя `if` подряд. Каждая строка: проверка и фраза с двумя подстановками.
 #:
@@ -613,6 +647,13 @@ _ALGORITHM_CHECKS: Final[
         "торговому алгоритму «{title}» нужны поля настроек, которых окно "
         "не показывает — {names}. Работать так нельзя: алгоритм получил бы "
         "умолчания вместо того, что выбрано в окне.",
+    ),
+    (
+        _demand_gap,
+        "торговый алгоритм «{title}» требует настроек, которых у программы "
+        "нет — {names}. Работать так нельзя: требование не сработало бы "
+        "ни разу, и робот торговал бы при настройке, при которой название "
+        "алгоритма — неправда.",
     ),
 )
 
@@ -661,6 +702,58 @@ def chosen_algorithm(values: Settings) -> registry.StrategyEntry:
     if trouble_said:
         raise SettingsRefused(trouble_said)
     return entry
+
+
+def _choice(value: enum.Enum) -> str:
+    """Значение выбора из списка так, как его видит человек в окне.
+
+    Подпись, а не имя элемента: `SAME_BAR` в отказе означало бы, что человек
+    обязан искать соответствие сам. Перечисление без подписи — законный
+    случай, и тогда берётся имя: это хуже, но не молчание.
+    """
+    said = getattr(value, "label", "")
+    return said if isinstance(said, str) and said else value.name
+
+
+def check_demands(values: Settings) -> None:
+    """Общие настройки отвечают требованиям выбранного алгоритма — или отказ.
+
+    ⚠️ **Проверяется пара, а не то поле, которое трогали.** Отказ смотрит
+    на выбранный алгоритм и на нынешнее значение названной им настройки —
+    поэтому ловятся оба порядка: «выбрали алгоритм при чужом моменте
+    переворота» и «поменяли момент переворота при выбранном алгоритме».
+    Проверка, повешенная на смену алгоритма, вторую правку пропустила бы
+    молча, и название в окне снова стало бы ложью — ровно ради чего отказ
+    и заводится.
+
+    ⛔ **Зовётся на границе применения, а не из `engine_settings`.** У той
+    есть вызовы помимо «Применить»: снимок настроек **прошлого** прогона
+    (`app/runs.py`), точки перебора (`app/leaders.py`) и конструктор порта
+    **без `try/except`**. Отказ внутри неё означал бы, что прогон, записанный
+    до правки, перестаёт открываться в журнале прогонов, а программа с таким
+    файлом настроек не запускается вовсе.
+
+    ⚠️ Файл настроек сюда не приходит: при **чтении** файла прежних настроек
+    не существует — отказывать не в пользу чего. Там несовместимое значение
+    подменяется вслух (`app/settings_store.py`), и это разные ответы на один
+    вопрос намеренно.
+
+    :raises SettingsRefused: требование не выполнено; называет, что стоит,
+        что нужно и почему.
+    """
+    entry = chosen_algorithm(values)
+    for demand in entry.demands:
+        # `getattr` безопасен, а элемент заведомо существует: обе стороны
+        # уже сверены `_demand_gap` внутри `chosen_algorithm` выше.
+        current = getattr(values, demand.outer)
+        if current.name == demand.value:
+            continue
+        wanted = type(current)[demand.value]
+        raise SettingsRefused(
+            f"Алгоритм «{entry.title}» {demand.reason}. Сейчас выбрано "
+            f"«{_choice(current)}», а нужно «{_choice(wanted)}». Прежние "
+            "настройки остались в силе."
+        )
 
 
 def strategy_settings(values: Settings) -> StrategySettings:
@@ -776,6 +869,7 @@ def _option(entry: registry.StrategyEntry, values: Settings) -> AlgorithmOption:
         ),
         details=_algorithm_details(entry, settings, refusal=refusal),
         chosen=chosen,
+        unused=unused_fields(entry.id),
     )
 
 
@@ -1087,20 +1181,22 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # Одна галочка без числа читалась бы как «включил и всё» — а включение
     # без числа не значит ничего; одно число без галочки читалось бы как
     # «ограничение поставлено» — а оно не поставлено, пока галочка снята.
-    "volume_cap_enabled": _Told("Потолок объёма", _as_switch, guard=True),
-    "volume_cap": _Told("Потолок объёма, контрактов", fmt_volume, guard=True),
-    "daily_loss_limit_enabled": _Told(
-        "Дневной лимит убытка", _as_switch, guard=True
-    ),
-    "daily_loss_limit_pct": _Told(
-        "Дневной лимит убытка, % от счёта", fmt_percent, guard=True
-    ),
-    "free_funds_reserve_enabled": _Told(
-        "Запас свободных средств", _as_switch, guard=True
-    ),
-    "free_funds_reserve_pct": _Told(
-        "Запас свободных средств, %", fmt_percent, guard=True
-    ),
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "volume_cap_enabled": _Told("Потолок объёма", _as_switch, guard=True),
+    # "volume_cap": _Told("Потолок объёма, контрактов", fmt_volume, guard=True),
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "daily_loss_limit_enabled": _Told(
+    #     "Дневной лимит убытка", _as_switch, guard=True
+    # ),
+    # "daily_loss_limit_pct": _Told(
+    #     "Дневной лимит убытка, % от счёта", fmt_percent, guard=True
+    # ),
+    # "free_funds_reserve_enabled": _Told(
+    #     "Запас свободных средств", _as_switch, guard=True
+    # ),
+    # "free_funds_reserve_pct": _Told(
+    #     "Запас свободных средств, %", fmt_percent, guard=True
+    # ),
 }
 
 #: Поля окна, о которых расскажет **движок** (`EngineSettings.changes_from`):
@@ -1143,6 +1239,36 @@ def _told_by_strategy() -> frozenset[str]:
 #: Считается один раз, при импорте: реестр за время работы не меняется.
 _TOLD_BY_STRATEGY: Final[frozenset[str]] = _told_by_strategy()
 
+#: Поля окна, принадлежащие алгоритму: всё, что читает хоть один алгоритм
+#: реестра, плюс выключатель фильтра — он не поле алгоритма, но существует
+#: только ради чисел фильтра (`_FILTER_OFF`).
+_ALGORITHM_OWNED: Final[frozenset[str]] = (
+    _TOLD_BY_STRATEGY | {"filter_enabled"} | frozenset(_FILTER_OFF)
+)
+
+
+def unused_fields(strategy_id: str) -> frozenset[str]:
+    """Поля окна, которые выбранный алгоритм **не читает** (`D-107`).
+
+    Считается по таблице полей самого алгоритма (`StrategyEntry.fields`),
+    а не списком руками: алгоритм объявляет, что читает, остальное
+    из `_ALGORITHM_OWNED` — нечитаемое. Выключатель фильтра нечитаем тогда,
+    когда алгоритм не читает ни одного числа фильтра: без них он ничего
+    не включает.
+
+    Окно гасит эти поля, журнал о их смене молчит — робот от них
+    не меняется ничем. Незнакомое имя алгоритма — пусто: гасить по догадке
+    нельзя, о незнакомом имени окно и так говорит вслух.
+    """
+    try:
+        entry = registry.find(strategy_id)
+    except registry.UnknownStrategy:
+        return frozenset()
+    reads = {one.outer for one in entry.fields}
+    if reads & set(_FILTER_OFF):
+        reads.add("filter_enabled")
+    return _ALGORITHM_OWNED - reads
+
 
 def _as_confirm(value: object) -> str:
     """Подтверждение сигнала: свечей подряд, с оговоркой про единицу."""
@@ -1179,18 +1305,29 @@ def _silent_fields() -> tuple[str, ...]:
 _SILENT_FIELDS: tuple[str, ...] = _silent_fields()
 
 
-def _changes(previous: Settings, now: Settings, *, guard: bool) -> list[str]:
-    """Изменённые поля одной половины таблицы — строками «было → стало»."""
-    lines = [
-        f"{told.label}: {told.show(getattr(previous, name))} → "
-        f"{told.show(getattr(now, name))}"
+def _changes_by_field(
+    previous: Settings, now: Settings, *, guard: bool
+) -> list[tuple[str, str]]:
+    """Изменённые поля одной половины таблицы — парами «поле, строка»."""
+    return [
+        (
+            name,
+            f"{told.label}: {told.show(getattr(previous, name))} → "
+            f"{told.show(getattr(now, name))}",
+        )
         for name, told in _WINDOW_TOLD.items()
         if told.guard is guard and getattr(previous, name) != getattr(now, name)
     ]
-    return lines
 
 
-def _muted_filter_changes(previous: Settings, now: Settings) -> list[str]:
+def _changes(previous: Settings, now: Settings, *, guard: bool) -> list[str]:
+    """Изменённые поля одной половины таблицы — строками «было → стало»."""
+    return [line for _, line in _changes_by_field(previous, now, guard=guard)]
+
+
+def _muted_filter_changes(
+    previous: Settings, now: Settings, *, unused: frozenset[str]
+) -> list[str]:
     """Правка чисел фильтра при снятой галочке — строкой, и сразу с оговоркой.
 
     Пусто, если галочка была или стала поднятой: тогда перемену увидел
@@ -1203,7 +1340,7 @@ def _muted_filter_changes(previous: Settings, now: Settings) -> list[str]:
         f"{told.label} (фильтр выключен, на робота не влияет): "
         f"{told.show(getattr(previous, name))} → {told.show(getattr(now, name))}"
         for name, told in _TOLD_WHILE_THE_FILTER_IS_OFF.items()
-        if getattr(previous, name) != getattr(now, name)
+        if name not in unused and getattr(previous, name) != getattr(now, name)
     ]
 
 
@@ -1223,8 +1360,17 @@ def window_changes(previous: Settings, now: Settings) -> list[str]:
     подписи было бы несоразмерно, а промолчать нельзя: молчание здесь
     означает изменение параметра по деньгам, которого нет в журнале.
     """
-    lines = _changes(previous, now, guard=False)
-    lines += _muted_filter_changes(previous, now)
+    # Поля, которые алгоритм, выбранный в `now`, не читает, строки не дают:
+    # робот от них не меняется, а строка «Фильтр против пилы: выключен →
+    # включён» читалась бы как включённая защита (`D-107`). Ключ — `now`:
+    # если прежний алгоритм поле читал, а новый нет, влиять ему уже не на что.
+    unused = unused_fields(now.strategy_id)
+    lines = [
+        line
+        for name, line in _changes_by_field(previous, now, guard=False)
+        if name not in unused
+    ]
+    lines += _muted_filter_changes(previous, now, unused=unused)
     if _SILENT_FIELDS and any(
         getattr(previous, name) != getattr(now, name) for name in _SILENT_FIELDS
     ):
@@ -1263,12 +1409,14 @@ def guard_changes(previous: Settings, now: Settings) -> list[str]:
 #: ничего. Показать одно без другого — соврать.
 MONEY_FIELDS: Final[frozenset[str]] = frozenset({
     "volume",
-    "volume_cap_enabled",
-    "volume_cap",
-    "daily_loss_limit_enabled",
-    "daily_loss_limit_pct",
-    "free_funds_reserve_enabled",
-    "free_funds_reserve_pct",
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "volume_cap_enabled",
+    # "volume_cap",
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "daily_loss_limit_enabled",
+    # "daily_loss_limit_pct",
+    # "free_funds_reserve_enabled",
+    # "free_funds_reserve_pct",
     "commission_per_side_rub",
 })
 
@@ -1290,17 +1438,33 @@ def all_changes(previous: Settings, now: Settings) -> tuple[list[str], str]:
     приходят из файла шаблона и могут быть негодны: подтверждение обязано
     сказать об этом, а не показать пустой список, читаемый как «ничего
     не меняется».
+
+    ⚠️ **Про алгоритм спрашивается `rule_changes`, а не `changes_from`
+    напрямую, и это правка `B-051`.** Здесь стояло
+    `module_now.changes_from(module_was)` — сравнение поле в поле настроек
+    **нового** алгоритма с настройками **старого**. У разных алгоритмов классы
+    настроек разные, и такое сравнение невозможно по построению: оно падало
+    `AttributeError`, а `AttributeError` в `except` ниже не входит. Падало
+    **до** того, как настройки уйдут наружу, то есть второй торговый алгоритм
+    из окна не выбирался вовсе — ни применение, ни отказ на несовместимой паре
+    до этого места не доходили.
+
+    ⚠️ Побочно закрыто расхождение, о котором говорит первый абзац этой же
+    строки документации. Журнал решений собирает строки про правило
+    **`rule_changes`** (`HistoryPort.apply_settings`), а здесь стояло своё,
+    более бедное сравнение: в подтверждении не было строки «правило теперь
+    читается так», а в журнале была. Два описания одних и тех же изменений
+    уже разошлись — просто тихо. Теперь источник один.
     """
     try:
         engine_was = engine_settings(previous, _DIFF_MODE)
         engine_now = engine_settings(now, _DIFF_MODE)
-        module_was = strategy_settings(previous)
-        module_now = strategy_settings(now)
+        rule = rule_changes(previous, now)
     except (SettingsRefused, ValueError, TypeError) as error:
         return [], str(error)
     lines = window_changes(previous, now)
     lines += engine_now.changes_from(engine_was)
-    lines += module_now.changes_from(module_was)
+    lines += rule
     lines += guard_changes(previous, now)
     return lines, ""
 

@@ -844,6 +844,10 @@ class AlgorithmOption:
     details: str
     #: Этот алгоритм выбран сейчас. От него же зависит, чьи числа в `details`.
     chosen: bool = False
+    #: Имена полей `Settings`, которые этот алгоритм **не читает** (`D-107`).
+    #: Считает `app/convert.py::unused_fields` по таблице полей алгоритма;
+    #: окно только гасит названные поля и говорит почему.
+    unused: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -985,17 +989,21 @@ class Settings:
     #
     # ⚠️ Числа — **предложение**, а не значение. 5 контрактов и 2 % ничем
     # не подкреплены: замеров под них у проекта нет.
-    volume_cap_enabled: bool = False
-    volume_cap: int = 5
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Потолок объёма убран
+    # из окна и из движка ответом заказчика 15.09.2026 («УБРАТЬ ЭТО ВООБЩЕ»,
+    # решение 0060 §4). Возврат — поиском по метке выше.
+    # volume_cap_enabled: bool = False
+    # volume_cap: int = 5
     #: Дневной лимит убытка и запас средств считаются **от размера счёта**,
     #: а его программе сегодня никто не сообщает: портфель у брокера ещё
     #: не читается. Включённая галочка при неизвестном счёте не срабатывает
     #: и не молчит: движок пишет «НЕ ПРОВЕРЕНО» в строку входа
     #: (`engine/pipeline.py::_blind_note`), а окно говорит это заранее.
-    daily_loss_limit_enabled: bool = False
-    daily_loss_limit_pct: float = 2.0
-    free_funds_reserve_enabled: bool = False
-    free_funds_reserve_pct: float = 30.0
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # daily_loss_limit_enabled: bool = False
+    # daily_loss_limit_pct: float = 2.0
+    # free_funds_reserve_enabled: bool = False
+    # free_funds_reserve_pct: float = 30.0
     # Тариф комиссии: рублей за контракт на ОДНУ сторону. `None` — не задан,
     # и это не то же самое, что ноль. Без тарифа движок не может проверить
     # требование ТЗ §4.4 В «цель должна окупать комиссию обеих сторон» и пишет

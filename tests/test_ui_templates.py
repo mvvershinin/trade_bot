@@ -28,9 +28,10 @@ from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QTableWidget
 import ui.templates_dialog
 from app import convert, runs
 from market import CandleStore, RunOrigin, SessionRecord
+from strategies import registry
 from ui import backend
 from ui.backend import Backend, RunStats, TemplateRun
-from ui.models import Settings
+from ui.models import AfterTakeProfit, Settings
 from ui.settings_dialog import SettingsDialog
 from ui.templates import BUILTIN_NAME, Library, Template
 from ui.templates_dialog import NEVER_RUN, TemplatesDialog
@@ -390,9 +391,9 @@ def test_the_money_half_and_the_rest_add_up_to_the_whole_list() -> None:
     """
     before = Settings()
     after = Settings(
-        volume=3, volume_cap_enabled=True, commission_per_side_rub=20.0,
+        volume=3, commission_per_side_rub=20.0,
         average_period=25, take_profit_pct=1.0, instrument="RIU6",
-        daily_loss_limit_enabled=True, free_funds_reserve_pct=40.0,
+        after_take_profit=AfterTakeProfit.WAIT_FOR_SIGNAL,
     )
     diff = convert.settings_diff(before, after)
     whole, trouble = convert.all_changes(before, after)
@@ -401,6 +402,66 @@ def test_the_money_half_and_the_rest_add_up_to_the_whole_list() -> None:
         "половины перечня не сходятся с полным перечнем"
     )
     assert not set(diff.money) & set(diff.other), "строка попала в оба списка"
+
+
+def test_the_list_of_changes_survives_a_change_of_the_algorithm() -> None:
+    """Смена алгоритма даёт перечень изменений, а не падение.
+
+    ⚠️ Был строгий `xfail` — сторож-долг на `B-051`. Пометка снята 14.09.2026
+    вместе с правкой; в этом и был её смысл: долг, записанный только словами
+    в документе, исчезает при первом же обновлении документа, а строгий `xfail`
+    после починки краснеет сам и требует себя снять.
+
+    Что было сломано. `convert.all_changes` звал `changes_from` у настроек
+    **нового** алгоритма, передавая ему настройки **старого**: классы разные,
+    поля разные, разбор падал `AttributeError`, а он в `except` там не входит.
+    Путь «Настройки» → выбрать другой алгоритм → «Применить» проходит через
+    подтверждение изменений (`ui/settings_dialog.py::confirm` →
+    `ui/confirm_changes.py::diff_of` → `convert.settings_diff`) **до** того,
+    как настройки уйдут наружу: второй торговый алгоритм из окна не выбирался
+    вовсе, а ни применение, ни отказ на несовместимой паре до этого места
+    не доходили.
+
+    Что стережётся теперь — три утверждения, падающие порознь:
+
+    * разбор не падает и причина пуста;
+    * перечень **не пуст**: молчание здесь читается как «ничего не меняется»
+      и стоит дороже падения (правило 13 `CLAUDE.md`);
+    * замена названа строкой с **обоими** именами. Одного нового названия
+      мало — оно стоит и в строке «правило теперь читается так», и проверка
+      «где-то есть название» зеленела бы при пропавшей строке замены.
+
+    Проверяются **обе** стороны: переход на второй алгоритм и возврат
+    на первый. Падали обе, и правка одной без другой оставила бы половину.
+
+    ⚠️ Соседняя проверка выше перечисляет изменяемые поля руками — потому
+    `strategy_id` в неё и не попал ни разу. Полем в поле все настройки окна
+    теперь проходит `tests/test_app_port.py::
+    test_a_change_of_any_settings_field_reaches_the_confirmation`.
+    """
+    first = Settings()
+    other = next(
+        one.id for one in registry.entries() if one.id != first.strategy_id
+    )
+    second = first.replace(strategy_id=other)
+    for previous, now in ((first, second), (second, first)):
+        diff = convert.settings_diff(previous, now)
+        assert not diff.trouble, (
+            f"перечень изменений не собран: {diff.trouble}"
+        )
+        assert diff.other, (
+            "перечень изменений пуст при смене торгового алгоритма — человек "
+            "подтвердит замену правила, которой ему не показали"
+        )
+        was_title = registry.find(previous.strategy_id).title
+        now_title = registry.find(now.strategy_id).title
+        assert any(
+            "→" in line and was_title in line and now_title in line
+            for line in diff.other
+        ), (
+            f"замена «{was_title}» → «{now_title}» в перечне изменений "
+            f"не названа одной строкой с обоими именами: {diff.other}"
+        )
 
 
 def test_money_changes_are_told_apart_from_the_rest() -> None:
@@ -427,8 +488,6 @@ def test_unreadable_settings_are_a_loud_trouble_not_an_empty_list() -> None:
     Пустой перечень читался бы как «ничего не меняется» ровно там, где
     настройки применить нельзя вовсе.
     """
-    from ui.models import AfterTakeProfit
-
     diff = convert.settings_diff(
         Settings(), Settings(after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
     )

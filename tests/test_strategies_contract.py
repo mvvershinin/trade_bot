@@ -970,6 +970,10 @@ def _stand_in_entry(factory: type, title: str) -> StrategyEntry:
         settings_type=StandInSettings,
         factory=factory,
         fields=(SettingsField("period", "average_period", "Период средней"),),
+        # Требований к общим настройкам у подставного нет — сказано вслух:
+        # поле записи обязательное, чтобы новый алгоритм не унаследовал
+        # поведение первого молча (`strategies/registry.py`).
+        demands=(),
         describe=_stand_in_description,
     )
 

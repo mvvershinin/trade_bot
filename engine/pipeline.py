@@ -94,7 +94,9 @@ from datetime import datetime, timedelta
 from strategies import Decision, Intent, check_bar
 
 from engine.contracts import (
-    AccountFunds,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `AccountFunds` держал слова
+    # про свободные средства и ГО в отказе входа.
+    # AccountFunds,
     DayMoney,
     EngineState,
     ExitReason,
@@ -109,7 +111,12 @@ from engine.contracts import (
     Side,
     Step,
 )
-from engine.guards import DayResult, Sizing, Unchecked, day_result, entry_size, unchecked_guards
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `DayResult`, `day_result`,
+# `Sizing`, `Unchecked` и `unchecked_guards` закомментированы вместе
+# с предохранителями. `entry_size` остался швом возврата. При возврате
+# раскомментировать строку ниже и удалить живую замену под ней.
+# from engine.guards import DayResult, Sizing, Unchecked, day_result, entry_size, unchecked_guards
+from engine.guards import entry_size
 from engine.ports import Refusal
 from engine.settings import EngineSettings, Mode, Reversal
 from engine.take_profit import covers_commission, target_profit
@@ -625,12 +632,12 @@ def process_closed_candle(
             writer, refused, steps, orders, closes_at, snapshot, halt=halt,
         )
 
-    # ---- предохранитель: дневной лимит убытка (между шагами 5 и 6) ---------
-    working, halt = _daily_loss_guard(
-        working, bar, closes_at, orders, writer, settings, armed_before
-    )
-    if halt:
-        return _done(writer, refused, steps, orders, closes_at, snapshot, halt=halt)
+    # ---- ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): дневной лимит убытка ----
+    # working, halt = _daily_loss_guard(
+    #     working, bar, closes_at, orders, writer, settings, armed_before
+    # )
+    # if halt:
+    #     return _done(writer, refused, steps, orders, closes_at, snapshot, halt=halt)
 
     # ---- шаг 6: вне окна или нерабочий день --------------------------------
     steps.append(Step.WINDOW)
@@ -1504,101 +1511,109 @@ def _held_by_costs(
     )
 
 
-def _daily_loss_guard(
-    state: EngineState,
-    bar: object,
-    closes_at: datetime,
-    orders: list[OrderRequest],
-    writer: "_Journal",
-    settings: EngineSettings,
-    armed_before: bool,
-) -> tuple[EngineState, str]:
-    """Дневной лимит убытка: закрыть позицию и остановиться.
-
-    Возвращает состояние и причину остановки; пустая причина — лимит
-    не достигнут или считать его нечем.
-
-    ⚠️ **Своего номера у проверки нет намеренно.** Десять шагов — это порядок
-    ПРОТОТИПА (`PROTOTYPE.md` §2), а у прототипа предохранителей нет вовсе.
-    Место в цепочке — между шагом 5 и шагом 6 — проверяется поведением:
-    лимит обязан срабатывать вне торгового окна (иначе шаг 6, выходящий
-    из обработки в любом случае, отменил бы его там, где позиция законно
-    живёт при выключенном «закрывать в конце окна») и обязан НЕ срабатывать
-    в режиме «Выключен» и на прогреве (шаги 1 и 2 сильнее любого
-    предохранителя, иначе выключенный робот начнёт управлять позицией).
-
-    Три правила, каждое из решения 0014 и `DOMAIN.md` §3, а не из удобства:
-
-    * **бумажный убыток считается вместе с зафиксированным.** Иначе лимит
-      молчит ровно тогда, когда убыток самый большой, — позиция открыта
-      и падает;
-    * **позиция закрывается**, а не бросается: таблица `DOMAIN.md` §3 говорит
-      «Закрытие, робот останавливается». Заявка на выход подаётся здесь же
-      и той же цепочкой, что и выход по концу окна: сначала снять тейк,
-      потом закрыть;
-    * **возобновление — только вручную.** Остановка снимается `reset()`,
-      то есть решением человека начать заново, а не наступлением следующего
-      дня.
-
-    ⚠️ **Названная цена: сделку по этой заявке движок уже не увидит.**
-    Остановленный робот не спрашивает исполнителя о сделках
-    (`Engine.on_market_candle`), а заявка на выход исполняется не раньше
-    следующей свечи. Значит позиция останется у движка в состоянии
-    «закрывается» до вмешательства человека. Журнал обязан сказать это
-    прямым текстом — иначе владелец счёта прочитает «выход подан» и решит,
-    что всё закончилось само.
-    """
-    result = day_result(state, settings, float(bar.close), closes_at)  # type: ignore[attr-defined]
-    if result is None or not result.breached:
-        return state, ""
-    position = state.position
-    leaving = position is not None and position.is_open
-    words = _daily_loss_words(result, settings, closes_at, leaving)
-    writer.note("Дневной лимит убытка достигнут", words, JournalLevel.ERROR)
-    if position is not None and position.is_open:
-        intent = (
-            f"Дневной лимит убытка достигнут: {money(-result.total)} против "
-            f"порога {money(result.limit)}. Выходим в деньги, без оглядки "
-            "на среднюю"
-        )
-        state = _exit(
-            orders, state, position, closes_at, ExitReason.DAILY_LOSS,
-            intent, armed_before,
-        )
-        writer.action(
-            f"Выход из {position.side.label.lower()}а по дневному лимиту убытка",
-            orders[-1].reason, key=orders[-1].order_id, intent=intent,
-        )
-    return state, f"Дневной лимит убытка достигнут. {words}"
-
-
-def _daily_loss_words(
-    result: DayResult, settings: EngineSettings, closes_at: datetime, leaving: bool
-) -> str:
-    """Причина остановки человеческим языком, со всеми числами.
-
-    Числа названы все до одного намеренно: владелец счёта, вернувшийся
-    к компьютеру, обязан суметь пересчитать порог сам и увидеть, из чего
-    он сложился. «Достигнут дневной лимит» без цифр — это код ошибки
-    русскими словами.
-    """
-    tail = (
-        " ⚠️ Заявка на выход подана этой же свечой, но сделку по ней робот "
-        "уже не увидит: остановленный робот исполнителя больше не спрашивает. "
-        "Проверьте позицию и заявки в приложении брокера."
-        if leaving else
-        " Открытой позиции нет — закрывать нечего."
-    )
-    return (
-        f"Убыток за {in_moscow(closes_at):%d.%m.%Y} дошёл до "
-        f"{money(-result.total)}: зафиксировано {money(result.realized)}, "
-        f"открытая позиция даёт {money(result.unrealized)} по цене закрытия "
-        f"свечи. Лимит {percent(settings.daily_loss_limit_percent)}% "
-        f"от счёта {money(result.equity)} на момент снимка "
-        f"{in_moscow(result.snapshot_at):%d.%m %H:%M} — это "
-        f"{money(result.limit)}. Робот остановлен, новых заявок не будет; "
-        "возобновление — только вручную, после разбора." + tail
-    )
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Дневной лимит убытка целиком:
+# проверка между шагами 5 и 6 и её слова для человека. ⚠️ Пока это
+# закомментировано, один из пяти законных случаев «робот вне рынка»
+# (решение 0019) недостижим, и боевой режим недопустим: лимит — единственное,
+# что останавливает робота, когда он теряет деньги быстрее, чем человек
+# смотрит на экран.
+# def _daily_loss_guard(
+#     state: EngineState,
+#     bar: object,
+#     closes_at: datetime,
+#     orders: list[OrderRequest],
+#     writer: "_Journal",
+#     settings: EngineSettings,
+#     armed_before: bool,
+# ) -> tuple[EngineState, str]:
+#     """Дневной лимит убытка: закрыть позицию и остановиться.
+#
+#     Возвращает состояние и причину остановки; пустая причина — лимит
+#     не достигнут или считать его нечем.
+#
+#     ⚠️ **Своего номера у проверки нет намеренно.** Десять шагов — это порядок
+#     ПРОТОТИПА (`PROTOTYPE.md` §2), а у прототипа предохранителей нет вовсе.
+#     Место в цепочке — между шагом 5 и шагом 6 — проверяется поведением:
+#     лимит обязан срабатывать вне торгового окна (иначе шаг 6, выходящий
+#     из обработки в любом случае, отменил бы его там, где позиция законно
+#     живёт при выключенном «закрывать в конце окна») и обязан НЕ срабатывать
+#     в режиме «Выключен» и на прогреве (шаги 1 и 2 сильнее любого
+#     предохранителя, иначе выключенный робот начнёт управлять позицией).
+#
+#     Три правила, каждое из решения 0014 и `DOMAIN.md` §3, а не из удобства:
+#
+#     * **бумажный убыток считается вместе с зафиксированным.** Иначе лимит
+#       молчит ровно тогда, когда убыток самый большой, — позиция открыта
+#       и падает;
+#     * **позиция закрывается**, а не бросается: таблица `DOMAIN.md` §3 говорит
+#       «Закрытие, робот останавливается». Заявка на выход подаётся здесь же
+#       и той же цепочкой, что и выход по концу окна: сначала снять тейк,
+#       потом закрыть;
+#     * **возобновление — только вручную.** Остановка снимается `reset()`,
+#       то есть решением человека начать заново, а не наступлением следующего
+#       дня.
+#
+#     ⚠️ **Названная цена: сделку по этой заявке движок уже не увидит.**
+#     Остановленный робот не спрашивает исполнителя о сделках
+#     (`Engine.on_market_candle`), а заявка на выход исполняется не раньше
+#     следующей свечи. Значит позиция останется у движка в состоянии
+#     «закрывается» до вмешательства человека. Журнал обязан сказать это
+#     прямым текстом — иначе владелец счёта прочитает «выход подан» и решит,
+#     что всё закончилось само.
+#     """
+#     result = day_result(  # type: ignore[attr-defined]
+#         state, settings, float(bar.close), closes_at
+#     )
+#     if result is None or not result.breached:
+#         return state, ""
+#     position = state.position
+#     leaving = position is not None and position.is_open
+#     words = _daily_loss_words(result, settings, closes_at, leaving)
+#     writer.note("Дневной лимит убытка достигнут", words, JournalLevel.ERROR)
+#     if position is not None and position.is_open:
+#         intent = (
+#             f"Дневной лимит убытка достигнут: {money(-result.total)} против "
+#             f"порога {money(result.limit)}. Выходим в деньги, без оглядки "
+#             "на среднюю"
+#         )
+#         state = _exit(
+#             orders, state, position, closes_at, ExitReason.DAILY_LOSS,
+#             intent, armed_before,
+#         )
+#         writer.action(
+#             f"Выход из {position.side.label.lower()}а по дневному лимиту убытка",
+#             orders[-1].reason, key=orders[-1].order_id, intent=intent,
+#         )
+#     return state, f"Дневной лимит убытка достигнут. {words}"
+#
+#
+# def _daily_loss_words(
+#     result: DayResult, settings: EngineSettings, closes_at: datetime, leaving: bool
+# ) -> str:
+#     """Причина остановки человеческим языком, со всеми числами.
+#
+#     Числа названы все до одного намеренно: владелец счёта, вернувшийся
+#     к компьютеру, обязан суметь пересчитать порог сам и увидеть, из чего
+#     он сложился. «Достигнут дневной лимит» без цифр — это код ошибки
+#     русскими словами.
+#     """
+#     tail = (
+#         " ⚠️ Заявка на выход подана этой же свечой, но сделку по ней робот "
+#         "уже не увидит: остановленный робот исполнителя больше не спрашивает. "
+#         "Проверьте позицию и заявки в приложении брокера."
+#         if leaving else
+#         " Открытой позиции нет — закрывать нечего."
+#     )
+#     return (
+#         f"Убыток за {in_moscow(closes_at):%d.%m.%Y} дошёл до "
+#         f"{money(-result.total)}: зафиксировано {money(result.realized)}, "
+#         f"открытая позиция даёт {money(result.unrealized)} по цене закрытия "
+#         f"свечи. Лимит {percent(settings.daily_loss_limit_percent)}% "
+#         f"от счёта {money(result.equity)} на момент снимка "
+#         f"{in_moscow(result.snapshot_at):%d.%m %H:%M} — это "
+#         f"{money(result.limit)}. Робот остановлен, новых заявок не будет; "
+#         "возобновление — только вручную, после разбора." + tail
+#     )
 
 
 def _step_open(
@@ -1623,13 +1638,18 @@ def _step_open(
         встала бы строка «сигнала на выход нет», и журнал сказал бы про одну
         свечу две противоположные вещи.
     """
-    blind = unchecked_guards(state, settings, closes_at)
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): проверять нечего, и хвоста
+    # «НЕ ПРОВЕРЕНО» в строке входа больше нет — разбор в `_blind_note`.
+    # blind = unchecked_guards(state, settings, closes_at)
     if not _may_enter(snapshot, state, orders, settings):
         if not orders:
             # Заявку на этой свече не подавали — журнал обязан сказать почему.
             # Если подавали, строка уже написана действием.
             writer.quiet(
-                *_with_blind(_no_entry_now(state, decision, held), blind, settings)
+                # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): при возврате раскомментировать
+                # строку ниже и удалить живую замену под ней.
+                # *_with_blind(_no_entry_now(state, decision, held), blind, settings)
+                *_no_entry_now(state, decision, held)
             )
         return state
     side = _entry_side(decision, settings)
@@ -1637,15 +1657,19 @@ def _step_open(
         writer.quiet(*_no_entry(decision, settings))
         return state
     sizing = entry_size(state, settings, closes_at)
-    if sizing.blocked:
-        writer.quiet(
-            *_guard_blocks(side, sizing, settings, state.funds, closes_at),
-            JournalLevel.WARNING,
-        )
-        return state
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # if sizing.blocked:
+    #     writer.quiet(
+    #         *_guard_blocks(side, sizing, settings, state.funds, closes_at),
+    #         JournalLevel.WARNING,
+    #     )
+    #     return state
     order = _open_order(
         side, decision, closes_at, sizing.volume,
-        _cut_note(sizing, settings) + _blind_note(blind, settings),
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): при возврате раскомментировать
+        # строку ниже и удалить живую замену под ней.
+        # _cut_note(sizing, settings) + _blind_note(blind, settings),
+        "",
     )
     state = _submitted(orders, state, order)
     writer.action(
@@ -1654,119 +1678,121 @@ def _step_open(
     return state
 
 
-def _with_blind(
-    said: tuple[str, str, str], blind: Unchecked, settings: EngineSettings
-) -> tuple[str, str, str]:
-    """Дописать к объяснению молчания предупреждение о непроверенном лимите.
-
-    ⚠️ Меняется **и ключ**, а не только текст. Ключ решает, писать ли строку
-    вообще (`_Journal.quiet` молчит на повторе), и без правки ключа
-    предупреждение появлялось бы ровно тогда, когда сменилась причина
-    молчания, — то есть случайно. С правкой строка пишется в момент, когда
-    предохранитель ослеп или прозрел, и это ровно то событие, о котором
-    владельцу счёта надо знать.
-
-    Позиция при этом открыта, а лимит считать не от чего: робот держит риск,
-    который не измеряет. Промолчать здесь — тот самый дефект, ради которого
-    предохранители и писались.
-    """
-    tail = _blind_note(blind, settings)
-    if not tail:
-        return said
-    key, event, reason = said
-    return (f"{key}!blind", event, reason + tail)
-
-
-def _guard_blocks(
-    side: Side,
-    sizing: Sizing,
-    settings: EngineSettings,
-    funds: AccountFunds | None,
-    closes_at: datetime,
-) -> tuple[str, str, str]:
-    """Предохранитель не пустил заявку на вход — ключ, событие, причина."""
-    if sizing.stale:
-        return _stale_funds_blocks(side, funds, closes_at)
-    if sizing.over_cap:
-        return (
-            "cap-blocks",
-            "Вход не открыт: потолок объёма",
-            f"Сигнал на {side.label.lower()} есть, но заданный объём "
-            f"{_volume(sizing.wanted)} выше потолка "
-            f"{_volume(settings.volume_cap or 0.0)}. Заявка не подаётся вовсе. "
-            "Потолок ставится один раз и стоит против опечатки в один знак — "
-            "она меняет последствия в десять раз. Урезать до потолка робот "
-            "не станет: это была бы догадка за вас. Поправьте объём "
-            "в настройках",
-        )
-    return (
-        "margin-blocks",
-        "Вход не открыт: не хватает обеспечения",
-        f"Сигнал на {side.label.lower()} есть, но свободных средств не хватает "
-        f"даже на один контракт: {_funds_words(settings, funds)}. Сигнал "
-        "пропущен, робот продолжает работать — нехватка обеспечения "
-        "рыночное событие, а не поломка. Заявку нулевого объёма подать нельзя, "
-        "а останавливаться из-за поднятого биржей ГО значило бы звать человека "
-        "на штатное событие",
-    )
-
-
-def _stale_funds_blocks(
-    side: Side, funds: AccountFunds | None, closes_at: datetime
-) -> tuple[str, str, str]:
-    """Вход запрещён: деньги счёта устарели. Решение 0037.
-
-    ⚠️ Читаться это обязано **иначе**, чем «сегодня не торгуем по правилу»
-    (решение 0037, следствие 4): пять законных случаев «робота нет в рынке» —
-    про торговые правила, а здесь техническая неготовность. Поэтому событие
-    называет причину прямо, а причина называет **оба времени** и разницу:
-    по ним владелец счёта отличает молчащий портфель от убежавших часов
-    машины, и это единственные два объяснения, какие тут бывают.
-
-    Что делать, сказано в той же строке: продолжения без вмешательства
-    не будет, пока портфель снова не ответит.
-    """
-    when = (
-        f"последний снимок счёта — {in_moscow(funds.at):%d.%m %H:%M:%S}, "
-        f"свеча закрылась {in_moscow(closes_at):%d.%m %H:%M:%S}, "
-        f"разница {_age_words(closes_at - funds.at)}"
-        if funds is not None
-        else "снимка счёта нет"
-    )
-    return (
-        "stale-funds-blocks",
-        "Вход не открыт: состояние счёта устарело",
-        f"Сигнал на {side.label.lower()} есть, но {when}. Предохранители "
-        f"по деньгам включены, а считать их не от чего: свободные средства "
-        f"и обеспечение биржа пересматривает внутри дня, и вчерашние числа "
-        f"здесь не осторожность, а неправда. Вход не открывается — "
-        f"предохранитель, который в момент неизвестности пускает, "
-        f"предохранителем не является. Проверьте связь с брокером и часы "
-        f"компьютера: других причин у этой строки не бывает. Как только "
-        f"портфель ответит снова, робот продолжит сам",
-    )
-
-
-def _age_words(age: timedelta) -> str:
-    """Возраст снимка человеческим языком: «3 мин 12 с», «41 с»."""
-    seconds = int(age.total_seconds())
-    if seconds < 0:
-        return "снимок новее свечи"
-    minutes, rest = divmod(seconds, 60)
-    return f"{minutes} мин {rest} с" if minutes else f"{rest} с"
-
-
-def _funds_words(settings: EngineSettings, funds: AccountFunds | None) -> str:
-    """Свободные деньги и ГО словами. Без снимка — честное «не сообщены»."""
-    if funds is None or funds.margin_per_contract is None:
-        return "состояние счёта движку не сообщено"
-    reserve = settings.free_funds_reserve_percent
-    usable = funds.free * (1.0 - reserve / 100.0)
-    return (
-        f"свободных {money(funds.free)}, запас {percent(reserve)}% "
-        f"оставляет {money(usable)}, ГО контракта "
-        f"{money(funds.margin_per_contract)}"
-    )
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): отказ входа по деньгам
+# и все его слова для человека.
+# def _with_blind(
+#     said: tuple[str, str, str], blind: Unchecked, settings: EngineSettings
+# ) -> tuple[str, str, str]:
+#     """Дописать к объяснению молчания предупреждение о непроверенном лимите.
+#
+#     ⚠️ Меняется **и ключ**, а не только текст. Ключ решает, писать ли строку
+#     вообще (`_Journal.quiet` молчит на повторе), и без правки ключа
+#     предупреждение появлялось бы ровно тогда, когда сменилась причина
+#     молчания, — то есть случайно. С правкой строка пишется в момент, когда
+#     предохранитель ослеп или прозрел, и это ровно то событие, о котором
+#     владельцу счёта надо знать.
+#
+#     Позиция при этом открыта, а лимит считать не от чего: робот держит риск,
+#     который не измеряет. Промолчать здесь — тот самый дефект, ради которого
+#     предохранители и писались.
+#     """
+#     tail = _blind_note(blind, settings)
+#     if not tail:
+#         return said
+#     key, event, reason = said
+#     return (f"{key}!blind", event, reason + tail)
+#
+#
+# def _guard_blocks(
+#     side: Side,
+#     sizing: Sizing,
+#     settings: EngineSettings,
+#     funds: AccountFunds | None,
+#     closes_at: datetime,
+# ) -> tuple[str, str, str]:
+#     """Предохранитель не пустил заявку на вход — ключ, событие, причина."""
+#     if sizing.stale:
+#         return _stale_funds_blocks(side, funds, closes_at)
+#     if sizing.over_cap:
+#         return (
+#             "cap-blocks",
+#             "Вход не открыт: потолок объёма",
+#             f"Сигнал на {side.label.lower()} есть, но заданный объём "
+#             f"{_volume(sizing.wanted)} выше потолка "
+#             f"{_volume(settings.volume_cap or 0.0)}. Заявка не подаётся вовсе. "
+#             "Потолок ставится один раз и стоит против опечатки в один знак — "
+#             "она меняет последствия в десять раз. Урезать до потолка робот "
+#             "не станет: это была бы догадка за вас. Поправьте объём "
+#             "в настройках",
+#         )
+#     return (
+#         "margin-blocks",
+#         "Вход не открыт: не хватает обеспечения",
+#         f"Сигнал на {side.label.lower()} есть, но свободных средств не хватает "
+#         f"даже на один контракт: {_funds_words(settings, funds)}. Сигнал "
+#         "пропущен, робот продолжает работать — нехватка обеспечения "
+#         "рыночное событие, а не поломка. Заявку нулевого объёма подать нельзя, "
+#         "а останавливаться из-за поднятого биржей ГО значило бы звать человека "
+#         "на штатное событие",
+#     )
+#
+#
+# def _stale_funds_blocks(
+#     side: Side, funds: AccountFunds | None, closes_at: datetime
+# ) -> tuple[str, str, str]:
+#     """Вход запрещён: деньги счёта устарели. Решение 0037.
+#
+#     ⚠️ Читаться это обязано **иначе**, чем «сегодня не торгуем по правилу»
+#     (решение 0037, следствие 4): пять законных случаев «робота нет в рынке» —
+#     про торговые правила, а здесь техническая неготовность. Поэтому событие
+#     называет причину прямо, а причина называет **оба времени** и разницу:
+#     по ним владелец счёта отличает молчащий портфель от убежавших часов
+#     машины, и это единственные два объяснения, какие тут бывают.
+#
+#     Что делать, сказано в той же строке: продолжения без вмешательства
+#     не будет, пока портфель снова не ответит.
+#     """
+#     when = (
+#         f"последний снимок счёта — {in_moscow(funds.at):%d.%m %H:%M:%S}, "
+#         f"свеча закрылась {in_moscow(closes_at):%d.%m %H:%M:%S}, "
+#         f"разница {_age_words(closes_at - funds.at)}"
+#         if funds is not None
+#         else "снимка счёта нет"
+#     )
+#     return (
+#         "stale-funds-blocks",
+#         "Вход не открыт: состояние счёта устарело",
+#         f"Сигнал на {side.label.lower()} есть, но {when}. Предохранители "
+#         f"по деньгам включены, а считать их не от чего: свободные средства "
+#         f"и обеспечение биржа пересматривает внутри дня, и вчерашние числа "
+#         f"здесь не осторожность, а неправда. Вход не открывается — "
+#         f"предохранитель, который в момент неизвестности пускает, "
+#         f"предохранителем не является. Проверьте связь с брокером и часы "
+#         f"компьютера: других причин у этой строки не бывает. Как только "
+#         f"портфель ответит снова, робот продолжит сам",
+#     )
+#
+#
+# def _age_words(age: timedelta) -> str:
+#     """Возраст снимка человеческим языком: «3 мин 12 с», «41 с»."""
+#     seconds = int(age.total_seconds())
+#     if seconds < 0:
+#         return "снимок новее свечи"
+#     minutes, rest = divmod(seconds, 60)
+#     return f"{minutes} мин {rest} с" if minutes else f"{rest} с"
+#
+#
+# def _funds_words(settings: EngineSettings, funds: AccountFunds | None) -> str:
+#     """Свободные деньги и ГО словами. Без снимка — честное «не сообщены»."""
+#     if funds is None or funds.margin_per_contract is None:
+#         return "состояние счёта движку не сообщено"
+#     reserve = settings.free_funds_reserve_percent
+#     usable = funds.free * (1.0 - reserve / 100.0)
+#     return (
+#         f"свободных {money(funds.free)}, запас {percent(reserve)}% "
+#         f"оставляет {money(usable)}, ГО контракта "
+#         f"{money(funds.margin_per_contract)}"
+#     )
 
 
 def _may_enter(
@@ -2098,49 +2124,51 @@ def _open_order(
     )
 
 
-def _cut_note(sizing: Sizing, settings: EngineSettings) -> str:
-    """Хвост про уменьшенный объём. Пусто, если объём не урезали.
-
-    Урезание — это одноразовое снижение уже введённого числа под конкретную
-    заявку (решения 0014 и 0015), а не формула, выводящая объём. Молча оно
-    происходить не должно: заявка меньше настроенной — это меньший риск,
-    но и другой результат, чем ждал владелец счёта.
-    """
-    if not sizing.cut:
-        return ""
-    return (
-        f". ⚠️ Объём уменьшен с {_volume(sizing.wanted)}: свободных средств "
-        f"с запасом {percent(settings.free_funds_reserve_percent)}% хватает "
-        f"на {_volume(sizing.affordable or 0.0)}. Сигнал не пропущен — вход "
-        "меньшим объёмом"
-    )
-
-
-def _blind_note(blind: Unchecked, settings: EngineSettings) -> str:
-    """Хвост про предохранитель, который включён, а проверить его нечем.
-
-    Пишется в строку **входа** — там, где робот собирается занять деньги.
-    Это единственное место, где молчание стоит дороже шума: число в окне
-    стоит, владелец счёта считает защиту работающей, а движку её считать
-    не от чего.
-
-    ⚠️ Названная цена: строка появляется только при входе. Пока позиция
-    открыта и входов нет, о непроверенном лимите не напоминает никто.
-    """
-    if not blind:
-        return ""
-    which = []
-    if blind.daily_limit:
-        which.append(
-            f"дневной лимит убытка {percent(settings.daily_loss_limit_percent)}% "
-            "— движку не сообщён размер счёта на эту дату"
-        )
-    if blind.free_funds:
-        which.append(
-            f"запас свободных средств {percent(settings.free_funds_reserve_percent)}% "
-            "— движку не сообщены свободные средства и ГО контракта"
-        )
-    return ". ⚠️ НЕ ПРОВЕРЕНО: " + "; ".join(which)
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): оба хвоста строки входа —
+# про урезанный объём и про непроверенный предохранитель.
+# def _cut_note(sizing: Sizing, settings: EngineSettings) -> str:
+#     """Хвост про уменьшенный объём. Пусто, если объём не урезали.
+#
+#     Урезание — это одноразовое снижение уже введённого числа под конкретную
+#     заявку (решения 0014 и 0015), а не формула, выводящая объём. Молча оно
+#     происходить не должно: заявка меньше настроенной — это меньший риск,
+#     но и другой результат, чем ждал владелец счёта.
+#     """
+#     if not sizing.cut:
+#         return ""
+#     return (
+#         f". ⚠️ Объём уменьшен с {_volume(sizing.wanted)}: свободных средств "
+#         f"с запасом {percent(settings.free_funds_reserve_percent)}% хватает "
+#         f"на {_volume(sizing.affordable or 0.0)}. Сигнал не пропущен — вход "
+#         "меньшим объёмом"
+#     )
+#
+#
+# def _blind_note(blind: Unchecked, settings: EngineSettings) -> str:
+#     """Хвост про предохранитель, который включён, а проверить его нечем.
+#
+#     Пишется в строку **входа** — там, где робот собирается занять деньги.
+#     Это единственное место, где молчание стоит дороже шума: число в окне
+#     стоит, владелец счёта считает защиту работающей, а движку её считать
+#     не от чего.
+#
+#     ⚠️ Названная цена: строка появляется только при входе. Пока позиция
+#     открыта и входов нет, о непроверенном лимите не напоминает никто.
+#     """
+#     if not blind:
+#         return ""
+#     which = []
+#     if blind.daily_limit:
+#         which.append(
+#             f"дневной лимит убытка {percent(settings.daily_loss_limit_percent)}% "
+#             "— движку не сообщён размер счёта на эту дату"
+#         )
+#     if blind.free_funds:
+#         which.append(
+#             f"запас свободных средств {percent(settings.free_funds_reserve_percent)}% "
+#             "— движку не сообщены свободные средства и ГО контракта"
+#         )
+#     return ". ⚠️ НЕ ПРОВЕРЕНО: " + "; ".join(which)
 
 
 def _no_entry(decision: Decision, settings: EngineSettings) -> tuple[str, str, str]:

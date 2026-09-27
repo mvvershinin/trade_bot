@@ -112,6 +112,18 @@ from strategies.contracts import (
     check_bar,
 )
 
+# Оформление чисел для строк журнала. Жило здесь тремя закрытыми функциями
+# до 14.09.2026; со вторым модулем переехало в `strategies/wording.py`
+# (долг `D-106`) — разбор трёх возможных домов в шапке того файла.
+#
+# ⚠️ Имена оставлены закрытыми, и это не формальность: закрытыми они были
+# и здесь. Вынос сменил им дом, а не смысл, — и переписывать двадцать три
+# места вызова ради открытого имени значило бы предъявить сверке с прототипом
+# диффом на двадцать три строки вместо четырёх.
+from strategies.wording import bars as _bars
+from strategies.wording import number as _number
+from strategies.wording import percent as _percent
+
 __all__ = [
     "OnPriceEqualsAverage",
     "EmaReverseSettings",
@@ -1040,45 +1052,3 @@ def describe(settings: EmaReverseSettings) -> Description:
             _boundary_fact(),
         ),
     )
-
-
-def _number(value: float) -> str:
-    """Цена для строки журнала: `284 812,53`.
-
-    Оформление повторяет `ui.formatting.fmt_number` (пробел между тысячами,
-    запятая в дробной части), но своим кодом: `strategies/` не импортирует
-    ни один слой проекта. Хвостовые нули отбрасываются, дробная часть — до шести
-    знаков: округление до двух знаков сделало бы строку «закрытие 1,23 выше
-    EMA(15) 1,23» на инструменте с мелким шагом цены.
-    """
-    text = f"{value:,.6f}"
-    whole, _, fraction = text.partition(".")
-    fraction = fraction.rstrip("0")
-    whole = whole.replace(",", " ")
-    return f"{whole},{fraction}" if fraction else whole
-
-
-def _percent(value: float) -> str:
-    """Процент для строки журнала: `0,04%`. Хвостовые нули отброшены.
-
-    Такая же функция есть в `engine/settings.py`, и это не повод их объединять:
-    `strategies/` не импортирует ни один слой проекта (ARCHITECTURE.md §2),
-    а общего слоя типов среди семи нет. Ровно то же соображение записано
-    у `_number` выше.
-    """
-    text = f"{float(value):.6f}".rstrip("0").rstrip(".")
-    return f"{text.replace('.', ',')}%"
-
-
-def _bars(count: int) -> str:
-    """`1 свеча`, `3 свечи`, `5 свечей` — число со своим окончанием."""
-    tail = count % 100
-    if 11 <= tail <= 14:  # noqa: PLR2004 — 11–14 это русская грамматика, не порог
-        word = "свечей"
-    elif count % 10 == 1:
-        word = "свеча"
-    elif count % 10 in (2, 3, 4):
-        word = "свечи"
-    else:
-        word = "свечей"
-    return f"{count} {word}"

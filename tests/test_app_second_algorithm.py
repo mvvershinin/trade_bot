@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -45,9 +46,11 @@ from strategies import (
     Claim,
     Decision,
     Description,
+    EmaReverseSettings,
     Intent,
     Sample,
     SettingsField,
+    Strategy,
     StrategyEntry,
     registry,
 )
@@ -172,6 +175,7 @@ def second_entry(
             SettingsField("bars", "average_period", "Свечей у второго"),
             SettingsField("smoothing", "average_kind", "Сглаживание второго"),
         ),
+        demands=(),
         describe=describe_second,
     )
 
@@ -194,6 +198,109 @@ def two_algorithms(monkeypatch: pytest.MonkeyPatch) -> StrategyEntry:
 def chose_the_second() -> Settings:
     """Набор окна с выбранным вторым алгоритмом."""
     return Settings(strategy_id="second", average_period=9)
+
+
+# ---------------------------------------------------------------------------
+# Второй подставной: тот же класс настроек, другая фабрика
+# ---------------------------------------------------------------------------
+#
+# ⚠️ Зачем он нужен помимо `SecondAlgorithm`, который непохож нарочно.
+# Класс настроек у того **свой**, и подмена «показать выбранный, посчитать
+# первым» гибнет на нём громко и не по делу: `EmaReverse` получает
+# `SecondSettings` и отвергает их (`StrategyEntry._own`). Прогон краснеет
+# по несовпадению классов, а настоящий вред подмены — **другие сделки под
+# чужим названием** — остаётся непроверенным, потому что до сделок дело
+# не доходит вовсе.
+#
+# До 14.09.2026 это свойство несла настоящая запись реестра: `ma_crossing`
+# делил класс настроек с алгоритмом №1 по прямой просьбе владельца счёта
+# («все условия те же»). Запись удалена решением того же дня, а свойство
+# осталось предметом проверки и живёт теперь здесь.
+
+
+class TwinAlgorithm:
+    """Подставной с настройками алгоритма №1 и своим решением.
+
+    Намерений не даёт никогда — довод тот же, что у `SecondAlgorithm`:
+    «Сделок 0» в записи прогона это единственное свидетельство о том, **чем**
+    считали, а не о том, что написали.
+    """
+
+    title = "Подставной с общим классом настроек"
+
+    def __init__(self, settings: EmaReverseSettings) -> None:
+        self.settings = settings
+        self.seen = 0
+
+    def reset(self) -> None:
+        """Забыть накопленное."""
+        self.seen = 0
+
+    def on_closed_bar(self, bar: Bar) -> Decision:
+        """Прогрев по периоду настроек первого, дальше молчание."""
+        self.seen += 1
+        if self.seen <= self.settings.period:
+            return Decision(
+                intent=Intent.NONE,
+                reason="прогрев близнеца",
+                close=bar.close,
+                skip_bar=True,
+            )
+        return Decision(
+            intent=Intent.NONE,
+            reason="близнец молчит",
+            close=bar.close,
+            average=bar.close,
+            warmed_up=True,
+            bars=self.seen,
+        )
+
+
+def describe_twin(settings: EmaReverseSettings) -> Description:
+    """Правило близнеца словами. Заголовок — его собственный."""
+    return Description(
+        title=TwinAlgorithm.title,
+        lead=f"Близнец смотрит выше и ниже {settings.label}.",
+        claims=(
+            Claim(
+                relation="закрытие выше линии близнеца",
+                detail=f"закрытие выше {settings.label}",
+                intent=Intent.LONG,
+                probe=lambda average: Sample.flat(average + 10.0),
+            ),
+            Claim(
+                relation="закрытие ниже линии близнеца",
+                detail=f"закрытие ниже {settings.label}",
+                intent=Intent.SHORT,
+                probe=lambda average: Sample.flat(average - 10.0),
+            ),
+        ),
+    )
+
+
+def twin_entry() -> StrategyEntry:
+    """Запись близнеца: класс настроек **первого**, фабрика своя.
+
+    Таблица полей берётся у записи алгоритма №1, а не пишется рядом:
+    один класс настроек — одна таблица полей на всех, кто им пользуется
+    (`tests/test_strategies_registry.py`). Своя копия таблицы сделала бы
+    запись нарушением ровно того правила, ради проверки которого она заведена.
+    """
+    first = registry.default_entry()
+    return StrategyEntry(
+        id="settings_twin",
+        title=TwinAlgorithm.title,
+        settings_type=first.settings_type,
+        factory=TwinAlgorithm,
+        fields=first.fields,
+        demands=first.demands,
+        describe=describe_twin,
+    )
+
+
+def chose_the_twin() -> Settings:
+    """Набор окна с выбранным близнецом. Поля те же, что у первого."""
+    return Settings(strategy_id="settings_twin", average_period=9)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +520,61 @@ def test_the_registry_builds_the_chosen_module_not_the_first(
     assert made.title == SecondAlgorithm.title
 
 
+#: Час МСК одной строкой: тест про выбор алгоритма, а не про часовые пояса.
+MSK = timezone(timedelta(hours=3))
+
+
+def _bar(close: float, step: int) -> Bar:
+    """Ровная свеча на пятиминутной сетке. Всё, кроме закрытия, безразлично."""
+    return Bar(
+        closes_at=datetime(2026, 6, 19, 10, 5, tzinfo=MSK) + timedelta(minutes=5 * step),
+        open=close,
+        high=close,
+        low=close,
+        close=close,
+    )
+
+
+def test_the_decision_is_taken_by_the_chosen_algorithm_not_the_first(
+    two_algorithms: StrategyEntry,
+) -> None:
+    """Свечи те же — решения разные. Сторож стоит на **решении**, а не на типе.
+
+    ⚠️ Зачем отдельно от проверки выше. Тип собранного модуля — это то,
+    что программа **написала**; намерение на свече — то, что она **посчитала**.
+    Между ними помещается целый класс дефекта: собрать выбранный модуль
+    и спросить сигнал у первого. Проверка типа на нём зелёная.
+
+    Контраст даёт подставной: намерения он не даёт **никогда**, а алгоритм
+    №1 на этом же ряду даёт `LONG` — пятнадцать ровных свечей на прогрев
+    и одна выше средней.
+
+    ⚠️ Проверка переехала сюда 14.09.2026 из `test_app_convert.py`: там она
+    стояла на настоящем алгоритме №2 (`ma_crossing`), а он удалён решением
+    владельца счёта. Контраст сохранён — подделка молчит так же.
+    """
+    first = convert.chosen_algorithm(Settings()).build(
+        convert.strategy_settings(Settings())
+    )
+    second = convert.chosen_algorithm(chose_the_second()).build(
+        convert.strategy_settings(chose_the_second())
+    )
+
+    series = [*(_bar(100.0, step) for step in range(15)), _bar(101.0, 15)]
+
+    def last_intent(module: Strategy) -> Intent:
+        for bar in series:
+            decision = module.on_closed_bar(bar)
+        return decision.intent
+
+    assert last_intent(first) is Intent.LONG, (
+        "алгоритм №1 на закрытии выше средней обязан хотеть лонг"
+    )
+    assert last_intent(second) is Intent.NONE, (
+        "решение принял первый алгоритм, хотя выбран второй"
+    )
+
+
 def test_the_settings_of_one_algorithm_are_refused_by_another(
     two_algorithms: StrategyEntry,
 ) -> None:
@@ -565,6 +727,61 @@ def test_the_sweep_follows_its_own_declaration_not_the_registry_default(
 # ---------------------------------------------------------------------------
 
 
+def replayed_session(loop, tmp_path, values: Settings, *, database_name: str):
+    """Прогон по истории через порт — и запись о нём в журнале прогонов.
+
+    Общая оснастка проверок ниже: ряд минуток, база, порт, ожидание. Разного
+    у них ровно одно — выбранный в окне алгоритм, и разница обязана быть
+    видна в вызове, а не тонуть в двадцати пяти одинаковых строках.
+
+    Ряд синусоидальный нарочно: алгоритм №1 делает на нём сделки. Без этого
+    «Сделок 0» у подставного не доказывало бы ничего — доказывает не число,
+    а **разница** с тем, что на этом же ряду делает первый.
+
+    :param database_name: своё имя файла на каждый вызов — два прогона в одной
+        базе легли бы в один журнал, и `sessions[0]` оказался бы чужим.
+    """
+    import math
+    from datetime import datetime, timedelta
+
+    from app.port import HistoryPort
+    from market import MSK, Candle, MarketWorker, Source, Timeframe
+    from market.storage import CandleStore
+
+    day = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)
+    minutes = [
+        Candle(
+            time=day + timedelta(minutes=index),
+            open=(price := 100000.0 + 300.0 * math.sin(index / 9.0)),
+            high=price + 40.0, low=price - 40.0, close=price,
+            volume=1.0, timeframe=Timeframe(1), filled_minutes=1,
+        )
+        for index in range(300)
+    ]
+    database = tmp_path / database_name
+    with CandleStore(database) as store:
+        store.put_minutes("MXU6", minutes, Source.ISS)
+
+    async def go() -> None:
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(
+            worker, values=values, days=0, sanitize=lambda text: text
+        )
+        try:
+            port.refresh("тест")
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+    with CandleStore(database) as store:
+        sessions = list(store.journal_sessions(limit=999).rows)
+    assert sessions, "прогон не записан в журнал прогонов вовсе"
+    return sessions[0]
+
+
 def test_the_port_records_the_run_under_the_chosen_algorithm(
     loop, tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -578,46 +795,10 @@ def test_the_port_records_the_run_under_the_chosen_algorithm(
     Мутация, обязанная ронять проверку: `registry.default_entry().build(...)`
     вместо `algorithm.build(...)` в `app/port.py::_replay`.
     """
-    import math
-    from datetime import datetime, timedelta
-
-    from app.port import HistoryPort
-    from market import MSK, Candle, MarketWorker, Source, Timeframe
-    from market.storage import CandleStore
-
     monkeypatch.setattr(registry, "_ENTRIES", (registry.default_entry(), second_entry()))
-    day = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)
-    minutes = [
-        Candle(
-            time=day + timedelta(minutes=index),
-            open=(price := 100000.0 + 300.0 * math.sin(index / 9.0)),
-            high=price + 40.0, low=price - 40.0, close=price,
-            volume=1.0, timeframe=Timeframe(1), filled_minutes=1,
-        )
-        for index in range(300)
-    ]
-    database = tmp_path / "candles.sqlite3"
-    with CandleStore(database) as store:
-        store.put_minutes("MXU6", minutes, Source.ISS)
-
-    async def go() -> None:
-        worker = MarketWorker(database)
-        await worker.open()
-        port = HistoryPort(
-            worker, values=chose_the_second(), days=0, sanitize=lambda text: text
-        )
-        try:
-            port.refresh("тест")
-            await port.wait()
-        finally:
-            await port.aclose()
-            await worker.close()
-
-    loop.run_until_complete(go())
-    with CandleStore(database) as store:
-        sessions = list(store.journal_sessions(limit=999).rows)
-    assert sessions, "прогон не записан в журнал прогонов вовсе"
-    session = sessions[0]
+    session = replayed_session(
+        loop, tmp_path, chose_the_second(), database_name="candles.sqlite3"
+    )
     assert session.strategy == SecondAlgorithm.title, (
         f"прогон записан чужим алгоритмом: {session.strategy!r}"
     )
@@ -635,6 +816,55 @@ def test_the_port_records_the_run_under_the_chosen_algorithm(
     assert "Сделок 0" in (session.finish_note or ""), (
         "прогон посчитан не выбранным алгоритмом: подставной сделок "
         f"не делает, а в итоге записано «{session.finish_note}»"
+    )
+
+
+def test_a_run_named_by_the_twin_is_not_computed_by_the_first(
+    loop, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Класс настроек общий — подмена алгоритма первым видна **сделками**.
+
+    ⚠️ Зачем отдельно от проверки выше, хотя мутация та же. У подставного
+    `SecondAlgorithm` класс настроек свой, и подмена «показать выбранный,
+    посчитать первым» умирает на нём раньше сделок: `EmaReverse` отвергает
+    `SecondSettings` вслух, прогон краснеет по несовпадению классов. Красный
+    прогон по чужой причине — не доказательство: настоящий вред подмены
+    состоит в **других сделках под чужим названием**, и до сделок дело
+    там не доходит вовсе.
+
+    Близнец делит класс настроек с алгоритмом №1, как делил его удалённый
+    `ma_crossing`. Подмена проходит все проверки типов и всплывает там, где
+    и должна, — в числе сделок.
+
+    Мутация, обязанная ронять проверку: `registry.default_entry().build(...)`
+    вместо `algorithm.build(...)` в `app/port.py::_replay`.
+    """
+    monkeypatch.setattr(registry, "_ENTRIES", (registry.default_entry(), twin_entry()))
+    assert twin_entry().settings_type is registry.default_entry().settings_type, (
+        "близнец перестал делить класс настроек с алгоритмом №1 — подмена "
+        "снова умирала бы на отказе, а не на сделках, и проверка стала пустой"
+    )
+
+    # Тот же ряд первым алгоритмом: контроль против вакуума. Без него
+    # «Сделок 0» у близнеца ничего не означает — их могло не быть ни у кого.
+    control = replayed_session(
+        loop, tmp_path, Settings(average_period=9), database_name="control.sqlite3"
+    )
+    assert control.strategy == registry.default_entry().title
+    assert "Сделок 0" not in (control.finish_note or ""), (
+        "алгоритм №1 на этом ряду сделок не делает — сравнивать не с чем, "
+        f"проверка вакуумна. Записано: «{control.finish_note}»"
+    )
+
+    session = replayed_session(
+        loop, tmp_path, chose_the_twin(), database_name="twin.sqlite3"
+    )
+    assert session.strategy == TwinAlgorithm.title, (
+        f"прогон записан чужим алгоритмом: {session.strategy!r}"
+    )
+    assert "Сделок 0" in (session.finish_note or ""), (
+        "выбран близнец, а посчитал первый: близнец сделок не делает, "
+        f"а в итоге записано «{session.finish_note}»"
     )
 
 

@@ -296,9 +296,10 @@ _ANOTHER_ENGINE: dict[str, object] = {
     "commission_per_side": 7.0,
     "ruble_per_point": 2.0,
     "close_wait_bars": 5,
-    "volume_cap": 9.0,
-    "daily_loss_limit_percent": 3.5,
-    "free_funds_reserve_percent": 25.0,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "volume_cap": 9.0,
+    # "daily_loss_limit_percent": 3.5,
+    # "free_funds_reserve_percent": 25.0,
     "calendar": DayMarks.of({date(2026, 6, 12): False}),
     "exchange_days": DayMarks.of({date(2026, 6, 12): False}),
 }

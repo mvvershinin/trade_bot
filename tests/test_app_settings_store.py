@@ -45,6 +45,9 @@ DIFFERENT = Settings(
     # этого поля **закрыт**: чтение отвергает имя, которого нет в реестре
     # (`SettingsStore._known_algorithm`), и подставить сюда выдуманное значит
     # проверять не перезапуск, а отказ. Отказ проверяется отдельно.
+    # ⚠️ Откат на умолчание здесь **тихий**, и сторожит его не этот кусок,
+    # а `test_the_sample_differs_from_the_defaults_in_every_field`: он падает
+    # вслух, как только в реестре остаётся один алгоритм.
     strategy_id=(
         next(
             (name for name in registry.known_ids()
@@ -60,7 +63,13 @@ DIFFERENT = Settings(
     reversal_moment=ReversalMoment.SAME_BAR,
     after_take_profit=AfterTakeProfit.WAIT_FOR_SIGNAL,
     on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_LONG,
-    take_profit_enabled=False,
+    # ⚠️ Фиксация прибыли включена, хотя умолчание тоже «включена»,
+    # и это вынужденно: пара «фиксация / способ» выражает ОДИН выбор из трёх,
+    # и сочетания «не фиксируем + скользящий уровень» у настроек не бывает
+    # (решение 0060, `app/settings_store.py::_one_way_to_take_profit`).
+    # Отличаться от умолчания обоими полями сразу образец не может; второе
+    # поле проверяется отдельно — см. `_COVERED_APART`.
+    take_profit_enabled=True,
     take_profit_pct=1.25,
     trailing_enabled=True,
     trailing_start_pct=1.5,
@@ -70,12 +79,13 @@ DIFFERENT = Settings(
     window_end=time(11, 30),
     close_on_time_end=False,
     volume=4,
-    volume_cap_enabled=True,
-    volume_cap=9,
-    daily_loss_limit_enabled=True,
-    daily_loss_limit_pct=3.5,
-    free_funds_reserve_enabled=True,
-    free_funds_reserve_pct=12.5,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # volume_cap_enabled=True,
+    # volume_cap=9,
+    # daily_loss_limit_enabled=True,
+    # daily_loss_limit_pct=3.5,
+    # free_funds_reserve_enabled=True,
+    # free_funds_reserve_pct=12.5,
     commission_per_side_rub=None,
     price_step=25.0,
     ruble_per_point=1.73774,
@@ -103,6 +113,33 @@ def _names() -> list[str]:
 
 # ------------------------------------------------------------- перезапуск
 
+#: Поле, которому отличающегося от умолчания значения в образце не досталось,
+#: и проверка, которая стережёт его сохранение отдельно.
+#:
+#: ⚠️ Список поимённый и проверяемый: названная проверка обязана существовать
+#: в этом файле. Тихо вычеркнуть поле из канарейки нельзя — так однажды
+#: отключилась проверка сохранения имени алгоритма (правка 14.09.2026),
+#: и мутация «подменять выбранное при каждом старте» не роняла ничего.
+_COVERED_APART = {
+    "take_profit_enabled": "test_the_take_switch_survives_a_restart_on_its_own",
+}
+
+
+def test_the_take_switch_survives_a_restart_on_its_own(store: SettingsStore) -> None:
+    """Выключенная фиксация прибыли переживает перезапуск.
+
+    Отдельной проверкой, потому что в общем образце этому полю не досталось
+    второго значения (`_COVERED_APART`): пара «фиксация / способ» выражает
+    один выбор из трёх. Поле, которое не сохраняется, вернулось бы
+    к умолчанию «фиксируем» — и робот поставил бы уровень, которого человек
+    не просил.
+    """
+    assert store.save(Settings(take_profit_enabled=False)) == ""
+    read = SettingsStore(store.path.parent).load()
+    assert read.troubles == ()
+    assert read.values.take_profit_enabled is False
+
+
 def test_the_sample_differs_from_the_defaults_in_every_field() -> None:
     """Образец для проверок отличается от умолчания **каждым** полем.
 
@@ -110,17 +147,33 @@ def test_the_sample_differs_from_the_defaults_in_every_field() -> None:
     совпавшее с умолчанием, «переживает перезапуск» и при полностью
     потерянном файле.
     """
+    # ⚠️ Условие, а не поимённое исключение, и правка эта от 14.09.2026.
+    # Прежняя редакция при одном алгоритме в реестре **молча** вычёркивала
+    # `strategy_id` из списка совпавших: у поля закрытый набор значений, и
+    # отличающегося значения не существовало. Вычёркивание было тихим — то
+    # есть проверка сохранения имени алгоритма отключалась сама, и мутация
+    # «при каждом старте подменять выбранный алгоритм первым»
+    # (`app/settings_store.py::_known_algorithm`) не роняла ничего. Теперь
+    # алгоритмов два и вычёркивать нечего; вернётся один — об этом будет
+    # сказано вслух, а не сделано молча (`CLAUDE.md` №13).
+    assert len(registry.known_ids()) > 1, (
+        "в сборке один торговый алгоритм: отличающегося от умолчания значения "
+        "у поля strategy_id не существует, и проверка сохранения этого поля "
+        "вакуумна. Это не повод выключить её молча — пока алгоритм один, "
+        "подмена выбранного алгоритма при чтении файла не ловится ничем"
+    )
     default = Settings()
     same = [name for name in _names() if getattr(DIFFERENT, name) == getattr(default, name)]
-    # ⚠️ Поимённое исключение с причиной, а не «пропустить всё, что не сошлось».
-    # У имени алгоритма набор значений закрыт реестром, и сегодня в нём одно
-    # имя: отличающегося значения не существует. Как только появится второй
-    # алгоритм, исключение исчезнет само — проверка снова станет полной.
-    if len(registry.known_ids()) == 1:
-        same = [name for name in same if name != "strategy_id"]
-    assert not same, (
+    assert sorted(same) == sorted(_COVERED_APART), (
         "поля образца совпали с умолчанием, и проверка сохранения их не видит: "
-        + ", ".join(same)
+        + ", ".join(sorted(set(same) - set(_COVERED_APART)))
+        + "; названные исключением перестали совпадать: "
+        + ", ".join(sorted(set(_COVERED_APART) - set(same)))
+    )
+    missing = [name for name in _COVERED_APART.values() if name not in globals()]
+    assert not missing, (
+        "исключение ссылается на проверку, которой в этом файле нет: "
+        + ", ".join(missing)
     )
 
 
@@ -145,6 +198,65 @@ def test_an_unknown_algorithm_in_the_file_is_replaced_out_loud(
         "подмена алгоритма прошла молча"
     )
     assert not read.notes, "оговорка ушла не в тот список: её могут не показать"
+
+
+def test_a_method_without_the_take_in_the_file_is_replaced_out_loud(
+    store: SettingsStore,
+) -> None:
+    """Файл прежней сборки: «скользящий при выключенной фиксации» — вслух.
+
+    Способов фиксировать прибыль два, применяется один (решение 0060).
+    Сочетание «способ скользящий, а фиксация выключена» не означает ничего:
+    уровня выхода у позиции в нём нет вовсе (`EngineSettings.plan`), зато
+    движок проверяет пару «порог/отступ» и вправе отвергнуть настройки целиком
+    из-за чисел, которых никто не читает. Окно такого больше не отдаёт,
+    а в файле прежней сборки оно лежит.
+
+    ⚠️ Подмена поведения не меняет: уровня не было и не будет. Молчать о ней
+    всё равно нельзя — снят переключатель, который человек ставил руками
+    (правило 13 `CLAUDE.md`).
+
+    Мутация, обязанная ронять проверку: принять сочетание как есть, без строки
+    в `troubles`.
+    """
+    assert store.save(Settings(
+        take_profit_enabled=False, trailing_enabled=True,
+        trailing_start_pct=0.5, trailing_offset_pct=0.2,
+    )) == ""
+    read = SettingsStore(store.path.parent).load()
+
+    assert read.values.trailing_enabled is False, (
+        "способ оставлен выбранным при выключенной фиксации — движок отвергнет "
+        "настройки из-за чисел, которых не читает"
+    )
+    assert read.values.take_profit_enabled is False, (
+        "подмена включила фиксацию прибыли: это уже смена поведения робота, "
+        "а не приведение настроек в порядок"
+    )
+    assert any(
+        "скользящий уровень" in trouble.lower() for trouble in read.troubles
+    ), "снятый переключатель прошёл молча"
+    assert not read.notes, "оговорка ушла не в тот список: её могут не показать"
+    # ⚠️ Числа способа при этом не трогаются: они хранятся, чтобы включение
+    # вернуло подобранное, а не умолчание.
+    assert read.values.trailing_start_pct == pytest.approx(0.5)
+    assert read.values.trailing_offset_pct == pytest.approx(0.2)
+
+
+def test_a_chosen_method_with_the_take_on_is_left_alone(store: SettingsStore) -> None:
+    """Канарейка: «фиксация включена, способ скользящий» — законный выбор.
+
+    Это и есть выбор «скользящий уровень» (решение 0060), а не сочетание
+    двух галочек. Подмена здесь означала бы, что программа отменяет выбранный
+    человеком способ при каждом запуске.
+    """
+    assert store.save(Settings(
+        take_profit_enabled=True, trailing_enabled=True,
+        trailing_start_pct=0.5, trailing_offset_pct=0.2,
+    )) == ""
+    read = SettingsStore(store.path.parent).load()
+    assert read.values.trailing_enabled is True, "выбранный способ отменён"
+    assert read.troubles == (), f"законный выбор объявлен неполадкой: {read.troubles}"
 
 
 def test_a_known_algorithm_in_the_file_is_left_alone(store: SettingsStore) -> None:
@@ -443,7 +555,14 @@ def test_a_real_settings_file_survives_a_read_and_a_write(tmp_path) -> None:
 
     loaded = store.load()
     assert loaded.troubles == (), "настоящий файл прочитался с оговорками"
-    assert loaded.notes == (), "в настоящем файле нашлось непрочитанное поле"
+    # ⚠️ Одна оговорка законна и обязательна: в файле лежат ключи потолка
+    # объёма, а ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Принять их молча —
+    # дефект (правило 13 `CLAUDE.md`). Тревожной она не становится: галочка
+    # в этом файле снята, поведение робота не изменилось ничем.
+    assert len(loaded.notes) == 1, (
+        f"в настоящем файле нашлось непрочитанное поле: {loaded.notes}"
+    )
+    assert "потолок объёма" in loaded.notes[0], loaded.notes[0]
     assert loaded.values.average_period == 15
     assert loaded.values.take_profit_pct == pytest.approx(0.2)
     assert loaded.values.window_start.hour == 10 and loaded.values.window_start.minute == 20
@@ -453,3 +572,112 @@ def test_a_real_settings_file_survives_a_read_and_a_write(tmp_path) -> None:
     assert path.read_text(encoding="utf-8") == OWNER_FILE, (
         "перезапись изменила файл настроек владельца счёта"
     )
+
+
+# ------------------------------- выключенные на этапе предохранители (D-113)
+
+def _file_with_guards(folder: pathlib.Path, *, armed: bool) -> SettingsStore:
+    """Файл настроек прежней сборки: шесть ключей трёх предохранителей."""
+    body = {
+        "format_version": FORMAT_VERSION,
+        "settings": {
+            "average_period": 20,
+            "volume": 3,
+            "volume_cap_enabled": armed,
+            "volume_cap": 7,
+            "daily_loss_limit_enabled": armed,
+            "daily_loss_limit_pct": 2.5,
+            "free_funds_reserve_enabled": armed,
+            "free_funds_reserve_pct": 40.0,
+        },
+    }
+    (folder / SETTINGS_FILE_NAME).write_text(
+        json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return SettingsStore(folder)
+
+
+def test_an_old_file_with_the_guards_still_opens_the_program(tmp_path) -> None:
+    """Стережёт: файл прежней сборки не роняет запуск и не теряет остальное.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). У людей на дисках лежат файлы,
+    где шесть ключей трёх предохранителей записаны. Отказ разбора означал бы
+    «программа не запускается, потому что в файле стоит потолок объёма»,
+    а рядом в файле лежит всё, что человек подбирал руками.
+    """
+    store = _file_with_guards(tmp_path, armed=True)
+    loaded = store.load()
+    assert loaded.values.average_period == 20, "остальные настройки потерялись"
+    assert loaded.values.volume == 3
+
+
+def test_an_armed_guard_in_an_old_file_is_not_accepted_in_silence(tmp_path) -> None:
+    """Стережёт МОЛЧАНИЕ: включённая в файле защита перестала работать — скажи.
+
+    Самый дорогой случай всей правки. Владелец счёта ставил галочку руками,
+    открывает программу — и защиты нет. Принять это молча значит оставить его
+    в уверенности, что робот остановится по дневному лимиту.
+
+    Строка идёт в `troubles`, то есть доходит до журнала решений
+    **предупреждением**, а не обычной оговоркой: `Loaded.troubles` — это
+    «настройки потеряны или могли быть потеряны».
+    """
+    loaded = _file_with_guards(tmp_path, armed=True).load()
+    said = [line for line in loaded.troubles if "предохранител" in line]
+    assert said, (
+        "включённый в файле предохранитель принят молча — владелец счёта "
+        f"вправе считать, что защита работает. Оговорки: {loaded.troubles}"
+    )
+    whole = said[0].lower()
+    for guard in ("потолок объёма", "дневной лимит убытка", "запас свободных средств"):
+        assert guard in whole, f"не назван предохранитель «{guard}»: {said[0]!r}"
+    assert "не следит" in whole, "не сказано последствие: робот за этим не следит"
+
+
+def test_a_cleared_guard_in_an_old_file_is_a_note_and_not_an_alarm(tmp_path) -> None:
+    """Стережёт вторую половину: снятая галочка — оговорка, а не тревога.
+
+    Поведение робота от неё не изменилось ничем, и кричать здесь значит
+    приучить не читать предупреждения. Но и промолчать нельзя: ключи в файле
+    остались, и человек вправе знать, почему их больше не видно в окне.
+    """
+    loaded = _file_with_guards(tmp_path, armed=False).load()
+    assert not loaded.troubles, (
+        f"снятая галочка поднята до тревоги: {loaded.troubles}"
+    )
+    said = [line for line in loaded.notes if "предохранител" in line]
+    assert said, f"о выключенных предохранителях не сказано ничего: {loaded.notes}"
+
+
+def test_the_guard_keys_are_not_explained_as_a_newer_build(tmp_path) -> None:
+    """Стережёт неправду: сборка не новее, предохранители выключены у нас.
+
+    Общая оговорка про незнакомые ключи говорит «скорее всего файл сделан
+    более новой сборкой программы». Отправить человека искать несуществующее
+    обновление — это не «сказал», а «соврал».
+    """
+    loaded = _file_with_guards(tmp_path, armed=False).load()
+    for line in loaded.notes + loaded.troubles:
+        if "более новой сборкой" in line:
+            for key in ("volume_cap", "daily_loss_limit", "free_funds_reserve"):
+                assert key not in line, (
+                    f"ключ «{key}» объяснён более новой сборкой: {line!r}"
+                )
+
+
+def test_the_numbers_of_the_switched_off_guards_survive_a_write(tmp_path) -> None:
+    """Стережёт возврат `D-113`: цифры предохранителей переживают выключение.
+
+    Их подбирал человек. Выбросить их за то, что предохранитель выключен
+    на этапе, значит потребовать подбирать заново после возврата.
+    """
+    store = _file_with_guards(tmp_path, armed=True)
+    loaded = store.load()
+    assert store.save(loaded.values) == ""
+    written = json.loads(
+        (tmp_path / SETTINGS_FILE_NAME).read_text(encoding="utf-8")
+    )["settings"]
+    assert written["volume_cap"] == 7
+    assert written["daily_loss_limit_pct"] == 2.5
+    assert written["free_funds_reserve_pct"] == 40.0
+    assert written["volume_cap_enabled"] is True
