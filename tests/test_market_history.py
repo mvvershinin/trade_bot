@@ -214,6 +214,9 @@ def test_an_unknown_ticker_is_explained_and_nothing_is_downloaded(
     assert "не знает инструмента" in trouble
     assert "опечатка" in trouble
     assert "--fetch-market shares" in trouble, "про чужой рынок не сказано"
+    # D-073: совет обязан назвать и окно, а не только ключ консоли — человек
+    # грузит историю из окна, и ключ, которого там нет, ему не поможет.
+    assert "«Загрузка истории с биржи»" in trouble, "в окне что делать — не сказано"
     assert rows(path) == 0
 
 

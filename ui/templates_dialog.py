@@ -97,6 +97,7 @@ from ui.templates import (
     Template,
     export_templates,
     merge_templates,
+    with_current_contract,
 )
 from ui.templates_import import ImportDialog
 from ui.theme import current as current_theme
@@ -111,7 +112,11 @@ __all__ = ["TemplatesDialog"]
 COLUMNS: tuple[tuple[str, str], ...] = (
     ("Шаблон", "Название, которое вы дали набору настроек."),
     ("Сохранён", "Когда набор записан. Время московское."),
-    ("Инструмент", "Инструмент и размер свечи из самого набора."),
+    (
+        "Свеча",
+        "Размер свечи из самого набора. Инструмента в наборе нет: какой "
+        "контракт торговать, решает программа, а не шаблон.",
+    ),
     ("Прогонов", "Сколько раз этот набор уже прогонялся и записан в журнал."),
     (
         "Последний прогон",
@@ -334,7 +339,10 @@ class TemplatesDialog(QDialog):
         self._templates = loaded.templates
         troubles = list(loaded.troubles)
         with busy_cursor():
-            self._stats = self._read_stats([one.values for one in self._templates])
+            # Прогоны ищутся по текущему инструменту: шаблон его не несёт.
+            self._stats = self._read_stats([
+                with_current_contract(one, self._current) for one in self._templates
+            ])
         if self._stats.trouble:
             troubles.append(self._stats.trouble)
         self._say(troubles)
@@ -406,7 +414,7 @@ class TemplatesDialog(QDialog):
         self.export_button.setEnabled(template is not None)
         self._fill_runs(self._runs_of(row))
         self.snapshot.setPlainText(
-            _snapshot_text(template) if template is not None else ""
+            _snapshot_text(template, self._current) if template is not None else ""
         )
 
     def _fill_runs(self, runs: tuple[TemplateRun, ...]) -> None:
@@ -458,11 +466,13 @@ class TemplatesDialog(QDialog):
         template = self.selected()
         if template is None:
             return
+        # Инструмент остаётся текущим: шаблон контракта не несёт (решение 0061).
+        values = with_current_contract(template, self._current)
         if confirm_changes(
-            self, self._current, template.values, lead=_apply_lead(template)
+            self, self._current, values, lead=_apply_lead(template)
         ):
-            self._current = template.values
-            self.applied.emit(template.values)
+            self._current = values
+            self.applied.emit(values)
             self.accept()
 
     def save_current(self) -> None:
@@ -685,7 +695,7 @@ def _row_of(template: Template, runs: tuple[TemplateRun, ...]) -> tuple[str, ...
     return (
         template.name,
         fmt_datetime(template.saved_at) if template.saved_at else EMPTY,
-        f"{template.values.instrument}, {template.values.timeframe}",
+        template.values.timeframe,
         str(len(runs)) if runs else NEVER_RUN,
         last.period if last and last.period else EMPTY,
         str(last.trades) if last and last.trades is not None else EMPTY,
@@ -769,8 +779,12 @@ def _apply_lead(template: Template) -> str:
     return lead
 
 
-def _snapshot_text(template: Template) -> str:
-    """Что в наборе — тем же текстом, что уходит в журнал прогона."""
+def _snapshot_text(template: Template, current: Settings) -> str:
+    """Что в наборе — тем же текстом, что уходит в журнал прогона.
+
+    Инструмент — текущий: шаблон его не несёт, и показать здесь умолчание
+    сборки значило бы назвать контракт, на который набор не переключит.
+    """
     door = backend.current()
     if door is None:
         return (
@@ -778,7 +792,7 @@ def _snapshot_text(template: Template) -> str:
             "словами нечем."
         )
     try:
-        return door.snapshot(template.values)
+        return door.snapshot(with_current_contract(template, current))
     except Exception as error:  # noqa: BLE001 — фраза человеку важнее типа
         return (
             f"Настройки этого набора показать не удалось: {error}\n\n"
@@ -800,7 +814,7 @@ def _snippet(values: Settings) -> str:
         else "выключен"
     )
     return (
-        f"Сейчас: {values.instrument}, {values.timeframe}, "
+        f"Сейчас: {values.timeframe}, "
         f"средняя {values.average_period}, тейк {take}, "
         f"объём {values.volume}, "
         f"окно {values.window_start:%H:%M}–{values.window_end:%H:%M} МСК."

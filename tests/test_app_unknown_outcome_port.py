@@ -42,6 +42,12 @@ from market import MSK, Candle, CandleStore, MarketWorker, Source, Timeframe
 from market.journal import redact
 from ui.models import Settings as UiSettings
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = UiSettings().instrument
+
 #: Слова самого отказа: указание владельцу счёта, что делать руками.
 CHECK_WITH_THE_BROKER = "Проверьте заявки и позицию у брокера"
 
@@ -72,7 +78,7 @@ def live_base(tmp_path: pathlib.Path) -> pathlib.Path:
         for index in range(600)
     ]
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", minutes, Source.ISS)
+        store.put_minutes(SYMBOL, minutes, Source.ISS)
     return path
 
 

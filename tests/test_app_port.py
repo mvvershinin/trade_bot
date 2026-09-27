@@ -55,6 +55,12 @@ from ui.models import (
 from app import convert
 from app.port import NO_GUARDS, HistoryPort, _Frame
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
+
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)  # пятница, до открытия окна
 
 
@@ -81,7 +87,7 @@ def _minutes(count: int = 300, start: datetime = DAY) -> list[Candle]:
 def database(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(), Source.ISS)
     return path
 
 
@@ -97,7 +103,7 @@ def long_database(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "long-candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes((BREATHE_EVERY * 2 + 20) * 5), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes((BREATHE_EVERY * 2 + 20) * 5), Source.ISS)
     return path
 
 
@@ -110,8 +116,8 @@ def two_day_database(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "two-days.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(300, DAY - timedelta(days=1)), Source.ISS)
-        store.put_minutes("MXU6", _minutes(300, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY - timedelta(days=1)), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY), Source.ISS)
     return path
 
 
@@ -126,8 +132,8 @@ def database_with_tails(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "tails.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(298, DAY), Source.ISS)
-        store.put_minutes("MXU6", _minutes(298, DAY + timedelta(days=3)), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(298, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(298, DAY + timedelta(days=3)), Source.ISS)
     return path
 
 
@@ -200,7 +206,7 @@ def test_candles_and_deals_reach_the_window(loop, database) -> None:
     port, recorded = replay_history(loop, database, values=Settings(), days=0)
 
     chart = recorded.charts[-1]
-    assert chart.instrument == "MXU6"
+    assert chart.instrument == SYMBOL
     assert len(chart.candles) > 50, "свечи из базы не доехали"
     assert chart.average, "линия средней пуста — торговый модуль её не отдал"
     assert chart.average_label.startswith("EMA(15)")
@@ -318,7 +324,7 @@ def test_the_state_is_always_simulation(loop, database) -> None:
     assert state.simulation is True, "боевой режим не подключён и объявляться не должен"
     assert state.running is False
     assert state.connection is Connection.UNKNOWN
-    assert state.instrument == "MXU6"
+    assert state.instrument == SYMBOL
 
 
 @pytest.mark.slow
@@ -360,7 +366,7 @@ def test_a_missing_instrument_names_what_is_there(loop, database) -> None:
         loop, database, values=Settings().replace(instrument="RIU6"), days=0
     )
     message = recorded.failures[-1]
-    assert "RIU6" in message and "MXU6" in message
+    assert "RIU6" in message and SYMBOL in message
 
 
 def test_start_refuses_with_an_explanation(loop, database) -> None:
@@ -1676,7 +1682,11 @@ def test_an_accepted_stream_command_does_not_pretend_to_know_the_connection(
     assert len(recorded.failures) == failures, "принятая команда связи объявлена отказом"
     assert len(recorded.states) == states, "ради команды связи переслан снимок состояния"
     assert port.connection is Connection.UNKNOWN, "состояние связи выставляет поток, не команда"
-    said = [row.event for row in recorded.appended[-2:]]
+    # Только строки про ход: при включении порт вправе сказать и про срок
+    # контракта («Срок контракта не известен» — таблицы в этой базе нет).
+    said = [
+        row.event for row in recorded.appended if row.event.startswith("Наблюдение")
+    ][-2:]
     assert said == ["Наблюдение включено", "Наблюдение выключено"], (
         f"о включении и выключении живого хода не сказано: {said}"
     )
@@ -1756,12 +1766,12 @@ class LiveRun:
         добавленных справа, и уточнений последней свечи.
         """
         was = self.counters()
-        await self.worker.put_minutes("MXU6", [_one_minute(moment)], Source.BROKER)
-        self.port.live_candle("MXU6")
+        await self.worker.put_minutes(SYMBOL, [_one_minute(moment)], Source.BROKER)
+        self.port.live_candle(SYMBOL)
         await self.port.wait()
         return tuple(b - a for a, b in zip(was, self.counters(), strict=True))  # type: ignore[return-value]
 
-    async def growing(self, minute: Candle, symbol: str = "MXU6") -> tuple[int, int, int]:
+    async def growing(self, minute: Candle, symbol: str = SYMBOL) -> tuple[int, int, int]:
         """Отдать порту снимок **ещё идущей** минуты — как это делает поток.
 
         В базу при этом не пишется ничего: формирующаяся минута туда
@@ -2092,11 +2102,11 @@ def test_a_growing_minute_is_never_written_to_the_base(loop, database) -> None:
     """
 
     async def body(run: LiveRun):
-        before = await run.worker.minutes("MXU6")
+        before = await run.worker.minutes(SYMBOL)
         for shift, price in enumerate((222_000.0, 333_000.0, 444_000.0)):
             moment = NEXT_MINUTE + timedelta(minutes=shift)
             await run.growing(_running_minute(moment, close=price))
-        return before, await run.worker.minutes("MXU6"), run.recorded.retouched
+        return before, await run.worker.minutes(SYMBOL), run.recorded.retouched
 
     before, after, drawn = live_session(
         loop, database, body, values=Settings(), days=0, redraw_gap=0.0
@@ -2265,7 +2275,7 @@ def _broker_wire(close: float, turnover: float) -> str:
 
     return json.dumps({
         "responseType": "CandleStick",
-        "ticker": "MXU6",
+        "ticker": SYMBOL,
         "classCode": "SPBFUT",
         "timeFrame": "M1",
         "open": close, "high": close, "low": close, "close": close,
@@ -2311,7 +2321,7 @@ def test_a_hanging_growing_candle_does_not_swallow_the_run_at_the_bar_close(
             return await honest(*args, **kwargs)
 
         run.worker.minutes = slow  # type: ignore[method-assign]
-        run.port.growing_minute("MXU6", _running_minute(
+        run.port.growing_minute(SYMBOL, _running_minute(
             NEXT_MINUTE + timedelta(minutes=2), close=222_222.0
         ))
         await asyncio.sleep(0.01)  # дать задаче дойти до чтения базы
@@ -2322,9 +2332,9 @@ def test_a_hanging_growing_candle_does_not_swallow_the_run_at_the_bar_close(
         was = run.counters()
         for shift in range(5):  # 12:00 … 12:04 — бар [12:00, 12:05) закрылся
             await run.worker.put_minutes(
-                "MXU6", [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))], Source.BROKER
+                SYMBOL, [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))], Source.BROKER
             )
-        run.port.live_candle("MXU6")
+        run.port.live_candle(SYMBOL)
         gate.set()
         await run.port.wait()
         return was, run.counters()
@@ -2376,7 +2386,7 @@ def test_a_broker_snapshot_moves_the_painted_candle_all_the_way_to_the_pixels(
                 assert snapshot is not None, "сообщение брокера не разобрано"
                 tally = tally_after(tally, snapshot)
                 assert tally.refusal is None, tally.refusal
-                port.growing_minute("MXU6", to_minute(snapshot, tally.contracts, unsettled=True))
+                port.growing_minute(SYMBOL, to_minute(snapshot, tally.contracts, unsettled=True))
                 await port.wait()
                 qapp.processEvents()
                 shots.append(_painted(surface))
@@ -2433,7 +2443,7 @@ def test_a_bar_the_run_refused_comes_back_once_the_exchange_confirmed_the_gap(
         await run.minute(NEXT_MINUTE + timedelta(minutes=2))     # 12:02, 12:01 нет
         await run.minute(NEXT_MINUTE + timedelta(minutes=4))     # 12:04 — бар закрылся
         refused = run.recorded.charts[-1].candles[-1].opens_at
-        moved = run.port.history_confirmed("MXU6", NEXT_MINUTE + timedelta(minutes=5))
+        moved = run.port.history_confirmed(SYMBOL, NEXT_MINUTE + timedelta(minutes=5))
         run.port.refresh("догрузка пропущенного")
         await run.port.wait()
         return refused, moved, run.recorded.charts[-1].candles[-1].opens_at
@@ -2462,8 +2472,8 @@ def test_the_confirmed_edge_never_moves_back(loop, database) -> None:
         await run.minute(NEXT_MINUTE)
         await run.minute(NEXT_MINUTE + timedelta(minutes=2))
         await run.minute(NEXT_MINUTE + timedelta(minutes=4))
-        forward = run.port.history_confirmed("MXU6", NEXT_MINUTE + timedelta(minutes=5))
-        backward = run.port.history_confirmed("MXU6", NEXT_MINUTE)
+        forward = run.port.history_confirmed(SYMBOL, NEXT_MINUTE + timedelta(minutes=5))
+        backward = run.port.history_confirmed(SYMBOL, NEXT_MINUTE)
         run.port.refresh("после отката")
         await run.port.wait()
         return forward, backward, run.recorded.charts[-1].candles[-1].opens_at
@@ -2540,7 +2550,7 @@ def two_instrument_database(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "two-instruments.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(300, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY), Source.ISS)
         store.put_minutes("SiU6", _holed(LATER_DAY, drop=HOLE), Source.ISS)
     return path
 
@@ -2621,15 +2631,15 @@ def test_a_deeper_instrument_does_not_lend_its_edge_to_the_shallower_one(
             await _run(port)                                        # MXU6
             port.apply_settings(replace(Settings(), instrument="SiU6"))
             await port.wait()                                       # край уехал на 22.06
-            port.apply_settings(replace(Settings(), instrument="MXU6"))
+            port.apply_settings(replace(Settings(), instrument=SYMBOL))
             await port.wait()
             # Живая минута MXU6 с пропуском: бар [12:00, 12:05) из трёх минут.
             for shift in (0, 2, 4):
                 await worker.put_minutes(
-                    "MXU6", [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))],
+                    SYMBOL, [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))],
                     Source.BROKER,
                 )
-                port.live_candle("MXU6")
+                port.live_candle(SYMBOL)
                 await port.wait()
         finally:
             await port.aclose()
@@ -2639,7 +2649,7 @@ def test_a_deeper_instrument_does_not_lend_its_edge_to_the_shallower_one(
     recorded = loop.run_until_complete(go())
 
     shown = recorded.charts[-1]
-    assert shown.instrument == "MXU6", f"на графике не тот инструмент: {shown.instrument}"
+    assert shown.instrument == SYMBOL, f"на графике не тот инструмент: {shown.instrument}"
     starts = {candle.opens_at for candle in shown.candles}
     assert NEXT_MINUTE not in starts, (
         "бар из минут потока с пропуском показан закрытым: границу доверия "
@@ -2677,7 +2687,7 @@ def test_a_base_that_appeared_later_still_gets_its_first_look(
             await _run(port)  # базы ещё нет
             missing = list(recorded.failures)
             with CandleStore(path) as store:
-                store.put_minutes("MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)),
+                store.put_minutes(SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)),
                                   Source.ISS)
             await worker.open()
             port.refresh("база появилась")
@@ -2726,9 +2736,9 @@ def test_minutes_the_stream_wrote_itself_are_never_confirmed_as_history(
             await _run(port)  # базы ещё нет
             await worker.open()  # так делает поток: `LiveFeed._listen`
             await worker.put_minutes(
-                "MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.BROKER
+                SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.BROKER
             )
-            port.live_candle("MXU6")  # поток: минута записана
+            port.live_candle(SYMBOL)  # поток: минута записана
             await port.wait()
             port.refresh("после потока")
             await port.wait()
@@ -2805,7 +2815,7 @@ def test_the_drawing_does_not_argue_with_the_run(loop, database, edge_at, note) 
 
     async def body(run: LiveRun):
         await run.worker.put_minutes(
-            "MXU6",
+            SYMBOL,
             [_one_minute(NEXT_MINUTE + timedelta(minutes=shift)) for shift in range(5)],
             Source.BROKER,
         )
@@ -2815,7 +2825,7 @@ def test_the_drawing_does_not_argue_with_the_run(loop, database, edge_at, note) 
         assert edge is not None, "прогон не оставил правого края — проверять нечего"
         run.port._edge = replace(edge, last=edge_at, forming=None)  # noqa: SLF001
         was = (len(run.recorded.grown), len(run.recorded.retouched))
-        run.port.live_candle("MXU6")
+        run.port.live_candle(SYMBOL)
         await run.port.wait()
         return (len(run.recorded.grown), len(run.recorded.retouched)), was
 
@@ -2917,7 +2927,7 @@ def test_a_bar_that_closed_and_went_into_the_run_is_not_drawn_a_second_time(
     async def body(run: LiveRun):
         drawn = await run.minute(NEXT_MINUTE)  # 12:00 — бар набирается
         await run.worker.put_minutes(
-            "MXU6",
+            SYMBOL,
             [_one_minute(NEXT_MINUTE + timedelta(minutes=shift)) for shift in (1, 2, 3, 4)],
             Source.BROKER,
         )
@@ -3021,11 +3031,11 @@ def test_the_boundary_of_a_never_seen_instrument_comes_from_the_first_stream_min
             await _run(port)  # базы ещё нет, первый взгляд отложен
             await worker.open()
             await worker.put_minutes(
-                "MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
+                SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
             )
-            port.stream_leads("MXU6", lead)  # поток: подписка открыта с этой минуты
-            await worker.put_minutes("MXU6", _stream_tail(lead), Source.BROKER)
-            port.live_candle("MXU6")
+            port.stream_leads(SYMBOL, lead)  # поток: подписка открыта с этой минуты
+            await worker.put_minutes(SYMBOL, _stream_tail(lead), Source.BROKER)
+            port.live_candle(SYMBOL)
             await port.wait()
             port.refresh("после потока")
             await port.wait()
@@ -3076,12 +3086,12 @@ def test_only_the_first_connection_of_a_session_sets_the_boundary(
             await _run(port)  # базы ещё нет, первый взгляд отложен
             await worker.open()
             await worker.put_minutes(
-                "MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
+                SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
             )
-            port.stream_leads("MXU6", lead)            # подключение первое
-            await worker.put_minutes("MXU6", _stream_tail(lead), Source.BROKER)
-            port.stream_leads("MXU6", again)           # обрыв и подключение второе
-            port.live_candle("MXU6")
+            port.stream_leads(SYMBOL, lead)            # подключение первое
+            await worker.put_minutes(SYMBOL, _stream_tail(lead), Source.BROKER)
+            port.stream_leads(SYMBOL, again)           # обрыв и подключение второе
+            port.live_candle(SYMBOL)
             await port.wait()
             port.refresh("после переподключения")
             await port.wait()
@@ -3147,14 +3157,14 @@ class _Exchange:
 #: Взят намеренно не единицей — на единице тест не отличил бы подстановку
 #: с биржи от умолчания программы.
 RTS = PointValue(
-    "MXU6", 1.737744, "биржей — карточка RIU6 (RFUD): шаг цены 10, "
+    SYMBOL, 1.737744, "биржей — карточка RIU6 (RFUD): шаг цены 10, "
     "стоимость шага 17,37744 ₽, помечена 2026-09-04 07:00:01"
 )
 
 #: Ответ биржи про фьючерс на индекс: ровно рубль. На нём стоит сверка
 #: с прототипом — 127 сделок из 127.
 INDEX = PointValue(
-    "MXU6", 1.0, "биржей — карточка MXU6 (RFUD): шаг цены 25, "
+    SYMBOL, 1.0, "биржей — карточка MXU6 (RFUD): шаг цены 25, "
     "стоимость шага 25 ₽, помечена 2026-09-04 07:00:01"
 )
 
@@ -3214,7 +3224,7 @@ def test_the_cost_of_a_point_is_asked_from_the_exchange_and_reaches_the_engine(
     port, recorded = replay_with_exchange(
         loop, database, exchange, values=Settings(), days=0
     )
-    assert exchange.asked == ["MXU6"], (
+    assert exchange.asked == [SYMBOL], (
         f"биржу спросили {exchange.asked} раз вместо одного про MXU6"
     )
     assert port._engine_settings.ruble_per_point == pytest.approx(1.737744)  # noqa: SLF001 — настройки движка наружу не отдаются
@@ -3279,7 +3289,7 @@ def test_a_silent_exchange_is_said_out_loud_and_names_what_is_used_instead(
 
 def test_an_answer_without_a_number_is_said_out_loud_too(loop, database) -> None:
     """Стережёт: «биржа не назвала стоимость шага» — тоже событие для журнала."""
-    silent = PointValue("MXU6", None, "у акций колонки STEPPRICE нет вовсе")
+    silent = PointValue(SYMBOL, None, "у акций колонки STEPPRICE нет вовсе")
     _, recorded = replay_with_exchange(
         loop, database, _Exchange(silent), values=Settings(), days=0
     )
@@ -3347,7 +3357,7 @@ def test_the_exchange_is_not_asked_more_often_than_the_gap(loop, database) -> No
         return exchange
 
     exchange = loop.run_until_complete(go())
-    assert exchange.asked == ["MXU6"], (
+    assert exchange.asked == [SYMBOL], (
         f"за три прохода биржу спросили {len(exchange.asked)} раз"
     )
 
@@ -3434,13 +3444,13 @@ def test_an_answer_about_an_instrument_no_longer_shown_is_not_applied(
         recorded = Recorded(port)
 
         def switch(symbol: str) -> None:
-            if symbol == "MXU6":
+            if symbol == SYMBOL:
                 port.apply_settings(values.replace(instrument="SiU6"))
 
         # По MXU6 биржа отвечает «Брентом», по SiU6 — единицей. Применённый
         # ответ про MXU6 виден сразу: 868,872 не спутать ни с чем.
         def answer(symbol: str) -> PointValue:
-            return PointValue(symbol, 868.872 if symbol == "MXU6" else 1.0, f"биржей {symbol}")
+            return PointValue(symbol, 868.872 if symbol == SYMBOL else 1.0, f"биржей {symbol}")
 
         port.attach_exchange(_Exchange(answer, before=switch))
         try:
@@ -3684,13 +3694,13 @@ def test_no_developer_speak_reaches_the_window(loop, database) -> None:
     async def go() -> list[str]:
         worker = MarketWorker(database)
         await worker.open()
-        port = HistoryPort(worker, values=Settings(instrument="MXU6"),
+        port = HistoryPort(worker, values=Settings(instrument=SYMBOL),
                            days=0, sanitize=redact)
         said = _everything_said(port)
         await worker.close()  # база закрыта, а окно ещё спрашивает
-        port.request_history_facts("MXU6")
+        port.request_history_facts(SYMBOL)
         port.request_backtest_options()
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=3))
+        port.load_history(HistoryLoadRequest(symbol=SYMBOL, days=3))
         port.refresh("после закрытия базы")
         for _ in range(200):
             await asyncio.sleep(0.01)
@@ -3725,7 +3735,7 @@ def _watch_key_of(loop, database: pathlib.Path, values: Settings) -> tuple:
                 values=values,
                 engine=convert.engine_settings(values, Mode.OFF),
             )
-            return port._watch_key(frame, "MXU6")  # noqa: SLF001 — сторож на ключ
+            return port._watch_key(frame, SYMBOL)  # noqa: SLF001 — сторож на ключ
         finally:
             await port.aclose()
             await worker.close()
@@ -3759,3 +3769,33 @@ def test_the_live_run_is_keyed_by_the_chosen_algorithm(loop, database) -> None:
         assert _watch_key_of(
             loop, database, values.replace(strategy_id=other)
         ) != key, "смена алгоритма не пересобирает живой ход"
+
+
+def test_the_start_line_about_guards_carries_the_warning_itself(loop, database) -> None:
+    """Стережёт МОЛЧАНИЕ: в журнал при запуске доезжает сам текст про предохранители.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Прочие сторожа проверяют
+    константу `NO_GUARDS` и то, что строка с нужным событием стоит уровнем
+    WARNING. Ни один не смотрел, **что написано в строке, дошедшей до журнала**:
+    заголовок «Предохранители по деньгам» с пустым или успокаивающим текстом
+    проходил их все, а владелец счёта читал журнал, в котором о выключенной
+    защите не сказано ни слова.
+
+    Проверяется строка журнала, а не константа: сказано, что защиты нет,
+    что робот не остановится и что к бою программа не допущена.
+    """
+    _, recorded = replay_history(loop, database, values=Settings(), days=0)
+    lines = [
+        row for row in recorded.decisions[-1]
+        if row.event == "Предохранители по деньгам"
+    ]
+    assert lines, "строки про предохранители при запуске нет вовсе"
+    said = lines[0].reason.lower()
+    for words in (
+        "предохранителей по деньгам нет ни одного",
+        "не остановится",
+        "не допущена",
+    ):
+        assert words in said, (
+            f"строка журнала про предохранители не говорит «{words}»: {said!r}"
+        )

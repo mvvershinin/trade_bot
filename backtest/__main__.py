@@ -84,7 +84,7 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         prog="python -m backtest",
         description="Перебор настроек с раздельными подбором и проверкой.",
     )
-    parser.add_argument("--symbol", default="MXU6", help="инструмент, по умолчанию MXU6")
+    parser.add_argument("--symbol", default="MXZ6", help="инструмент, по умолчанию MXZ6")
     parser.add_argument("--db", default="userdata/candles.sqlite3", help="база со свечами")
     parser.add_argument("--commission", type=float, default=COMMISSION,
                         help="комиссия в рублях за контракт на сторону")

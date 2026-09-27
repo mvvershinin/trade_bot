@@ -362,7 +362,14 @@ class HistoryDialog(QDialog):
     def _sync(self, *_: object) -> None:
         """Свести окно к согласованному виду и сказать, что получится."""
         reloading = self.reload.isChecked()
-        self.since.setEnabled(reloading)
+        # Для контракта отрезок задаёт рубеж (решение 0061): дата из поля
+        # на загрузку не влияла бы, а доступное поле обещало бы обратное.
+        self.since.setEnabled(reloading and not self._facts.by_contract)
+        if self._facts.by_contract:
+            self.since.setToolTip(
+                "Для контракта дата не выбирается: заново запрашивается весь "
+                "его период с рубежа и прогрев перед ним."
+            )
         self.reload_note.setText(self._reload_warning())
         self.summary.setText(self._summary_text())
 
@@ -395,8 +402,31 @@ class HistoryDialog(QDialog):
             "или которые не докачались; внутри таких дней свеча из потока "
             "брокера будет заменена биржевой."
         )
+        facts = self._facts
+        if facts.by_contract:
+            # Решение 0061: для контракта отрезок задаёт рубеж, а не число
+            # дней из настроек. Обещать здесь «90 дней» значило бы описать
+            # не ту загрузку, что пойдёт.
+            start = (
+                f"с рубежа контракта {facts.contract_from:%d.%m.%Y}"
+                if facts.contract_from is not None else
+                "с рубежа контракта (его день программа уточнит у биржи "
+                "по дневным объёмам перед загрузкой)"
+            )
+            return (
+                f"Будет запрошено: {facts.symbol} {start} по {until:%d.%m.%Y} "
+                f"и {facts.warmup_bars} баров прогрева средней перед рубежом. "
+                "Минуты до рубежа не качаются: тогда ближним был другой "
+                f"контракт. {how}"
+                + (
+                    f" Если у этого актива есть месячные контракты (как у нефти BR), "
+                    f"биржа это покажет перед загрузкой, и она пойдёт по дням: "
+                    f"{since:%d.%m.%Y} — {until:%d.%m.%Y} ({days} дн.)."
+                    if facts.quarterly_unchecked else ""
+                )
+            )
         return (
-            f"Будет запрошено: {self._facts.symbol or 'инструмент не задан'}, "
+            f"Будет запрошено: {facts.symbol or 'инструмент не задан'}, "
             f"{since:%d.%m.%Y} — {until:%d.%m.%Y} ({days} дн.). {how}"
         )
 

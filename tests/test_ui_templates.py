@@ -33,7 +33,7 @@ from ui import backend
 from ui.backend import Backend, RunStats, TemplateRun
 from ui.models import AfterTakeProfit, Settings
 from ui.settings_dialog import SettingsDialog
-from ui.templates import BUILTIN_NAME, Library, Template
+from ui.templates import BUILTIN_NAME, NOT_IN_TEMPLATE, Library, Template
 from ui.templates_dialog import NEVER_RUN, TemplatesDialog
 from ui.wheel_guard import GUARDED_TYPES, guard_wheel
 
@@ -89,8 +89,9 @@ def test_a_saved_template_returns_every_field_unchanged(library) -> None:
     Мутация, которую тест обязан ловить: укладка, забывшая поле, — тогда
     человек применяет шаблон и получает умолчание вместо того, что сохранял.
     """
+    # Инструмент в шаблоне не хранится (решение 0061) — здесь он не задан.
     values = Settings(
-        instrument="RIU6", timeframe="15 минут", average_period=21,
+        timeframe="15 минут", average_period=21,
         take_profit_pct=0.9, volume=4, window_start=time(10, 30),
         commission_per_side_rub=None, threshold_percent=0.4, confirm_bars=3,
     )
@@ -113,7 +114,9 @@ def test_the_field_list_of_a_template_is_the_field_list_of_settings(library) -> 
     library.write((Template(name="Проба", values=Settings()),))
     payload = json.loads(library.path.read_text(encoding="utf-8"))
     stored = set(payload["templates"][0]["settings"])
-    assert stored == {field.name for field in dataclasses.fields(Settings)}
+    assert stored == {
+        field.name for field in dataclasses.fields(Settings)
+    } - set(NOT_IN_TEMPLATE)
 
 
 def test_a_template_with_one_bad_value_is_refused_whole(library) -> None:
@@ -297,6 +300,91 @@ def test_applying_a_template_sends_the_whole_set_at_once(
     assert len(got) == 1, "набор ушёл не одним движением"
     assert got[0] == values, "ушло не то, что лежало в шаблоне"
     assert asked and asked[0][1] == values, "подтверждение спрашивали не про тот набор"
+
+
+def test_an_old_template_with_an_instrument_opens_and_keeps_the_current_contract(
+    qapp, library, real_backend, monkeypatch
+) -> None:
+    """Стережёт: шаблон не меняет торгуемый контракт (решение 0061, п. 7).
+
+    Старый файл несёт `"instrument": "MXU6"` — истёкший контракт. Шаблон
+    открывается без оговорок (поле не «незнакомое» и не «пропущенное»),
+    а применение оставляет инструмент тем, что стоит сейчас. Мутации, которые
+    тест ловит: чтение, берущее `instrument` из файла; применение, отдающее
+    `template.values` как есть (тогда встанет MXU6 или умолчание сборки).
+    """
+    asked = _accepting(monkeypatch)
+    library.write((Template(name="Старый", values=Settings(volume=3)),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["settings"]["instrument"] = "MXU6"
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = library.read()
+    assert loaded.troubles == (), "старый шаблон с инструментом открылся с отказом"
+    old = [one for one in loaded.templates if not one.builtin]
+    assert len(old) == 1
+    assert old[0].complete, "поле инструмента названо незнакомым или пропущенным"
+
+    current = Settings(instrument="RIZ6")
+    got: list[Settings] = []
+    dialog = TemplatesDialog(library, current)
+    dialog.applied.connect(got.append)
+    try:
+        dialog.table.selectRow(1)
+        dialog.apply_selected()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+    assert len(got) == 1
+    assert got[0].instrument == "RIZ6", "шаблон сменил торгуемый контракт"
+    assert got[0].volume == 3, "остальные значения шаблона не применились"
+    assert asked[0][1].instrument == "RIZ6", "подтверждение спрашивало о смене контракта"
+
+
+def test_the_builtin_template_keeps_the_current_contract(
+    qapp, library, real_backend, monkeypatch
+) -> None:
+    """Стережёт: «Умолчания проекта» не переключают робота на контракт из сборки."""
+    _accepting(monkeypatch)
+    got: list[Settings] = []
+    dialog = TemplatesDialog(library, Settings(instrument="RIZ6", volume=7))
+    dialog.applied.connect(got.append)
+    try:
+        dialog.table.selectRow(0)
+        dialog.apply_selected()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+    assert [one.instrument for one in got] == ["RIZ6"]
+    assert got[0].volume == Settings().volume
+
+
+def test_a_template_file_does_not_carry_the_instrument(library) -> None:
+    """Стережёт: сохранённый шаблон ключа `instrument` в файле не несёт.
+
+    Старый ключ, прочитанный из файла, обратно тоже не пишется.
+    """
+    library.write((Template(name="Проба", values=Settings(instrument="RIU6")),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["settings"]["instrument"] = "MXU6"
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    library.write(library.read().templates)
+    stored = json.loads(library.path.read_text(encoding="utf-8"))
+    assert "instrument" not in stored["templates"][0]["settings"]
+
+
+def test_the_shipped_examples_do_not_carry_the_instrument() -> None:
+    """Стережёт: примеры в поставке контракта не несут (решение 0061)."""
+    from ui.templates import example_files
+
+    files = example_files()
+    assert files, "примеры не найдены — проверять нечего"
+    for path in files:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for one in payload["templates"]:
+            assert "instrument" not in one["settings"], f"{path.name}: {one['name']}"
 
 
 def test_a_refused_confirmation_applies_nothing_at_all(
@@ -892,7 +980,7 @@ def test_an_exported_set_reads_back_as_the_same_set(tmp_path) -> None:
     """
     from ui.templates import export_templates, read_for_import
 
-    values = Settings(instrument="RIU6", average_period=21, take_profit_pct=0.9, volume=4)
+    values = Settings(average_period=21, take_profit_pct=0.9, volume=4)
     one = Template(name="Перенос", values=values, origin="RIU6, июль 2026")
     path = tmp_path / "перенос.json"
     assert export_templates(path, (one,)) == ""
@@ -1162,6 +1250,35 @@ def test_every_shipped_example_says_where_it_came_from() -> None:
         assert not mute, (
             f"в {path.name} нет происхождения у наборов: {mute}. Пример без "
             "отрезка и инструмента читается как совет"
+        )
+
+
+def test_no_shipped_example_carries_a_key_this_build_does_not_know() -> None:
+    """Стережёт: в примерах из поставки нет ключей, незнакомых этой сборке.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Шесть ключей трёх
+    предохранителей убраны из `examples/settings-templates.json` вместе
+    с полями окна: оставленный ключ окно показало бы как «незнакомый»,
+    и собственный пример программы читался бы применённым с оговоркой.
+    При возврате `D-113` ключи возвращаются в примеры тем же движением.
+
+    ⚠️ Проверяется только половина `Template.complete` — незнакомые ключи.
+    Вторая половина, недостающие поля, на 27.09.2026 красная сама по себе:
+    у всех примеров нет `strategy_id`, к предохранителям это не относится
+    и заведено отдельной находкой.
+    """
+    from ui.templates import example_files, examples_dir, read_for_import
+
+    files = example_files(examples_dir())
+    assert files, "в поставке нет ни одного файла примеров"
+    for path in files:
+        loaded = read_for_import(path)
+        assert loaded.templates, f"файл примеров {path.name} не прочитался"
+        strangers = {one.name: one.unknown for one in loaded.templates if one.unknown}
+        assert not strangers, (
+            f"в {path.name} у примеров есть ключи, которых сборка не знает: "
+            f"{strangers}. Окно покажет собственный пример программы "
+            "применённым с оговоркой"
         )
 
 

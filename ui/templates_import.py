@@ -66,7 +66,7 @@ COLUMNS: tuple[tuple[str, str], ...] = (
         "Набор без этой строки нельзя считать советом: на другом отрезке "
         "он ведёт себя иначе.",
     ),
-    ("Инструмент, свеча", "Инструмент и размер свечи из самого набора."),
+    ("Свеча", "Размер свечи из самого набора. Инструмента в наборе нет."),
     (
         "Оговорки",
         "Чего в наборе не хватает и что в нём эта сборка не понимает.",
@@ -352,7 +352,7 @@ class ImportDialog(QDialog):
         cells = (
             one.name,
             one.origin or NO_ORIGIN,
-            f"{one.values.instrument}, {one.values.timeframe}",
+            one.values.timeframe,
             _reservations(one),
         )
         for shift, text in enumerate(cells, start=1):

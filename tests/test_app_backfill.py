@@ -41,6 +41,7 @@ from typing import TypeVar
 import pytest
 from market_helpers import FakeTransport, iss_body, no_sleep, pages_handler
 
+import app.backfill
 from app.backfill import (
     EXCHANGE_WORDS,
     Backfiller,
@@ -64,6 +65,7 @@ from market import (
     WriteStats,
     pick_new,
 )
+from tests.pinned_clock import PinnedClock
 from ui.models import DecisionLevel
 
 _T = TypeVar("_T")
@@ -93,6 +95,14 @@ BACK = OPEN + timedelta(minutes=63)  # 14:03
 AFTER = 12
 #: Минута первого снимка подписки — граница: с неё и правее ведёт поток.
 EDGE = BACK + timedelta(minutes=AFTER)  # 14:15
+#: «Сейчас» для догрузки во всём файле (`D-112`). `Backfiller.run` ужимает
+#: границу по часам программы, и на машинных часах файл зависел от дня прогона:
+#: сдвиг часов на 137 дней назад давал 28 красных — «сейчас» оказывалось левее
+#: подставной дыры, и спрашивать было нечего. Понедельник через месяц после
+#: дыры: правее самой дальней границы файла (`EDGE` + 30 дней, проверка старой
+#: базы), день дыры давно кончился. Настоящее сегодня намеренно далеко — иначе
+#: сторож границы из будущего не отличил бы подставные часы от машинных.
+NOW = datetime(2026, 7, 20, 12, 0, tzinfo=MSK)
 
 
 def one_minute(moment: datetime, *, close: float = 100_000.0, volume: float = 7.0) -> Candle:
@@ -270,6 +280,16 @@ def the_real_transport_is_disarmed(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(HttpxTransport, "get", refuse)
+
+
+@pytest.fixture(autouse=True)
+def the_clock_is_named_by_the_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Догрузка берёт «сейчас» у `NOW`, а не у часов машины (`D-112`).
+
+    Подменено имя `datetime` в одном модуле `app.backfill`, и только `now()`:
+    рабочий код не менялся, отрезок и отчёт считаются тем же путём.
+    """
+    monkeypatch.setattr(app.backfill, "datetime", PinnedClock(NOW))
 
 
 def iss_denies(_url: str) -> bytes:
@@ -637,7 +657,7 @@ def test_the_growing_minute_never_reaches_the_base(tmp_path: pathlib.Path) -> No
     Период, дотянутый до «сейчас», вернул бы недобранную минуту: её `close`
     не окончательный, а средняя считается по нему.
     """
-    now = datetime.now(MSK).replace(second=0, microsecond=0)
+    now = NOW
     path = tmp_path / "now.sqlite3"
     start = now - timedelta(minutes=20)
     with CandleStore(path) as store:
@@ -663,7 +683,7 @@ def test_a_boundary_from_the_future_is_cut_back_by_the_clock(
     Второй рубеж к первому: метка сервера, ушедшая вперёд, иначе втащила бы
     в базу растущую минуту через параметр, а не через ответ брокера.
     """
-    now = datetime.now(MSK).replace(second=0, microsecond=0)
+    now = NOW
     path = tmp_path / "future.sqlite3"
     start = now - timedelta(minutes=20)
     with CandleStore(path) as store:

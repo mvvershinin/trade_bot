@@ -72,12 +72,18 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import pathlib
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from datetime import date, datetime
 from types import TracebackType
 from typing import TypeVar
 
 from market.candles import Candle, Timeframe
+from market.contracts import (
+    ContractLoad,
+    ContractRequest,
+    load_contract_minutes,
+    refresh_contracts,
+)
 from market.gaps import Gap
 from market.history import HistoryOutcome, HistoryRequest, load_history
 from market.inventory import Inventory, take_inventory
@@ -99,7 +105,7 @@ from market.journal import (
 )
 from market.point import MARKETS_PROBED, PointValue, ask_point_value
 from market.reports import LoadReport
-from market.storage import CandleStore, Coverage, Source, WriteStats
+from market.storage import CandleStore, ContractRow, Coverage, Source, WriteStats
 from market.sync import CHUNK_DAYS, GAP_THRESHOLD_MINUTES, sync_minutes
 from market.synthetic import refuse_synthetic_for_trading
 
@@ -656,6 +662,52 @@ class MarketWorker:
             )
         finally:
             self._loading.discard(loader)
+
+    async def refresh_contracts(
+        self,
+        symbols: Sequence[str],
+        *,
+        market: Market,
+        now: datetime | None = None,
+        client: IssClient | None = None,
+    ) -> list[ContractRow]:
+        """Уточнить таблицу контрактов у биржи: сроки и дневные объёмы.
+
+        Ходит в сеть и занимает поток данных, поэтому останавливается
+        той же кнопкой, что и загрузка (`stop_loading`). Разбор —
+        `market.contracts.refresh_contracts`.
+        """
+        store = await self._ready_store()
+        loader = self._loader(client)
+        self._loading.add(loader)
+        try:
+            return await self._submit(
+                lambda: refresh_contracts(store, loader, symbols, market=market, now=now)
+            )
+        finally:
+            self._loading.discard(loader)
+
+    async def load_contract(
+        self, request: ContractRequest, *, client: IssClient | None = None
+    ) -> ContractLoad:
+        """Минуты контракта с его рубежа и прогрев перед ним, без хвоста.
+
+        Разбор — `market.contracts.load_contract_minutes`. Ход — через
+        `request.progress`, **в потоке данных**.
+        """
+        store = await self._ready_store()
+        loader = self._loader(client)
+        self._loading.add(loader)
+        try:
+            return await self._submit(
+                lambda: load_contract_minutes(store, loader, request)
+            )
+        finally:
+            self._loading.discard(loader)
+
+    async def contracts(self) -> list[ContractRow]:
+        """Таблица контрактов как есть. В сеть не ходит."""
+        return await self.call(lambda store: store.contracts())
 
     def stop_loading(self) -> None:
         """Попросить идущие загрузки остановиться на ближайшей границе страницы.

@@ -57,6 +57,8 @@ from ui.background import busy_cursor
 from ui.backtest_dialog import BacktestDialog
 from ui.backtest_report import BacktestReportDialog
 from ui.chart_panel import ChartPanel
+from ui.confirm_changes import confirm_changes
+from ui.contract_banner import ContractBar
 from ui.export import decisions_table, trades_table, write_csv
 from ui.formatting import MSK, fmt_time
 from ui.history_dialog import HistoryDialog
@@ -68,6 +70,7 @@ from ui.models import (
     Candle,
     ChartData,
     Connection,
+    ContractNotice,
     DecisionRow,
     HistoryFacts,
     HistoryLoadOutcome,
@@ -465,6 +468,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.token_banner)
         layout.addWidget(self.mode_banner)
         layout.addWidget(self.history_banner)
+        layout.addWidget(self.contract_bar)
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
@@ -503,6 +507,9 @@ class MainWindow(QMainWindow):
         #: неотличим от потерянной связи (`app/port.py::_Span`).
         self.history_banner = _Banner(on_close=self.show_recent_data,
                                       close_hint=UNPIN_HINT)
+        #: Действующий контракт по таблице биржи и кнопка перехода (0061, 0016).
+        self.contract_bar = ContractBar()
+        self.contract_bar.switch_requested.connect(self._switch_contract)
 
     # --------------------------------------------------------------- сборка
 
@@ -742,6 +749,7 @@ class MainWindow(QMainWindow):
         port.backtest_options_ready.connect(self.show_backtest_dialog)
         port.backtest_finished.connect(self.show_backtest_report)
         port.history_facts_ready.connect(self.show_history_dialog)
+        port.contract_checked.connect(self.show_contract)
         port.history_progress.connect(self._on_history_progress)
         port.history_finished.connect(self.show_history_result)
 
@@ -854,6 +862,7 @@ class MainWindow(QMainWindow):
         self.stream_action.setToolTip(look.tooltip)
 
     def _update_banners(self, state: RobotState) -> None:
+        self.contract_bar.update_state(state)
         # Остановка робота. Строкой в журнале её показывать нельзя: журнал
         # читают после происшествия, а остановленный робот с открытой позицией
         # это происшествие, которое ещё идёт. Причина приходит готовой строкой
@@ -950,6 +959,28 @@ class MainWindow(QMainWindow):
     def show_error(self, text: str) -> None:
         """Сообщение об отказе. Уже человеческим языком: код сюда не доходит."""
         self.statusBar().showMessage(text, 15000)
+
+    def show_contract(self, notice: ContractNotice) -> None:
+        """Действующий контракт по таблице — плашкой над графиком, если расходится."""
+        self.contract_bar.show_notice(notice, self._state)
+
+    def _switch_contract(self, symbol: str) -> None:
+        """Перейти на действующий контракт — обычной правкой настроек.
+
+        Через то же подтверждение, что и правка руками: человек видит
+        прежний и новый код и соглашается сам (решение 0016). Состояние
+        робота проверяется ещё раз — кнопка могла устареть.
+        """
+        if not self.contract_bar.button.isEnabled():
+            return
+        fresh = self._settings.replace(instrument=symbol)
+        if confirm_changes(
+            self, self._settings, fresh,
+            lead=f"Переход на действующий контракт {symbol}. Робот будет "
+                 f"смотреть и торговать {symbol}; прежний код останется "
+                 "в базе с его историей.",
+        ):
+            self._on_settings_changed(fresh)
 
     def show_stuck(self, text: str) -> None:
         """Долгая работа не отвечает: сказать об этом крупно и не убирать.
@@ -1144,6 +1175,7 @@ class MainWindow(QMainWindow):
         # внутри этого вызова, и `self._algorithms` ниже обязан быть уже им.
         self.port.request_settings()
         dialog = SettingsDialog(self._settings, self)
+        dialog.set_contract(self.contract_bar.notice)
         dialog.settings_changed.connect(self._on_settings_changed)
         dialog.set_algorithms(self._algorithms)
         self._settings_dialog = dialog

@@ -56,6 +56,26 @@ from market.chain import (
     roll_day,
     stitch,
 )
+from market.contracts import (
+    WARMUP_LOOK_BACK_DAYS,
+    AdoptReport,
+    ChainNotQuarterly,
+    ContractError,
+    ContractLoad,
+    ContractRequest,
+    Expiry,
+    ExpiryVerdict,
+    adopt_chain,
+    asset_of,
+    chain_around,
+    current_contract,
+    expiry_verdict,
+    load_contract_minutes,
+    periods_of_chain,
+    pieces,
+    refresh_contracts,
+    rows_of_asset,
+)
 from market.depth import Depth, declared_depth, measured_depth
 from market.fee import Commission, read_commission
 from market.gaps import Gap, count_missing_minutes, find_gaps
@@ -126,7 +146,14 @@ from market.journal import (
 from market.paths import default_db_path, ensure_userdata_dir, userdata_dir
 from market.point import MARKETS_PROBED, PointValue, ask_point_value
 from market.reports import LoadReport
-from market.storage import SCHEMA_VERSION, CandleStore, Coverage, Source, WriteStats
+from market.storage import (
+    SCHEMA_VERSION,
+    CandleStore,
+    ContractRow,
+    Coverage,
+    Source,
+    WriteStats,
+)
 from market.sync import (
     CHUNK_DAYS,
     EMPTY_CHUNK_TRUSTED_DAYS,
@@ -148,6 +175,25 @@ __all__ = [
     "refuse_synthetic_for_trading",
     "refuse_synthetic_in_working_base",
     "Leg",
+    "WARMUP_LOOK_BACK_DAYS",
+    "AdoptReport",
+    "ContractError",
+    "ContractLoad",
+    "ContractRequest",
+    "ContractRow",
+    "Expiry",
+    "ExpiryVerdict",
+    "adopt_chain",
+    "asset_of",
+    "chain_around",
+    "ChainNotQuarterly",
+    "current_contract",
+    "expiry_verdict",
+    "load_contract_minutes",
+    "periods_of_chain",
+    "pieces",
+    "refresh_contracts",
+    "rows_of_asset",
     "Seam",
     "StitchReport",
     "daily_volume",

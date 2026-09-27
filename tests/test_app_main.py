@@ -79,6 +79,10 @@ def _launch(entry_point: list[str], arguments) -> subprocess.CompletedProcess[st
     # на столе владельца счёта (`B-033`). Негодный плагин окна не откроет
     # ни на какой машине.
     environment["QT_QPA_PLATFORM"] = "there-is-no-such-plugin"
+    # Биржа ребёнку не нужна, а при старте он сам догружает историю (B-047):
+    # заглушка отвечает отказом сети, не открывая сокета
+    # (`tests/child_guard/offline_iss.py`).
+    environment["TERMINAL_TEST_ISS_STUB"] = "1"
     return subprocess.run(
         [sys.executable, *entry_point, *arguments],
         cwd=REPO, env=environment, capture_output=True, text=True,

@@ -56,6 +56,12 @@ from strategies import (
 )
 from ui.models import AverageKind, Settings
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
+
 # ---------------------------------------------------------------------------
 # Подставной второй алгоритм: свои поля, своё перечисление, своё правило
 # ---------------------------------------------------------------------------
@@ -760,7 +766,7 @@ def replayed_session(loop, tmp_path, values: Settings, *, database_name: str):
     ]
     database = tmp_path / database_name
     with CandleStore(database) as store:
-        store.put_minutes("MXU6", minutes, Source.ISS)
+        store.put_minutes(SYMBOL, minutes, Source.ISS)
 
     async def go() -> None:
         worker = MarketWorker(database)
@@ -905,7 +911,7 @@ def test_the_live_run_is_computed_by_the_chosen_algorithm_too(
     ]
     database = tmp_path / "live.sqlite3"
     with CandleStore(database) as store:
-        store.put_minutes("MXU6", minutes, Source.ISS)
+        store.put_minutes(SYMBOL, minutes, Source.ISS)
 
     async def go():
         worker = MarketWorker(database)

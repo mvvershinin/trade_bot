@@ -73,11 +73,12 @@ import pathlib
 import sys
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 import pytest
 
 from backtest import Costs, Tariff, replay
+from backtest.stitched import Piece, replay_pieces
 from engine import AccountFunds, Engine, EngineSettings, Mode, TradingWindow
 from strategies import EmaReverse, EmaReverseSettings
 from engine import Fill, MarketCandle, OrderAction, OrderRequest
@@ -963,3 +964,50 @@ def test_slippage_is_zero_in_the_parity_run_and_says_so(candles) -> None:
     outcome = replayed(candles, TradingWindow(time(9, 30), time(11, 30)), False, 0.5)
     assert outcome.costs.slippage == 0.0
     assert outcome.costs.slippage_steps == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Прогон по склейке (решение 0061, Ф3): один контракт — прежние 127
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_one_contract_through_the_stitched_run_is_the_prototypes_127(candles) -> None:
+    """Эталонный отрезок одним куском без прогрева — ровно `replay` и 127 прототипа.
+
+    Равенство на синтетике (`tests/test_backtest_stitched.py`) этого
+    не доказывает: там нет тейка внутри бара, окна 09:30–11:30 и «стопа
+    после тейка». Сломается нарезка или закрытие на стыке заденет
+    последний кусок — разойдётся здесь.
+    """
+    if not (RESULTS / "mxu6_p2.json").is_file():
+        pytest.skip(NO_ARCHIVE_HINT)
+    window = TradingWindow(time(9, 30), time(11, 30))
+    costs = Costs(commission_per_side=14.0)
+    plain = replayed(candles, window, False, 0.5, costs=costs)
+    settings = EngineSettings(
+        mode=Mode.REVERSE, window=window, close_on_time_end=True,
+        trade_in_weekend=False, volume=1.0, stop_after_take_profit=True,
+        take_profit=True, take_profit_percent=0.5, commission_per_side=14.0,
+    )
+    piece = Piece("MXU6", date(2026, 6, 19), date(2026, 8, 26), (), tuple(candles), 0)
+    run = asyncio.run(replay_pieces(
+        [piece], lambda: EmaReverse(EmaReverseSettings(period=PERIOD)), settings, costs,
+    ))
+    assert run.deals == plain.deals
+    assert run.summary == plain.summary
+    assert run.problems == ()
+    mine = [
+        (deal.entry_time.replace(tzinfo=None), deal.side.value, deal.entry_price,
+         deal.exit_time.replace(tzinfo=None), deal.exit_price)
+        for deal in run.deals
+    ]
+    theirs = [
+        (datetime.fromisoformat(row["open_time"][:19]),
+         "long" if row["direction"] == "Long" else "short",
+         float(row["entry_price"]),
+         datetime.fromisoformat(row["close_time"][:19]),
+         float(row["close_price"]))
+        for row in reversed(archive("mxu6_p2.json")["positions"])
+    ]
+    assert len(mine) == 127
+    assert mine == theirs

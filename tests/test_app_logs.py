@@ -22,7 +22,7 @@ import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -39,7 +39,6 @@ from app.logs import (
     default_log_dir,
     setup_logging,
 )
-from broker.redaction import FOREIGN_LOGGERS, LOGGER_NAME, RedactingFilter, RedactingSink
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -50,47 +49,6 @@ CANARY = "КАНАРЕЙКА-В-ЛОГЕ-0192837465"
 
 WINDOWS = os.name == "nt"
 POSIX_ONLY = pytest.mark.skipif(WINDOWS, reason="права POSIX; на Windows их ставит ACL")
-
-
-@pytest.fixture(autouse=True)
-def pristine_logging() -> Iterator[None]:
-    """Дерево логгеров возвращается в исходное состояние после каждой проверки.
-
-    `setup_logging` правит **корневой** логгер процесса и ставит стоки чистки
-    на чужие ветки. Без уборки соседний файл тестов зеленел бы или краснел
-    по порядку запуска, а не по коду.
-    """
-    root = logging.getLogger()
-    handlers_before = list(root.handlers)
-    level_before = root.level
-    watched = (LOGGER_NAME, *FOREIGN_LOGGERS)
-    before = {
-        name: (
-            list(logging.getLogger(name).filters),
-            list(logging.getLogger(name).handlers),
-        )
-        for name in watched
-    }
-    try:
-        yield
-    finally:
-        close_logging()
-        for handler in list(root.handlers):
-            if handler not in handlers_before:
-                root.removeHandler(handler)
-        for handler in handlers_before:
-            if handler not in root.handlers:
-                root.addHandler(handler)
-        root.setLevel(level_before)
-        for name in watched:
-            logger = logging.getLogger(name)
-            filters_before, sinks_before = before[name]
-            for item in list(logger.filters):
-                if isinstance(item, RedactingFilter) and item not in filters_before:
-                    logger.removeFilter(item)
-            for sink in list(logger.handlers):
-                if isinstance(sink, RedactingSink) and sink not in sinks_before:
-                    logger.removeHandler(sink)
 
 
 @pytest.fixture

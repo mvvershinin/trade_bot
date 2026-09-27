@@ -125,7 +125,11 @@ def with_port(loop, database: pathlib.Path, work):
     async def go():
         worker = MarketWorker(database)
         await worker.open()
-        port = HistoryPort(worker, values=Settings(), sanitize=redact, days=0)
+        # Инструмент назван, а не взят умолчанием: фикстура кладёт в базу MXU6,
+        # а умолчание окна сменяется вместе с текущим контрактом.
+        port = HistoryPort(
+            worker, values=Settings(instrument="MXU6"), sanitize=redact, days=0,
+        )
         heard = _Heard(port)
         try:
             await work(port, heard)

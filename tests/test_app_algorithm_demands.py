@@ -61,6 +61,12 @@ from ui.models import (
     Settings,
 )
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
+
 #: Алгоритм, который требует переворота в одной свече, и его требование.
 ALWAYS = "ma_reverse_always"
 
@@ -481,7 +487,7 @@ def _database(tmp_path: pathlib.Path) -> pathlib.Path:
     start = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", [
+        store.put_minutes(SYMBOL, [
             Candle(
                 time=start + timedelta(minutes=number),
                 open=100.0, high=101.0, low=99.0, close=100.0 + number % 7,

@@ -275,7 +275,7 @@ def arguments(argv: Sequence[str] | None) -> argparse.Namespace:
                         help="база со свечами ряда перебора, только на чтение")
     parser.add_argument("--symbol", default="@MX",
                         help="ряд, на котором идёт перебор и выбираются лидеры")
-    parser.add_argument("--contract", default="MXU6",
+    parser.add_argument("--contract", default="MXZ6",
                         help="торгуемый контракт: он попадёт в шаблон и в журнал")
     parser.add_argument("--contract-db", default="",
                         help="база со свечами контракта; без ключа — база программы")

@@ -81,6 +81,7 @@ from ui.formatting import (
     to_msk,
 )
 from ui.models import (
+    EXPIRY_HALT_DAYS_LIMITS,
     AfterTakeProfit,
     AlgorithmOption,
     BacktestReport,
@@ -715,6 +716,21 @@ def _choice(value: enum.Enum) -> str:
     return said if isinstance(said, str) and said else value.name
 
 
+def expiry_days_of(values: Settings) -> int:
+    """Дней до экспирации, за которые робот встаёт, — или отказ вслух.
+
+    :raises SettingsRefused: число вне `EXPIRY_HALT_DAYS_LIMITS`.
+    """
+    low, high = EXPIRY_HALT_DAYS_LIMITS
+    days = values.expiry_halt_days
+    if isinstance(days, bool) or not isinstance(days, int) or not low <= days <= high:
+        raise SettingsRefused(
+            f"Остановка перед экспирацией — целое число дней от {low} до {high}, "
+            f"а стоит {days!r}. Прежние настройки остались в силе."
+        )
+    return days
+
+
 def check_demands(values: Settings) -> None:
     """Общие настройки отвечают требованиям выбранного алгоритма — или отказ.
 
@@ -1100,6 +1116,11 @@ def _as_days(value: object) -> str:
     return "вся история" if value == 0 else f"{value} дн."
 
 
+def _as_expiry_days(value: object) -> str:
+    """Остановка перед экспирацией: «за N дн.», ноль — словами."""
+    return "в последний день обращения" if str(value) == "0" else f"за {value} дн."
+
+
 def _as_load_days(value: object) -> str:
     """Глубина загрузки: всегда число дней.
 
@@ -1160,6 +1181,7 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # с биржи. Общая строка в журнале не дала бы ответить, что именно
     # владелец счёта поменял (`D-068`).
     "history_depth_days": _Told("Глубина загрузки истории", _as_load_days),
+    "expiry_halt_days": _Told("Остановка перед экспирацией", _as_expiry_days),
     "price_step": _Told("Шаг цены инструмента", fmt_number),
     # ⚠️ Само число рассказывает движок (`ruble_per_point` — его поле).
     # Здесь — только **происхождение**: «подсказано биржей» или «ввод руками».

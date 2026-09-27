@@ -170,6 +170,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Final, Protocol
 
 from app.backfill import Backfiller
@@ -821,6 +822,12 @@ class LiveFeed:
         #: токене попытки идут до конца сеанса, чужие снимки могут идти потоком.
         self._complaint: str | None = None
         self._foreign: set[str] = set()
+        #: Пауза перед следующей попыткой подключения (`_ride`).
+        self._pause: float = RETRY_FIRST
+        #: Когда в этом заходе пришёл первый снимок, по `monotonic`; `None` —
+        #: не пришёл. По нему `_settle_pause` решает, заслужил ли заход сброс
+        #: паузы (`D-025`).
+        self._online_since: float | None = None
         #: Виды незнания расписания, о которых уже сказано в журнал решений.
         #: По одной строке на вид **за всё время жизни потока**, а не за круг:
         #: расписание спрашивается перед каждой попыткой подключения, и
@@ -964,18 +971,22 @@ class LiveFeed:
         Пауза повторов при этом начинается заново: биржа открылась — первая
         попытка идёт сразу, а не через минуту, накопленную за ночь.
 
+        Удачный заход — дошёл первый снимок и связь прожила не меньше
+        `RETRY_CAP` — тоже начинает паузу заново (`_settle_pause`, `D-025`).
+
         Причина говорится один раз (`_complain`), а не каждые 2…60 секунд, —
         но в **технический лог** уходит каждая: по нему обрыв и разбирают.
         """
         await self._drain()
         self._complaint = None
-        pause = RETRY_FIRST
+        self._pause = RETRY_FIRST
+        self._online_since = None
         self._phase(LinkPhase.CONNECTING)
         while True:
             shut = await self._shut()
             if shut is not None:
                 await self._wait_out(shut)
-                pause = RETRY_FIRST
+                self._pause = RETRY_FIRST
                 continue
             # ⚠️ Фаза ставится **здесь**, а не в конце круга. Иначе выход
             # из ожидания объявлял бы подключение до того, как расписание
@@ -1019,9 +1030,26 @@ class LiveFeed:
                     DecisionLevel.WARNING,
                 )
                 return
-            self._phase(LinkPhase.PAUSED, f"{pause:.0f} с")
-            await asyncio.sleep(pause)
-            pause = min(pause * 2, RETRY_CAP)
+            self._settle_pause()
+            self._phase(LinkPhase.PAUSED, f"{self._pause:.0f} с")
+            await asyncio.sleep(self._pause)
+            self._pause = min(self._pause * 2, RETRY_CAP)
+
+    def _settle_pause(self) -> None:
+        """Начать паузу повторов заново, если оборвавшийся заход прожил долго.
+
+        Сброс — только когда от первого снимка до обрыва прошло не меньше
+        `RETRY_CAP`. Сброс на самом первом снимке (правка 27.09.2026) открывал
+        петлю: брокер отдаёт снимок и рвёт соединение (вторая сессия на том
+        же токене) → повтор каждые две секунды без нарастания, и каждый заход
+        зовёт догрузку истории у брокера — прямой путь в ограничение частоты.
+        Заход, проживший дольше потолка, сам по себе уже реже, чем повтор
+        на потолке, — сброс ничего не учащает. Короткий заход паузу не
+        сбрасывает, и она растёт дальше (`D-025`).
+        """
+        since, self._online_since = self._online_since, None
+        if since is not None and monotonic() - since >= RETRY_CAP:
+            self._pause = RETRY_FIRST
 
     async def _wait_out(self, shut: MarketShut) -> None:
         """Биржа закрыта: сказать один раз и ждать открытия вместо повторов.
@@ -1235,6 +1263,7 @@ class LiveFeed:
                 continue
             if first:
                 self._complaint = None
+                self._online_since = monotonic()
                 self._phase(LinkPhase.ONLINE)
                 self._watch.say(
                     "Связь с брокером",

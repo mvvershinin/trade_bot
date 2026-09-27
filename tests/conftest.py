@@ -62,7 +62,7 @@ import pathlib
 import socket
 import subprocess
 import sys
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, Final
 
 import pytest
@@ -373,8 +373,94 @@ def _screen_in(environment) -> str:
     return ", ".join(found)
 
 
+#: Каталог с `sitecustomize.py`, запрещающим сеть ребёнку (`B-047`).
+CHILD_GUARD_DIR: Final[pathlib.Path] = pathlib.Path(__file__).resolve().parent / "child_guard"
+
+#: Переменная, которой ребёнку называют файл отчёта о попытках выйти в сеть.
+#: Прочитает её `tests/child_guard/sitecustomize.py`.
+OFFLINE_REPORT_ENV: Final[str] = "TERMINAL_TEST_OFFLINE_REPORT"
+
+
+class ChildPlace:
+    """Папка данных и отчёт о сети для детей одного теста — по требованию.
+
+    Заводится лениво: подпроцессы запускают десятки тестов из трёх с
+    половиной тысяч, и папка на каждый тест была бы работой впустую.
+    Своя на тест, а не общая на прогон: в папке данных живёт отметка
+    единственной копии, и общая папка связала бы соседние тесты (правило 14).
+    """
+
+    def __init__(self, factory: pytest.TempPathFactory) -> None:
+        self._factory = factory
+        self.root: pathlib.Path | None = None
+
+    def ensure(self) -> pathlib.Path:
+        if self.root is None:
+            self.root = self._factory.mktemp("child")
+            (self.root / "userdata").mkdir()
+        return self.root
+
+    def went_outside(self) -> str:
+        """Что дети этого теста пытались достать из сети. Пусто — ничего."""
+        if self.root is None:
+            return ""
+        report = self.root / "offline-report.txt"
+        return report.read_text(encoding="utf-8") if report.exists() else ""
+
+
+def child_environment(
+    given: Mapping[str, str] | None, place: ChildPlace, *, offline: bool
+) -> dict[str, str]:
+    """Окружение ребёнка: своя папка данных и, если не разрешено, без сети.
+
+    `B-047`. Подмены `no_internet` и `logs_go_to_a_temporary_folder` живут
+    внутри процесса pytest, а копия программы, поднятая `subprocess`, — в своём
+    интерпретаторе, и до неё не доезжало ни то, ни другое: ребёнок писал
+    технический лог в `userdata/logs/` владельца счёта и ходил на биржу.
+    Окружение наследуется — поэтому переносится им.
+
+    Папка данных — переменной `market.paths.USERDATA_ENV`; довод `--db`
+    ребёнка главнее её для базы, и тесты, называющие базу, это сохраняют.
+    Сеть — каталогом `tests/child_guard` в начале `PYTHONPATH`: оттуда
+    интерпретатор сам подхватит `sitecustomize`. В начало, а не на место:
+    тесты сами кладут туда корень рабочей копии, и его терять нельзя.
+    """
+    from market.paths import TEST_RUN_ENV, USERDATA_ENV
+
+    root = place.ensure()
+    environment = dict(os.environ if given is None else given)
+    environment[USERDATA_ENV] = str(root / "userdata")
+    # Без признака тестового прогона ребёнок переменную папки не слушает
+    # (`market.paths._test_override`): в поставке она действовать не должна.
+    environment[TEST_RUN_ENV] = "1"
+    if offline:
+        paths = [str(CHILD_GUARD_DIR), environment.get("PYTHONPATH", "")]
+        environment["PYTHONPATH"] = os.pathsep.join(path for path in paths if path)
+        environment[OFFLINE_REPORT_ENV] = str(root / "offline-report.txt")
+    return environment
+
+
+def children_stayed_offline(nodeid: str, place: ChildPlace) -> None:
+    """Уронить тест, если его подпроцессы пытались выйти в сеть (`B-047`).
+
+    Отказ в самом ребёнке — обычный `OSError`, и программа встречает его
+    как лежащую сеть, то есть молча. Громким его делает этот отчёт.
+    """
+    outside = place.went_outside()
+    assert not outside, (
+        f"{nodeid}: копия программы, запущенная отдельным процессом, пошла "
+        f"в сеть без заглушки (B-047):\n{outside}"
+        "Тест, тихо сходивший на биржу, зависит от того, что она сегодня "
+        "отдаёт. Подставьте ребёнку заглушку биржи (TERMINAL_TEST_ISS_STUB=1, "
+        "tests/child_guard/offline_iss.py) или данные; разрешение выдаётся "
+        "только поимённо в INTERNET_ALLOWED (tests/conftest.py) — с причиной."
+    )
+
+
 @pytest.fixture(autouse=True)
-def no_screen_for_children(request: pytest.FixtureRequest, monkeypatch) -> None:
+def no_screen_for_children(
+    request: pytest.FixtureRequest, monkeypatch, tmp_path_factory
+) -> Iterator[None]:
     """Подпроцессу не отдают окружение, в котором Qt откроет окно.
 
     Владелец счёта 06.09.2026: «доработай что бы с offscreen работали —
@@ -393,12 +479,20 @@ def no_screen_for_children(request: pytest.FixtureRequest, monkeypatch) -> None:
     и виноватый назван по имени. Проверка «тест упал» этого не заменяет —
     она зеленеет и тогда, когда окно тихо открылось.
 
+    **Здесь же ребёнку отдают папку данных и запрет сети** (`B-047`,
+    `child_environment`). Попытка ребёнка выйти в сеть отказывается в нём
+    самом и дописывается в отчёт; непустой отчёт роняет тест после его
+    конца — громко, с именем хоста и командой ребёнка.
+
     **Чего сторож не закрывает, сказано вслух.** Он смотрит окружение,
     а не то, что ребёнок с ним сделает: копия программы, сама выставившая
     себе `DISPLAY`, пройдёт мимо. Такого в дереве нет, и заводить сторожа
-    впрок значит стеречь то, чего нет.
+    впрок значит стеречь то, чего нет. Ребёнок, запущенный с `-I`, `-E`
+    или `-S`, `sitecustomize` не подхватит — таких запусков в дереве тоже нет.
     """
     nodeid = request.node.nodeid
+    place = ChildPlace(tmp_path_factory)
+    offline = not named_in(nodeid, INTERNET_ALLOWED)
 
     # Подпись `Popen.__init__` берётся как есть: пересказывать двадцать
     # её аргументов значит спорить с CPython о порядке там, где сторож
@@ -425,9 +519,16 @@ def no_screen_for_children(request: pytest.FixtureRequest, monkeypatch) -> None:
                 "настоящий экран в прогоне тестов не выдаётся, и правится "
                 "это только правкой самой обвязки, с записью решения."
             )
+        environment = child_environment(handed, place, offline=offline)
+        if "env" in named or len(rest) <= 9:
+            named["env"] = environment
+        else:
+            rest = (*rest[:9], environment, *rest[10:])
         start(self, args, *rest, **named)
 
     monkeypatch.setattr(subprocess.Popen, "__init__", guarded_init)
+    yield
+    children_stayed_offline(nodeid, place)
 
 
 #: Тест, поднявший Qt на экранной платформе. Записывается один раз: платформу

@@ -133,6 +133,37 @@ def _coverage_note(info: InstrumentInfo | None) -> str:
     )
 
 
+#: Подпись единственного выбора, когда тестер гонит период (решение 0061).
+BY_PERIOD = "Ближний контракт на каждом отрезке"
+
+
+def _period_info(periods: Sequence[InstrumentInfo]) -> InstrumentInfo | None:
+    """Охват склейки: от первой свечи первого периода до последней последнего."""
+    firsts = [one.first for one in periods if one.first is not None]
+    lasts = [one.last for one in periods if one.last is not None]
+    if not firsts or not lasts:
+        return None
+    return InstrumentInfo(
+        symbol=" → ".join(one.symbol for one in periods),
+        first=min(firsts), last=max(lasts),
+        minutes=sum(one.minutes for one in periods),
+    )
+
+
+def _periods_note(periods: Sequence[InstrumentInfo]) -> str:
+    """Какой контракт на каком отрезке — одной строкой человеку."""
+    parts = [
+        f"{one.symbol} {fmt_date(one.first)} – {fmt_date(one.last)}"
+        for one in periods if one.first is not None and one.last is not None
+    ]
+    return (
+        "На каждом отрезке считается контракт, который тогда был ближним: "
+        + "; ".join(parts)
+        + ". На стыке позиция закрывается по последней цене прежнего "
+        "контракта, с комиссией. Даты вне этого охвата выбрать нельзя."
+    )
+
+
 class BacktestDialog(QDialog):
     """Просьба о прогоне: инструмент, отрезок, чем гнать.
 
@@ -174,13 +205,24 @@ class BacktestDialog(QDialog):
     def _build_widgets(self) -> None:
         """Поля окна. Раскладка — отдельно: так короче каждое из двух."""
         self.instrument = QComboBox()
-        for info in self._options.instruments:
-            self.instrument.addItem(info.symbol, info)
-        self.instrument.setToolTip(
-            "Чем торговать в прогоне. В списке только то, по чему в базе есть "
-            "свечи. Кода, которого здесь нет, программа не знает: историю "
-            "по нему сначала надо загрузить."
-        )
+        # Решение 0061: есть периоды контрактов — выбирается период, а не
+        # тикер. Выбор один, и он назван словами, а не кодом.
+        stitched = _period_info(self._options.periods)
+        if stitched is not None:
+            self.instrument.addItem(BY_PERIOD, stitched)
+            self.instrument.setEnabled(False)
+            self.instrument.setToolTip(
+                "Тикер не выбирается: на каждом отрезке периода программа берёт "
+                "контракт, который тогда был ближним."
+            )
+        else:
+            for info in self._options.instruments:
+                self.instrument.addItem(info.symbol, info)
+            self.instrument.setToolTip(
+                "Чем торговать в прогоне. В списке только то, по чему в базе есть "
+                "свечи. Кода, которого здесь нет, программа не знает: историю "
+                "по нему сначала надо загрузить."
+            )
         self.instrument.currentIndexChanged.connect(self._pick_instrument)
 
         self.coverage = QLabel()
@@ -326,7 +368,10 @@ class BacktestDialog(QDialog):
         """
         raw = self.instrument.itemData(index) if index >= 0 else None
         info = raw if isinstance(raw, InstrumentInfo) else None
-        self.coverage.setText(_coverage_note(info))
+        self.coverage.setText(
+            _periods_note(self._options.periods) if self._options.periods
+            else _coverage_note(info)
+        )
         span = _covered(info)
         for field in (self.since, self.until):
             field.setEnabled(span is not None)
@@ -403,8 +448,12 @@ class BacktestDialog(QDialog):
                     "без свечей прогонять нечего."
                 )
             return "Выбор не сложился: проверьте инструмент и даты."
+        what = (
+            f"ближние контракты по периодам ({self.instrument.currentData().symbol})"
+            if self._options.periods else request.settings.instrument
+        )
         return (
-            f"Будет прогнано: {request.settings.instrument}, свечи "
+            f"Будет прогнано: {what}, свечи "
             f"{request.settings.timeframe}, с {fmt_date(request.since)} "
             f"по {fmt_date(request.until)} МСК, настройки — "
             f"{request.settings_source}."
@@ -432,8 +481,11 @@ class BacktestDialog(QDialog):
         since, until = day_bounds(_pydate(self.since.date()), _pydate(self.until.date()))
         if until < since:
             return None
+        # Период, а не тикер: инструмент остаётся тем, что стоит в настройках
+        # (шаблон его не несёт, решение 0061), контракты режет порт.
+        symbol = self._settings.instrument if self._options.periods else info.symbol
         return BacktestRequest(
-            settings=values.replace(instrument=info.symbol),
+            settings=values.replace(instrument=symbol),
             since=since,
             until=until,
             settings_source=source,

@@ -307,8 +307,9 @@ def test_a_deal_at_a_price_the_candle_never_had_is_a_defect_not_a_gap() -> None:
 
     ⚠️ Проверка идёт **напрямую по `ExecutionModel.fills_at`**, а не через
     `Engine`: тот ловит любое исключение исполнителя и превращает его
-    в остановку с фразой «Сделки исполнителя не получены», которая описывает
-    не то, что случилось (`B-048`).
+    в остановку. С 27.09.2026 (`B-048` закрыт) `AssertionError` там
+    называется «Ошибка внутри исполнителя», но текст сторожа здесь
+    проверяется у самого источника.
     """
     model = ExecutionModel()
     order = _armed_over_the_measured_candle(model, 226_800.0, LevelTouch.RISE)

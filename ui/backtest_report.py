@@ -108,6 +108,7 @@ class BacktestReportDialog(QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addWidget(self._head())
         layout.addWidget(self._money())
+        layout.addWidget(self._contracts())
         layout.addWidget(self._headline())
         layout.addWidget(self._tabs(), 1)
         layout.addWidget(self._close_button())
@@ -162,6 +163,25 @@ class BacktestReportDialog(QDialog):
                 colour = self._theme.success if value >= 0 else self._theme.danger
                 cell.setStyleSheet(f"color: {colour}; font-weight: 600;")
             form.addRow(f"{field.label}:", cell)
+        return box
+
+    def _contracts(self) -> QWidget:
+        """Прогон по склейке: итог по каждому контракту и стыки (решение 0061).
+
+        Строки приходят готовыми из `backtest.stitched.stitched_lines`: окно
+        их не считает. Комиссия в каждой — отдельной колонкой. Прогон одним
+        контрактом группу не показывает.
+        """
+        box = QGroupBox("По контрактам")
+        rows = QVBoxLayout(box)
+        for line in self._report.contracts:
+            label = QLabel(line)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if line.startswith("⚠"):
+                label.setStyleSheet(f"color: {self._theme.warning};")
+            rows.addWidget(label)
+        box.setVisible(bool(self._report.contracts))
         return box
 
     def _headline(self) -> QWidget:

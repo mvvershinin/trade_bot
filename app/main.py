@@ -174,7 +174,7 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--symbol", dest="symbol", metavar="CODE",
-        help="инструмент, по умолчанию MXU6",
+        help="инструмент, по умолчанию MXZ6",
     )
     parser.add_argument(
         "--days", dest="days", type=_positive, default=None, metavar="N",
@@ -815,9 +815,18 @@ def _wire_settings_and_log(
     3. **говорится, что вышло при чтении** настроек — до первой записи,
        иначе она затрёт файл, о котором ещё не сказано ни слова;
     4. **включается запись** применённых настроек.
+
+    Перед ними — строка о переменной папки данных, если она задана и не
+    действует (`market.paths.ignored_override`): человек, выставивший её,
+    иначе искал бы базу и остановку робота не там.
     """
     from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
+    from market.paths import ignored_override  # noqa: PLC0415 — то же
 
+    ignored = ignored_override()
+    if ignored:
+        log.warning("%s", ignored)
+        port.note("Папка данных", ignored, level)
     _say_where_the_log_goes(port, setup_logging(values.log_directory), level=level)
     _say_what_was_read(port, loaded, store, level=level)
     _keep_settings(port, store, level=level)

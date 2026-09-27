@@ -37,10 +37,11 @@ from ui.settings_codec import field_codecs
 #: с умолчанием хотя бы одним полем, это поле не проверяет вовсе — оно
 #: совпадёт и при полностью потерянном файле.
 DIFFERENT = Settings(
-    instrument="MXZ6",
+    instrument="MXH7",
     timeframe="15 минут",
     depth_days=45,
     history_depth_days=120,
+    expiry_halt_days=5,
     # ⚠️ Второй алгоритм сборки, а при одном — тот же самый. Набор значений
     # этого поля **закрыт**: чтение отвергает имя, которого нет в реестре
     # (`SettingsStore._known_algorithm`), и подставить сюда выдуманное значит
@@ -509,6 +510,7 @@ OWNER_FILE = """{
     "daily_loss_limit_enabled": false,
     "daily_loss_limit_pct": 2.0,
     "depth_days": 90,
+    "expiry_halt_days": 1,
     "filter_enabled": false,
     "free_funds_reserve_enabled": false,
     "free_funds_reserve_pct": 30.0,
@@ -681,3 +683,39 @@ def test_the_numbers_of_the_switched_off_guards_survive_a_write(tmp_path) -> Non
     assert written["daily_loss_limit_pct"] == 2.5
     assert written["free_funds_reserve_pct"] == 40.0
     assert written["volume_cap_enabled"] is True
+
+
+def test_a_guard_returned_to_the_build_is_no_longer_called_switched_off() -> None:
+    """Стережёт обещание возврата `D-113`: вернувшийся предохранитель не зовётся выключенным.
+
+    Список выключенных считается **от самой сборки**: предохранитель попадает
+    в строку про старый файл, только если поля с его именем в таблице полей нет.
+    Когда `D-113` вернёт поле в окно, строка о нём обязана замолчать сама —
+    без правки, о которой некому будет вспомнить. Иначе после возврата
+    человек прочтёт «в этой сборке его НЕТ» про работающий потолок объёма.
+
+    Вход подставной: таблица полей, в которой потолок объёма уже вернулся,
+    а два других предохранителя ещё нет. Контрольная половина — о двух
+    невернувшихся строка по-прежнему есть: «молчать всегда» тест не проходит.
+    """
+    from app.settings_store import _guards_off_in_the_file
+
+    raw: dict[str, object] = {
+        "volume_cap_enabled": True,
+        "volume_cap": 7,
+        "daily_loss_limit_enabled": True,
+        "daily_loss_limit_pct": 2.5,
+        "free_funds_reserve_enabled": True,
+        "free_funds_reserve_pct": 40.0,
+    }
+    table = {**field_codecs(), "volume_cap_enabled": None, "volume_cap": None}
+    notes, troubles = _guards_off_in_the_file(raw, table)
+    said = " ".join(notes + troubles).lower()
+    assert "потолок объёма" not in said, (
+        "потолок объёма вернулся в сборку, а строка про старый файл всё ещё "
+        f"называет его выключенным: {said!r}"
+    )
+    for guard in ("дневной лимит убытка", "запас свободных средств"):
+        assert guard in said, (
+            f"невернувшийся предохранитель «{guard}» больше не назван: {said!r}"
+        )

@@ -182,7 +182,7 @@ from market.synthetic import (
     refuse_synthetic_in_working_base,
 )
 
-__all__ = ["Source", "Coverage", "WriteStats", "CandleStore", "SCHEMA_VERSION"]
+__all__ = ["Source", "Coverage", "ContractRow", "WriteStats", "CandleStore", "SCHEMA_VERSION"]
 
 #: Версия схемы. Меняется, когда меняется **смысл** записанного, а не только
 #: набор колонок.
@@ -227,7 +227,17 @@ __all__ = ["Source", "Coverage", "WriteStats", "CandleStore", "SCHEMA_VERSION"]
 #: бы базу со стоящей остановкой и **не увидела** бы её: таблицу она
 #: не читает, робот пошёл бы торговать. Поднятая версия превращает это
 #: в честный отказ при открытии вместо тихого обхода предохранителя.
-SCHEMA_VERSION = 6
+#:
+#: 6 → 7 (27.09.2026). В базе поселились **контракты с периодами жизни**
+#: (`contract`): какой фьючерс на каком отрезке времени был ближним,
+#: по рубежу решения 0049 (`market.contracts`, решение 0061). Переносить
+#: нечего — таблицы не было, `CREATE TABLE IF NOT EXISTS` заводит её сама.
+#:
+#: ⚠️ Версия поднята по той же причине, что и в 5 → 6. Сборка со схемой 6
+#: не знает таблицы и продолжала бы торговать тикером из настроек после
+#: того, как база уже знает, что контракт закрыт. Отказ при открытии
+#: честнее, чем торговля истёкшим кодом.
+SCHEMA_VERSION = 7
 
 #: Начиная с этой версии ключ `ts` — гарантированно начало минуты. База
 #: младше её проходит `_migrate_minute_keys`; база от неё и старше — нет,
@@ -306,6 +316,31 @@ class Coverage:
     @property
     def empty(self) -> bool:
         return self.count == 0
+
+
+@dataclass(frozen=True, slots=True)
+class ContractRow:
+    """Строка таблицы `contract`: контракт и период, когда он был ближним.
+
+    Обе границы периода включительно, календарные дни МСК. `None` в границе —
+    «не установлена», а не «бесконечность»; смысл пустот — в тексте схемы.
+    """
+
+    symbol: str
+    last_trade_day: date | None = None
+    active_from: date | None = None
+    active_to: date | None = None
+    checked_at: datetime | None = None
+
+    @property
+    def archived(self) -> bool:
+        """Период закрыт. Выводится из конца периода, а не хранится отдельно."""
+        return self.active_to is not None
+
+    @property
+    def current(self) -> bool:
+        """Контракт ближний сейчас: начало установлено, конца нет."""
+        return self.active_from is not None and self.active_to is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,6 +617,28 @@ CREATE TABLE IF NOT EXISTS robot_halt (
 -- и без этого база копила бы по сто двадцать одинаковых причин в час.
 CREATE UNIQUE INDEX IF NOT EXISTS robot_halt_reason_is_one
     ON robot_halt (reason);
+
+-- Контракты и периоды их ближней жизни (решение 0061, `market.contracts`).
+-- Даты — строкой ISO, как в `data_day`: это календарные дни МСК, не моменты.
+--
+-- `active_from` пуст — начало не установлено: первый контракт цепочки
+-- (его датировал бы предыдущий, которого в базе нет) либо следующий,
+-- ещё не обогнавший ближний. `active_to` пуст — период не закрыт.
+-- Действующий — ровно тот, у кого начало есть, а конца нет.
+--
+-- `archived` повторяет «конец есть» намеренно — так просил владелец счёта,
+-- и `CHECK` не даёт двум способам сказать одно и то же разойтись.
+-- Строки не удаляются: архивный контракт — это история, а не мусор.
+CREATE TABLE IF NOT EXISTS contract (
+    symbol         TEXT    NOT NULL PRIMARY KEY,
+    last_trade_day TEXT,
+    active_from    TEXT,
+    active_to      TEXT,
+    archived       INTEGER NOT NULL
+        CHECK (archived = (active_to IS NOT NULL)),
+    checked_at     INTEGER NOT NULL,
+    CHECK (active_to IS NULL OR active_from IS NULL OR active_from <= active_to)
+) WITHOUT ROWID;
 
 -- Сторожа журнала вынесены в `_GUARDS` (ниже по файлу) и **пересоздаются
 -- при каждом открытии базы**: тело сторожа принадлежит коду, а не файлу.
@@ -2799,6 +2856,75 @@ class CandleStore:
         )
 
     # -- остановка робота ---------------------------------------------------
+
+    def put_contracts(
+        self, rows: Iterable[ContractRow], *, now: datetime | None = None
+    ) -> None:
+        """Записать контракты. Известное **не стирается** пустым.
+
+        Пустая дата в строке значит «в этом заходе не узнали», а не «не было».
+        Уточнение цепочки по двум последним контрактам не знает начала первого
+        из них — и не имеет права стереть начало, которое записал перенос
+        всей цепочки. Поэтому каждая дата ложится через `COALESCE`: новое
+        значение заменяет старое, пустое оставляет старое на месте.
+
+        Строки не удаляются вовсе: закрытый контракт — история (решение 0061).
+        `archived` выводится из конца периода в самом запросе, а `CHECK`
+        в схеме не даёт ему разойтись с концом.
+        """
+        at = _to_ts(now or datetime.now(MSK))
+
+        def day(value: date | None) -> str | None:
+            return value.isoformat() if value is not None else None
+
+        values = [
+            (
+                row.symbol,
+                day(row.last_trade_day),
+                day(row.active_from),
+                day(row.active_to),
+                int(row.active_to is not None),
+                at,
+            )
+            for row in rows
+        ]
+        with self._transaction():
+            self._db.executemany(
+                """
+                INSERT INTO contract (symbol, last_trade_day, active_from,
+                                      active_to, archived, checked_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    last_trade_day = COALESCE(excluded.last_trade_day,
+                                              contract.last_trade_day),
+                    active_from = COALESCE(excluded.active_from, contract.active_from),
+                    active_to = COALESCE(excluded.active_to, contract.active_to),
+                    archived = (COALESCE(excluded.active_to, contract.active_to)
+                                IS NOT NULL),
+                    checked_at = excluded.checked_at
+                """,
+                values,
+            )
+
+    def contracts(self) -> list[ContractRow]:
+        """Все контракты таблицы, по коду. Порядок во времени задаёт вызывающий."""
+
+        def day(value: object) -> date | None:
+            return date.fromisoformat(str(value)) if value is not None else None
+
+        return [
+            ContractRow(
+                symbol=str(symbol),
+                last_trade_day=day(last),
+                active_from=day(since),
+                active_to=day(until),
+                checked_at=_from_ts(int(checked)),
+            )
+            for symbol, last, since, until, checked in self._db.execute(
+                "SELECT symbol, last_trade_day, active_from, active_to, checked_at "
+                "FROM contract ORDER BY symbol"
+            )
+        ]
 
     def standing_halt(self) -> tuple[StoredHalt, ...]:
         """Причины остановки, стоящие сейчас, **в порядке появления**.

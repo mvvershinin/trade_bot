@@ -152,6 +152,34 @@ EDITS = (
 )
 
 
+def test_a_filter_number_the_algorithm_does_not_read_stays_grey_with_the_filter_on(
+    make_dialog, monkeypatch
+) -> None:
+    """Число фильтра гаснет поимённо, а не только вместе с галочкой фильтра.
+
+    У двух алгоритмов каталога фильтр читается целиком или не читается вовсе,
+    и потому гашение чисел фильтра по одной галочке совпадало бы с верным
+    ответом — случайно. Алгоритм, читающий порог, но не подтверждение,
+    получил бы живое поле «Подтверждение сигнала», которое робот не читает:
+    ровно тот дефект `D-107`, от которого поставлена вся проверка.
+
+    Вход подставной: окну говорят, что выбранный алгоритм не читает одно
+    `confirm_bars`. Контрольная половина — порог при этом активен: «гасить
+    всё» тест не проходит.
+    """
+    window = make_dialog(BASE.replace(strategy_id="ema_reverse"))
+    monkeypatch.setattr(window, "_unused_now", lambda: frozenset({"confirm_bars"}))
+    window.filter_enabled.setChecked(False)
+    window.filter_enabled.setChecked(True)
+    assert window.threshold_percent.isEnabled(), (
+        "порог читается алгоритмом и фильтр включён, а поле погашено"
+    )
+    assert not window.confirm_bars.isEnabled(), (
+        "алгоритм не читает подтверждение сигнала, а поле при включённом "
+        "фильтре активно — человек меняет число, которое робот игнорирует"
+    )
+
+
 @pytest.mark.parametrize("edit", range(len(EDITS)))
 def test_the_journal_is_silent_about_fields_the_algorithm_does_not_read(edit) -> None:
     """№2: правка нечитаемых полей не даёт строк; №1: та же правка — строки есть."""

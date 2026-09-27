@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import sqlite3
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from market import (
     MARKETS,
     MSK,
     CandleStore,
+    ContractError,
     FetchResult,
     HistoryOutcome,
     HistoryRequest,
@@ -67,11 +69,14 @@ from market import (
     IssError,
     Leg,
     StitchReport,
+    adopt_chain,
     daily_volume,
+    default_db_path,
     ensure_userdata_dir,
     is_synthetic,
     legs_of_chain,
     load_history,
+    refresh_contracts,
     stitch,
     take_inventory,
     userdata_dir,
@@ -81,6 +86,7 @@ __all__ = [
     "CHAIN_DB_FILE_NAME",
     "STITCH_DEPTH_DAYS",
     "ChainRequest",
+    "adopt_into_working_base",
     "build_chain",
     "chain_lines",
     "fetch_history",
@@ -503,6 +509,54 @@ def build_chain(
     return 0
 
 
+def adopt_into_working_base(
+    source: pathlib.Path,
+    target: pathlib.Path,
+    legs: Sequence[str],
+    *,
+    out: TextIO,
+    client: IssClient | None = None,
+) -> int:
+    """Перенести контракты цепочки в рабочую базу и уточнить периоды у биржи.
+
+    Два шага, и второй не обязателен. Перенос не ходит в сеть: минуты
+    и отметки дней берутся из `source` только на чтение, периоды считаются
+    по перенесённым минутам (`market.contracts.adopt_chain`). Уточнение
+    у биржи (`client` не `None`) добавляет последний день обращения и рубеж
+    контракта, которого в источнике нет, — без него действующим останется
+    последний перенесённый, даже если он истёк.
+    """
+    try:
+        with CandleStore(target) as store:
+            report = adopt_chain(source, store, legs)
+            for leg in legs:
+                out.write(
+                    f"{leg}: минут {report.minutes.get(leg, 0)}, "
+                    f"записано {report.written.get(leg, 0)}, "
+                    f"дней отмечено {report.days.get(leg, 0)}\n"
+                )
+            rows = report.contracts
+            if client is not None:
+                rows = refresh_contracts(store, client, legs, market=MARKETS["futures"])
+    except (ContractError, IssError, sqlite3.Error) as error:
+        out.write(f"Перенос не выполнен: {error}\n")
+        return 1
+    for row in rows:
+        period = (
+            f"{row.active_from or '?'} … {row.active_to or 'сейчас'}"
+            if row.active_from or row.active_to
+            else "период не установлен"
+        )
+        mark = (
+            "архивный" if row.archived
+            else "срок не проверен у биржи" if row.last_trade_day is None
+            else "действующий" if row.current
+            else ""
+        )
+        out.write(f"{row.symbol}: {period} {mark}".rstrip() + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """`python3 -m app.fetch --stitch @MX --legs MXM5,MXU5,…` — сборка ряда.
 
@@ -530,6 +584,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="сколько последних дней качать по каждому контракту")
     parser.add_argument("--no-fetch", action="store_true",
                         help="не ходить на биржу: собрать из того, что уже в базе")
+    parser.add_argument("--adopt", action="store_true",
+                        help="не сшивать, а перенести контракты --legs из базы цепочки "
+                             "в рабочую базу и заполнить периоды (решение 0061)")
+    parser.add_argument("--target", metavar="PATH", default=None,
+                        help="рабочая база для --adopt, по умолчанию userdata/candles.sqlite3")
     args = parser.parse_args(argv)
     database = (
         pathlib.Path(args.db) if args.db else userdata_dir() / CHAIN_DB_FILE_NAME
@@ -540,6 +599,12 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(f"{error}\n")
         return 1
     legs = [leg.strip().upper() for leg in args.legs.split(",") if leg.strip()]
+    if args.adopt:
+        target = pathlib.Path(args.target) if args.target else default_db_path()
+        return adopt_into_working_base(
+            database, target, legs, out=sys.stdout,
+            client=None if args.no_fetch else IssClient(),
+        )
     return build_chain(
         database,
         ChainRequest(

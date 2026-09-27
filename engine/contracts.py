@@ -339,6 +339,11 @@ class ExitReason(enum.Enum):
     TAKE_PROFIT = "take_profit"
     MANUAL = "manual"
     DAILY_LOSS = "daily_loss"
+    #: Поданный ряд кончился, а позиция открыта: её закрыл тот, кто ряд
+    #: подавал, по последней цене ряда. Движок эту причину **не выдаёт**
+    #: сам — у него нет понятия «конец ряда»; она нужна, чтобы сделка
+    #: закрытия отличалась от сигнальной (прогон по склейке, решение 0061).
+    SERIES_END = "series_end"
 
     @property
     def label(self) -> str:
@@ -349,6 +354,7 @@ class ExitReason(enum.Enum):
             ExitReason.TAKE_PROFIT: "тейк-профит",
             ExitReason.MANUAL: "команда человека",
             ExitReason.DAILY_LOSS: "дневной лимит убытка",
+            ExitReason.SERIES_END: "конец поданного отрезка",
         }[self]
 
 

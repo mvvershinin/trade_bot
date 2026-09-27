@@ -30,6 +30,12 @@ from app.settings_store import SettingsStore
 from market import MSK, Candle, CandleStore, MarketWorker, Source, Timeframe, redact
 from ui.models import DecisionRow, Mode, Settings
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
+
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)
 
 
@@ -54,8 +60,8 @@ def _minutes(count: int, start: datetime) -> list[Candle]:
 def database(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(300, DAY - timedelta(days=2)), Source.ISS)
-        store.put_minutes("MXU6", _minutes(300, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY - timedelta(days=2)), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY), Source.ISS)
     return path
 
 
@@ -324,7 +330,7 @@ def test_applied_settings_reach_the_file(loop, database, tmp_path) -> None:
         port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
         _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
         try:
-            port.apply_settings(Settings(instrument="MXU6", volume=3, depth_days=12))
+            port.apply_settings(Settings(instrument=SYMBOL, volume=3, depth_days=12))
             await port.wait()
         finally:
             await port.aclose()
@@ -495,3 +501,41 @@ def test_an_unchanged_pair_gives_no_lines() -> None:
 #     )
 #     guards = convert.guard_changes(before, after)
 #     assert len(guards) == 2 and all("→" in line for line in guards)
+
+
+def test_ignored_userdata_variable_is_said_in_the_journal(
+    loop, database, tmp_path, monkeypatch
+) -> None:
+    """`TERMINAL_USERDATA` вне тестового прогона не действует — и это строка журнала.
+
+    Ревью 27.09.2026, находка 9: молча проигнорированная переменная —
+    человек ищет базу и остановку робота в папке, которой программа не видит.
+    """
+    from app.main import _wire_settings_and_log
+    from market.paths import TEST_RUN_ENV, USERDATA_ENV
+
+    monkeypatch.setenv(USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(TEST_RUN_ENV, raising=False)
+    store = SettingsStore(tmp_path / "userdata")
+    values = Settings(log_directory=str(tmp_path / "логи"))
+    said: list[DecisionRow] = []
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        port.decision_appended.connect(said.append)
+        try:
+            _wire_settings_and_log(
+                port, store, store.load(), values,
+                level=convert.DecisionLevel.WARNING,
+            )
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+
+    about = [row for row in said if row.event == "Папка данных"]
+    assert about, "проигнорированная переменная папки данных в журнале не названа"
+    assert USERDATA_ENV in about[0].reason

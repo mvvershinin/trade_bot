@@ -67,6 +67,12 @@ from strategies import (
 from ui.models import RunOrigin as WindowOrigin
 from ui.models import Settings
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
+
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)  # пятница, до открытия окна
 
 
@@ -87,7 +93,7 @@ def _minutes(count: int = 300, start: datetime = DAY) -> list[Candle]:
 def database(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(), Source.ISS)
     return path
 
 
@@ -99,7 +105,7 @@ def _conditions(*, days: int = 30, until: datetime | None = None) -> RunConditio
     """Условия прогона для проверок записи. Меняются только отбор и правый край."""
     return RunConditions(
         origin=RunOrigin.BACKTEST,
-        symbol="MXU6",
+        symbol=SYMBOL,
         timeframe="5 минут",
         engine=EngineSettings(mode=Mode.REVERSE, commission_per_side=14.0),
         strategy=EmaReverseSettings(),
@@ -164,7 +170,7 @@ def test_a_pass_of_the_engine_leaves_a_finished_row_with_conditions_and_result(
     session = sessions[0]
     assert session.origin is RunOrigin.BACKTEST, "происхождение прогона не то"
     assert session.finished_at is not None, "прогон закрылся, но остался незакрытым"
-    assert session.symbol == "MXU6"
+    assert session.symbol == SYMBOL
     assert session.timeframe == "5 минут"
     assert session.strategy == EmaReverse.title
     assert session.app_version, "версия программы не записана"
@@ -630,7 +636,7 @@ def test_the_runs_key_prints_the_conditions_next_to_the_result(loop, database) -
     assert "Прогон 1 — прогон по истории" in text
     assert "Тейк-профит, %: 0,5" in text, "настроек в выдаче нет"
     assert "Период средней: 15" in text, "настроек торгового модуля в выдаче нет"
-    assert "MXU6, 5 минут: свечей" in text, "отрезка в выдаче нет"
+    assert f"{SYMBOL}, 5 минут: свечей" in text, "отрезка в выдаче нет"
     assert "Сделок" in text and "чистая" in text, "итога в выдаче нет"
 
 
@@ -678,7 +684,7 @@ def test_the_runs_key_answers_on_a_machine_where_qt_cannot_start(database) -> No
     """
     with CandleStore(database) as store:
         session = store.open_journal_session(
-            SessionRecord(RunOrigin.BACKTEST, symbol="MXU6", settings="Настройки движка")
+            SessionRecord(RunOrigin.BACKTEST, symbol=SYMBOL, settings="Настройки движка")
         )
         store.finish_journal_session(session.id, note="Сделок 3")
 

@@ -174,7 +174,7 @@ def test_defaults_match_the_agreed_numbers(dialog) -> None:
 def test_settings_survive_a_round_trip(dialog) -> None:
     """Что записали в поля, то и прочитали. Без этого «применить» врёт."""
     source = Settings(
-        instrument="MXZ6",
+        instrument="MXH7",
         timeframe="15 минут",
         average_period=20,
         average_kind=AverageKind.SMA,
@@ -1298,7 +1298,7 @@ def test_tab_order_follows_the_screen(dialog, qapp) -> None:
     # и список с дырами перестал бы стеречь то, ради чего заведён.
     expected = [
         # «Инструмент и данные»
-        dialog.instrument, dialog.timeframe,
+        dialog.instrument, dialog.expiry_halt_days, dialog.timeframe,
         dialog.history_depth_days, dialog.depth_days,
         dialog.price_step, dialog.ruble_per_point,
         # «Сигнал»
@@ -2112,10 +2112,11 @@ def test_the_take_switch_survives_the_exchange_on_its_own(dialog) -> None:
 #: Набор, отличающийся от умолчания **каждым** полем: иначе проверка обмена
 #: половину полей не видит — они совпали бы и при полностью потерянном окне.
 SAMPLE = Settings(
-    instrument="MXZ6",
+    instrument="MXH7",
     timeframe="15 минут",
     depth_days=45,
     history_depth_days=120,
+    expiry_halt_days=5,
     # ⚠️ Имя нарочно **не из реестра**: окно значений не проверяет и проверять
     # не может — реестра оно не видит (ARCHITECTURE.md §2). Проверяется здесь
     # ровно то, что окно обязано делать: пронести пришедшее снаружи имя через
@@ -2165,6 +2166,33 @@ SAMPLE = Settings(
     # как снятие календаря владельцем счёта.
     calendar=(CalendarDay(day=date(2026, 6, 12), trading=False),),
 )
+
+
+def test_the_note_that_there_are_no_money_guards_is_on_screen(dialog) -> None:
+    """Стережёт МОЛЧАНИЕ: строка «предохранителей нет» не только написана, но и видна.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Прочие сторожа читают
+    `guards_note.text()` — а текст у спрятанной надписи остаётся прежним.
+    Спрятать строку (или группу над ней) значило бы вернуть ровно то, от чего
+    она поставлена: вкладка без полей и без слов читается как «здесь всё
+    в порядке», и все проверки текста при этом зелёные.
+
+    Вкладка с надписью делается текущей, после чего надпись обязана быть
+    видимой в окне: скрытый предок на любом уровне это ломает.
+    """
+    from PySide6.QtWidgets import QTabWidget
+
+    dialog.set_values(Settings())
+    note = dialog.guards_note
+    tabs = dialog.findChild(QTabWidget)
+    assert tabs is not None, "у окна настроек нет вкладок"
+    pages = [i for i in range(tabs.count()) if tabs.widget(i).isAncestorOf(note)]
+    assert pages, "строка про предохранители не стоит ни на одной вкладке"
+    tabs.setCurrentIndex(pages[0])
+    assert note.text().strip(), "строка про предохранители пуста"
+    assert note.isVisibleTo(dialog), (
+        "строка о том, что предохранителей нет, спрятана — на вкладке её не видно"
+    )
 
 
 # ------------------------------------------- сторож на этот файл

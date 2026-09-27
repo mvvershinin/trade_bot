@@ -98,6 +98,11 @@ __all__ = [
     "parse_borders",
     "parse_security",
     "InstrumentSpec",
+    "DAY_INTERVAL",
+    "daily_url",
+    "description_url",
+    "parse_daily_volumes",
+    "parse_last_trade_day",
 ]
 
 _T = TypeVar("_T")
@@ -407,6 +412,136 @@ def check_interval(interval: int) -> None:
             "от способа загрузки. Нужен другой размер свечи — качайте минутные "
             "и собирайте market.aggregate.build_bars"
         )
+
+
+#: Интервал дневных свечей ISS. Берётся **только ради объёма** (`daily_url`).
+DAY_INTERVAL = 24
+
+
+def daily_url(
+    secid: str,
+    *,
+    market: Market,
+    date_from: date,
+    date_to: date,
+    start: int = 0,
+    base: str = ISS_BASE,
+) -> str:
+    """Адрес страницы дневных свечей — источник дневных объёмов для рубежа.
+
+    ⚠️ Это **не** вход для свечей. Правило «с ISS только минутки»
+    (`check_interval`) стоит на том, что собранная сервером свеча не сообщает
+    свою полноту и не должна стать баром. Здесь бара не получается вовсе:
+    `parse_daily_volumes` отдаёт словарь «день → объём», а не `Candle`,
+    и в `put_minutes` положить из него нечего.
+
+    Объём нужен рубежу (`market.chain.roll_day`) по обоим контрактам пары,
+    и дневной объём у биржи — дешёвая страница на год, а не минуты хвоста,
+    которые владелец счёта качать запретил (решение 0061).
+    """
+    path = (
+        f"{base}/engines/{market.engine}/markets/{market.market}"
+        f"/boards/{market.board}/securities/{urllib.parse.quote(secid)}/candles.json"
+    )
+    query = urllib.parse.urlencode(
+        {
+            "from": date_from.isoformat(),
+            "till": date_to.isoformat(),
+            "interval": DAY_INTERVAL,
+            "iss.meta": "off",
+            "start": start,
+        }
+    )
+    return f"{path}?{query}"
+
+
+#: Самая короткая дневная свеча, которую разбор принимает за дневную без
+#: оговорок. Короче — принимается только свеча, начатая в полночь и
+#: кончившаяся в тот же день: у дневной свечи ISS `end` — последняя сделка
+#: дня, и в укороченный день (первый день контракта, праздничный режим) он
+#: раньше 23:00. Живой ответ ISS 27.09.2026 по MXH6: `2025-03-11 00:00:00 …
+#: 19:30:22`. Внутридневная свеча в полночь не начинается: торгов в 00:00 нет.
+_SHORTEST_DAY = 23 * 3600
+
+
+def parse_daily_volumes(payload: bytes) -> dict[date, float]:
+    """Дневные объёмы из ответа ISS: день МСК → контракты. Не свечи.
+
+    Длина свечи проверяется **по самим данным**, как у минуток
+    (`parse_candles`): ответ с минутками под видом дневных дал бы рубеж
+    по объёму одной минуты. Короче суток — отказ вслух.
+
+    :raises IssPayloadError: нет колонок `begin`, `end`, `volume`, строка
+        не разобрана либо свеча короче суток.
+    """
+    columns, rows = _block(_decode(payload), "candles")
+    try:
+        index = {name: columns.index(name) for name in ("volume", "begin", "end")}
+    except ValueError as error:
+        raise IssPayloadError(f"в ответе нет обязательной колонки: {error}") from error
+    volumes: dict[date, float] = {}
+    for row in rows:
+        if not isinstance(row, list) or len(row) < len(columns):
+            raise IssPayloadError(f"строка дневной свечи короче заголовка: {row!r}")
+        try:
+            begin = datetime.strptime(str(row[index["begin"]]), "%Y-%m-%d %H:%M:%S")
+            end = datetime.strptime(str(row[index["end"]]), "%Y-%m-%d %H:%M:%S")
+            volume = float(str(row[index["volume"]]))
+        except (TypeError, ValueError) as error:
+            raise IssPayloadError(f"не разобрана дневная свеча {row!r}: {error}") from error
+        whole_day = begin.time() == datetime.min.time() and end.date() == begin.date()
+        if (end - begin).total_seconds() < _SHORTEST_DAY and not whole_day:
+            raise IssPayloadError(
+                f"свеча {begin} … {end} короче суток: это не дневной объём, "
+                "и рубеж по нему считать нельзя"
+            )
+        volumes[begin.date()] = volume
+    return volumes
+
+
+def description_url(secid: str, *, base: str = ISS_BASE) -> str:
+    """Адрес описания инструмента — последний день обращения.
+
+    ⚠️ Адрес **не** рыночный. Карточка рынка (`securities_url`) у истёкшего
+    контракта пуста: живой запрос 27.09.2026 по MXU6 и MXM5 вернул ноль строк.
+    Описание отвечает и за истёкшие — там `LSTTRADE` есть у MXM5 2025 года.
+    """
+    return (
+        f"{base}/securities/{urllib.parse.quote(secid)}.json"
+        "?iss.meta=off&iss.only=description"
+    )
+
+
+def parse_last_trade_day(payload: bytes, *, secid: str) -> date | None:
+    """Последний день обращения из описания инструмента. `None` — биржа не назвала.
+
+    :raises IssUnknownInstrument: описание пусто — биржа кода не знает.
+    :raises IssPayloadError: дата не разобрана.
+    """
+    columns, rows = _block(_decode(payload), "description")
+    if not rows:
+        raise IssUnknownInstrument(
+            f"биржа не знает инструмента {secid!r}: описание пусто. "
+            "Проверьте тикер: у фьючерса он меняется с каждой экспирацией"
+        )
+    try:
+        name_at, value_at = columns.index("name"), columns.index("value")
+    except ValueError as error:
+        raise IssPayloadError(f"в описании нет обязательной колонки: {error}") from error
+    for row in rows:
+        if isinstance(row, list) and len(row) > max(name_at, value_at) and (
+            row[name_at] == "LSTTRADE"
+        ):
+            value = row[value_at]
+            if value in (None, ""):
+                return None
+            try:
+                return date.fromisoformat(str(value))
+            except ValueError as error:
+                raise IssPayloadError(
+                    f"последний день обращения {secid!r} не дата: {value!r}"
+                ) from error
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -864,6 +999,47 @@ class IssClient:
         interval = kwargs.pop("interval", MINUTE_INTERVAL)
         check_interval(interval)  # type: ignore[arg-type]
         return self.candles(secid, interval=MINUTE_INTERVAL, **kwargs)  # type: ignore[arg-type]
+
+    def daily_volumes(
+        self, secid: str, *, market: Market, date_from: date, date_to: date
+    ) -> dict[date, float]:
+        """Дневные объёмы за период — все страницы, до пустой.
+
+        Обход короче минутного: страница у биржи — 500 дней, год дневных
+        свечей это одна страница. Страница, не ушедшая вперёд, — отказ,
+        а не бесконечный цикл: тот же приём, что у минуток (`B-031`).
+
+        :raises ValueError: период задом наперёд.
+        """
+        if date_to < date_from:
+            raise ValueError(f"период задом наперёд: {date_from} .. {date_to}")
+        volumes: dict[date, float] = {}
+        result = FetchResult()
+        while True:
+            self._check_stop(secid)
+            if result.pages >= self._max_pages:
+                raise IssPagingError(
+                    f"{secid}: биржа отдала уже {self._max_pages} страниц "
+                    "дневных свечей и не кончается"
+                )
+            url = daily_url(
+                secid, market=market, date_from=date_from, date_to=date_to,
+                start=len(volumes), base=self._base,
+            )
+            page = self._fetch(url, parse_daily_volumes, result)
+            result.pages += 1
+            fresh = {day: volume for day, volume in page.items() if day not in volumes}
+            if not fresh:
+                return volumes
+            volumes.update(fresh)
+
+    def last_trade_day(self, secid: str) -> date | None:
+        """Последний день обращения контракта — из описания, не из карточки рынка."""
+        return self._fetch(
+            description_url(secid, base=self._base),
+            lambda body: parse_last_trade_day(body, secid=secid),
+            FetchResult(),
+        )
 
     def borders(self, secid: str, *, market: Market) -> list[CandleBorder]:
         """Что сервер заявляет о доступной глубине по каждому интервалу."""

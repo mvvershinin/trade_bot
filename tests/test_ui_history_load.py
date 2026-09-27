@@ -71,6 +71,11 @@ from market_helpers import FakeTransport, iss_body, minute, no_sleep
 
 TODAY = date(2026, 9, 6)
 
+# ⚠️ Загрузка «последние N дней» с 27.09.2026 идёт только для кодов без
+# квартальной цепочки: проверки этого пути гоняют месячный фьючерс BRX6.
+# Квартальный код (MXZ6) грузится по контракту, с рубежа и без хвоста
+# (решение 0061) — его стерегут `tests/test_ui_contract_load.py`.
+
 
 def noon_of(day: date) -> Callable[[], datetime]:
     """Часы, у которых «сейчас» — всегда полдень названного дня.
@@ -1179,14 +1184,14 @@ def test_the_button_makes_the_base_out_of_nothing(loop, bare_folder) -> None:
     handler = exchange(alive_borders(TODAY), [iss_body(session(day, 300))])
 
     async def work(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=7))
         await _settle(port)
 
     port, heard = _run_as_main(loop, bare_folder, handler, work)
 
     assert bare_folder.exists(), "база сама себя не завела"
     with CandleStore(bare_folder) as store:
-        assert store.coverage("MXU6").count > 0, "свечей в базе так и не появилось"
+        assert store.coverage("BRX6").count > 0, "свечей в базе так и не появилось"
     assert heard.finished, "порт не сказал, чем кончилась загрузка"
     assert heard.finished[-1].ok, heard.finished[-1].trouble
 
@@ -1219,13 +1224,13 @@ def test_the_button_works_on_any_day_of_the_calendar(loop, tmp_path, today) -> N
     handler = exchange(alive_borders(today), [iss_body(session(day, 300))])
 
     async def work(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=7))
         await _settle(port)
 
     port, heard = _run(loop, path, handler, work, today=today)
 
     with CandleStore(path) as store:
-        assert store.coverage("MXU6").count > 0, (
+        assert store.coverage("BRX6").count > 0, (
             f"свечей в базе нет, хотя биржа их отдавала: сегодня {today}"
         )
     assert heard.finished, "порт не сказал, чем кончилась загрузка"
@@ -1257,7 +1262,7 @@ def test_the_port_takes_its_today_from_the_clock_it_was_given(loop, tmp_path) ->
     handler, asked = picky_exchange(alive_borders(deeper), session(far - timedelta(days=1), 60))
 
     async def work(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=5))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=5))
         await _settle(port)
 
     _run(loop, path, handler, work, today=far)
@@ -1296,7 +1301,7 @@ def test_every_line_of_the_journal_is_stamped_by_the_ports_own_clock(loop, tmp_p
     handler = exchange(alive_borders(far), [iss_body(session(day, 300))])
 
     async def work(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=7))
         await _settle(port)
 
     port, heard = _run(loop, tmp_path / "stamps.sqlite3", handler, work, today=far)
@@ -1346,13 +1351,13 @@ def test_the_button_puts_candles_into_an_empty_base(loop, empty_database) -> Non
     handler = exchange(alive_borders(TODAY), [iss_body(session(day, 300))])
 
     async def work(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=7))
         await _settle(port)
 
     port, heard = _run(loop, empty_database, handler, work)
 
     with CandleStore(empty_database) as store:
-        assert store.coverage("MXU6").count > 0, "свечей в базе так и не появилось"
+        assert store.coverage("BRX6").count > 0, "свечей в базе так и не появилось"
     assert heard.finished, "порт не сказал, чем кончилась загрузка"
     assert heard.finished[-1].ok, heard.finished[-1].trouble
 
@@ -1378,7 +1383,7 @@ def test_the_load_runs_outside_the_event_loop(loop, empty_database) -> None:
 
     async def work(port, worker) -> None:
         beat = asyncio.ensure_future(tick())
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=7))
         await _settle(port)
         beat.cancel()
 
@@ -1410,7 +1415,7 @@ def test_the_progress_reaches_the_window(loop, empty_database) -> None:
     handler = exchange(alive_borders(TODAY), [iss_body(minutes)])
 
     async def work(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=7))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=7))
         await _settle(port)
 
     port, heard = _run(loop, empty_database, handler, work)
@@ -1545,7 +1550,7 @@ def test_the_menu_has_the_load_button_and_it_asks_the_port(qapp, monkeypatch) ->
         )
         window.history_action.trigger()
         qapp.processEvents()
-        assert ("request_history_facts", "MXU6") in port.calls, (
+        assert ("request_history_facts", Settings().instrument) in port.calls, (
             f"нажатие не дошло до порта: {port.calls}"
         )
     finally:
@@ -1803,13 +1808,13 @@ def test_the_reload_forgets_the_marks_and_the_plain_load_does_not(
     day = TODAY - timedelta(days=2)
     with CandleStore(path) as store:
         store.mark_days_requested(
-            "MXU6", [day], counts={day: 60},
+            "BRX6", [day], counts={day: 60},
             now=datetime.combine(TODAY, time(0, 0), MSK),
         )
     handler, asked = picky_exchange(alive_borders(TODAY), session(day, 60))
 
     async def plain(port, worker) -> None:
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=5))
+        port.load_history(HistoryLoadRequest(symbol="BRX6", days=5))
         await _settle(port)
 
     _run(loop, path, handler, plain)
@@ -1818,16 +1823,16 @@ def test_the_reload_forgets_the_marks_and_the_plain_load_does_not(
         f"обычная догрузка перезапросила уже отмеченный день: {asked}"
     )
     with CandleStore(path) as store:
-        assert store.coverage("MXU6").count == 0, (
+        assert store.coverage("BRX6").count == 0, (
             "обычная догрузка притащила свечи дня, который просила не трогать"
         )
-        assert day in store.settled_days("MXU6")
+        assert day in store.settled_days("BRX6")
 
     handler, asked = picky_exchange(alive_borders(TODAY), session(day, 60))
 
     async def again(port, worker) -> None:
         port.load_history(
-            HistoryLoadRequest(symbol="MXU6", days=5, since=day, replace=True)
+            HistoryLoadRequest(symbol="BRX6", days=5, since=day, replace=True)
         )
         await _settle(port)
 
@@ -1836,6 +1841,6 @@ def test_the_reload_forgets_the_marks_and_the_plain_load_does_not(
         f"«заново» не перезапросило отмеченный день: {asked}"
     )
     with CandleStore(path) as store:
-        assert store.coverage("MXU6").count == 60, (
+        assert store.coverage("BRX6").count == 60, (
             "«заново» не принесло свечей перезапрошенного дня"
         )

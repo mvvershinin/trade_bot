@@ -91,6 +91,7 @@ class TerminalPort(QObject):
     history_facts_ready = Signal(object)  # HistoryFacts — что уже есть в базе
     history_progress = Signal(int, str)   # 0…100, подпись — ход загрузки истории
     history_finished = Signal(object)     # HistoryLoadOutcome — чем кончилась
+    contract_checked = Signal(object)     # ContractNotice — действующий контракт по таблице
 
     # ⚠️ `stuck_changed` — не отказ и не ошибка, поэтому сигнал свой, а не
     # `failed`. Отказ отвечает на нажатие и живёт в строке состояния секунды;

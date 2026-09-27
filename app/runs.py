@@ -820,7 +820,7 @@ def show_runs(
         out.write(
             f"Базы свечей нет: {database}\n"
             "Прогоны записываются в неё же; она появится при первой загрузке "
-            f"истории. {how_to_fetch('MXU6')}\n"
+            f"истории. {how_to_fetch('MXZ6')}\n"
         )
         return 1
     with CandleStore(database) as store:

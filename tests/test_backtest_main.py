@@ -14,8 +14,10 @@ from datetime import date, datetime, time, timedelta
 
 import pytest
 
+import backtest.__main__
 from backtest.__main__ import (
     COMMISSION,
+    DEPTH,
     PACE,
     _bars,
     _confirm,
@@ -35,8 +37,24 @@ from engine import EngineSettings
 from market.candles import MINUTE, Candle
 from market.storage import CandleStore, Source
 from tests.engine_helpers import MSK
+from tests.pinned_clock import PinnedClock
 
 SYMBOL = "MXU6"
+#: «Сейчас» для команды во всём файле (`D-112`). `_bars` берёт ряд за `DEPTH`
+#: дней от часов, а данные файла лежат в июне 2026: на машинных часах проверки
+#: краснели сами с 21.07.2027 (сдвиг +400 дней — девять красных). Сентябрь
+#: 2026 — после всех подставных дней и в пределах `DEPTH` от самого раннего.
+NOW = datetime(2026, 9, 1, 12, 0, tzinfo=MSK)
+
+
+@pytest.fixture(autouse=True)
+def the_clock_is_named_by_the_file(monkeypatch) -> None:
+    """Команда берёт «сейчас» у `NOW`, а не у часов машины (`D-112`).
+
+    Подменено имя `datetime` в одном модуле `backtest.__main__`, и только
+    `now()`: рабочий код не менялся, глубина ряда считается тем же путём.
+    """
+    monkeypatch.setattr(backtest.__main__, "datetime", PinnedClock(NOW))
 
 
 def _ground_for_test() -> Ground:
@@ -131,6 +149,29 @@ def test_a_symbol_without_candles_is_a_loud_refusal(tmp_path) -> None:
     copy = _database(tmp_path)
     with pytest.raises(SystemExit, match="нет свечей"):
         _bars(copy, "НЕТ-ТАКОГО")
+
+
+def test_the_series_reaches_back_depth_days_from_the_clock_not_further(
+    tmp_path, monkeypatch
+) -> None:
+    """Стережёт глубину ряда: день старше `DEPTH` от «сейчас» в перебор не идёт.
+
+    «Сейчас» здесь своё и далеко от настоящего сегодня: на часах машины
+    старый день прошёл бы в ряд, и проверка покраснела бы — так видно, что
+    подмена часов в этом файле вообще действует, а не просто зелёная.
+    """
+    now = datetime(2028, 1, 10, 12, 0, tzinfo=MSK)
+    monkeypatch.setattr(backtest.__main__, "datetime", PinnedClock(now))
+    old, fresh = date(2026, 6, 15), date(2027, 12, 15)
+    assert now - datetime.combine(old, time(0), tzinfo=MSK) > DEPTH
+    file = tmp_path / "depth.sqlite3"
+    with CandleStore(file) as store:
+        for day in (old, fresh):
+            store.put_minutes(SYMBOL, _minutes(day, count=340), Source.ISS)
+
+    days = {bar.time.astimezone(MSK).date() for bar in _bars(file, SYMBOL)}
+
+    assert days == {fresh}, f"в ряд попали не те дни: {sorted(days)}"
 
 
 # -- какие дни считаются торговыми -------------------------------------------

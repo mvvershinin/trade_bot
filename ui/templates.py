@@ -107,6 +107,7 @@ __all__ = [
     "export_templates",
     "merge_templates",
     "read_for_import",
+    "with_current_contract",
 ]
 
 #: Имя файла библиотеки внутри `userdata/`.
@@ -132,6 +133,20 @@ _KEY_ORIGIN: Final[str] = "origin"
 #: 127 сделок из 127. Он показывается первым — за пользовательскими наборами
 #: пока не стоит ничего.
 BUILTIN_NAME: Final[str] = "Умолчания проекта"
+
+#: Настройки, которых шаблон **не несёт**. Решение 0061, п. 7 — слова
+#: владельца счёта 27.09.2026: «для шаблона неважно должно быть что за
+#: контракт». Инструмент — это «какой контракт брать сейчас», его решает
+#: программа по таблице контрактов, а не набор, сохранённый полгода назад.
+#: Шаблон, несущий `MXU6`, вернул бы истёкший контракт тем же нажатием,
+#: которым возвращают проверенный набор.
+#:
+#: В файл не пишется, при чтении старого файла **выбрасывается молча**: это
+#: не «незнакомая настройка» (её бы вечно возвращало в файл и называло
+#: в подтверждении) и не «пропущенная» (её бы подставляло умолчанием
+#: программы и тем самым меняло инструмент). При применении берётся
+#: из текущих настроек — `with_current_contract`.
+NOT_IN_TEMPLATE: Final[tuple[str, ...]] = ("instrument",)
 
 #: Сколько знаков имени шаблона показывается и хранится. Ограничение
 #: не от жадности: имя уходит в заголовок строки таблицы и в фразу отказа.
@@ -184,6 +199,20 @@ class LoadedTemplates:
 
     templates: tuple[Template, ...] = ()
     troubles: tuple[str, ...] = ()
+
+
+def with_current_contract(template: Template, current: Settings) -> Settings:
+    """Значения шаблона с тем, чего шаблон не несёт, — из текущих настроек.
+
+    Применение шаблона меняет настройки стратегии, а не торгуемый контракт
+    (`NOT_IN_TEMPLATE`). Встроенный набор тоже: его `Settings()` несёт
+    умолчание инструмента, и без этой подстановки «Умолчания проекта»
+    переключали бы робота на контракт из сборки.
+    """
+    return replace(
+        template.values,
+        **{name: getattr(current, name) for name in NOT_IN_TEMPLATE},
+    )
 
 
 def builtin_template() -> Template:
@@ -295,7 +324,13 @@ def _body_of(templates: Sequence[Template]) -> str:
                 # ⚠️ Незнакомые ключи кладутся ПЕРВЫМИ и потому не могут
                 # перебить своими значениями то, что программа понимает.
                 # Порядок здесь — правило безопасности, а не оформление.
-                _KEY_VALUES: {**one.extras, **encode_fields(one.values)},
+                _KEY_VALUES: {
+                    key: value
+                    for key, value in {
+                        **one.extras, **encode_fields(one.values)
+                    }.items()
+                    if key not in NOT_IN_TEMPLATE
+                },
             }
             for one in templates
         ],
@@ -539,7 +574,11 @@ def _template_of(item: object, number: int) -> tuple[Template | None, str]:
             f"Шаблон «{name}» пропущен: в нём нет настроек. Остальные шаблоны "
             "прочитаны."
         )
-    table = field_codecs()
+    table = {
+        name: codec for name, codec in field_codecs().items()
+        if name not in NOT_IN_TEMPLATE
+    }
+    raw = {key: value for key, value in raw.items() if key not in NOT_IN_TEMPLATE}
     values = Settings()
     changes: dict[str, object] = {}
     for field_name, codec in table.items():

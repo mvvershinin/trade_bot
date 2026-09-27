@@ -59,3 +59,44 @@ def test_unwritable_directory_is_a_loud_error(tmp_path: pathlib.Path) -> None:
             paths.ensure_userdata_dir(target)
     finally:
         target.chmod(0o700)
+
+
+# -- переменная папки данных действует только в тестовом прогоне (ревью, находка 9)
+
+@pytest.mark.parametrize(
+    ("marker", "frozen", "honoured"),
+    [("1", False, True), (None, False, False), ("0", False, False), ("1", True, False)],
+)
+def test_userdata_variable_works_only_in_a_test_run_from_sources(
+    tmp_path: pathlib.Path, monkeypatch, marker: str | None, frozen: bool, honoured: bool,
+) -> None:
+    """Случайная `TERMINAL_USERDATA` в поставке не уводит к другой базе и замку.
+
+    Действует только вместе с `TERMINAL_TEST_RUN=1` и только из исходников;
+    иначе папка — обычная, а `ignored_override` даёт строку для журнала.
+    """
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setenv(paths.USERDATA_ENV, str(tmp_path / "чужая"))
+    if marker is None:
+        monkeypatch.delenv(paths.TEST_RUN_ENV, raising=False)
+    else:
+        monkeypatch.setenv(paths.TEST_RUN_ENV, marker)
+    monkeypatch.setattr(paths, "_is_frozen", lambda: frozen)
+    standard = (
+        pathlib.Path(paths.sys.executable).resolve().parent / "userdata" if frozen
+        else pathlib.Path(paths.__file__).resolve().parent.parent / "userdata"
+    )
+
+    if honoured:
+        assert paths.userdata_dir() == (tmp_path / "чужая").resolve()
+        assert paths.ignored_override() == ""
+    else:
+        assert paths.userdata_dir() == standard
+        assert paths.default_db_path().parent == standard
+        assert paths.USERDATA_ENV in paths.ignored_override()
+
+
+def test_no_variable_no_line(monkeypatch) -> None:
+    """Переменной нет — и сказать нечего: строка не должна появляться на каждом запуске."""
+    monkeypatch.delenv(paths.USERDATA_ENV, raising=False)
+    assert paths.ignored_override() == ""

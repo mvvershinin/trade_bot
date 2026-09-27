@@ -43,6 +43,7 @@ from ui.models import (
     CandleInfo,
     ChartData,
     ChartSpan,
+    ContractSeam,
     Layer,
     LinePoint,
     Marker,
@@ -120,6 +121,7 @@ class PainterChartSurface(QWidget, ChartSurface):
         self._visible: dict[Layer, bool] = {Layer.PLAN: True, Layer.FACT: True}
         self._levels: list[PriceLevel] = []
         self._shades: list[Shade] = []
+        self._seams: list[ContractSeam] = []
         self._view = _Viewport()
         self._drag_x: float | None = None
         #: Где стоит мышь. `None` — курсор ушёл с виджета, перекрестья нет.
@@ -192,6 +194,7 @@ class PainterChartSurface(QWidget, ChartSurface):
         }
         self._levels = list(data.levels)
         self._shades = list(data.shades)
+        self._seams = list(data.seams)
         if same_chart and not self._line.empty:
             self._keep_view(anchor)
         else:
@@ -606,6 +609,7 @@ class PainterChartSurface(QWidget, ChartSurface):
         self._draw_grid(painter, plot, low, high)
         self._draw_candles(painter, plot, low, high)
         self._draw_gaps(painter, plot)
+        self._draw_seams(painter, plot)
         self._draw_average(painter, plot, low, high)
         self._draw_paths(painter, plot, low, high)
         self._draw_levels(painter, plot, low, high)
@@ -725,6 +729,45 @@ class PainterChartSurface(QWidget, ChartSurface):
             painter.drawText(box, int(Qt.AlignmentFlag.AlignCenter), text)
         painter.setFont(self.font())
 
+    def _draw_seams(self, painter: QPainter, plot: QRectF) -> None:
+        """Стык контрактов: вертикальный пунктир и тикер нового контракта.
+
+        Решение 0061: на каждом отрезке показан свой действующий контракт.
+        Цены на стыке не подгоняются (0049 §2), и скачок между последней
+        свечой старого и первой свечой нового — разница контрактов, а не
+        движение рынка. Метка стоит ровно затем, чтобы его так и прочли.
+        Линия — по левому краю первой свечи нового контракта.
+        """
+        if not self._seams:
+            return
+        font = QFont(self.font())
+        font.setPointSizeF(max(font.pointSizeF() - 1.0, 6.0))
+        font.setBold(True)
+        metrics = QFontMetrics(font)
+        pen = QPen(QColor(self._theme.warning))
+        pen.setWidthF(1.5)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        for seam in self._seams:
+            x = self._x_of_index(self._index_of_time(seam.time) - 0.5, plot)
+            if not plot.left() <= x <= plot.right():
+                continue
+            painter.setPen(pen)
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+            text = (
+                f"{seam.previous} → {seam.symbol}" if seam.previous else seam.symbol
+            )
+            width = metrics.horizontalAdvance(text) + 10
+            # Подпись у нижнего края: верхний занят подписью затенения
+            # («Вне торгового окна…»), и поверх неё тикер читался бы обрывком.
+            height = metrics.height() + 4
+            box = QRectF(x + 2, plot.bottom() - height - 2, width, height)
+            fill = self._theme.warning
+            painter.fillRect(box, QColor(fill))
+            painter.setFont(font)
+            painter.setPen(QPen(QColor(text_on(fill))))
+            painter.drawText(box, int(Qt.AlignmentFlag.AlignCenter), text)
+        painter.setFont(self.font())
+
     def _gap_caption(
         self, box: QRectF, metrics: QFontMetrics, start: int, stop: int
     ) -> str:
@@ -747,8 +790,18 @@ class PainterChartSurface(QWidget, ChartSurface):
         pen = QPen(QColor(self._theme.average))
         pen.setWidthF(1.8)
         painter.setPen(pen)
+        # ⚠️ Линия рвётся на стыке контрактов: у каждого своя средняя
+        # (решение 0061), и отрезок между ними рисовал бы переход, которого
+        # не считал никто, — скачок стыка выглядел бы сглаженным.
+        seams = sorted(seam.time for seam in self._seams)
         polygon = QPolygonF()
+        passed = 0
         for point in self._average:
+            while passed < len(seams) and point.time >= seams[passed]:
+                passed += 1
+                if polygon.count() > 1:
+                    painter.drawPolyline(polygon)
+                polygon = QPolygonF()
             index = self._index_of_time(point.time)
             if index < self._first_index() - 2 or index > self._view.right + 2:
                 continue

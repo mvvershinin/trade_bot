@@ -42,7 +42,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import cast
 
-from PySide6.QtCore import QEvent, QSignalBlocker, QTime, Qt, Signal
+from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -70,9 +70,11 @@ from market import warmup_bars
 from ui.algorithm_dialog import AlgorithmDialog
 from ui.confirm_changes import confirm_changes
 from ui.models import (
+    EXPIRY_HALT_DAYS_LIMITS,
     AfterTakeProfit,
     AlgorithmOption,
     AverageKind,
+    ContractNotice,
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
@@ -183,6 +185,7 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("instrument", "Инструмент и данные", "instrument"),
     ("timeframe", "Инструмент и данные", "timeframe"),
     ("history_depth_days", "Инструмент и данные", "history_depth_days"),
+    ("expiry_halt_days", "Инструмент и данные", "expiry_halt_days"),
     ("depth_days", "Инструмент и данные", "depth_days"),
     ("price_step", "Инструмент и данные", "price_step"),
     ("ruble_per_point", "Инструмент и данные", "ruble_per_point"),
@@ -514,7 +517,8 @@ class SettingsDialog(QDialog):
     def _build_instrument_fields(self) -> None:
         """Инструмент, размер свечи и две глубины — загрузки и показа."""
         self.instrument = QLineEdit()
-        self.instrument.setPlaceholderText("Например, MXU6")
+        self.instrument.setPlaceholderText("Например, MXZ6")
+        self._build_contract_row()
 
         self.timeframe = QComboBox()
         self.timeframe.addItems(TIMEFRAMES)
@@ -537,6 +541,10 @@ class SettingsDialog(QDialog):
         # «вся история»; десять лет сверху взяты как заведомо больший предел,
         # чем есть данных у любого фьючерса.
         self.depth_days = _whole(0, 3650)
+        # Остановка перед экспирацией: ноль — встать в сам последний день
+        # обращения; тридцать сверху — дольше месяца до экспирации стоять
+        # квартальному контракту незачем, это уже не «перед экспирацией».
+        self.expiry_halt_days = _whole(*EXPIRY_HALT_DAYS_LIMITS, " дн.")
         self.depth_days.setSpecialValueText("0 — вся история")
         self.depth_days.valueChanged.connect(self._sync_depth)
 
@@ -884,16 +892,80 @@ class SettingsDialog(QDialog):
                 form.addRow(_hint(hint))
         return box
 
+    def _build_contract_row(self) -> None:
+        """Действующий контракт по таблице биржи и кнопка «Подставить».
+
+        Решение 0061: какой контракт брать сейчас, решает программа по
+        дневным объёмам биржи. Решение 0016: переход ручной — поэтому
+        кнопка только ставит код в поле, а применяется он «ОК» с
+        подтверждением, как любая правка.
+        """
+        self.contract_note = QLabel()
+        self.contract_note.setWordWrap(True)
+        self.contract_use = QPushButton()
+        self.contract_use.setVisible(False)
+        self.contract_use.clicked.connect(self._use_contract)
+        self.contract_row = QWidget()
+        row = QHBoxLayout(self.contract_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.contract_note, 1)
+        row.addWidget(self.contract_use)
+        self._contract = ContractNotice()
+        self.set_contract(self._contract)
+
+    def set_contract(self, notice: ContractNotice) -> None:
+        """Показать действующий контракт по таблице. Поле не меняется само."""
+        self._contract = notice
+        since = (
+            f" с {notice.current_since:%d.%m.%Y}" if notice.current_since else ""
+        )
+        if notice.current:
+            same = notice.current == self.instrument.text().strip()
+            self.contract_note.setText(
+                f"{notice.current}{since}"
+                + (" — совпадает с полем выше." if same else
+                   " — в поле выше стоит другой код.")
+            )
+            self.contract_use.setText(f"Подставить {notice.current}")
+            self.contract_use.setVisible(not same)
+        else:
+            self.contract_note.setText(
+                notice.trouble or "Не проверен: таблица контрактов заполнится "
+                "при загрузке истории."
+            )
+            self.contract_use.setVisible(False)
+
+    def _use_contract(self) -> None:
+        if self._contract.current:
+            self.instrument.setText(self._contract.current)
+            self.set_contract(self._contract)
+
     def _instrument_group(self) -> QGroupBox:
         box = self._group("Инструмент и свечи", [
             ("Инструмент", self.instrument,
-             "Чем торгуем. Один инструмент за раз — так задумано."),
+             "Чем торгуем. Один инструмент за раз — так задумано. Новый код "
+             "действует со следующей сделки. Пока робот запущен или на счёте "
+             "открыта позиция, код не меняется: программа откажет вслух."),
+            ("Действующий контракт", self.contract_row,
+             "Какой фьючерс сейчас ближний по дневным объёмам биржи. Программа "
+             "сама код не меняет: «Подставить» ставит его в поле выше, а "
+             "применяется он кнопкой «ОК» с подтверждением."),
+            ("Остановка перед экспирацией, за дней", self.expiry_halt_days,
+             "За сколько дней до последнего дня обращения контракта робот "
+             "встаёт сам. Ноль — встать в сам последний день. Срок берётся "
+             "из таблицы контрактов биржи для кода в поле «Инструмент». "
+             "На новый контракт робот не переходит: переключите инструмент "
+             "и снимите остановку кнопкой «Возобновить работу…»."),
             ("Размер свечи", self.timeframe,
              "На каких свечах работает робот. Решение он принимает только "
              "на закрытии свечи: на пятиминутке — раз в пять минут."),
             ("Скачивать историю за, дней", self.history_depth_days,
              "Сколько последних дней качать с биржи, когда вы нажимаете "
-             "«Загрузить историю…» в меню «Программа». Это про добычу данных, "
+             "«Загрузить историю…» в меню «Программа». Для квартального "
+             "фьючерса (MXZ6 и подобных) это число не действует: история "
+             "качается с рубежа контракта и прогрев средней перед ним, а минуты "
+             "до рубежа не качаются — тогда ближним был другой контракт. "
+             "Это про добычу данных, "
              "а не про показ: ниже стоит второе поле — сколько из добытого "
              "показывать. Девяносто дней — примерно вся жизнь одного "
              "фьючерсного контракта в ближней позиции, дальше по нему идут "
@@ -1449,7 +1521,7 @@ class SettingsDialog(QDialog):
         """
         order = [
             # «Инструмент и данные»
-            self.instrument, self.timeframe,
+            self.instrument, self.expiry_halt_days, self.timeframe,
             self.history_depth_days, self.depth_days,
             self.price_step, self.ruble_per_point,
             # «Сигнал»
@@ -1493,6 +1565,7 @@ class SettingsDialog(QDialog):
         self._show_timeframe(settings.timeframe)
         self.depth_days.setValue(settings.depth_days)
         self.history_depth_days.setValue(max(settings.history_depth_days, 1))
+        self.expiry_halt_days.setValue(settings.expiry_halt_days)
         self._take_algorithm(settings.strategy_id)
         self.average_period.setValue(settings.average_period)
         self.threshold_percent.setValue(settings.threshold_percent)
@@ -1629,13 +1702,12 @@ class SettingsDialog(QDialog):
 
     def values(self) -> Settings:
         """Собрать настройки из полей."""
-        start = self.window_start.time()
-        end = self.window_end.time()
         return Settings(
             instrument=self.instrument.text().strip(),
             timeframe=self.timeframe.currentText(),
             depth_days=self.depth_days.value(),
             history_depth_days=self.history_depth_days.value(),
+            expiry_halt_days=self.expiry_halt_days.value(),
             # ⚠️ Имя алгоритма отдаётся как есть, даже если каталог не приехал
             # и названия мы не знаем. Подстановка умолчания на этом месте была
             # бы сменой торгового правила, которой владелец счёта не делал
@@ -1671,8 +1743,8 @@ class SettingsDialog(QDialog):
             trailing_start_pct=self.trailing_start.value(),
             trailing_offset_pct=self.trailing_offset.value(),
             trailing_step_pct=self.trailing_step.value(),
-            window_start=start.toPython(),
-            window_end=end.toPython(),
+            window_start=self.window_start.time().toPython(),
+            window_end=self.window_end.time().toPython(),
             close_on_time_end=self.close_on_time_end.isChecked(),
             price_step=self.price_step.value(),
             ruble_per_point=self.ruble_per_point.value(),
