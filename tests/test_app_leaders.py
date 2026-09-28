@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import date, datetime
 
@@ -190,6 +191,22 @@ def a_stretch(since: date, until: date) -> Stretch:
 
 TUNING = (date(2026, 5, 26), date(2026, 7, 17))
 CHECKING = (date(2026, 7, 20), date(2026, 9, 4))
+
+
+def test_a_leaders_run_records_the_program_numbers(tmp_path):
+    """D-117: прогон перебора пишет в снимок числа программы из набора.
+
+    Мутация: убрать `program=` из `RunConditions` в `app.leaders.record`.
+    Числа не умолчания — иначе проверка зеленела бы и при чужих числах.
+    """
+    values = dataclasses.replace(
+        settings_of(recipes()[0], BASE), expiry_halt_days=3, history_depth_days=17
+    )
+    with CandleStore(tmp_path / "candles.sqlite3") as store:
+        record(store, values, (a_stretch(*TUNING),), timeframe=values.timeframe)
+        (row,) = store.journal_sessions(limit=10).rows
+    assert "Остановка перед экспирацией, дней: 3" in row.settings, row.settings
+    assert "Глубина загрузки истории, дней: 17" in row.settings, row.settings
 
 
 def test_the_checking_run_is_written_last(tmp_path):

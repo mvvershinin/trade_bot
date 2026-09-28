@@ -48,7 +48,7 @@ from PySide6.QtCore import QObject, QTimer, SignalInstance
 
 from app import contract_view, convert, stitched_view
 from app.observe import LiveObserver
-from app.runs import RunConditions, RunLog, result_note, settings_text
+from app.runs import ProgramFields, RunConditions, RunLog, result_note, settings_text
 from backtest import HistoryRun, Summary, pairs, replay, reversal_entries, summarise
 from engine import MSK, EngineSettings, PositionState, close_time, in_moscow
 from market import (
@@ -84,6 +84,7 @@ from market import (
 from market import (
     Candle as MarketCandle,
 )
+from market.contracts import monthly_assets
 from ui.formatting import fmt_datetime
 from ui.models import (
     BacktestOptions,
@@ -580,15 +581,21 @@ class _HaltWrite:
 
     `cause` — причину поднять. `lift` — причину с таким текстом снять.
     Заполнено ровно одно из двух.
+
+    `at` — когда причина встала, **по часам порта** (`D-111`). Без него база
+    ставила бы отметку по часам машины, и время остановки в окне (память)
+    и после перезапуска (база) разошлось бы с часами, которые подменяет
+    проверка.
     """
 
     cause: HaltRecord | None = None
     lift: str = ""
+    at: datetime | None = None
 
     async def apply(self, worker: MarketWorker) -> None:
         """Сделать правку в базе."""
         if self.cause is not None:
-            await worker.raise_halt(self.cause)
+            await worker.raise_halt(self.cause, now=self.at)
             return
         await worker.lift_halt(self.lift)
 
@@ -1632,8 +1639,14 @@ class HistoryPort(TerminalPort):
             except Exception:  # рубеж уточнится при загрузке; опись важнее
                 log.exception("таблица контрактов не прочитана для описи")
                 rows = []
-            row = next((one for one in rows if one.symbol == symbol), None)
             asset = asset_of(symbol)
+            if asset in monthly_assets(rows):
+                # Месячность актива биржа назвала в прошлом сеансе, и след
+                # остался в таблице (`D-125`): загрузка пойдёт по дням.
+                self._history.monthly.add(asset)
+                self._send(self.history_facts_ready, facts)
+                return
+            row = next((one for one in rows if one.symbol == symbol), None)
             facts = dataclasses.replace(
                 facts,
                 by_contract=True,
@@ -1876,8 +1889,11 @@ class HistoryPort(TerminalPort):
                 f"Инструмент не сменён: {reason} Прежние настройки остались в силе."
             )
 
-    def _judge_expiry(self) -> None:
+    def _judge_expiry(self) -> bool:
         """Сверить срок кода при живом ходе: отказ, остановка или предупреждение.
+
+        Ответ — «код отвергнут» (склейка, истёкший, архивный): смена суток
+        по нему закрывает ход, не подав движку ни одного бара (`D-126`).
 
         Зовётся после чтения таблицы контрактов. Без живого хода молчит:
         робот не работает, останавливать нечего, а расхождение с действующим
@@ -1892,25 +1908,28 @@ class HistoryPort(TerminalPort):
         if not self._watch.observing or self._history.term.rows is None:
             # Таблица не прочитана — про срок сказать нечего, и «не известен»
             # здесь было бы ложью: его узнают через мгновение.
-            return
+            return False
         self._history.term.day = in_moscow(self._clock()).date()
         verdict = self._expiry(self._values.instrument)
         if verdict.kind.refused:
             self.stream(False)
             self._refuse("Поток котировок остановлен", verdict.text)
-        elif verdict.kind is Expiry.NEAR:
+            return True
+        if verdict.kind is Expiry.NEAR:
             self.halt(
                 "Остановка перед экспирацией", verdict.text, kind=HaltKind.ENGINE
             )
         elif verdict.kind is Expiry.UNKNOWN and verdict.text != self._history.term.said:
             self._history.term.said = verdict.text
             self.note("Срок контракта не известен", verdict.text, DecisionLevel.WARNING)
+        return False
 
-    async def _reread_term(self) -> None:
+    async def _reread_term(self) -> bool:
         """Перечитать таблицу контрактов и сразу сверить срок кода.
 
         Ждётся вызывающим, в отличие от `check_contract`: смена суток
         обязана решить «стоять или работать» до того, как движок увидит бар.
+        Ответ — как у `_judge_expiry`: код отвергнут.
         """
         try:
             self._history.term.rows = await self._worker.contracts()
@@ -1918,7 +1937,7 @@ class HistoryPort(TerminalPort):
             raise
         except Exception:  # остаётся прежняя таблица; сверка всё равно идёт
             log.exception("таблица контрактов не перечитана на смене суток")
-        self._judge_expiry()
+        return self._judge_expiry()
 
     def check_contract(self) -> None:
         """Сверить инструмент из настроек с действующим контрактом таблицы.
@@ -2770,7 +2789,13 @@ class HistoryPort(TerminalPort):
             # **до** первого бара нового дня: программа живёт через ночь,
             # а экспирация наступает по календарю. Остановка обнуляет ключ
             # хода, и ниже он закрывается, не разобрав ни одного бара.
-            await self._reread_term()
+            if await self._reread_term():
+                # Отказ по сроку (истёк, архивный): ход закрывается здесь же,
+                # а не ждёт задачи, поставленной снятием потока, — иначе этот
+                # же проход подал бы бар движку на отвергнутом коде (`D-126`).
+                # Ответ зависит от вердикта, а не от того, как снимается поток.
+                await self._retire()
+                return await self._replay(frame, symbol, candles)
         key = self._watch_key(frame, symbol)
         if self._watch.observer is not None and key != self._watch.key:
             # Настройки, инструмент или размер свечи сменились. Ход, начатый
@@ -2833,9 +2858,10 @@ class HistoryPort(TerminalPort):
         она уже стоит в памяти порта, — но о нём говорится вслух
         (`_save_halt`): молчаливо потерянный предохранитель это `D-043`.
         """
-        self._halt.marks[reason] = _Mark(kind=kind, at=self._clock())
+        at = self._clock()
+        self._halt.marks[reason] = _Mark(kind=kind, at=at)
         self._write_halt(
-            _HaltWrite(cause=HaltRecord(kind=kind, reason=reason, event=event))
+            _HaltWrite(cause=HaltRecord(kind=kind, reason=reason, event=event), at=at)
         )
 
     def _write_halt(self, write: _HaltWrite) -> None:
@@ -3212,6 +3238,7 @@ class HistoryPort(TerminalPort):
             app_version=version(),
             days=self._days,
             until=self._until,
+            program=ProgramFields.of(frame.values),
         ).record(candles)
         observer = LiveObserver(
             # ⚠️ Модуль собирает **реестр** по выбранной записи, а не порт
@@ -3410,6 +3437,7 @@ class HistoryPort(TerminalPort):
             app_version=version(),
             days=self._days,
             until=self._until,
+            program=ProgramFields.of(frame.values),
         )
         async with self._runs.around(conditions.record(candles)) as entry:
             if stitch is not None:
@@ -4003,6 +4031,7 @@ class HistoryPort(TerminalPort):
                 self._engine_settings,
                 convert.strategy_settings(self._values),
                 algorithm=convert.chosen_algorithm(self._values),
+                program=ProgramFields.of(self._values),
             ),
         )
         if self._stitched is not None:

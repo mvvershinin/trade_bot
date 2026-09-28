@@ -35,6 +35,7 @@ MXU6 истёк 17.09.2026, а программа продолжала счит�
 
 from __future__ import annotations
 
+import logging
 import pathlib
 import re
 import sqlite3
@@ -50,6 +51,8 @@ from market.reports import LoadReport
 from market.storage import CandleStore, ContractRow, Source
 from market.sync import sync_minutes
 from market.synthetic import is_synthetic, refuse_synthetic_for_trading
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "DAILY_DEPTH_DAYS",
@@ -68,6 +71,7 @@ __all__ = [
     "current_contract",
     "expiry_verdict",
     "load_contract_minutes",
+    "monthly_assets",
     "periods_of_chain",
     "pieces",
     "refresh_contracts",
@@ -96,7 +100,17 @@ class ChainNotQuarterly(ContractError):
     Отдельный вид отказа, а не просто `ContractError`: вызывающий на нём
     не повторяет уточнение укороченной цепочкой, а уходит на загрузку
     по дням, как до решения 0061.
+
+    `monthly` — месячный код, который биржа назвала (BRX6), и его последний
+    день обращения. По ним `refresh_contracts` оставляет в таблице след
+    (`D-125`): признак «актив месячный» переживает перезапуск программы.
     """
+
+    def __init__(self, message: str, *, monthly: str = "",
+                 last_trade_day: date | None = None) -> None:
+        super().__init__(message)
+        self.monthly = monthly
+        self.last_trade_day = last_trade_day
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +121,33 @@ class ChainNotQuarterly(ContractError):
 #: декабрь. Регламент биржи, а не настройка (правило 16 разрешает константу).
 QUARTER_MONTHS = "HMUZ"
 
-_QUARTERLY = re.compile(r"^([A-Z]{2})([HMUZ])(\d)$")
+#: Код актива — две буквы, **вторая бывает строчной**: `Si`, `Eu`, `Su`
+#: (живой запрос ISS 28.09.2026 по всем фьючерсам FORTS: у Si, Eu, MX, RI,
+#: GD, CR, MM, SR — только H, M, U, Z; у BR и NG — месячные). Прежний
+#: шаблон `[A-Z]{2}` не признавал `SiZ6` квартальным (`D-122`).
+_QUARTERLY = re.compile(r"^([A-Z][A-Za-z])([HMUZ])(\d)$")
 
 #: Месяцы экспирации по коду биржи, январь…декабрь. Регламент биржи.
 MONTH_CODES = "FGHJKMNQUVXZ"
+
+#: Код **месячного** контракта — месяц вне `QUARTER_MONTHS`. Такой код
+#: попадает в таблицу `contract` одним способом: его назвала биржа при
+#: отказе квартальной цепочки (`ChainNotQuarterly`), и он там — признак
+#: «у актива месячные контракты» (`monthly_assets`, `D-125`).
+_MONTHLY = re.compile(r"^([A-Z][A-Za-z])([FGJKNQVX])(\d)$")
+
+
+def monthly_assets(rows: Sequence[ContractRow]) -> set[str]:
+    """Активы, у которых таблица знает месячный контракт (BR по BRX6).
+
+    Признак хранится **строкой таблицы**, а не отдельным полем: схема не
+    меняется, а сама строка — правда биржи (код и его срок), а не наша
+    пометка. Квартальную цепочку она не портит: `rows_of_asset` месячных
+    кодов не берёт.
+    """
+    return {
+        found.group(1) for row in rows if (found := _MONTHLY.match(row.symbol)) is not None
+    }
 
 
 def asset_of(symbol: str) -> str:
@@ -160,13 +197,15 @@ def confirm_quarterly(client: IssClient, symbol: str) -> None:
     month, year = found.group(2), found.group(3)
     between = f"{asset}{MONTH_CODES[MONTH_CODES.index(month) - 1]}{year}"
     try:
-        client.last_trade_day(between)
+        last = client.last_trade_day(between)
     except IssUnknownInstrument:
         return
     raise ChainNotQuarterly(
         f"у актива {asset} есть месячные контракты (биржа знает {between}): "
         f"квартальная цепочка вокруг {symbol} для него ложна, рубежи по ней "
-        "считать нельзя. История грузится по дням, склейки по контрактам нет"
+        "считать нельзя. История грузится по дням, склейки по контрактам нет",
+        monthly=between,
+        last_trade_day=last,
     )
 
 
@@ -275,7 +314,9 @@ def refresh_contracts(
     `now` — момент проверки; `None` — сейчас. Задаётся в тестах.
 
     Все коды — одного актива, и цепочка подтверждается у биржи квартальной
-    (`confirm_quarterly`) **до** записи: месячный актив в таблицу не попадает.
+    (`confirm_quarterly`) **до** записи: квартальных строк месячного актива
+    в таблице не появляется. Появляется одна — месячный код, названный
+    биржей в отказе (`monthly_assets`, `D-125`).
 
     ⚠️ Объёмы берутся **по вчера**, не по сегодня. Сегодняшняя дневная свеча
     не закрыта: утром новый контракт может обогнать старый, к вечеру отстать.
@@ -296,7 +337,32 @@ def refresh_contracts(
         )
     # Проверяется месяц перед **первым** кодом: он в прошлом, и биржа его
     # точно перечислила бы, будь он. Дальний (BRG7) мог ещё не выйти в список.
-    confirm_quarterly(client, symbols[0])
+    try:
+        confirm_quarterly(client, symbols[0])
+    except ChainNotQuarterly as refused:
+        # Квартальных строк не пишется ни одной; пишется только названный
+        # биржей месячный код — след, по которому признак «актив месячный»
+        # переживает перезапуск (`D-125`).
+        #
+        # ⚠️ Сбой записи следа не подменяет отказ: вызывающий по
+        # `ChainNotQuarterly` уходит на загрузку по дням, а `sqlite3.Error`
+        # вместо него оборвал бы загрузку целиком. Сбой говорится вслух —
+        # в технический лог и в текст самого отказа (правило 13).
+        try:
+            store.put_contracts(
+                [ContractRow(refused.monthly, last_trade_day=refused.last_trade_day)],
+                now=now,
+            )
+        except sqlite3.Error as failure:
+            log.warning("след месячного актива %s не записан: %s", refused.monthly, failure)
+            raise ChainNotQuarterly(
+                f"{refused}. Признак «актив месячный» в таблицу контрактов "
+                f"не записан ({failure}): после перезапуска программа спросит "
+                "биржу снова",
+                monthly=refused.monthly,
+                last_trade_day=refused.last_trade_day,
+            ) from failure
+        raise refused
     chain: list[tuple[str, dict[date, float]]] = []
     last_days: dict[str, date | None] = {}
     closed = today - timedelta(days=1)
@@ -452,9 +518,9 @@ def expiry_verdict(
         return ExpiryVerdict(
             Expiry.UNKNOWN,
             f"Срок обращения {symbol} программе не известен: таблица контрактов "
-            "его не знает или он не проверен у биржи. Остановка перед экспирацией "
-            "на этом коде не сработает — уточните таблицу «Загрузить историю…» "
-            "в меню «Программа».",
+            "его не знает или он не проверен у биржи. Возможно, контракт уже "
+            "истёк. Остановка перед экспирацией на этом коде не сработает — "
+            "уточните срок у биржи: «Загрузить историю…» в меню «Программа».",
         )
     left = (last - today).days
     if left <= halt_days:
@@ -488,11 +554,21 @@ def pieces(store: CandleStore, since: date, until: date, *, asset: str) -> list[
     """
     if until < since:
         raise ContractError(f"отрезок задом наперёд: {since} … {until}")
-    own = rows_of_asset(store.contracts(), asset)
+    table = store.contracts()
+    if asset in monthly_assets(table):
+        # `D-127`: совет «загрузите историю» здесь был бы неправдой — у
+        # месячного актива загрузка идёт по дням и цепочки не создаёт.
+        raise ContractError(
+            f"у актива {asset} месячные контракты: склейка по квартальной "
+            "цепочке для него не строится, и загрузка истории её не создаст"
+        )
+    own = rows_of_asset(table, asset)
     if not any(row.active_from is not None for row in own):
         raise ContractError(
             f"в таблице контрактов нет цепочки {asset}: резать период по "
-            "контрактам не по чему — загрузите историю по коду этого актива"
+            "контрактам не по чему — её создаёт загрузка истории по "
+            "квартальному коду актива (месяц H, M, U или Z), если биржа "
+            "подтвердит, что месячных контрактов у него нет"
         )
     dated = sorted(
         (row.active_from, row.symbol, row)
@@ -649,6 +725,36 @@ class AdoptReport:
     contracts: list[ContractRow] = field(default_factory=list)
 
 
+def _close_by_the_next(store: CandleStore, symbol: str, *, now: datetime) -> None:
+    """Закрыть период последнего перенесённого, если таблица знает рубеж следующего.
+
+    `D-123`: перенос без биржи оставляет последний контракт (MXU6) открытым
+    и без срока. Если в таблице уже есть контракт того же актива с более
+    поздним началом периода (MXZ6 с 17.09), MXU6 ближним после этого рубежа
+    не был: конец его периода — день перед рубежом. Без этого таблица
+    держала бы два «действующих», а срок MXU6 читался бы как неизвестный.
+    Следующего с рубежом нет — период остаётся открытым: про срок скажет
+    `expiry_verdict` («уточните срок у биржи»).
+    """
+    rows = rows_of_asset(store.contracts(), asset_of(symbol))
+    own = next((row for row in rows if row.symbol == symbol), None)
+    if own is None or own.active_from is None or own.active_to is not None:
+        return
+    later = [
+        row.active_from for row in rows
+        if row.active_from is not None and row.active_from > own.active_from
+    ]
+    if later:
+        # Конец — не позже последнего дня обращения, если он известен: при
+        # разрыве в таблице (MXH5…MXM5 перенесены, а следующий известный
+        # рубеж — MXU6 в 06.2026) «день перед рубежом» растянул бы MXM5
+        # на год, и год он числился бы ближним.
+        end = min(later) - timedelta(days=1)
+        if own.last_trade_day is not None:
+            end = min(end, own.last_trade_day)
+        store.put_contracts([ContractRow(symbol, active_to=end)], now=now)
+
+
 def _read_minutes(source: sqlite3.Connection, symbol: str) -> dict[Source, list[Candle]]:
     """Минуты контракта из базы-источника, по происхождению."""
     grouped: dict[Source, list[Candle]] = {}
@@ -727,6 +833,7 @@ def adopt_chain(
         source.close()
     volumes = [(symbol, daily_volume(store, symbol)) for symbol in symbols]
     store.put_contracts(periods_of_chain(volumes), now=moment)
+    _close_by_the_next(store, symbols[-1], now=moment)
     wanted = set(symbols)
     report.contracts = [row for row in store.contracts() if row.symbol in wanted]
     return report

@@ -466,7 +466,8 @@ class TemplatesDialog(QDialog):
         template = self.selected()
         if template is None:
             return
-        # Инструмент остаётся текущим: шаблон контракта не несёт (решение 0061).
+        # Инструмент и остановка перед экспирацией остаются текущими: шаблон
+        # их не несёт (`NOT_IN_TEMPLATE`, решение 0061).
         values = with_current_contract(template, self._current)
         if confirm_changes(
             self, self._current, values, lead=_apply_lead(template)
@@ -807,12 +808,23 @@ def _snippet(values: Settings) -> str:
     названо то, по чему человек узнаёт свой набор, — инструмент, свеча,
     средняя, тейк, объём. Полный снимок виден во вкладке «Что в наборе»
     сразу после сохранения.
+
+    ⚠️ Способ фиксации прибыли называется тот, который **работает**, а не
+    тот, у которого стоит галочка (`B-052`). При скользящем уровне число
+    неподвижной цели движок не читает вовсе, и подпись «тейк 0,5%» называла
+    параметр, которого в наборе нет. Порядок проверок значим: выключенная
+    фиксация выключает и скользящий уровень (`EngineSettings.plan`:
+    `trailing = take_profit and trailing_take_profit`).
     """
-    take = (
-        f"{values.take_profit_pct:g}%".replace(".", ",")
-        if values.take_profit_enabled
-        else "выключен"
-    )
+    if not values.take_profit_enabled:
+        take = "выключен"
+    elif values.trailing_enabled:
+        take = (
+            f"скользящий: порог {values.trailing_start_pct:g}%, "
+            f"отступ {values.trailing_offset_pct:g}%"
+        ).replace(".", ",")
+    else:
+        take = f"{values.take_profit_pct:g}%".replace(".", ",")
     return (
         f"Сейчас: {values.timeframe}, "
         f"средняя {values.average_period}, тейк {take}, "

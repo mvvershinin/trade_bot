@@ -162,7 +162,9 @@ line-length = 100
 target-version = "py312"
 # Корни импорта: слои лежат в корне репозитория, а не в `src/`.
 src = ["."]
-extend-exclude = ["reference", "userdata", "mockups"]
+# `.claude/worktrees` — временные копии репозитория под проверку мутациями:
+# без исключения `ruff .` считает дерево дважды и роняет сторож порога.
+extend-exclude = ["reference", "userdata", "mockups", ".claude/worktrees"]
 
 [tool.ruff.lint]
 # Набор подобран под фактическое дерево, а не под красивый список.

@@ -639,7 +639,7 @@ async def _run(
     from ui.main_window import MainWindow  # noqa: PLC0415
     from ui.models import DecisionLevel  # noqa: PLC0415
 
-    if not _userdata_ready(database.parent):
+    if not _database_ready(database):
         return 1
     store, loaded, values, depth = _stored_settings(database.parent, args)
 
@@ -690,7 +690,7 @@ async def _run(
         application.lastWindowClosed.connect(closed.set)
         _on_interrupt(closed)
 
-        port.announce(database)
+        _announce(port, database, level=DecisionLevel.WARNING)
         await _restore_halt(port, database)
         _wire_settings_and_log(port, store, loaded, values, level=DecisionLevel.WARNING)
         if note:  # папка данных не держит замок «одна копия» (решение 0039)
@@ -731,6 +731,39 @@ async def _restore_halt(port: HistoryPort, database: pathlib.Path) -> None:
     if not database.exists():
         return
     await port.restore_halt()
+
+
+def _database_ready(database: pathlib.Path) -> bool:
+    """Всё, что зависит от места базы, — до сборки окна.
+
+    Две вещи: окно шаблонов смотрит в ту же базу, что программа
+    (`_templates_read_runs_from`), и папка данных готова к записи
+    (`_userdata_ready`, отказ — фразой).
+    """
+    _templates_read_runs_from(database)
+    return _userdata_ready(database.parent)
+
+
+def _templates_read_runs_from(database: pathlib.Path) -> None:
+    """Окно шаблонов читает прогоны из той базы, с которой запущена программа.
+
+    Створку двери (`ui/backend.py`) вставляет `app/runs.py` при импорте,
+    и ключа `--db` он не знает: без этой проводки при `--db FILE` статистика
+    шаблонов читалась бы из базы по умолчанию, и человек решил бы, что набор
+    не гонялся (`D-052`).
+
+    ⚠️ `app.runs` импортируется **здесь, первым**: створка ставится при его
+    импорте, и импорт, случившийся позже этой замены, затёр бы её молча.
+    """
+    from app.runs import matching_runs  # noqa: PLC0415 — слои после QT_API
+    from ui import backend  # noqa: PLC0415
+
+    door = backend.current()
+    if door is None:
+        return
+    backend.use(
+        dataclasses.replace(door, runs=lambda sets: matching_runs(database, sets))
+    )
 
 
 def _userdata_ready(userdata: pathlib.Path) -> bool:
@@ -795,6 +828,25 @@ def _say_where_the_log_goes(port: HistoryPort, setup: LogSetup, *, level: Decisi
         )
 
 
+def _announce(port: HistoryPort, database: pathlib.Path, *, level: DecisionLevel) -> None:
+    """Строки старта (`HistoryPort.announce`) и — следом — о переменной папки данных.
+
+    Вторая пишется, если переменная задана и не действует
+    (`market.paths.ignored_override`): человек, выставивший её, иначе
+    искал бы базу и остановку робота не там. `database` — база этого запуска:
+    названная ключом `--database`, она и называется в строке, а не папка
+    по умолчанию (`D-124`). Рядом со строкой «База свечей», а не в
+    `_wire_settings_and_log`: база к настройкам отношения не имеет.
+    """
+    from market.paths import ignored_override  # noqa: PLC0415 — слои после разбора ключей
+
+    port.announce(database)
+    ignored = ignored_override(database)
+    if ignored:
+        log.warning("%s", ignored)
+        port.note("Папка данных", ignored, level)
+
+
 def _wire_settings_and_log(
     port: HistoryPort,
     store: SettingsStore,
@@ -816,17 +868,10 @@ def _wire_settings_and_log(
        иначе она затрёт файл, о котором ещё не сказано ни слова;
     4. **включается запись** применённых настроек.
 
-    Перед ними — строка о переменной папки данных, если она задана и не
-    действует (`market.paths.ignored_override`): человек, выставивший её,
-    иначе искал бы базу и остановку робота не там.
+    Перед ними сборка зовёт `_announce`.
     """
     from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
-    from market.paths import ignored_override  # noqa: PLC0415 — то же
 
-    ignored = ignored_override()
-    if ignored:
-        log.warning("%s", ignored)
-        port.note("Папка данных", ignored, level)
     _say_where_the_log_goes(port, setup_logging(values.log_directory), level=level)
     _say_what_was_read(port, loaded, store, level=level)
     _keep_settings(port, store, level=level)

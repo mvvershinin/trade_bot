@@ -886,6 +886,7 @@ def _option(entry: registry.StrategyEntry, values: Settings) -> AlgorithmOption:
         details=_algorithm_details(entry, settings, refusal=refusal),
         chosen=chosen,
         unused=unused_fields(entry.id),
+        refused=bool(refusal),
     )
 
 

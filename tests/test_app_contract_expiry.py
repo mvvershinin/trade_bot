@@ -104,6 +104,16 @@ def test_an_archived_contract_is_refused_before_it_expires() -> None:
     assert verdict.kind is Expiry.ARCHIVED and verdict.kind.refused, verdict
 
 
+def test_the_last_front_day_of_a_contract_is_not_archived_yet() -> None:
+    """16.09 — последний день, когда MXU6 ближний: им ещё работают, отказа нет.
+
+    Граница строгая: архивный — с дня **после** конца периода. Отказ
+    на день раньше снял бы поток в последний законный день контракта.
+    """
+    verdict = expiry_verdict(ROWS, "MXU6", today=date(2026, 9, 16), halt_days=0)
+    assert verdict.kind is Expiry.OK, verdict
+
+
 def test_a_stitched_series_is_refused_without_any_table() -> None:
     """`@MX` отвергается даже тогда, когда таблицу ещё не читали."""
     verdict = expiry_verdict(None, "@MX", today=date(2026, 9, 27), halt_days=1)
@@ -301,6 +311,40 @@ def test_switching_to_a_stitched_series_drops_the_live_stream(loop, base) -> Non
                for row in journal), f"отказ не сказан: {journal}"
 
 
+def test_a_live_stream_is_dropped_when_its_code_becomes_archived(loop, base) -> None:
+    """Поток идёт по MXZ6; таблица уточнилась — MXZ6 стал архивным: поток снят вслух.
+
+    Отказ на входе (`stream(True)`) этого не ловит: код был живым, когда
+    поток включали. Архивным его делает уточнение таблицы посреди живого
+    хода — и робот обязан перестать смотреть на код вне его периода,
+    а не торговать им до перезапуска.
+    """
+    today = date(2026, 12, 1)
+    rolled = [
+        ContractRow("MXZ6", last_trade_day=LAST, active_from=date(2026, 9, 17),
+                    active_to=date(2026, 11, 30)),
+        ContractRow("MXH7", last_trade_day=date(2027, 3, 18),
+                    active_from=date(2026, 12, 1)),
+    ]
+
+    async def scenario(port: HistoryPort, link: _Link):
+        port.stream(True)
+        await _settle(port)
+        before = list(link.switched)
+        await port._worker.call(lambda store: store.put_contracts(rolled))  # noqa: SLF001
+        port.check_contract()
+        await _settle(port)
+        return before, link.switched, _journal(port)
+
+    before, switched, journal = _run(
+        loop, base, today, scenario, instrument="MXZ6", expiry_halt_days=0
+    )
+    assert before == [True], f"поток по живому MXZ6 не включён — проверять нечего: {before}"
+    assert switched[-1] is False, f"поток по архивному MXZ6 не снят: {switched}"
+    assert any(row[0] == "Поток котировок остановлен" and "MXZ6" in row[1]
+               for row in journal), f"снятие потока не сказано: {journal}"
+
+
 def test_the_instrument_does_not_change_under_a_running_robot(loop, base) -> None:
     """Робот запущен — смена инструмента отвергается портом, настройки прежние."""
 
@@ -461,6 +505,74 @@ def test_the_term_is_checked_again_when_the_day_changes(loop, base, monkeypatch)
     assert "before" in fed, "живой ход не шёл до смены суток — проверять нечего"
     assert "Экспирация MXZ6" in after, "смена суток не вызвала сверку срока"
     assert "halt day" not in fed, "бар дня остановки прошёл через движок до сверки срока"
+
+
+def test_an_expired_code_at_midnight_feeds_no_bar(loop, base, monkeypatch) -> None:
+    """D-126: наутро после последнего дня код истёк — движок не видит ни одного бара.
+
+    Мутация: убрать выход после `_reread_term` в `_advance` — тот же проход
+    подаёт бар нового дня живому ходу на отвергнутом коде.
+    """
+    from app.observe import LiveObserver
+
+    minutes = [
+        Candle(
+            time=at(LAST - timedelta(days=2)) + timedelta(minutes=index),
+            open=100000.0, high=100010.0, low=99990.0, close=100000.0 + index,
+            volume=1.0, timeframe=Timeframe(1), filled_minutes=1,
+        )
+        for index in range(120)
+    ]
+    with CandleStore(base) as store:
+        store.put_minutes("MXZ6", minutes, Source.ISS)
+    fed: list[str] = []
+    original = LiveObserver.feed
+    stage = ["before"]
+
+    async def spy(self, candles):
+        fed.append(stage[0])
+        return await original(self, candles)
+
+    monkeypatch.setattr(LiveObserver, "feed", spy)
+
+    async def scenario(port: HistoryPort, link: _Link):
+        port.stream(True)
+        await _settle(port)
+        stage[0] = "expired day"
+        port._clock = lambda: at(LAST + timedelta(days=1))  # noqa: SLF001 — наступили сутки после экспирации
+        port.refresh("новый бар")
+        await _settle(port)
+        return port._watch.observer, _journal(port)  # noqa: SLF001 — ход наружу не отдаётся
+
+    observer, journal = _run(loop, base, LAST - timedelta(days=5), scenario,
+                             instrument="MXZ6", expiry_halt_days=0)
+    assert "before" in fed, "живой ход не шёл до смены суток — проверять нечего"
+    assert "expired day" not in fed, "бар после экспирации прошёл через движок"
+    assert observer is None, "живой ход на истёкшем коде не закрыт"
+    assert any("истёк" in reason for _, reason, _ in journal), (
+        f"отказ по сроку не сказан: {journal}"
+    )
+
+
+def test_a_monthly_asset_is_remembered_after_a_restart(loop, base) -> None:
+    """D-125: BR назван месячным в прошлом сеансе — новая программа это знает.
+
+    В базе лежит след отказа биржи (месячный код BRX6); порт собран заново,
+    загрузки в этом сеансе не было. Мутация: убрать проверку
+    `monthly_assets` из `_history_facts` — опись снова обещает загрузку
+    по контракту и называет оба исхода.
+    """
+    with CandleStore(base) as store:
+        store.put_contracts([ContractRow("BRX6", last_trade_day=date(2026, 10, 30))],
+                            now=at(date(2026, 9, 20)))
+
+    async def scenario(port: HistoryPort, link: _Link):
+        seen = _facts(port, "BRZ6")
+        await _done(port._history.facts)  # noqa: SLF001 — задача описи наружу не отдаётся
+        return seen
+
+    seen = _run(loop, base, date(2026, 9, 27), scenario, instrument="MXZ6")
+    assert seen and not seen[-1].by_contract and not seen[-1].quarterly_unchecked, seen
 
 
 def test_a_halted_robot_may_switch_the_instrument(loop, base) -> None:

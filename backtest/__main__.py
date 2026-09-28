@@ -55,6 +55,7 @@ from backtest.table import render
 from engine import EngineSettings, in_moscow
 from market.aggregate import build_bars
 from market.candles import M5, Candle
+from market.paths import default_db_path, say_ignored_override
 from market.storage import CandleStore
 
 __all__ = ["main"]
@@ -85,7 +86,9 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
         description="Перебор настроек с раздельными подбором и проверкой.",
     )
     parser.add_argument("--symbol", default="MXZ6", help="инструмент, по умолчанию MXZ6")
-    parser.add_argument("--db", default="userdata/candles.sqlite3", help="база со свечами")
+    parser.add_argument("--db", default=None,
+                        help="база со свечами, по умолчанию userdata/candles.sqlite3 "
+                             "рядом с программой")
     parser.add_argument("--commission", type=float, default=COMMISSION,
                         help="комиссия в рублях за контракт на сторону")
     parser.add_argument("--slippage", type=float, default=0.0,
@@ -327,6 +330,13 @@ def _notes(runs: int, spent: float, bars: int) -> tuple[str, ...]:
 def main(argv: Sequence[str] | None = None) -> int:
     """Точка входа. Возвращает код возврата процесса."""
     args = _arguments(argv)
+    # Умолчание — та же база, что у окна (`market.paths`), а не путь от
+    # текущей папки: из другой папки прежнее «userdata/…» молча открывало
+    # другую базу. И строка о переменной папки данных (`D-124`) — до работы:
+    # переменная здесь не действует, и молчать об этом нельзя.
+    database = pathlib.Path(args.db) if args.db else default_db_path()
+    args.db = str(database)
+    say_ignored_override(database)
     text = asyncio.run(_work(args))
     if args.out:
         pathlib.Path(args.out).write_text(text, encoding="utf-8")

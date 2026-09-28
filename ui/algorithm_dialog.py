@@ -58,6 +58,7 @@ __all__ = [
     "EMPTY_NOTE",
     "INTRO",
     "NOTHING_AT_ALL",
+    "NOTHING_CHOSEN_ON_OK",
     "NOTHING_TO_CHOOSE_FROM",
     "ROWS_SHOWN",
     "WINDOW_HEIGHT",
@@ -127,6 +128,13 @@ NOTHING_TO_CHOOSE_FROM = (
 #: как «выбор сделан», а он не сделан и сделан быть не может.
 NOTHING_AT_ALL = "Выбирать не из чего: список торговых алгоритмов не пришёл."
 
+#: Что стоит под списком после «ОК» без выделения (`B-043`). Сказано, что
+#: ничего не выбрано, что сделать и как выйти, не меняя настроек.
+NOTHING_CHOSEN_ON_OK = (
+    "Алгоритм не выбран: выделите его в списке и нажмите «ОК». Закрыть окно, "
+    "ничего не меняя, — «Отмена»."
+)
+
 #: Ширина окна в точках. Она же — ширина, по которой считается высота
 #: под текст (`_fit_the_window`): считать по одной, а показывать по другой
 #: значило бы промахнуться ровно на перенос строк.
@@ -152,7 +160,18 @@ def details_preamble(option: AlgorithmOption) -> str:
     «правило с вашими настройками», а числа в нём — чужие: полей этого
     алгоритма в окне нет, показываются его собственные умолчания
     (`app/convert.py::_algorithm_details`).
+
+    ⚠️ Оговорка знает про **отказ**, а не только про выбор (`D-103`). Когда
+    ваши настройки собрать не удалось, описание ниже идёт с умолчаниями
+    алгоритма и начинается с «⚠️ Показать правило с вашими числами
+    не удалось»; прежняя подпись «с вашими нынешними настройками» стояла
+    над ним и говорила противоположное.
     """
+    if option.refused:
+        return (
+            "Ваших настроек в этом правиле нет: собрать их не удалось, "
+            "показаны умолчания самого алгоритма. Причина — ниже."
+        )
     if option.chosen:
         return "Правило с вашими нынешними настройками."
     return (
@@ -216,7 +235,8 @@ class AlgorithmDialog(QDialog):
             # ведёт мышью по списку и не жмёт «Подробнее».
             item.setToolTip(option.summary)
             self.list.addItem(item)
-        self.list.currentRowChanged.connect(self._on_current_changed)
+        # Выделение, а не «текущая строка» — см. `current_option` (`B-043`).
+        self.list.itemSelectionChanged.connect(self._on_current_changed)
         self._fit_the_list()
 
         self.details_button = QPushButton("Подробнее…")
@@ -265,7 +285,7 @@ class AlgorithmDialog(QDialog):
         self._build_layout()
         self._set_tab_order()
         # Он же подгонит высоту окна под текст: `_show_summary` → `_fit_the_window`.
-        self._on_current_changed(self.list.currentRow())
+        self._on_current_changed()
 
     def _fit_the_list(self) -> None:
         """Высота списка — по числу строк, но не больше потолка `ROWS_SHOWN`.
@@ -370,6 +390,7 @@ class AlgorithmDialog(QDialog):
                 self.list.setCurrentRow(row)
                 return
         self.list.setCurrentRow(-1)
+        self.list.clearSelection()
         self._show_summary(None, missing=strategy_id)
 
     def chosen_id(self) -> str:
@@ -378,15 +399,24 @@ class AlgorithmDialog(QDialog):
         return option.id if option is not None else ""
 
     def current_option(self) -> AlgorithmOption | None:
-        """Выделенный алгоритм целиком. `None` — выделения нет."""
-        row = self.list.currentRow()
+        """Выделенный алгоритм целиком. `None` — выделения нет.
+
+        ⚠️ По выделению, а не по `currentRow()` (`B-043`). Получив фокус без
+        текущей строки, список Qt сам делает текущей первую — без выделения
+        и без ведома человека. Окно, открытое при незнакомом алгоритме
+        в настройках, по «ОК» возвращало бы первый из списка: смена торгового
+        правила, которого никто не выбирал. Поэтому же строка под списком
+        и кнопка «Подробнее» следят за выделением (`itemSelectionChanged`).
+        """
+        rows = self.list.selectionModel().selectedRows()
+        row = rows[0].row() if rows else -1
         if 0 <= row < len(self._options):
             return self._options[row]
         return None
 
     # ------------------------------------------------------------ поведение
 
-    def _on_current_changed(self, _row: int) -> None:
+    def _on_current_changed(self) -> None:
         """Выделение сменилось: строка под списком и доступность кнопки."""
         option = self.current_option()
         self.details_button.setEnabled(option is not None)
@@ -433,6 +463,25 @@ class AlgorithmDialog(QDialog):
                 "работать не сможет."
             )
         return "Алгоритм не выбран."
+
+    def accept(self) -> None:
+        """«ОК» без выделения — не закрыть окно молча, а сказать почему (`B-043`).
+
+        Список есть, а выделения нет — так бывает, когда в настройках стоит
+        алгоритм, которого в этой сборке нет. «ОК» здесь намеренно включён:
+        выбрать есть из чего, и выключенная кнопка читалась бы как запрет.
+        Но принять пустой выбор значит закрыть окно и не поменять ничего —
+        нажатие без последствий и без слов (правило 13 `CLAUDE.md`). Поэтому
+        окно остаётся открытым, а строка под списком говорит, что сделать.
+        """
+        if self._options and self.current_option() is None:
+            self.summary.setText(NOTHING_CHOSEN_ON_OK)
+            # ⚠️ Без `setFocus()` на списке: получив фокус без текущей строки,
+            # список сам делает текущей первую — то есть выделил бы алгоритм,
+            # которого человек не выбирал, и затёр бы эту строку его описанием.
+            self._fit_the_window()
+            return
+        super().accept()
 
     def show_details(self) -> None:
         """Всплывающее описание выделенного алгоритма."""

@@ -342,6 +342,54 @@ def test_an_old_template_with_an_instrument_opens_and_keeps_the_current_contract
     assert asked[0][1].instrument == "RIZ6", "подтверждение спрашивало о смене контракта"
 
 
+def test_applying_a_template_keeps_the_owners_expiry_halt(
+    qapp, library, real_backend, monkeypatch
+) -> None:
+    """Стережёт: шаблон не меняет остановку перед экспирацией.
+
+    Это предохранитель живого хода, а не настройка торговли: сделок прогона
+    он не меняет, и число дней выбирает владелец счёта, а не набор.
+    Старый файл (и пример поставки до 28.09.2026) несёт `expiry_halt_days`;
+    шаблон открывается без оговорок, а применение оставляет текущие 3 дня —
+    ни 5 из файла, ни умолчание программы (1).
+
+    Мутации, которые тест ловит: убрать `expiry_halt_days`
+    из `NOT_IN_TEMPLATE` (встанет 5 из файла); применение, отдающее
+    `template.values` как есть (встанет умолчание 1).
+    """
+    asked = _accepting(monkeypatch)
+    library.write((Template(name="Старый", values=Settings(volume=3)),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["settings"]["expiry_halt_days"] = 5
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = library.read()
+    assert loaded.troubles == (), "старый шаблон с остановкой открылся с отказом"
+    old = [one for one in loaded.templates if not one.builtin]
+    assert len(old) == 1
+    assert old[0].complete, "поле остановки названо незнакомым или пропущенным"
+
+    current = Settings(expiry_halt_days=3)
+    got: list[Settings] = []
+    dialog = TemplatesDialog(library, current)
+    dialog.applied.connect(got.append)
+    try:
+        dialog.table.selectRow(1)
+        dialog.apply_selected()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+    assert len(got) == 1
+    assert got[0].expiry_halt_days == 3, (
+        f"шаблон переставил остановку перед экспирацией на {got[0].expiry_halt_days}"
+    )
+    assert got[0].volume == 3, "остальные значения шаблона не применились"
+    assert asked[0][1].expiry_halt_days == 3, (
+        "подтверждение спрашивало о смене остановки перед экспирацией"
+    )
+
+
 def test_the_builtin_template_keeps_the_current_contract(
     qapp, library, real_backend, monkeypatch
 ) -> None:
@@ -376,7 +424,12 @@ def test_a_template_file_does_not_carry_the_instrument(library) -> None:
 
 
 def test_the_shipped_examples_do_not_carry_the_instrument() -> None:
-    """Стережёт: примеры в поставке контракта не несут (решение 0061)."""
+    """Стережёт: примеры в поставке не несут полей вне шаблона (решение 0061).
+
+    Ни контракта, ни остановки перед экспирацией (`NOT_IN_TEMPLATE`): при
+    чтении они выбросились бы молча, но лежащий в файле ключ читается
+    человеком как значение, которое пример поставит.
+    """
     from ui.templates import example_files
 
     files = example_files()
@@ -384,7 +437,8 @@ def test_the_shipped_examples_do_not_carry_the_instrument() -> None:
     for path in files:
         payload = json.loads(path.read_text(encoding="utf-8"))
         for one in payload["templates"]:
-            assert "instrument" not in one["settings"], f"{path.name}: {one['name']}"
+            carried = set(NOT_IN_TEMPLATE) & set(one["settings"])
+            assert not carried, f"{path.name}: {one['name']} несёт {sorted(carried)}"
 
 
 def test_a_refused_confirmation_applies_nothing_at_all(
@@ -1253,32 +1307,49 @@ def test_every_shipped_example_says_where_it_came_from() -> None:
         )
 
 
-def test_no_shipped_example_carries_a_key_this_build_does_not_know() -> None:
-    """Стережёт: в примерах из поставки нет ключей, незнакомых этой сборке.
+def test_every_shipped_example_applies_without_a_caveat() -> None:
+    """Стережёт: каждый пример из поставки применяется целиком, без оговорки.
+
+    Оговорок две половины (`Template.complete`), и обе окно говорит вслух:
+    незнакомые ключи — «не применятся», недостающие поля — «возьмутся
+    умолчанием программы». Собственный пример программы, применённый
+    «с оговоркой», читается как испорченный.
+
+    До 28.09.2026 у всех пятнадцати примеров не было `strategy_id`
+    (`B-055`): поле появилось в настройках позже, чем примеры были
+    отобраны. Алгоритм проставлен `ema_reverse` не по полям, а по
+    происхождению: примеры отобраны 05.09.2026 перебором первого
+    алгоритма, второй появился в сборке 27.09.2026. `expiry_halt_days`
+    шаблон не несёт вовсе (`NOT_IN_TEMPLATE`) — это предохранитель живого
+    хода, и в примерах его нет.
 
     ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Шесть ключей трёх
-    предохранителей убраны из `examples/settings-templates.json` вместе
-    с полями окна: оставленный ключ окно показало бы как «незнакомый»,
-    и собственный пример программы читался бы применённым с оговоркой.
-    При возврате `D-113` ключи возвращаются в примеры тем же движением.
-
-    ⚠️ Проверяется только половина `Template.complete` — незнакомые ключи.
-    Вторая половина, недостающие поля, на 27.09.2026 красная сама по себе:
-    у всех примеров нет `strategy_id`, к предохранителям это не относится
-    и заведено отдельной находкой.
+    предохранителей убраны из примеров вместе с полями окна; при возврате
+    `D-113` ключи возвращаются в примеры тем же движением — иначе этот тест
+    покраснеет на недостающих полях.
     """
     from ui.templates import example_files, examples_dir, read_for_import
 
+    known = {entry.id for entry in registry.entries()}
     files = example_files(examples_dir())
     assert files, "в поставке нет ни одного файла примеров"
     for path in files:
         loaded = read_for_import(path)
         assert loaded.templates, f"файл примеров {path.name} не прочитался"
-        strangers = {one.name: one.unknown for one in loaded.templates if one.unknown}
+        caveats = {
+            one.name: (one.missing, one.unknown)
+            for one in loaded.templates if not one.complete
+        }
+        assert not caveats, (
+            f"в {path.name} примеры применяются с оговоркой — (нет полей, "
+            f"незнакомые ключи): {caveats}"
+        )
+        strangers = {
+            one.name: one.values.strategy_id
+            for one in loaded.templates if one.values.strategy_id not in known
+        }
         assert not strangers, (
-            f"в {path.name} у примеров есть ключи, которых сборка не знает: "
-            f"{strangers}. Окно покажет собственный пример программы "
-            "применённым с оговоркой"
+            f"в {path.name} у примеров алгоритм, которого нет в сборке: {strangers}"
         )
 
 
@@ -1647,4 +1718,103 @@ def test_closing_the_clash_question_keeps_my_set_untouched(
 
     assert answer is NameClash.SKIP, (
         "закрытое без ответа окно решило судьбу набора само"
+    )
+
+
+def _snippet_of(qapp, library, current: Settings, monkeypatch) -> str:
+    """Что окно сохранения показывает над полем имени — через кнопку, а не мимо."""
+    from PySide6.QtWidgets import QInputDialog
+
+    shown: list[str] = []
+
+    def ask(_parent, _title, label, *args, **kwargs):
+        shown.append(label)
+        return "", False
+
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(ask))
+    dialog = TemplatesDialog(library, current)
+    try:
+        dialog.save_current()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+    assert shown, "окно сохранения не открылось"
+    return shown[0]
+
+
+def test_the_save_snippet_names_the_trailing_level_and_not_the_fixed_target(
+    qapp, library, monkeypatch
+) -> None:
+    """Стережёт `B-052`: выжимка называет тот способ фиксации, который работает.
+
+    При скользящем уровне число неподвижной цели движок не читает вовсе;
+    подпись «тейк 0,77%» называла бы параметр, которого в наборе нет.
+
+    Мутация: вернуть в `_snippet` выбор по одному `take_profit_enabled` —
+    в подписи снова появится «0,77%».
+    """
+    said = _snippet_of(
+        qapp,
+        library,
+        Settings(
+            take_profit_enabled=True, take_profit_pct=0.77, trailing_enabled=True,
+            trailing_start_pct=0.6, trailing_offset_pct=0.3,
+        ),
+        monkeypatch,
+    )
+    assert "0,77" not in said, f"выжимка назвала цель, которую движок не читает: {said!r}"
+    assert "скользящий" in said and "0,6" in said and "0,3" in said, (
+        f"выжимка не назвала скользящий уровень и его числа: {said!r}"
+    )
+
+
+def test_the_save_snippet_says_off_when_fixing_is_off_whatever_the_method(
+    qapp, library, monkeypatch
+) -> None:
+    """Стережёт `B-052`: выключенная фиксация выключает и скользящий уровень.
+
+    Мутация: проверить `trailing_enabled` раньше `take_profit_enabled` —
+    выжимка назовёт скользящий уровень, которого у позиции нет.
+    """
+    said = _snippet_of(
+        qapp,
+        library,
+        Settings(take_profit_enabled=False, trailing_enabled=True),
+        monkeypatch,
+    )
+    assert "тейк выключен" in said, f"выжимка не сказала «выключен»: {said!r}"
+    assert "скользящ" not in said, f"выжимка назвала уровень, которого нет: {said!r}"
+
+
+def test_an_old_template_with_trailing_but_no_fixing_is_normalised_out_loud(
+    tmp_path,
+) -> None:
+    """Стережёт `B-052`: шаблон прежней сборки не приносит невозможное сочетание.
+
+    «Скользящий уровень выбран, фиксация выключена» — уровня в нём нет,
+    а пару «порог/отступ» движок проверяет и вправе отвергнуть набор из-за
+    чисел, которых никто не читает. Снимается при чтении — и вслух.
+
+    Мутации: убрать подмену в `ui/templates.py::_one_way_to_take_profit` —
+    красная первая проверка; оставить подмену, но вернуть пустую строку
+    вместо фразы (молчание) — красная вторая.
+    """
+    from ui.templates import export_templates, read_for_import
+
+    path = tmp_path / "old.json"
+    export_templates(
+        path,
+        [Template(
+            name="Старый",
+            values=Settings(take_profit_enabled=False, trailing_enabled=True),
+        )],
+    )
+    loaded = read_for_import(path)
+    (one,) = loaded.templates
+    assert not one.values.trailing_enabled, (
+        "шаблон принёс скользящий уровень при выключенной фиксации"
+    )
+    said = [line for line in loaded.troubles if "«Старый»" in line]
+    assert said and "скользящий уровень" in said[0], (
+        f"подмена сделана молча: {loaded.troubles!r}"
     )

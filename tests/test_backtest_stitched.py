@@ -128,6 +128,23 @@ def test_short_warmup_is_said_aloud_and_its_bars_do_not_trade() -> None:
     assert any("прогрев 12 из 15" in line for line in stitched_lines(run))
 
 
+def test_a_short_warmup_reaches_the_journal_the_window_shows() -> None:
+    """Правило 13: пометка о недогретой средней не теряется по пути к окну.
+
+    Окно получает журнал прогона через `app.stitched_view.as_history`
+    (порт: `_publish_journal` → `decisions_replaced`). Отфильтруй там
+    предупреждения склейки — прогон «знает» о недогреве, а человек нет.
+    """
+    from app.stitched_view import as_history
+
+    run = _run([_old(), _new(WARMUP[3:])])
+    shown = as_history(run, COSTS).journal
+    assert any(
+        entry.event == "Прогрев неполный" and "MXZ6" in entry.reason
+        for entry in shown
+    ), [entry.event for entry in shown]
+
+
 def test_an_empty_piece_is_said_aloud() -> None:
     empty = Piece("MXZ6", date(2026, 9, 17), date(2026, 9, 17), WARMUP, (), PERIOD)
     run = _run([_old(), empty])

@@ -55,6 +55,7 @@ from broker.schedule import DailySchedule, Schedule, SessionKind, TradingStatus
 from broker.session import (
     ADDRESS_SENSITIVE,
     CANDLES_PATH,
+    DAILY_SCHEDULE_PATH,
     TRADING_STATUS_PATH,
     BrokerSession,
 )
@@ -1444,8 +1445,11 @@ def test_switching_on_again_reuses_the_session_and_restarts_the_stream(
     sessions: list[Any] = []
     built: list[LiveFeed] = []
 
-    class FakeSession:
+    class FakeSession(ScheduleDesk):
+        """Расписание — по документации брокера (`ScheduleDesk`, `D-116`)."""
+
         def __init__(self, store: object) -> None:
+            super().__init__()
             sessions.append(self)
             self.closed = 0
 
@@ -1495,6 +1499,123 @@ def test_switching_on_again_reuses_the_session_and_restarts_the_stream(
     assert sessions[0].closed == 1
     # RECONNECTING, ONLINE, OFFLINE, RECONNECTING, ONLINE — и ни одного повтора.
     assert port.restated == 5
+    schedule_was_asked()
+
+
+class ScheduleDesk:
+    """Сессия-дублёр отвечает на расписание торгов так, как брокер (`D-116`).
+
+    До 28.09.2026 у дублёров сессии в тестах звена `read` не было вовсе:
+    `broker/schedule.py` падал `AttributeError`, звено писало в лог
+    «расписание торгов не спрошено» и шло дальше как без расписания, а тесты
+    оставались зелёными. Проверялось звено, у которого расписание сломано.
+
+    Поля — по документации брокера (`.docs/broker-api/06-trading-status.md`,
+    `05-daily-schedule.md`): статус `tradingSessionTypeId`,
+    `tradingSessionType`, `tradingSessionStatus` (`OPEN`/`CLOSE`),
+    `nextSessionDate` с поясом; расписание дня `isWorkDay` и `dailySchedule`
+    из `startDate`, `endDate`, `tradingSessionType`, `tradingSessionStatus`.
+    Сайт брокера 28.09.2026 не сверен: обращение к нему из разработки
+    закрыто предохранителем боевого режима.
+
+    Торги идут (`OPEN`): звено подключается, как подключалось бы без
+    расписания, — остальное поведение теста не меняется. Любой другой адрес —
+    отказ вслух: молча отвечающий дублёр спрятал бы новое обращение сессии.
+
+    Каждый дублёр записывается в `ScheduleDesk.made`; сторож
+    `schedule_is_really_asked` после теста требует, чтобы каждый был
+    спрошен о статусе торгов.
+    """
+
+    #: Дублёры, построенные текущим тестом. Опустошает сторож.
+    made: list[ScheduleDesk] = []
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+        ScheduleDesk.made.append(self)
+
+    def answers(self, path: str) -> bool:
+        return path in (TRADING_STATUS_PATH, DAILY_SCHEDULE_PATH)
+
+    async def read(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        params: Mapping[str, str] | None = None,
+        json: object = None,
+    ) -> dict[str, object]:
+        self.asked.append(path)
+        if path == TRADING_STATUS_PATH:
+            later = datetime.now(UTC) + timedelta(hours=1)
+            return {
+                "tradingSessionTypeId": 1,
+                "tradingSessionType": "Торговый период",
+                "tradingSessionStatus": "OPEN",
+                "nextSessionDate": later.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            }
+        if path == DAILY_SCHEDULE_PATH:
+            return {
+                "isWorkDay": True,
+                "dailySchedule": [
+                    {"startDate": "09:00:00", "endDate": "23:50:00",
+                     "tradingSessionType": "Торговый период",
+                     "tradingSessionStatus": "OPEN"},
+                ],
+            }
+        raise RuntimeError(f"дублёр сессии отвечает только на расписание, а спросили {path}")
+
+
+#: Тесты, ломающие расписание **нарочно**: подставной `hours` падает
+#: `RuntimeError`, и проверяется именно реакция звена на эту беду.
+SCHEDULE_BROKEN_ON_PURPOSE: Final[tuple[str, ...]] = (
+    "test_an_unknown_schedule_behaves_exactly_as_it_did_before",
+    "test_a_schedule_that_breaks_says_it_is_our_own_defect",
+)
+
+
+@pytest.fixture(autouse=True)
+def schedule_is_really_asked(
+    request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture
+) -> Iterator[None]:
+    """Сторож `D-116`: расписание в тестах звена не упало — ни в одном тесте.
+
+    Строка «расписание торгов не спрошено» в логе значит, что дублёр
+    не умеет того, что спрашивает `broker/schedule.py` (было: `AttributeError`
+    у восьми тестов, и все зелёные). Вторая половина — что расписание
+    вообще спрошено — у тестов, доходящих до подключения:
+    `schedule_was_asked`. Здесь её нет: часть тестов снимает звено раньше
+    первого захода, и спрашивать там нечего.
+    """
+    ScheduleDesk.made.clear()
+    yield
+    ScheduleDesk.made.clear()
+    if request.node.originalname in SCHEDULE_BROKEN_ON_PURPOSE:
+        return
+    # `get_records("call")`, а не `records`: здесь уже разбор после теста,
+    # и `records` отдал бы пустой список этой стадии — сторож молчал бы всегда.
+    broken = [
+        record for record in caplog.get_records("call")
+        if record.getMessage().startswith("расписание торгов не спрошено")
+    ]
+    assert not broken, (
+        f"звено не смогло спросить расписание — дублёр сессии не отвечает "
+        f"тому, что спрашивает `broker/schedule.py`: {broken[0].exc_info!r}"
+    )
+
+
+def schedule_was_asked() -> None:
+    """Каждый дублёр сессии этого теста спрошен о статусе торгов (`D-116`).
+
+    Зовётся в конце теста, дошедшего до подключения. Без неё сторож
+    `schedule_is_really_asked` зеленел бы и на звене, переставшем спрашивать
+    расписание вовсе: нет вопроса — нет и упавшего вопроса в логе.
+    """
+    assert ScheduleDesk.made, "дублёр сессии с расписанием в тесте не построен"
+    for desk in ScheduleDesk.made:
+        assert TRADING_STATUS_PATH in desk.asked, (
+            f"звено подключалось, а статус торгов у сессии не спросило: {desk.asked}"
+        )
 
 
 class CandleTape:
@@ -1574,8 +1695,20 @@ def test_the_link_backfill_reaches_the_load_report_instead_of_the_log(
     class FakeSession:
         def __init__(self, store: object) -> None:
             self.clock = ClockWatch()
-            #: Ответ на запрос свечей — лента, общая с проверками теста.
-            self.read = tape.read
+            #: Расписание торгов — по документации брокера (`D-116`).
+            self.desk = ScheduleDesk()
+
+        async def read(
+            self,
+            path: str,
+            *,
+            method: str = "GET",
+            params: Mapping[str, str] | None = None,
+            json: object = None,
+        ) -> dict[str, object]:
+            # Свечи — лента, общая с проверками теста; расписание — дублёр.
+            answer = self.desk if self.desk.answers(path) else tape
+            return await answer.read(path, method=method, params=params, json=json)
 
         def stored(self) -> SimpleNamespace:
             return SimpleNamespace(permissions_were_loose=False)
@@ -1636,6 +1769,7 @@ def test_the_link_backfill_reaches_the_load_report_instead_of_the_log(
     )
     [report] = worker.load_reports
     assert report.inserted == len(hole)
+    schedule_was_asked()
 
 
 def test_the_feed_names_the_first_minute_of_every_session_exactly_once(
@@ -1697,9 +1831,11 @@ def test_the_link_starts_the_backfill_on_every_connection(
         async def aclose(self) -> None:
             closed.append("догрузка")
 
-    class FakeSession:
+    class FakeSession(ScheduleDesk):
+        """Расписание — по документации брокера (`ScheduleDesk`, `D-116`)."""
+
         def __init__(self, store: object) -> None:
-            pass
+            super().__init__()
 
         def stored(self) -> SimpleNamespace:
             return SimpleNamespace(permissions_were_loose=False)
@@ -1747,6 +1883,7 @@ def test_the_link_starts_the_backfill_on_every_connection(
         "ту же сессию, поэтому снимается первой, а сессия закрывается последней. "
         f"Получено {closed}"
     )
+    schedule_was_asked()
 
 
 def test_repeated_failed_presses_build_one_session(tmp_path: pathlib.Path, monkeypatch) -> None:
@@ -2032,11 +2169,14 @@ def quiet_session(monkeypatch) -> None:
     ⚠️ `close` именно ожидаемый. Заглушка с обычным `close` роняла звено
     на `aclose` — «object NoneType can't be used in await», — и падение
     выглядело бы дефектом правки, а не дублёра.
+
+    Расписание торгов отвечает по документации брокера (`ScheduleDesk`,
+    `D-116`): без `read` звено шло дальше с упавшим расписанием.
     """
 
-    class Session:
+    class Session(ScheduleDesk):
         def __init__(self, store: object) -> None:
-            pass
+            super().__init__()
 
         def stored(self) -> SimpleNamespace:
             return SimpleNamespace(permissions_were_loose=False)
@@ -3229,6 +3369,7 @@ def test_retargeting_before_the_first_connection_only_moves_the_ticker(
     assert stream.requests == [("SiU6", "SPBFUT")], (
         f"подписка ушла на прежний инструмент: {stream.requests}"
     )
+    schedule_was_asked()
 
 
 def test_the_first_minute_of_a_session_reaches_the_port_as_well_as_the_backfill(
@@ -3274,6 +3415,7 @@ def test_the_first_minute_of_a_session_reaches_the_port_as_well_as_the_backfill(
         f"порт не узнал минуту первого снимка: {port.leads}"
     )
     assert started == [MINUTE_A.astimezone(MSK)]
+    schedule_was_asked()
 
 
 def test_the_assembly_wires_both_the_switch_and_the_retarget(
@@ -3963,6 +4105,7 @@ def test_the_link_polls_the_account_from_the_moment_the_stream_is_online(
     # `ONLINE`, обязан быть снят. Снятие несуществующей задачи ничего не стоит.
     assert log.index("start") < len(log) - 1, f"после запуска опрос не снят: {log}"
     assert log[log.index("start") + 1] == "stop", log
+    schedule_was_asked()
 
 
 def test_a_broken_link_stops_the_account_poll_without_any_button(
@@ -3996,6 +4139,7 @@ def test_a_broken_link_stops_the_account_poll_without_any_button(
         await link.aclose()
 
     asyncio.run(scenario())
+    schedule_was_asked()
 
 
 def test_the_account_poll_is_queued_before_the_backfill(
@@ -4041,6 +4185,7 @@ def test_the_account_poll_is_queued_before_the_backfill(
 
     asyncio.run(scenario())
     assert order == ["счёт", "догрузка"], order
+    schedule_was_asked()
 
 
 def test_changing_the_instrument_moves_the_account_poll_too(
@@ -4102,6 +4247,7 @@ def test_without_a_receiver_the_link_never_asks_about_the_account(
 
     asyncio.run(scenario())
     assert "счёт" not in built, "портфель спросили без боевой сборки"
+    schedule_was_asked()
 
 
 async def _noop_aclose() -> None:

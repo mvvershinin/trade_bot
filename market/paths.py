@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+from typing import TextIO
 
 __all__ = [
     "DB_FILE_NAME",
@@ -34,6 +35,7 @@ __all__ = [
     "default_db_path",
     "ensure_userdata_dir",
     "ignored_override",
+    "say_ignored_override",
     "userdata_dir",
 ]
 
@@ -81,21 +83,53 @@ def _test_override() -> str:
     return named
 
 
-def ignored_override() -> str:
+def ignored_override(database: pathlib.Path | None = None) -> str:
     """Фраза для журнала, если `USERDATA_ENV` выставлена, но не действует.
 
     Пусто — переменной нет либо она действует (тестовый прогон). У `market/`
     журнала нет: строку пишет `app/` при запуске (правило 13 — отказ,
     не доехавший до человека, равен поломке).
+
+    :param database: база, с которой работает этот запуск, если её назвали
+        ключом (`--db`, `--database`). Лежит она не в папке данных — фраза
+        называет её, а не папку: «база берётся из папки» была бы неправдой
+        ровно там, где человек ищет, куда делись его данные.
     """
     named = os.environ.get(USERDATA_ENV, "")
     if not named or _test_override():
         return ""
+    standard = _standard_dir()
+    where = (
+        f"база, журналы и остановка робота берутся из {standard}."
+        if database is None or database.resolve().parent == standard
+        else f"папка данных программы — {standard}, а база этого запуска "
+             f"названа ключом: {database}."
+    )
     return (
         f"В окружении задана переменная {USERDATA_ENV}={named}. Она нужна "
-        "только прогону тестов и в обычном запуске не действует: база, журналы "
-        f"и остановка робота берутся из {_standard_dir()}."
+        f"только прогону тестов и в обычном запуске не действует: {where}"
     )
+
+
+def say_ignored_override(
+    database: pathlib.Path | None = None, *, out: TextIO | None = None
+) -> str:
+    """Сказать `ignored_override` в поток ошибок консольного запуска. `D-124`.
+
+    Для точек входа без окна — `--fetch`, `python3 -m app.fetch`,
+    `python -m backtest`: у них нет журнала решений, и до 28.09.2026
+    переменная игнорировалась в них молча. Окно говорит ту же фразу
+    своим журналом (`app/main.py`).
+
+    В stderr, а не в stdout: выдачу `backtest` перенаправляют в файл
+    таблицей, и чужая строка в ней испортила бы таблицу.
+
+    Возвращает сказанное — пусто, если говорить нечего.
+    """
+    line = ignored_override(database)
+    if line:
+        (out or sys.stderr).write(line + "\n")
+    return line
 
 
 def userdata_dir() -> pathlib.Path:

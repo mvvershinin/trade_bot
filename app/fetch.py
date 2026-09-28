@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import pathlib
 import sqlite3
 import sys
@@ -81,6 +82,9 @@ from market import (
     take_inventory,
     userdata_dir,
 )
+from market.paths import say_ignored_override
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "CHAIN_DB_FILE_NAME",
@@ -281,6 +285,12 @@ def run_from_arguments(
     `tests/test_app_boundaries.py`, и число прогрева живёт в `market.history`
     (`WARMUP_PERIOD`), а связь с модулем стратегии держит тест.
     """
+    # `D-124`: переменная папки данных, выставленная вне теста, не действует,
+    # и человек, её выставивший, искал бы свечи не там. Технический лог
+    # к этой минуте уже поднят (`app/main.py`), строка уходит и в него.
+    said = say_ignored_override(database)
+    if said:
+        log.warning("%s", said)
     today = datetime.now(MSK).date()
     since: date | None = None
     if args.fetch_since is not None:
@@ -593,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
     database = (
         pathlib.Path(args.db) if args.db else userdata_dir() / CHAIN_DB_FILE_NAME
     )
+    say_ignored_override(database)  # `D-124`: молча переменную не игнорируем
     try:
         ensure_userdata_dir(database.parent)
     except OSError as error:

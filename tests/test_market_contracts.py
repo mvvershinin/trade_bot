@@ -28,9 +28,12 @@ from market.contracts import (
     ContractRequest,
     Expiry,
     adopt_chain,
+    asset_of,
+    chain_around,
     current_contract,
     expiry_verdict,
     load_contract_minutes,
+    monthly_assets,
     periods_of_chain,
     pieces,
     refresh_contracts,
@@ -498,15 +501,62 @@ def test_asset_without_its_chain_is_refused_not_cut_by_another(store: CandleStor
         current_contract(store, today=NOW.date(), asset="RI")
 
 
-def test_monthly_asset_is_refused_before_anything_is_written(store: CandleStore) -> None:
-    """BR: биржа знает BRQ6 — квартальная цепочка BRU6 → BRZ6 ложна, таблица не тронута."""
+def test_an_update_without_the_end_does_not_unarchive_the_contract(
+    store: CandleStore,
+) -> None:
+    """Архивный остаётся архивным, когда уточнение конца его периода не знает.
+
+    Так бывает, когда MXU6 — последний в укороченной цепочке (загрузка
+    по MXM6: MXH6…MXU6): рубежа после него в запросе нет, конец пуст.
+    Сотри пустое известный конец — MXU6 снова «действующий» рядом с MXZ6,
+    и таблица противоречит сама себе.
+    """
+    store.put_contracts(MX_ROWS, now=NOW)
+    store.put_contracts(
+        [ContractRow("MXU6", last_trade_day=date(2026, 9, 17))], now=NOW
+    )
+
+    (mxu6,) = [row for row in store.contracts() if row.symbol == "MXU6"]
+    assert mxu6.archived and mxu6.active_to == date(2026, 9, 16), mxu6
+    assert current_contract(store, today=date(2026, 9, 17), asset="MX").symbol == "MXZ6"
+
+
+def test_the_banner_does_not_read_another_assets_chain(store: CandleStore) -> None:
+    """В таблице только RI — про MX плашка спокойно говорит «цепочки MX нет».
+
+    Не «действующего нет» тревогой: чужая цепочка — не беда таблицы MX,
+    а её отсутствие — обычное состояние до первой загрузки MX.
+    """
+    from app.contract_view import notice_of
+
+    store.put_contracts(
+        [ContractRow("RIU6", last_trade_day=date(2026, 9, 17),
+                     active_from=date(2026, 6, 18), active_to=date(2026, 9, 16)),
+         ContractRow("RIZ6", last_trade_day=date(2026, 12, 17),
+                     active_from=date(2026, 9, 17))],
+        now=NOW,
+    )
+    notice = notice_of(store, "MXZ6", today=NOW.date())
+    assert not notice.urgent, f"чужая цепочка подняла тревогу: {notice}"
+    assert notice.current == "", notice
+    assert "Цепочки MX" in notice.trouble, notice
+
+
+def test_monthly_asset_is_refused_before_any_quarterly_row_is_written(
+    store: CandleStore,
+) -> None:
+    """BR: биржа знает BRQ6 — цепочка BRU6 → BRZ6 ложна, квартальных строк нет.
+
+    В таблице остаётся только названный биржей месячный код (`D-125`).
+    """
     exchange = Exchange(
         daily={"BRU6": MXU6_DAYS, "BRZ6": MXZ6_DAYS},
         known={"BRU6": "2026-08-31", "BRQ6": "2026-07-31", "BRZ6": "2026-11-30"},
     )
     with pytest.raises(ChainNotQuarterly, match="BRQ6"):
         refresh_contracts(store, exchange.client, ["BRU6", "BRZ6"], market=FUTURES, now=NOW)
-    assert store.contracts() == []
+    # Квартальных строк нет ни одной; есть только названный биржей месячный код.
+    assert [row.symbol for row in store.contracts()] == ["BRQ6"]
 
 
 def test_monthly_check_asks_the_month_before_the_first_code(store: CandleStore) -> None:
@@ -522,7 +572,7 @@ def test_monthly_check_asks_the_month_before_the_first_code(store: CandleStore) 
         refresh_contracts(
             store, exchange.client, ["BRM6", "BRU6", "BRZ6", "BRH7"], market=FUTURES, now=NOW
         )
-    assert store.contracts() == []
+    assert [row.symbol for row in store.contracts()] == ["BRK6"]
 
 
 def test_quarterly_asset_passes_the_monthly_check(store: CandleStore) -> None:
@@ -573,3 +623,190 @@ def test_adopted_archived_leg_is_refused_without_a_last_trade_day(
 
     assert verdict.kind is Expiry.ARCHIVED
     assert verdict.kind.refused
+
+
+# -- D-122: код актива со строчной второй буквой -----------------------------
+
+#: Коды, найденные в ответе ISS 28.09.2026 (все фьючерсы FORTS): у Si и Eu
+#: вторая буква строчная, месяцы только H, M, U, Z.
+ISS_QUARTERLY = ["SiZ6", "SiH7", "EuZ6", "MXZ6", "RIZ6", "GDZ6", "BRZ6"]
+
+
+@pytest.mark.parametrize("code", ISS_QUARTERLY)
+def test_exchange_quarterly_codes_are_quarterly(code: str) -> None:
+    """`SiZ6` — квартальный код актива `Si`, как `MXZ6` — актива `MX` (D-122)."""
+    assert asset_of(code) == code[:2]
+    assert chain_around(code)[-2] == code
+
+
+@pytest.mark.parametrize("code", ["SIZ6x", "S1Z6", "sIZ6", "SiX6", "@Si", "Si"])
+def test_non_quarterly_codes_are_still_refused(code: str) -> None:
+    """Шаблон расширен на строчную вторую букву — и только на неё."""
+    with pytest.raises(ContractError):
+        asset_of(code)
+
+
+# -- D-125: месячность актива переживает перезапуск --------------------------
+
+def test_monthly_trace_survives_reopening_the_base(tmp_path: pathlib.Path) -> None:
+    """Отказ биржи оставляет в таблице месячный код; новая программа видит BR месячным.
+
+    Мутация: убрать `put_contracts` из ветки `ChainNotQuarterly` в
+    `refresh_contracts` — после переоткрытия базы признака нет.
+    """
+    path = tmp_path / "work.sqlite3"
+    exchange = Exchange(
+        daily={"BRU6": MXU6_DAYS, "BRZ6": MXZ6_DAYS},
+        known={"BRX6": "2026-10-30", "BRZ6": "2026-11-30"},
+    )
+    with CandleStore(path) as first, pytest.raises(ChainNotQuarterly):
+        refresh_contracts(first, exchange.client, ["BRZ6", "BRH7"], market=FUTURES, now=NOW)
+    with CandleStore(path) as second:
+        rows = second.contracts()
+    assert monthly_assets(rows) == {"BR"}, rows
+    (trace,) = rows
+    assert trace.last_trade_day == date(2026, 10, 30), "срок месячного кода потерян"
+    assert not trace.current, "месячный код стал «действующим» в квартальной таблице"
+
+
+def test_quarterly_rows_do_not_mark_an_asset_monthly(store: CandleStore) -> None:
+    """MX с кварталами в таблице месячным не считается (обратная сторона D-125)."""
+    store.put_contracts(MX_ROWS, now=NOW)
+    assert monthly_assets(store.contracts()) == set()
+
+
+# -- D-127: совет тестера по правде ------------------------------------------
+
+def test_pieces_of_a_monthly_asset_do_not_advise_a_useless_load(store: CandleStore) -> None:
+    """У BR месячные контракты — «загрузите историю» было бы неправдой.
+
+    Мутация: убрать ветку `monthly_assets` из `pieces` — вернётся совет
+    загрузить историю, которая цепочку не создаст.
+    """
+    store.put_contracts([ContractRow("BRX6", last_trade_day=date(2026, 10, 30))], now=NOW)
+    with pytest.raises(ContractError) as refused:
+        pieces(store, date(2026, 9, 1), date(2026, 9, 25), asset="BR")
+    text = str(refused.value)
+    assert "месячные" in text and "не создаст" in text, text
+
+
+def test_pieces_without_a_chain_name_the_quarterly_load(store: CandleStore) -> None:
+    """Цепочки нет и месячность не известна — совет называет условие, а не обещает."""
+    with pytest.raises(ContractError) as refused:
+        pieces(store, date(2026, 9, 1), date(2026, 9, 25), asset="RI")
+    text = str(refused.value)
+    assert "квартальному коду" in text and "месячных" in text, text
+
+
+# -- D-123: последний перенесённый контракт без биржи ------------------------
+
+def test_adopted_last_leg_is_closed_by_a_known_next_roll(
+    tmp_path: pathlib.Path, store: CandleStore,
+) -> None:
+    """Таблица уже знает рубеж MXU6 (17.09) — перенесённый MXM6 закрыт днём раньше.
+
+    Мутация: убрать `_close_by_the_next` из `adopt_chain` — MXM6 остаётся
+    открытым без срока, вердикт UNKNOWN, а нарезка отказывает на налезании.
+    """
+    source = tmp_path / "chain.sqlite3"
+    _chain_source(source)
+    store.put_contracts(
+        [ContractRow("MXU6", last_trade_day=date(2026, 9, 17),
+                     active_from=date(2026, 6, 18))],
+        now=NOW,
+    )
+    adopt_chain(source, store, ["MXH6", "MXM6"], now=NOW)
+    rows = store.contracts()
+    (mxm6,) = [row for row in rows if row.symbol == "MXM6"]
+    assert mxm6.active_to == date(2026, 6, 17), mxm6
+    verdict = expiry_verdict(rows, "MXM6", today=date(2026, 9, 27), halt_days=1)
+    assert verdict.kind is Expiry.ARCHIVED, verdict
+    legs = pieces(store, date(2026, 6, 1), date(2026, 6, 30), asset="MX")
+    assert [leg.symbol for leg in legs] == ["MXM6", "MXU6"], legs
+
+
+def test_adopted_last_leg_without_a_next_says_ask_the_exchange(
+    tmp_path: pathlib.Path, store: CandleStore,
+) -> None:
+    """Следующего нет — период открыт, а вердикт громко велит уточнить срок у биржи."""
+    source = tmp_path / "chain.sqlite3"
+    _chain_source(source)
+    adopt_chain(source, store, ["MXH6", "MXM6"], now=NOW)
+    rows = store.contracts()
+    (mxm6,) = [row for row in rows if row.symbol == "MXM6"]
+    assert mxm6.active_to is None
+    verdict = expiry_verdict(rows, "MXM6", today=date(2026, 9, 27), halt_days=1)
+    assert verdict.kind is Expiry.UNKNOWN
+    assert "уточните срок у биржи" in verdict.text and "истёк" in verdict.text, verdict.text
+
+
+def test_monthly_trace_write_failure_still_refuses_as_monthly(
+    store: CandleStore, monkeypatch, caplog,
+) -> None:
+    """Стережёт `D-125`: сбой записи следа не подменяет `ChainNotQuarterly`.
+
+    Вызывающий по этому отказу уходит на загрузку по дням; `sqlite3.Error`
+    вместо него оборвал бы загрузку целиком. Сбой говорится в лог и в текст.
+
+    Мутации: снять обёртку записи — вылетит `OperationalError`; убрать
+    строку лога или приписку к отказу — сбой уйдёт молча.
+    """
+    exchange = Exchange(
+        daily={"BRU6": MXU6_DAYS, "BRZ6": MXZ6_DAYS},
+        known={"BRX6": "2026-10-30", "BRZ6": "2026-11-30"},
+    )
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "put_contracts", broken)
+    with caplog.at_level("WARNING", logger="market.contracts"), \
+            pytest.raises(ChainNotQuarterly) as refused:
+        refresh_contracts(store, exchange.client, ["BRZ6", "BRH7"], market=FUTURES, now=NOW)
+    assert refused.value.monthly == "BRX6"
+    assert "не записан" in str(refused.value), refused.value
+    assert any("BRX6" in record.getMessage() for record in caplog.records), caplog.text
+
+
+def test_adopted_leg_across_a_gap_ends_at_its_last_trade_day(
+    tmp_path: pathlib.Path, store: CandleStore,
+) -> None:
+    """Стережёт `D-123` при разрыве: следующий известный рубеж — через полгода.
+
+    Перенесены MXH6…MXM6, а в таблице следующий с рубежом — MXH7 с 17.12.2026.
+    «День перед рубежом» растянул бы MXM6 до 16.12 и держал его ближним
+    всю осень. Конец обязан быть не позже его последнего дня обращения.
+
+    Мутация: убрать ограничение `last_trade_day` в `_close_by_the_next` —
+    `active_to` станет 16.12.2026, и сентябрь нарежется кодом MXM6.
+    """
+    source = tmp_path / "chain.sqlite3"
+    _chain_source(source)
+    store.put_contracts(
+        [ContractRow("MXM6", last_trade_day=date(2026, 6, 18)),
+         ContractRow("MXH7", last_trade_day=date(2027, 3, 18),
+                     active_from=date(2026, 12, 17))],
+        now=NOW,
+    )
+    adopt_chain(source, store, ["MXH6", "MXM6"], now=NOW)
+    (mxm6,) = [row for row in store.contracts() if row.symbol == "MXM6"]
+    assert mxm6.active_to == date(2026, 6, 18), mxm6
+    legs = pieces(store, date(2026, 9, 1), date(2026, 9, 30), asset="MX")
+    assert legs == [], f"MXM6 после экспирации нарезан в сентябрь: {legs}"
+
+
+def test_the_banner_of_a_monthly_asset_does_not_promise_a_load(store: CandleStore) -> None:
+    """Стережёт `D-127` в плашке: у BR месячные контракты, обещаний про загрузку нет.
+
+    Фраза «узнает у биржи при загрузке» висела бы для BR вечно.
+
+    Мутация: убрать ветку `monthly_assets` из `notice_of` — вернётся фраза
+    про загрузку истории квартального фьючерса.
+    """
+    from app.contract_view import notice_of
+
+    store.put_contracts([ContractRow("BRX6", last_trade_day=date(2026, 10, 30))], now=NOW)
+    notice = notice_of(store, "BRZ6", today=NOW.date())
+    assert "месячные" in notice.trouble, notice
+    assert "узнает у биржи" not in notice.trouble, notice
+    assert not notice.urgent and notice.current == "", notice

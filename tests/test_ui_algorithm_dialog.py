@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from helpers import settle_qt
 from PySide6.QtCore import QRect, Qt
@@ -519,3 +521,89 @@ def test_enter_means_ok_and_not_details(make_choice) -> None:
     window = make_choice(FIRST, SECOND)
     assert not window.details_button.isDefault()
     assert not window.details_button.autoDefault()
+
+
+
+def test_ok_without_a_selection_keeps_the_window_open_and_says_why(
+    qapp, make_choice
+) -> None:
+    """Стережёт `B-043`: «ОК» без выделения не закрывает окно молча.
+
+    Список есть, выделения нет (в настройках алгоритм, которого в сборке
+    нет). «ОК» здесь включён намеренно — см. канарейку
+    `test_a_missing_algorithm_in_a_real_catalogue_still_asks_for_a_choice`, —
+    но принять пустой выбор значит закрыть окно и не поменять ничего,
+    не сказав ни слова.
+
+    Мутации: убрать проверку из `AlgorithmDialog.accept` — окно примется,
+    красная первая проверка; оставить отказ, но не писать строку (молчание) —
+    красная вторая; вернуть `current_option` на `currentRow()` — фокус
+    при показе окна «выберет» первый алгоритм, красная проверка после `show()`.
+    """
+    window = make_choice(FIRST, SECOND)
+    window.set_chosen("no_such_algorithm")
+    assert window.current_option() is None, "выделение есть — проверять нечего"
+    window.show()
+    qapp.processEvents()
+    # Фокус на списке без текущей строки делает текущей первую — выбором
+    # это не является (правка `current_option` по выделению, 28.09.2026).
+    assert window.chosen_id() == "", (
+        "окно само выбрало алгоритм, которого человек не выбирал: "
+        f"{window.chosen_id()!r}"
+    )
+    window.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+    qapp.processEvents()
+    assert window.isVisible(), (
+        "«ОК» без выделения закрыл окно: выбор пустой, настройки не поменялись, "
+        "человеку не сказано ничего"
+    )
+    assert window.result() != window.DialogCode.Accepted
+    said = window.summary.text()
+    assert "выделите" in said and "Отмена" in said, (
+        f"окно не сказало, почему «ОК» не сработал и что делать: {said!r}"
+    )
+
+
+def test_ok_with_a_selection_still_accepts(qapp, make_choice) -> None:
+    """Канарейка предыдущей: отказ «ОК» не задевает обычный выбор."""
+    window = make_choice(FIRST, SECOND)
+    window.set_chosen("atr_channel")
+    window.show()
+    window.buttons.button(QDialogButtonBox.StandardButton.Ok).click()
+    qapp.processEvents()
+    assert window.result() == window.DialogCode.Accepted
+    assert window.chosen_id() == "atr_channel"
+
+
+def test_the_preamble_does_not_claim_your_numbers_after_a_refusal() -> None:
+    """Стережёт `D-103`: подпись над описанием знает про отказ, а не только про выбор.
+
+    Настройки не собрались — описание ниже начинается с «⚠️ Показать правило
+    с вашими числами не удалось». Подпись «с вашими нынешними настройками»
+    над ним говорила бы противоположное.
+
+    Мутация: убрать ветку `option.refused` из `details_preamble` — красная.
+    Проводку флага от `app/` стережёт следующая проверка.
+    """
+    refused = dataclasses.replace(FIRST, refused=True)
+    said = details_preamble(refused)
+    assert "нынешними" not in said, f"подпись обещает ваши числа при отказе: {said!r}"
+    assert "умолчания" in said, f"подпись не сказала, чьи числа показаны: {said!r}"
+
+
+def test_the_catalogue_marks_the_chosen_algorithm_refused_when_settings_fail() -> None:
+    """Стережёт `D-103`, проводку: `app/convert.py` поднимает флаг отказа.
+
+    Мутация: не передавать `refused=` в `AlgorithmOption` из `app/convert.py` —
+    флаг останется `False`, красная.
+    """
+    from app import convert
+    from ui.models import Settings
+
+    broken = next(
+        item for item in convert.algorithms(Settings().replace(average_period=0))
+        if item.chosen
+    )
+    assert broken.refused, "настройки не собрались, а флаг отказа не поднят"
+    fine = next(item for item in convert.algorithms(Settings()) if item.chosen)
+    assert not fine.refused, "флаг отказа поднят на исправных настройках"

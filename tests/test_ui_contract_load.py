@@ -700,7 +700,8 @@ def test_a_monthly_asset_falls_back_to_the_day_load_aloud(loop, tmp_path) -> Non
     """BR: биржа знает BRX6 — по контракту не грузим, говорим и грузим по дням.
 
     Квартальная цепочка BRM6…BRH7 для нефти ложна: рубежи по ней записали бы
-    в таблицу выдуманные периоды. Таблица остаётся пустой.
+    в таблицу выдуманные периоды. Квартальных строк в таблице нет; есть одна —
+    названный биржей месячный код, след месячности актива (`D-125`).
     """
     database = tmp_path / "base.sqlite3"
     chain = Chain(TODAY)
@@ -717,4 +718,6 @@ def test_a_monthly_asset_falls_back_to_the_day_load_aloud(loop, tmp_path) -> Non
     assert spans, "загрузка по дням не пошла"
     assert min(first for first, _ in spans) == TODAY - timedelta(days=89)
     with CandleStore(database) as store:
-        assert store.contracts() == []
+        rows = store.contracts()
+    assert [row.symbol for row in rows] == ["BRK6"], rows
+    assert all(row.active_from is None and row.active_to is None for row in rows), rows

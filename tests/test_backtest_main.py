@@ -393,3 +393,30 @@ def test_the_notes_say_the_stitched_series_is_not_for_trading() -> None:
     """
     footer = " ".join(_notes(runs=10, spent=1.0, bars=100))
     assert "торговать по нему нельзя" in footer
+
+
+def test_the_sweep_says_the_data_variable_does_not_work(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Стережёт: `python -m backtest` говорит в stderr о недействующей переменной.
+
+    `D-124`: переменная папки данных вне тестового прогона не действует,
+    и перебор, взявший базу не оттуда, где её ждал человек, молчал об этом.
+    Строка — в stderr: stdout перебора перенаправляют в файл таблицей.
+    Мутация, обязанная ронять проверку: убрать `say_ignored_override`
+    из `backtest.__main__.main`.
+    """
+    from market import paths
+
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setenv(paths.USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(paths.TEST_RUN_ENV, raising=False)
+
+    async def table(args) -> str:
+        return "таблица"
+
+    monkeypatch.setattr(backtest.__main__, "_work", table)
+    assert backtest.__main__.main(["--db", str(tmp_path / "candles.sqlite3")]) == 0
+    said = capsys.readouterr()
+    assert paths.USERDATA_ENV in said.err
+    assert paths.USERDATA_ENV not in said.out, "строка попала в таблицу, а не в stderr"

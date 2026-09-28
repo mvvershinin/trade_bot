@@ -94,8 +94,10 @@ from ui.models import Mode, Settings
 __all__ = [
     "RUNS_KEPT",
     "RUNS_SHOWN",
+    "ProgramFields",
     "RunConditions",
     "RunLog",
+    "UNFINISHED_SAID",
     "matching_runs",
     "result_note",
     "run_lines",
@@ -272,11 +274,47 @@ _COSTS_TITLES: Mapping[str, str] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class ProgramFields:
+    """Числа программы, которые меняют прогон, но не живут в настройках движка.
+
+    `D-117`: снимок собирался только из движка и алгоритма, и эти два числа
+    из окна настроек в него не попадали. Остановка перед экспирацией
+    говорит, за сколько дней до конца контракта встал бы живой ход;
+    глубина загрузки — сколько истории программа держала в базе. Оба числа
+    пишутся для человека: сделок прогона тестера ни одно не меняет, и при
+    сличении набора с прогоном оба пропускаются (`_UNCONTROLLED_TITLES`).
+
+    Поля перечисляются обходом (`_block`), подписи — `_PROGRAM_TITLES`:
+    новое поле попадёт в снимок само, а тест держит, что у каждого есть
+    подпись.
+    """
+
+    expiry_halt_days: int
+    history_depth_days: int
+
+    @classmethod
+    def of(cls, values: Settings) -> ProgramFields:
+        """Числа программы из набора настроек окна — по именам своих полей."""
+        return cls(**{
+            field.name: getattr(values, field.name)
+            for field in dataclasses.fields(cls)
+        })
+
+
+#: Подписи полей `ProgramFields`. Единицы — в подписи, как у движка.
+_PROGRAM_TITLES: Mapping[str, str] = {
+    "expiry_halt_days": "Остановка перед экспирацией, дней",
+    "history_depth_days": "Глубина загрузки истории, дней",
+}
+
+
 def settings_text(
     engine: EngineSettings,
     strategy: StrategySettings,
     *,
     algorithm: registry.StrategyEntry,
+    program: ProgramFields | None = None,
 ) -> str:
     """Снимок настроек прогона: движок целиком, модуль целиком и его правило.
 
@@ -307,11 +345,16 @@ def settings_text(
     Отступ здесь превратил бы предложение описания в поле снимка, и сверка
     набора с прогоном (`_made_with`) стала бы искать это «поле» в чужих
     записях.
+
+    `program` — числа программы (`ProgramFields`, `D-117`). Не поданы —
+    блока нет: так пишут места вызова, ещё не передающие их.
     """
     lines = _block("Настройки движка", engine, _ENGINE_TITLES)
     lines += _block(
         f"Торговый алгоритм: {algorithm.title}", strategy, algorithm.titles()
     )
+    if program is not None:
+        lines += _block("Настройки программы", program, _PROGRAM_TITLES)
     lines += ["", "Правило робота словами:"]
     lines += convert.rule_of(algorithm, strategy).splitlines()
     return "\n".join(lines)
@@ -406,6 +449,9 @@ class RunConditions:
     days: int = 0
     #: Ключ `--until`: правый край. `None` — последняя свеча в базе.
     until: datetime | None = None
+    #: Числа программы из окна настроек (`D-117`). `None` — место вызова
+    #: их ещё не передаёт, и в снимке их не будет.
+    program: ProgramFields | None = None
 
     def record(self, candles: Sequence[MarketCandle]) -> SessionRecord:
         """Объявление прогона — то, что уходит в базу при его открытии.
@@ -422,7 +468,8 @@ class RunConditions:
             timeframe=self.timeframe,
             strategy=self.algorithm.title,
             settings=settings_text(
-                self.engine, self.strategy, algorithm=self.algorithm
+                self.engine, self.strategy, algorithm=self.algorithm,
+                program=self.program,
             ),
             app_version=self.app_version,
             note=period_note(
@@ -451,8 +498,9 @@ class RunLog:
     Единица работы с компенсацией (`CLAUDE.md`, правило 9): у прогона два
     исхода, и оба обязаны оставить в базе правду. Прогон удался — строка
     закрывается итогом; отказал — тем же закрытием, но с причиной отказа;
-    снят при выходе из программы — не закрывается вовсе, и `finished_at`
-    остаётся пустым, что и означает «прервано».
+    снят кнопкой «Отменить» или при выходе из программы — не закрывается
+    вовсе, и `finished_at` остаётся пустым, что и означает «прервано»
+    (обе причины называет `UNFINISHED_SAID`).
 
     ⚠️ **Запись не имеет права уронить прогон.** Отказ базы здесь — это
     отсутствие записи, а не отсутствие графика; поэтому оба обращения
@@ -489,11 +537,12 @@ class RunLog:
             yield entry
         except asyncio.CancelledError:
             # ⚠️ Снятый прогон не закрывается вовсе, и это намеренно.
-            # Снимают его при выходе из программы (`HistoryPort.aclose`),
-            # когда хранилище закрывается следом: ещё одно обращение к нему
+            # Снимают его кнопкой «Отменить» (`HistoryPort.cancel_backtest`)
+            # и при выходе из программы (`HistoryPort.aclose`), когда
+            # хранилище закрывается следом: ещё одно обращение к нему
             # либо повиснет в очереди, либо отвергнется. Прогон без времени
-            # конца — честная запись о том, что программу закрыли на середине,
-            # и ровно так его читает `--runs`.
+            # конца — честная запись «снят на середине», и `--runs` называет
+            # обе причины словами (`UNFINISHED_SAID`, `D-066`).
             raise
         except Exception as error:
             await self._close(entry.id, f"Прогон не удался: {error}")
@@ -559,6 +608,20 @@ _UNCONTROLLED_TITLES: frozenset[str] = frozenset(
         # у прежних настроек — тот же случай, что `close_wait_bars`.
         "min_exit_profit_sides",
     )
+) | frozenset(
+    _PROGRAM_TITLES[name]
+    for name in (
+        # Глубина загрузки говорит, сколько истории скачано с биржи, а не на
+        # каком отрезке шёл прогон (отрезок — в заметке прогона). Сделок она
+        # не меняет.
+        "history_depth_days",
+        # Остановка перед экспирацией — предохранитель живого хода: её читает
+        # только вердикт срока контракта в `app/port.py`. Тестер, перебор
+        # и склейка её не знают, и сделки прогона от неё не зависят. Сличать
+        # по ней — значит отнять у шаблона его прогоны за то, что в окне
+        # стоит другое число дней.
+        "expiry_halt_days",
+    )
 )
 
 #: Режим, на котором собирается снимок набора для сравнения. Любой: его подпись
@@ -593,7 +656,8 @@ def snapshot_of(values: Settings) -> str:
     engine = convert.engine_settings(values, _SNAPSHOT_MODE)
     module = convert.strategy_settings(values)
     return settings_text(
-        engine, module, algorithm=convert.chosen_algorithm(values)
+        engine, module, algorithm=convert.chosen_algorithm(values),
+        program=ProgramFields.of(values),
     )
 
 
@@ -626,7 +690,8 @@ def _made_with(session: JournalSession, marks: Mapping[str, str], symbol: str,
 
     Прогон, в снимке которого подписи нет вовсе (запись более старой сборки),
     не совпадает: «не знаем» здесь обязано читаться как «не он». Приписать
-    шаблону чужие деньги хуже, чем показать прочерк.
+    шаблону чужие деньги хуже, чем показать прочерк. Числа программы
+    (`D-117`) сюда не доходят: обе их подписи — в `_UNCONTROLLED_TITLES`.
     """
     if session.symbol != symbol or session.timeframe != timeframe:
         return False
@@ -734,10 +799,10 @@ def _library() -> Path:
 #: модуль всегда, а `ui/` импортировать `app/` не имеет права
 #: (ARCHITECTURE.md §2).
 #:
-#: ⚠️ Ключ `--db` сюда пока не доходит: база берётся умолчанием
-#: (`market.default_db_path`). Владелец счёта запускает программу без ключа,
-#: но при `--db FILE` статистика шаблонов читалась бы из другой базы —
-#: записано в `BACKLOG.md`.
+#: База здесь — умолчание (`market.default_db_path`); ключ `--db` доводит
+#: до створки `app/main.py::_templates_read_runs_from` (D-052, 28.09.2026).
+#: ⚠️ Библиотека шаблонов (`userdata=_library`) при `--db` остаётся в папке
+#: по умолчанию — `BACKLOG.md`.
 backend.use(backend.Backend(
     changes=convert.settings_diff,
     runs=lambda sets: matching_runs(default_db_path(), sets),
@@ -758,6 +823,20 @@ def _indented(text: str) -> list[str]:
     return [f"{_STEP}{_STEP}{line}" for line in text.splitlines() if line.strip()]
 
 
+#: Что `--runs` пишет на месте времени конца у незакрытого прогона.
+#:
+#: ⚠️ Причин **две**, и фраза называет обе — это `D-066`. Прогон, снятый
+#: кнопкой «Отменить», и прогон, оборванный закрытием программы, в базе
+#: неотличимы: оба снимаются отменой задачи, и `RunLog.around` не закрывает
+#: ни тот, ни другой. Прежняя фраза называла только закрытие программы —
+#: и человек, нажавший «Отменить», читал о себе неправду. Различить их
+#: можно только причиной отмены, переданной снимающим (`task.cancel(msg)`).
+UNFINISHED_SAID: Final[str] = (
+    "не закрыт — прогон снят на середине: кнопкой «Отменить» "
+    "или закрытием программы"
+)
+
+
 def session_lines(session: JournalSession) -> list[str]:
     """Один прогон для консоли. Порядок строк — порядок вопросов человека.
 
@@ -768,7 +847,7 @@ def session_lines(session: JournalSession) -> list[str]:
     ended = (
         fmt_datetime(session.finished_at) + " МСК"
         if session.finished_at is not None
-        else "не закрыт — программу закрыли на середине прогона"
+        else UNFINISHED_SAID
     )
     lines = [
         f"Прогон {session.id} — {session.origin.label}",

@@ -96,7 +96,46 @@ def test_userdata_variable_works_only_in_a_test_run_from_sources(
         assert paths.USERDATA_ENV in paths.ignored_override()
 
 
+def test_userdata_variable_does_not_act_inside_an_appimage(
+    tmp_path: pathlib.Path, monkeypatch,
+) -> None:
+    """AppImage — поставка, даже если оба признака прогона выставлены.
+
+    Папка — рядом с образом, как у любого запуска AppImage, а не та, что
+    в переменной: иначе забытая переменная увела бы собранную программу
+    к базе без стоящей остановки робота и к другому замку «одна копия».
+    """
+    image = tmp_path / "Terminal.AppImage"
+    monkeypatch.setenv("APPIMAGE", str(image))
+    monkeypatch.setenv(paths.USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.setenv(paths.TEST_RUN_ENV, "1")
+    monkeypatch.setattr(paths, "_is_frozen", lambda: False)
+
+    assert paths.userdata_dir() == tmp_path.resolve() / "userdata"
+    assert paths.USERDATA_ENV in paths.ignored_override()
+
+
 def test_no_variable_no_line(monkeypatch) -> None:
     """Переменной нет — и сказать нечего: строка не должна появляться на каждом запуске."""
     monkeypatch.delenv(paths.USERDATA_ENV, raising=False)
     assert paths.ignored_override() == ""
+
+
+def test_a_base_named_by_a_key_is_named_in_the_line(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Стережёт: база, названная ключом вне папки данных, называется в строке.
+
+    `D-124`: у консольных запусков база бывает названа ключом (`--db`).
+    Фраза «база берётся из папки данных» была бы там неправдой — ровно там,
+    где человек ищет, куда делись его свечи.
+    """
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setenv(paths.USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(paths.TEST_RUN_ENV, raising=False)
+    elsewhere = tmp_path / "своя" / "candles.sqlite3"
+    line = paths.ignored_override(elsewhere)
+    assert str(elsewhere) in line, line
+    assert "база, журналы и остановка робота берутся из" not in line, line
+    usual = paths.ignored_override(paths.default_db_path())
+    assert usual == paths.ignored_override(), "база в папке данных — прежняя фраза"

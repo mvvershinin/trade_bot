@@ -35,6 +35,7 @@ from market import (
     Timeframe,
     asset_of,
     current_contract,
+    monthly_assets,
     pieces,
     rows_of_asset,
 )
@@ -71,7 +72,18 @@ def notice_of(store: CandleStore, configured: str, *, today: date) -> ContractNo
     except ContractError:
         # Код не квартальный фьючерс: цепочки у него нет, сверять не с чем.
         return ContractNotice(configured=configured)
-    if not rows_of_asset(store.contracts(), asset):
+    table = store.contracts()
+    if asset in monthly_assets(table):
+        # `D-127`: у месячного актива загрузка идёт по дням и цепочки
+        # не создаёт — обещать «узнает при загрузке» значило бы врать вечно.
+        return ContractNotice(
+            configured=configured,
+            trouble=f"У актива {asset} месячные контракты: квартальной цепочки "
+                    "у него нет, и какой контракт действующий, таблица контрактов "
+                    "не скажет. История грузится по дням; срок обращения кода "
+                    "сверяйте сами.",
+        )
+    if not rows_of_asset(table, asset):
         return ContractNotice(
             configured=configured,
             trouble=f"Цепочки {asset} в таблице контрактов нет: какой контракт "

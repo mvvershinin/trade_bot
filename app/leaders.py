@@ -250,6 +250,7 @@ def record(
         strategy=convert.strategy_settings(values),
         algorithm=convert.chosen_algorithm(values),
         app_version=version(),
+        program=runs_log.ProgramFields.of(values),
     )
     written: list[int] = []
     for one in made:

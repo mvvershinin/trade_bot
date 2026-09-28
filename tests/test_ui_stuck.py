@@ -499,6 +499,38 @@ def test_the_progress_bar_wraps_the_notice_instead_of_cutting_it(
     )
 
 
+def test_the_progress_dialog_gets_its_own_label_back_when_the_notice_goes(
+    benches,
+) -> None:
+    """Стережёт `B-044`: снятое «Не отвечает» уходит и с полоски хода.
+
+    Плашка над графиком гасла, а модальная полоска прогона продолжала
+    говорить «Не отвечает», пока ползла полоса: пустая строка выходила
+    из `show_stuck` до полосок. Во время прогона полоска — единственное,
+    что видно, и ложная тревога на ней не снималась никогда.
+
+    Проверяется прямыми вызовами, без `task.cancel()`: отмена задачи шлёт
+    «работа кончилась» и закрывает полоску раньше, чем её успеют прочесть.
+
+    Мутация: вернуть ранний `return` на пустой строке в `show_stuck` —
+    подпись останется «Не отвечает…», красная.
+    """
+    bench = benches()
+    window = bench.window
+    window._start_progress()  # noqa: SLF001 — то же делает кнопка прогона
+    bar = window._progress  # noqa: SLF001 — читаем то, что видит человек
+    own = bar.labelText()
+    window.show_stuck("Не отвечает: прогон робота по истории")
+    assert "Не отвечает" in bar.labelText(), "сообщение до полоски не дошло"
+    window.show_stuck("")
+    assert "Не отвечает" not in bar.labelText(), (
+        f"работа ожила, а полоска говорит: {bar.labelText()!r}"
+    )
+    assert bar.labelText() == own, (
+        f"полоска не вернула свою подпись: {bar.labelText()!r} вместо {own!r}"
+    )
+
+
 def test_a_healthy_wait_is_not_called_stuck(benches, loop) -> None:
     """Работа, подающая признаки жизни, застрявшей не считается.
 

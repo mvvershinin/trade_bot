@@ -281,6 +281,23 @@ def write_failure(error: BaseException) -> str:
     return "программа не смогла собрать файлы отчёта"
 
 
+#: Имя свойства полоски хода, в котором лежит её **собственная** подпись —
+#: та, что была до сообщения о застревании (`B-044`).
+OWN_LABEL = "терминал-своя-подпись"
+
+
+def _own_label(dialog: QProgressDialog, text: str) -> None:
+    """Подпись полоски по её собственному делу — показать и запомнить.
+
+    Запоминается затем, чтобы снятое сообщение «Не отвечает» было чем
+    заменить (`MainWindow.show_stuck`). Все три места, где полоска меняет
+    подпись сама, идут через эту функцию: пропустивший её оставил бы
+    после снятия тревоги устаревшую подпись.
+    """
+    dialog.setProperty(OWN_LABEL, text)
+    dialog.setLabelText(text)
+
+
 class _Banner(QLabel):
     """Крупная строка предупреждения над графиком.
 
@@ -1012,13 +1029,17 @@ class MainWindow(QMainWindow):
         рвущий соседнюю задачу (`B-026`, `_open_modal`). Плашка и подпись
         полоски вложенного цикла не поднимают.
         """
-        if not text:
+        if text:
+            self.stuck_banner.show_text(text, self.theme.danger)
+        else:
             self.stuck_banner.hide_text()
-            return
-        self.stuck_banner.show_text(text, self.theme.danger)
+        # ⚠️ Снятие сообщения идёт туда же, куда шло само сообщение (`B-044`).
+        # Прежде пустая строка гасила плашку и выходила до полосок: модальная
+        # полоска прогона продолжала говорить «Не отвечает», пока ползла
+        # полоса, — а во время прогона она единственное, что видно.
         for dialog in (self._progress, self._loading):
             if dialog is not None:
-                dialog.setLabelText(text)
+                dialog.setLabelText(text or str(dialog.property(OWN_LABEL) or ""))
 
     def _on_busy(self, busy: bool, what: str) -> None:
         """Длинная операция началась или кончилась.
@@ -1031,7 +1052,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(what if busy else "", 0 if busy else 1)
         if busy:
             if self._progress is not None:
-                self._progress.setLabelText(what)
+                _own_label(self._progress, what)
             return
         self._close_progress()
 
@@ -1364,7 +1385,7 @@ class MainWindow(QMainWindow):
         wrapping = QLabel(dialog)
         wrapping.setWordWrap(True)
         dialog.setLabel(wrapping)  # полоска забирает надпись себе
-        dialog.setLabelText(text)
+        _own_label(dialog, text)
         dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         dialog.setMinimumWidth(self.BAR_WIDTH)
@@ -1518,7 +1539,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Загрузка истории: {what}")
         if self._loading is not None:
             self._loading.setValue(percent)
-            self._loading.setLabelText(what)
+            _own_label(self._loading, what)
 
     def show_history_result(self, outcome: HistoryLoadOutcome) -> None:
         """Чем кончилась загрузка. Окно с ответом — всегда, даже на отказе.

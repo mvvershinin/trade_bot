@@ -511,12 +511,11 @@ def test_ignored_userdata_variable_is_said_in_the_journal(
     Ревью 27.09.2026, находка 9: молча проигнорированная переменная —
     человек ищет базу и остановку робота в папке, которой программа не видит.
     """
-    from app.main import _wire_settings_and_log
+    from app.main import _announce
     from market.paths import TEST_RUN_ENV, USERDATA_ENV
 
     monkeypatch.setenv(USERDATA_ENV, str(tmp_path / "чужая"))
     monkeypatch.delenv(TEST_RUN_ENV, raising=False)
-    store = SettingsStore(tmp_path / "userdata")
     values = Settings(log_directory=str(tmp_path / "логи"))
     said: list[DecisionRow] = []
 
@@ -526,10 +525,7 @@ def test_ignored_userdata_variable_is_said_in_the_journal(
         port = HistoryPort(worker, values=values, days=0, sanitize=redact)
         port.decision_appended.connect(said.append)
         try:
-            _wire_settings_and_log(
-                port, store, store.load(), values,
-                level=convert.DecisionLevel.WARNING,
-            )
+            _announce(port, database, level=convert.DecisionLevel.WARNING)
         finally:
             await port.aclose()
             await worker.close()
@@ -539,3 +535,41 @@ def test_ignored_userdata_variable_is_said_in_the_journal(
     about = [row for row in said if row.event == "Папка данных"]
     assert about, "проигнорированная переменная папки данных в журнале не названа"
     assert USERDATA_ENV in about[0].reason
+
+
+def test_ignored_userdata_line_names_the_database_given_by_the_key(
+    loop, database, tmp_path, monkeypatch
+) -> None:
+    """Стережёт `D-124` в окне: база названа ключом — строка называет её, не папку.
+
+    При `--database FILE` и выставленной `TERMINAL_USERDATA` журнал писал
+    «база, журналы и остановка робота берутся из <папка по умолчанию>» —
+    неправда ровно там, где человек ищет свои данные.
+
+    Мутация: `ignored_override()` без базы в `_announce` —
+    в строке снова папка по умолчанию, пути базы нет.
+    """
+    from app.main import _announce
+    from market.paths import TEST_RUN_ENV, USERDATA_ENV
+
+    monkeypatch.setenv(USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(TEST_RUN_ENV, raising=False)
+    values = Settings(log_directory=str(tmp_path / "логи"))
+    said: list[DecisionRow] = []
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        port.decision_appended.connect(said.append)
+        try:
+            _announce(port, database, level=convert.DecisionLevel.WARNING)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+
+    (about,) = [row for row in said if row.event == "Папка данных"]
+    assert str(database) in about.reason, f"база из ключа не названа: {about.reason}"
+    assert "берутся из" not in about.reason, f"названа папка по умолчанию: {about.reason}"

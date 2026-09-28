@@ -682,6 +682,37 @@ def test_a_defect_inside_the_executor_is_not_called_silence() -> None:
 @pytest.mark.parametrize(
     "error",
     [
+        ZeroDivisionError("деление на ноль в цене исполнения"),
+        ValueError("объём исполнения отрицательный"),
+        TypeError("цена пришла строкой"),
+        KeyError("order-1"),
+        IndexError("list index out of range"),
+        AttributeError("у свечи нет поля close"),
+        NameError("name 'price' is not defined"),
+    ],
+    ids=["arithmetic", "value", "type", "key", "index", "attribute", "name"],
+)
+def test_every_kind_of_code_defect_in_the_executor_is_named_a_defect(
+    error: Exception,
+) -> None:
+    """`B-048`: «сломана арифметика» — не одно `AssertionError`.
+
+    Список видов записан здесь руками, а не взят из `engine.runner`: сторож
+    из величин проверяемого правила зеленел бы вместе с ним. Выпади вид
+    из перечня движка — такой дефект снова назвали бы молчанием связи.
+    """
+    engine, lines = _halt_on_fills(error)
+
+    assert engine.halted
+    for text in (engine.halted, f"{lines[-1].event}. {lines[-1].reason}"):
+        assert "Ошибка внутри исполнителя" in text, text
+        assert f"{type(error).__name__}: {error}" in text, text
+        assert "не ответил" not in text, "дефект назван молчанием"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
         ConnectionError("связь с брокером потеряна"),
         TimeoutError("ответ брокера не пришёл за 5 с"),
         _LinkDown("отказ боевого слоя"),

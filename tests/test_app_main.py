@@ -432,3 +432,49 @@ def test_the_program_speaks_russian_without_a_locale() -> None:
     ascii_out.flush()
     printed = ascii_out.buffer.getvalue().decode("utf-8")  # type: ignore[attr-defined]
     assert "Базы свечей нет" in printed, printed
+
+
+def test_the_templates_window_reads_runs_from_the_database_given_by_key(
+    tmp_path: pathlib.Path, monkeypatch, qapp
+) -> None:
+    """Стережёт `D-052`: ключ `--db` доходит до окна шаблонов.
+
+    Створку двери (`ui/backend.py`) ставит `app/runs.py` при импорте, и базу
+    она берёт умолчанием. Без проводки в `_run` статистика шаблонов при
+    `--db FILE` читалась бы из другой базы, и человек решил бы, что набор
+    не гонялся.
+
+    Сборка идёт настоящим `_run` и обрывается сразу после проводки: папка
+    данных «не готова». Дальше окна и базы проверке ничего не нужно.
+
+    Мутация: убрать вызов `_templates_read_runs_from` из `_database_ready` (или отдать
+    створке `default_db_path()`) — прогоны читаются не из поданной базы,
+    красная.
+    """
+    import argparse
+
+    import app.main as main_module
+    from ui import backend
+    from ui.models import Settings
+
+    database = tmp_path / "по-ключу" / "candles.sqlite3"
+    before = backend.current()
+    monkeypatch.setattr(main_module, "_userdata_ready", lambda _folder: False)
+    try:
+        # Без цикла событий: до обрыва `_run` не ждёт ничего, и корутина
+        # кончается первым же шагом. `asyncio.run` здесь снял бы цикл,
+        # поставленный соседним тестом того же процесса.
+        work = main_module._run(None, argparse.Namespace(), database)  # noqa: SLF001 — сборка окна целиком, как её зовёт `main`
+        with pytest.raises(StopIteration) as finished:
+            work.send(None)
+        assert finished.value.value == 1, (
+            "сборка не оборвалась там, где проверка её обрывает"
+        )
+        door = backend.current()
+        assert door is not None, "створки нет вовсе"
+        said = door.runs([Settings()]).trouble
+    finally:
+        backend.use(before)
+    assert str(database) in said, (
+        f"окно шаблонов спрашивает прогоны не у базы из ключа --db: {said!r}"
+    )

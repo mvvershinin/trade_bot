@@ -511,3 +511,52 @@ def test_stitch_names_the_contracts_it_has_no_minutes_for(tmp_path: pathlib.Path
     )
     assert code == 1
     assert "AAA, BBB" in out.getvalue()
+
+
+# -- переменная папки данных вне теста (D-124) -----------------------------
+
+
+def _outside_a_test_run(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """Переменная папки данных выставлена, а признака тестового прогона нет."""
+    from market import paths
+
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setenv(paths.USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(paths.TEST_RUN_ENV, raising=False)
+
+
+def test_the_fetch_key_says_the_data_variable_does_not_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys
+) -> None:
+    """Стережёт: `--fetch` говорит в stderr, что переменная папки данных не действует.
+
+    `D-124`: окно говорило это журналом, а `--fetch` молчал — человек,
+    выставивший переменную, искал бы загруженные свечи не там.
+    Мутация, обязанная ронять проверку: убрать `say_ignored_override`
+    из `run_from_arguments`.
+    """
+    from market import paths
+
+    _outside_a_test_run(monkeypatch, tmp_path)
+    monkeypatch.setattr("app.fetch.fetch_history", lambda *a, **k: 0)
+    out = io.StringIO()
+    run_from_arguments(arguments(), tmp_path / "c.sqlite3", out=out)
+    assert paths.USERDATA_ENV in capsys.readouterr().err
+    assert paths.USERDATA_ENV not in out.getvalue(), "строка попала в выдачу, а не в stderr"
+
+
+def test_the_chain_entry_says_the_data_variable_does_not_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys
+) -> None:
+    """Стережёт: `python3 -m app.fetch` говорит в stderr о недействующей переменной.
+
+    Мутация, обязанная ронять проверку: убрать `say_ignored_override`
+    из `app.fetch.main`.
+    """
+    from app import fetch
+    from market import paths
+
+    _outside_a_test_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(fetch, "build_chain", lambda *a, **k: 0)
+    fetch.main(["--legs", "MXM6,MXU6", "--db", str(tmp_path / "chain.sqlite3"), "--no-fetch"])
+    assert paths.USERDATA_ENV in capsys.readouterr().err
