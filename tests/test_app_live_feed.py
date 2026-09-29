@@ -1808,6 +1808,49 @@ def test_the_feed_names_the_first_minute_of_every_session_exactly_once(
     ], f"объявлены не те минуты: {heard.leading}"
 
 
+@pytest.mark.parametrize(
+    ("ticker", "timeframe"),
+    [
+        pytest.param("MXU6", "M5", id="m5-in-m1-channel"),
+        pytest.param("SiU6", "M1", id="foreign-ticker"),
+    ],
+)
+def test_the_first_minute_of_a_session_is_set_by_our_own_snapshot(
+    monkeypatch, ticker: str, timeframe: str
+) -> None:
+    """Границу догрузки задаёт первый **свой** снимок захода, а не первый пришедший (`D-023`).
+
+    Чужой снимок раньше своего сдвинул бы границу левее настоящей, и минуты
+    между ними не догрузились бы никогда.
+    """
+    heard = Heard()
+    stream = FakeStream(
+        FakeSocket(
+            [
+                wire(dataclasses.replace(
+                    snapshot(MINUTE_A, close=100.0, turnover=100.0),
+                    ticker=ticker, timeframe=timeframe,
+                )),
+                wire(snapshot(MINUTE_C, close=100.0, turnover=100.0)),
+            ]
+        )
+    )
+    feed = feed_of(monkeypatch, stream, FakeWorker(), heard)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(lambda: len(heard.growing) == 1, "свой снимок принят")
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+
+    assert heard.leading == [MINUTE_C.astimezone(MSK)], (
+        f"граница догрузки поставлена не по своему снимку: {heard.leading}"
+    )
+
+
 def test_the_link_starts_the_backfill_on_every_connection(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:

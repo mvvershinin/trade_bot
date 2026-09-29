@@ -48,9 +48,16 @@ def test_the_painter_surface_lays_candles_out_by_their_axis_mark(qapp) -> None:
             "свечи встали не на отметки своих открытий — весь график сдвинут"
         )
 
-        extra = data.candles[-1]
+        # Свеча **новая**, следующая за последней: прибавление последней свечи
+        # того же набора давало ту же отметку и при пустом `append_candle`
+        # (`D-012`, мутация `append_candle` → `return` проходила зелёной).
+        step = data.candles[-1].opens_at - data.candles[-2].opens_at
+        extra = replace(data.candles[-1], opens_at=data.candles[-1].opens_at + step)
         surface.append_candle(extra)
-        assert surface._line.stamps[-1] == extra.opens_at.timestamp()  # noqa: SLF001 — то же
+        after = list(surface._line.stamps)  # noqa: SLF001 — то же
+        assert after == [*marks, extra.opens_at.timestamp()], (
+            "добавленная свеча не встала справа на отметку своего открытия"
+        )
 
         surface.update_last_candle(data.candles[0])
         assert surface._line.stamps[-1] == data.candles[0].opens_at.timestamp()  # noqa: SLF001

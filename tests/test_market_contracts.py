@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import io
 import json
 import pathlib
 import sqlite3
@@ -19,6 +21,7 @@ from datetime import date, datetime, timedelta
 import pytest
 from market_helpers import FakeTransport, minute, msk, no_sleep
 
+from app.fetch import adopt_into_working_base
 from app.fetch import main as fetch_main
 from market.candles import MSK, Candle
 from market.chain import Leg, legs_of_chain
@@ -68,8 +71,9 @@ def daily_body(days: Mapping[date, float]) -> bytes:
     return json.dumps({"candles": {"columns": columns, "data": rows}}).encode()
 
 
-def description_body(last: str | None) -> bytes:
-    rows = [["SECID", "Код", "X", "string"]]
+def description_body(last: str | None, secid: str = "MXU6") -> bytes:
+    """Описание, как у ISS: `SECID` — код биржи в её регистре, не набранный."""
+    rows = [["SECID", "Код", secid, "string"]]
     if last is not None:
         rows.append(["LSTTRADE", "Последний день обращения", last, "date"])
     columns = ["name", "title", "value", "type"]
@@ -118,11 +122,13 @@ class Exchange:
         query = dict(urllib.parse.parse_qsl(parsed.query))
         secid = parsed.path.rsplit("/", 2)[-1].removesuffix(".json")
         if query.get("iss.only") == "description":
-            if secid not in self.known:
+            # Регистр ISS не различает (живой запрос 29.09.2026).
+            canonical = {code.lower(): code for code in self.known}.get(secid.lower())
+            if canonical is None:
                 return json.dumps({"description": {
                     "columns": ["name", "title", "value", "type"], "data": [],
                 }}).encode()
-            return description_body(self.known[secid])
+            return description_body(self.known[canonical], canonical)
         secid = parsed.path.rsplit("/", 2)[-2]
         if query["interval"] == "24":
             first = date.fromisoformat(query["from"])
@@ -244,6 +250,38 @@ def test_short_refresh_keeps_the_start_written_by_the_whole_chain(store: CandleS
     (mxu6,) = [row for row in store.contracts() if row.symbol == "MXU6"]
     assert mxu6.active_from == date(2026, 6, 8)
     assert mxu6.active_to == date(2026, 9, 16)
+
+
+def test_a_far_code_the_exchange_does_not_know_drops_out_aloud(store: CandleStore) -> None:
+    """Биржа не знает MXH7 — он выпадает строкой человеку, MXU6 и MXZ6 уточнены (`B-054`)."""
+    exchange = Exchange()
+    rows = refresh_contracts(
+        store, exchange.client, ["MXU6", "MXZ6", "MXH7"], market=FUTURES, now=NOW
+    )
+    said = rows.said
+
+    by_symbol = {row.symbol: row for row in rows}
+    assert "MXH7" not in by_symbol
+    assert by_symbol["MXU6"].archived
+    assert by_symbol["MXZ6"].active_from == date(2026, 9, 17)
+    assert by_symbol["MXZ6"].last_trade_day == date(2026, 12, 17)
+    assert by_symbol["MXZ6"].current
+    assert len(said) == 1 and "MXH7" in said[0], f"незнакомый код не назван: {said}"
+    asked_volumes = [url for url in exchange.transport.urls if "interval=24" in url]
+    assert not any("/MXH7/" in url for url in asked_volumes), (
+        "объёмы незнакомого кода спрошены, будто он в цепочке"
+    )
+
+
+def test_an_unknown_code_inside_the_chain_is_refused(store: CandleStore) -> None:
+    """Посреди цепочки незнакомый код не выбрасывается: рубеж встал бы между несоседями."""
+    exchange = Exchange(known={"MXM7": "2027-06-17"})
+    with pytest.raises(ContractError, match="MXH7"):
+        refresh_contracts(
+            store, exchange.client, ["MXU6", "MXZ6", "MXH7", "MXM7"],
+            market=FUTURES, now=NOW,
+        )
+    assert store.contracts() == [], "отказ записал таблицу"
 
 
 def test_expired_contract_is_not_given_out_as_current(store: CandleStore) -> None:
@@ -419,6 +457,98 @@ def test_adopt_command_fills_the_working_base(tmp_path: pathlib.Path) -> None:
         # Без биржи срок обращения не проверен — действующим его не отдают.
         with pytest.raises(ContractError, match="не проверен"):
             current_contract(working, today=date(2026, 1, 20), asset="MX")
+
+
+def _pair_source(path: pathlib.Path, old: str, new: str, *, roll: date) -> None:
+    """База цепочки из двух контрактов: `new` обгоняет `old` в день `roll`."""
+    with CandleStore(path) as chain:
+        for shift in range(-5, 5):
+            moment = roll + timedelta(days=shift)
+            if moment.weekday() >= 5:
+                continue
+            ahead = moment >= roll
+            chain.put_minutes(old, [minute(msk(moment.year, moment.month, moment.day, 10),
+                                           volume=5 if ahead else 50)], Source.ISS)
+            chain.put_minutes(new, [minute(msk(moment.year, moment.month, moment.day, 10),
+                                           volume=50 if ahead else 5)], Source.ISS)
+            chain.mark_days_requested(old, [moment], now=NOW)
+            chain.mark_days_requested(new, [moment], now=NOW)
+
+
+def test_adopt_keeps_the_case_of_the_code(tmp_path: pathlib.Path) -> None:
+    """`--legs SiH6,SiM6` переносится как `SiM6`, а не `SIM6` (`D-128`).
+
+    Код биржи — `SiZ6`; ISS регистр не различает, а база различает, и `SIM6`
+    лёг бы отдельным инструментом, которого окно не найдёт.
+    """
+    source, target = tmp_path / "chain.sqlite3", tmp_path / "candles.sqlite3"
+    _pair_source(source, "SiH6", "SiM6", roll=date(2026, 3, 11))
+    code = fetch_main(["--legs", "SiH6,SiM6", "--adopt", "--no-fetch",
+                       "--db", str(source), "--target", str(target)])
+    assert code == 0
+    with CandleStore(target) as working:
+        assert {row.symbol for row in working.contracts()} == {"SiH6", "SiM6"}
+        assert working.minutes("SiM6"), "минуты SiM6 не перенесены под своим кодом"
+
+
+def test_adopt_without_the_exchange_says_the_current_one_may_be_expired(
+    tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--adopt --no-fetch`: у действующего нет срока — вслух, что он мог истечь (`D-130`)."""
+    source, target = tmp_path / "chain.sqlite3", tmp_path / "candles.sqlite3"
+    _chain_source(source)
+    fetch_main(["--legs", "MXH6,MXM6", "--adopt", "--no-fetch",
+                "--db", str(source), "--target", str(target)])
+    printed = capsys.readouterr().out
+    warned = [line for line in printed.splitlines() if "возможно, контракт уже истёк" in line]
+    assert len(warned) == 1 and "MXM6" in warned[0], f"предупреждения нет:\n{printed}"
+    assert "без --no-fetch" in warned[0], "не сказано, чем уточнить срок"
+
+
+def test_adopt_with_the_exchange_names_an_unknown_far_code_and_stays_quiet_on_expiry(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """С биржей: срок MXZ6 известен — молчание о сроке; MXH7 неизвестен — строка (`B-054`)."""
+    monkeypatch.setattr(
+        "app.fetch.refresh_contracts", functools.partial(refresh_contracts, now=NOW)
+    )
+    source, target = tmp_path / "chain.sqlite3", tmp_path / "candles.sqlite3"
+    _pair_source(source, "MXU6", "MXZ6", roll=date(2026, 9, 17))
+    out = io.StringIO()
+
+    code = adopt_into_working_base(
+        source, target, ["MXU6", "MXZ6", "MXH7"], out=out, client=Exchange().client
+    )
+
+    printed = out.getvalue()
+    assert code == 0, printed
+    assert "возможно, контракт уже истёк" not in printed
+    assert "Биржа не знает контракта MXH7" in printed, f"незнакомый код не назван:\n{printed}"
+    with CandleStore(target) as working:
+        assert current_contract(working, today=NOW.date(), asset="MX").symbol == "MXZ6"
+
+
+def test_adopt_with_the_exchange_takes_the_exchange_codes(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Стережёт: `--legs mxu6,mxz6` переносит `MXU6`, `MXZ6`, а не пустоту (`D-128`).
+
+    Мутация, обязанная ронять проверку: убрать приведение кодов
+    в `adopt_into_working_base`.
+    """
+    monkeypatch.setattr(
+        "app.fetch.refresh_contracts", functools.partial(refresh_contracts, now=NOW)
+    )
+    source, target = tmp_path / "chain.sqlite3", tmp_path / "candles.sqlite3"
+    _pair_source(source, "MXU6", "MXZ6", roll=date(2026, 9, 17))
+    out = io.StringIO()
+    code = adopt_into_working_base(
+        source, target, ["mxu6", "mxz6"], out=out, client=Exchange().client
+    )
+    assert code == 0, out.getvalue()
+    with CandleStore(target) as working:
+        assert {row.symbol for row in working.contracts()} == {"MXU6", "MXZ6"}
+        assert working.minutes("MXZ6"), "минуты не перенесены под кодом биржи"
 
 
 def test_open_contract_with_unknown_last_day_is_not_given_out(store: CandleStore) -> None:

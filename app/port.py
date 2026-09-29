@@ -945,11 +945,10 @@ class HistoryPort(TerminalPort):
         self._clock = clock
         self._worker = worker
         self._sanitize = sanitize
-        self._values = values or Settings()
+        self._values, self._engine_settings, refused = _startup_settings(values, mode)
         self._mode = mode
         self._days = days
         self._until = until
-        self._engine_settings = convert.engine_settings(self._values, self._mode)
         self._notes: list[DecisionRow] = []
         self._journal: tuple[DecisionRow, ...] = ()
         self._run: HistoryRun | None = None
@@ -1016,6 +1015,28 @@ class HistoryPort(TerminalPort):
         self._point = _Point()  # стоимость пункта; разбор полей — в `_Point`
         self._history = _History()  # загрузка истории; разбор полей — в `_History`
         self._stuck = _Stuck.watching(stuck_after)  # часы долгих работ; см. `_Stuck`
+        self._take_startup_substitution(values, refused)  # `B-050`: после сборки
+
+    def _take_startup_substitution(self, given: Settings | None, refused: str) -> None:
+        """Настройки из файла приняты не целиком (`B-050`): запомнить и сказать.
+
+        Зовётся последней строкой сборки: `note` нужны часы, чистка и поля
+        хода, которых раньше нет. Окно к сигналу в этот момент ещё не
+        подключено, и это не потеря: строка лежит в `_notes` и уходит в окно
+        с журналом первого же прохода (`_publish_journal`).
+
+        `_file_holds` — что лежит в файле вместо подменённого. Подмена живёт
+        в памяти и в журнале, а файл владельца счёта не трогает, пока человек
+        сам не нажал «Применить» (`for_file`).
+        """
+        self._file_holds: dict[str, Any] = {
+            item.name: getattr(given, item.name)
+            for item in dataclasses.fields(Settings)
+            if given is not None
+            and getattr(given, item.name) != getattr(self._values, item.name)
+        }
+        if refused:
+            self.note("Настройки не приняты", refused, DecisionLevel.ERROR)
 
     # ------------------------------------------------------- выход наружу
 
@@ -1262,8 +1283,32 @@ class HistoryPort(TerminalPort):
             if changes else f"Режим «{mode.label}» уже стоял",
         )
 
-    def apply_settings(self, settings: Settings) -> None:
-        """Принять настройки окна и пересчитать прогон.
+    @property
+    def values(self) -> Settings:
+        """Настройки, принятые портом, — после подмены при сборке (`B-050`).
+
+        Окно собирается с ними, а не с прочитанным из файла: иначе до первого
+        открытия настроек оно держало бы вариант, которого робот не умеет,
+        и тестер, шаблоны, календарь и плашка контракта отказывали бы
+        или несли его дальше. В файл по-прежнему идёт `for_file`.
+        """
+        return self._values
+
+    def for_file(self, values: Settings) -> Settings:
+        """Настройки, которые можно записать в файл, — без подмены при сборке.
+
+        Поле, подменённое при сборке порта (`_startup_settings`, `B-050`),
+        уходит в файл тем, что в нём и лежало, пока человек не применил
+        настройки сам. Иначе файл переписывала бы первая же запись, которую
+        человек не делал: ответ биржи о стоимости пункта (`_point_taken`)
+        или открытие окна настроек (`request_settings`). Отпускает подмену
+        только `apply_settings(by_person=True)`; программа, меняющая настройки
+        сама (`_point_taken`), зовёт его с `by_person=False`.
+        """
+        return dataclasses.replace(values, **self._file_holds) if self._file_holds else values
+
+    def apply_settings(self, settings: Settings, *, by_person: bool = True) -> None:
+        """Принять настройки окна и пересчитать прогон. `by_person` — см. `for_file`.
 
         Разбор строк окна — громкий: незнакомый размер свечи и пустой
         инструмент отвергаются с объяснением, а не подменяются умолчанием.
@@ -1324,20 +1369,9 @@ class HistoryPort(TerminalPort):
         guards = convert.guard_changes(self._values, settings)
         self._values = settings
         self._engine_settings = fresh
-        verdict = self._expiry(settings.instrument)
-        if verdict.kind.refused:
-            # Новый код брокеру не отдаётся вовсе: подписка на прежнем
-            # не остаётся (она перестала бы совпадать с окном, `B-020`),
-            # а снимается вслух. Живого хода без подписки нет.
-            if self._watch.observing:
-                self.stream(False)
-            self._refuse("Поток котировок не переключён", verdict.text)
-        elif self._retarget is not None:
-            # Поток котировок идёт за настройкой, а не остаётся на инструменте,
-            # выбранном при сборке (`B-020`). Зовётся **всегда**, даже когда
-            # инструмент тот же: решение «менять или нет» принимает тот, кто
-            # знает, на что подписан сейчас, а порт этого не знает.
-            self._retarget(convert.instrument_of(settings.instrument))
+        if by_person:  # применённое человеком — его выбор, и в файл идёт оно
+            self._file_holds.clear()
+        self._follow_instrument(settings.instrument)
         self._send(self.settings_applied, settings)
         self._send(self.algorithms_changed, convert.algorithms(settings))
         # Инструмент мог смениться — плашка «действующий контракт» обязана
@@ -1356,6 +1390,23 @@ class HistoryPort(TerminalPort):
         else:
             reason = "Значения совпали с прежними"
         self._apply("Настройки изменены", reason)
+
+    def _follow_instrument(self, instrument: str) -> None:
+        """Поток котировок — за инструментом только что принятых настроек."""
+        verdict = self._expiry(instrument)
+        if verdict.kind.refused:
+            # Новый код брокеру не отдаётся вовсе: подписка на прежнем
+            # не остаётся (она перестала бы совпадать с окном, `B-020`),
+            # а снимается вслух. Живого хода без подписки нет.
+            if self._watch.observing:
+                self.stream(False)
+            self._refuse("Поток котировок не переключён", verdict.text)
+        elif self._retarget is not None:
+            # Поток котировок идёт за настройкой, а не остаётся на инструменте,
+            # выбранном при сборке (`B-020`). Зовётся **всегда**, даже когда
+            # инструмент тот же: решение «менять или нет» принимает тот, кто
+            # знает, на что подписан сейчас, а порт этого не знает.
+            self._retarget(convert.instrument_of(instrument))
 
     def request_settings(self) -> None:
         """Текущие настройки и текущее правило робота словами.
@@ -1852,15 +1903,23 @@ class HistoryPort(TerminalPort):
         это недокачкой. Цепочка до контракта включительно отвечает на вопрос
         «стал ли он ближним» прямо. Месячный актив (`ChainNotQuarterly`)
         укороченная цепочка квартальным не сделает — он летит дальше как есть.
+
+        Код с края цепочки, которого биржа не знает, выпадает без отказа
+        (`B-054`), и сказать об этом человеку больше некому: слой данных
+        отдаёт фразу в `said`, порт кладёт её в журнал решений. Иначе
+        прежний громкий отказ стал бы тихим частичным успехом.
         """
         try:
-            return await self._worker.refresh_contracts(chain, market=FUTURES, now=now)
+            rows = await self._worker.refresh_contracts(chain, market=FUTURES, now=now)
         except ChainNotQuarterly:
             raise
         except ContractError:
-            return await self._worker.refresh_contracts(
+            rows = await self._worker.refresh_contracts(
                 chain[: chain.index(symbol) + 1], market=FUTURES, now=now
             )
+        for text in rows.said:
+            self.note("Контракт не уточнён у биржи", text, DecisionLevel.WARNING)
+        return rows
 
     def _expiry(self, instrument: str) -> ExpiryVerdict:
         """Срок кода по последней прочитанной таблице контрактов."""
@@ -2648,7 +2707,8 @@ class HistoryPort(TerminalPort):
         ):
             return
         self.apply_settings(
-            self._values.replace(ruble_per_point=rubles, ruble_per_point_source=told)
+            self._values.replace(ruble_per_point=rubles, ruble_per_point_source=told),
+            by_person=False,
         )
 
     def _point_trouble(self, reason: str) -> None:
@@ -2941,14 +3001,7 @@ class HistoryPort(TerminalPort):
         except Exception as error:
             # Та же причина, что в `_save_halt`: человеку нужна фраза, а не тип.
             log.exception("остановка робота не прочитана из базы")
-            self.note(
-                "Остановка робота и база",
-                "Не удалось прочитать, был ли робот остановлен в прошлый раз. "
-                "Если он был остановлен, программа об этом сейчас не знает — "
-                "посмотрите журнал решений за прошлый запуск, прежде чем "
-                f"запускать робота. Причина отказа базы: {error}",
-                DecisionLevel.WARNING,
-            )
+            self._halt_unread(error)
             return
         if not standing:
             return
@@ -2966,6 +3019,45 @@ class HistoryPort(TerminalPort):
         self._watch.key = None
         self.note(_restored_halt_event(standing), _restored_halt_words(standing),
                   DecisionLevel.ERROR)
+
+    def _halt_unread(self, error: Exception) -> None:
+        """Остановку прочитать не удалось — робот стоит (`D-091`).
+
+        Неизвестно, стоял ли запрет, — значит стоял. Прежде здесь была строка
+        `WARNING`, и робот поднимался **неостановленным**: предохранитель,
+        поставленный вчера по дневному лимиту или по неизвестному исходу
+        заявки, молча пропадал ровно при старте, среди прочих строк.
+
+        Причина стоит **только в памяти**, а не в базе, и это не упущение:
+        база только что не прочиталась, и отказ записи в неё дал бы вторую
+        строку «после перезапуска запрет не восстановится» — неправду, потому
+        что при следующем запуске чтение будет спрошено заново и, не удавшись,
+        остановит робота снова. Путь `halt` поэтому не годится.
+
+        Вид — `ACCOUNT`, «состояние счёта неизвестно». Из прошлых причин
+        самая требовательная — неизвестный исход команды брокеру, и снимать
+        её можно только после похода к брокеру. Какие причины стояли,
+        неизвестно, поэтому требуется самое строгое из действий.
+
+        Хвост тот же, что у удачного чтения и у `halt` (`said`, `_watch.key`,
+        строка `ERROR`), но общим помощником не вынесен: `halt` пишет в базу
+        и сам заводит прогон, удачное чтение ставит много причин разом
+        с пометкой «из прошлого сеанса», а здесь одна причина без записи.
+        Помощник с флагами на эти различия был бы хуже трёх коротких тел.
+        """
+        reason = (
+            "Не удалось прочитать из базы, был ли робот остановлен в прошлый "
+            "раз, поэтому он остановлен сейчас: неизвестно, стоял ли запрет, — "
+            "значит стоял. Прежде чем возобновлять, посмотрите журнал решений "
+            "за прошлый запуск и позицию у брокера. «Возобновить работу» здесь "
+            "означает, что вы проверили и согласны работать без остановок "
+            f"прошлого запуска. Причина отказа базы: {error}"
+        )
+        if self._halt.add(reason):
+            self._halt.marks[reason] = _Mark(kind=HaltKind.ACCOUNT, at=self._clock())
+        self._halt.said = self._halt.reason
+        self._watch.key = None
+        self.note("Остановка робота и база", reason, DecisionLevel.ERROR)
 
     def _say_no_restart(self) -> None:
         """Сказать однажды: ход не пересобран, потому что робот остановлен.
@@ -4134,7 +4226,11 @@ class HistoryPort(TerminalPort):
             # Закреплённый отрезок обязан быть виден всё время, пока он стоит:
             # живых свечей на него не приходит, и без плашки это неотличимо
             # от потерянной связи (`_Span`).
-            history_span=_span_note(self._back.span),
+            history_span=_span_note(
+                self._back.span,
+                None if candles is None or self._back.span is None
+                else convert.run_days(candles),
+            ),
             day_profit_rub=day.net_profit if day is not None else None,
             day_commission_rub=day.commission if day is not None else None,
             day_trades=day.trades if day is not None else None,
@@ -4382,7 +4478,52 @@ def _rubles(value: float) -> str:
     return (text or "0").replace(".", ",")
 
 
-def _span_note(span: _Span | None) -> str:
+def _startup_settings(
+    given: Settings | None, mode: Mode
+) -> tuple[Settings, EngineSettings, str]:
+    """Настройки для сборки порта: движок обязан их принять, программа — открыться.
+
+    `B-050`: файл настроек укладывает любое значение перечисления, а движок
+    принимает не все (`AfterTakeProfit.unavailable`). Прежде отказ летел
+    из конструктора порта, и программа не открывалась вовсе — не «настройки
+    не приняты», а трассировка вместо окна.
+
+    Поле с невыполнимым вариантом ставится в умолчание программы, остальные
+    остаются прочитанными. Третье значение — фраза для журнала, пусто, если
+    подменять не пришлось. Причина берётся из самого отказа движка: вторая
+    формулировка одной причины разошлась бы с первой.
+
+    ⚠️ Отказ, который подменой не лечится (программа собрана несогласованно,
+    `convert._ENGINE_GAP`), не глотается: чинить его значениями настроек
+    нечем, и работать с ним нельзя.
+    """
+    values = given or Settings()
+    try:
+        return values, convert.engine_settings(values, mode), ""
+    except convert.SettingsRefused as refusal:
+        defaults = Settings()
+        fixed = {
+            item.name: getattr(defaults, item.name)
+            for item in dataclasses.fields(values)
+            if getattr(getattr(values, item.name), "unavailable", "")
+        }
+        if not fixed:
+            raise
+        repaired = dataclasses.replace(values, **fixed)
+        chosen = ", ".join(
+            f"«{getattr(value, 'label', value)}»" for value in fixed.values()
+        )
+        return repaired, convert.engine_settings(repaired, mode), (
+            f"В файле настроек выбрано то, чего робот не умеет. {refusal} "
+            f"Вместо этого поставлено умолчание программы: {chosen}; остальные "
+            "настройки из файла в силе. Файл настроек не изменён: умолчание "
+            "запишется в него, когда вы сами измените настройки — «Применить», "
+            "шаблон, день в календаре, переход на контракт. Другой вариант "
+            "выбирается в окне настроек."
+        )
+
+
+def _span_note(span: _Span | None, days: int | None = None) -> str:
     """Закреплённый отрезок словами — для плашки окна. Пусто, если не закреплён.
 
     Текст один на все места, где об отрезке надо сказать: разные формулировки
@@ -4391,9 +4532,12 @@ def _span_note(span: _Span | None) -> str:
     if span is None:
         return ""
     made = f", настройки: {span.source}" if span.source else ""
+    # Число дней — то же, что в отчёте (`convert.run_days` по тем же свечам):
+    # отчёт закрыт, а плашка висит, и главное число не должно уходить с ним.
+    counted = f", торговых дней: {days}" if days is not None else ""
     return (
         f"Показан прогон на истории: {_when(span.since)} — {_when(span.until)} "
-        f"МСК{made}. Живые свечи на этот отрезок не приходят."
+        f"МСК{counted}{made}. Живые свечи на этот отрезок не приходят."
     )
 
 

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import sqlite3
 from datetime import date, datetime, time, timedelta
@@ -19,14 +20,17 @@ from backtest.__main__ import (
     COMMISSION,
     DEPTH,
     PACE,
+    _arguments,
     _bars,
     _confirm,
+    _cut,
     _days_of,
     _notes,
     _pace,
     _periods,
     _plan,
     _snapshot,
+    _table,
     _trim,
     main,
 )
@@ -174,6 +178,125 @@ def test_the_series_reaches_back_depth_days_from_the_clock_not_further(
     assert days == {fresh}, f"в ряд попали не те дни: {sorted(days)}"
 
 
+def _old_and_fresh(tmp_path) -> tuple[pathlib.Path, date, date]:
+    """База с днём старше глубины по умолчанию от `NOW` и днём внутри неё."""
+    old, fresh = date(2025, 6, 16), date(2026, 8, 17)
+    assert NOW - datetime.combine(old, time(0), tzinfo=MSK) > DEPTH
+    file = tmp_path / "cut.sqlite3"
+    with CandleStore(file) as store:
+        for day in (old, fresh):
+            store.put_minutes(SYMBOL, _minutes(day, count=340), Source.ISS)
+    return file, old, fresh
+
+
+def test_the_days_key_reaches_further_back_than_the_default(tmp_path) -> None:
+    """Стережёт `D-056`: ключ `--days` действительно задаёт глубину ряда.
+
+    Мутация, обязанная ронять проверку: в `_bars` брать `DEPTH` вместо
+    переданной глубины — или не передавать `args.depth` из `_work`.
+    """
+    file, old, fresh = _old_and_fresh(tmp_path)
+    depth = _arguments(["--days", "500"]).depth
+    assert depth == timedelta(days=500)
+
+    days = {bar.time.astimezone(MSK).date() for bar in _bars(file, SYMBOL, depth=depth)}
+
+    assert days == {old, fresh}, f"ключ глубины не подействовал: {sorted(days)}"
+
+
+@pytest.mark.parametrize("text", ["0", "-5", "год"])
+def test_a_depth_that_is_not_a_positive_number_of_days_is_refused(text, capsys) -> None:
+    """Стережёт: нулевая или кривая глубина — отказ с именем ключа, а не пустой ряд."""
+    with pytest.raises(SystemExit):
+        _arguments(["--days", text])
+    assert "--days" in capsys.readouterr().err
+
+
+def test_a_cut_history_is_named_to_the_human(tmp_path, monkeypatch, capsys) -> None:
+    """Стережёт `D-056`: история, подрезанная глубиной, названа вслух.
+
+    Строка обязана дойти двумя путями: в поток ошибок (человек видит её до
+    согласия на перебор) и в оговорки таблицы (таблицу читают потом, без
+    экрана). Мутации, обязанные ронять проверку: `_cut` всегда возвращает
+    `None`; `_work` не печатает строку; `_table` не отдаёт её в `_notes`.
+    """
+    file, old, _fresh = _old_and_fresh(tmp_path)
+    seen: dict[str, object] = {}
+
+    async def table(args, bars, *, cut=None) -> str:
+        seen["cut"] = cut
+        return " ".join(_notes(runs=1, spent=1.0, bars=len(bars), cut=cut))
+
+    monkeypatch.setattr(backtest.__main__, "_table", table)
+    assert main(["--db", str(file), "--symbol", SYMBOL, "--out", str(tmp_path / "t.txt")]) == 0
+
+    cut = seen["cut"]
+    assert isinstance(cut, str), "подрезка истории прошла молча"
+    assert f"{old:%d.%m.%Y}" in cut and "--days" in cut, cut
+    assert cut in capsys.readouterr().err, "строка о подрезке не дошла до экрана"
+    assert cut in (tmp_path / "t.txt").read_text(encoding="utf-8")
+
+
+def test_the_days_key_reaches_the_series_through_the_command(tmp_path, monkeypatch) -> None:
+    """Стережёт `D-056` на пути команды: `--days` доезжает от ключа до ряда.
+
+    Мутация, обязанная ронять проверку: `_work` зовёт `_bars` и `_cut`
+    без `depth=args.depth` — ключ разбирается и молча не действует.
+    """
+    file, old, _fresh = _old_and_fresh(tmp_path)
+    seen: dict[str, object] = {}
+
+    async def table(args, bars, *, cut=None) -> str:
+        seen["days"] = {bar.time.astimezone(MSK).date() for bar in bars}
+        seen["cut"] = cut
+        return "таблица"
+
+    monkeypatch.setattr(backtest.__main__, "_table", table)
+    assert main(["--db", str(file), "--symbol", SYMBOL, "--days", "500",
+                 "--out", str(tmp_path / "t.txt")]) == 0
+
+    days = seen["days"]
+    assert isinstance(days, set) and old in days, "ключ --days до ряда не доехал"
+    assert seen["cut"] is None, "при полной истории команда назвала её обрезанной"
+
+
+def test_the_table_carries_the_cut_among_its_notes(tmp_path, monkeypatch) -> None:
+    """Стережёт `D-056` внутри `_table`: строка о подрезке уходит в оговорки отчёта.
+
+    Перебор подменён пустым — проверяется проводка, а не деньги. Мутация,
+    обязанная ронять проверку: `_table` зовёт `_notes` без `cut=cut`.
+    """
+    seen: dict[str, object] = {}
+
+    async def nothing(*_rest, **_named) -> tuple[()]:
+        return ()
+
+    def study(**named) -> str:
+        seen["notes"] = named["notes"]
+        return "отчёт"
+
+    monkeypatch.setattr(backtest.__main__, "sweep", nothing)
+    monkeypatch.setattr(backtest.__main__, "study", study)
+    monkeypatch.setattr(backtest.__main__, "render", lambda report: report)
+    file = _database(tmp_path, days=12)
+    bars = _bars(file, SYMBOL)
+    args = _arguments(["--symbol", SYMBOL, "--tuning-days", "6", "--checking-days", "2",
+                       "--yes"])
+
+    asyncio.run(_table(args, bars, cut="ИСТОРИЯ ОБРЕЗАНА"))
+
+    notes = seen["notes"]
+    assert isinstance(notes, tuple) and notes[0] == "ИСТОРИЯ ОБРЕЗАНА", notes
+
+
+def test_a_whole_history_is_not_called_cut(tmp_path) -> None:
+    """Стережёт обратное: без подрезки строки нет — иначе её перестанут читать."""
+    file, _old, _fresh = _old_and_fresh(tmp_path)
+
+    assert _cut(file, SYMBOL, depth=timedelta(days=500)) is None
+    assert _cut(file, SYMBOL) is not None
+
+
 # -- какие дни считаются торговыми -------------------------------------------
 
 def test_only_the_hours_of_the_sweep_decide_whether_a_day_counts(tmp_path) -> None:
@@ -216,7 +339,7 @@ def test_the_same_period_is_named_once(tmp_path) -> None:
 
 def test_the_number_of_runs_is_printed_before_the_run(capsys) -> None:
     """Стережёт требование ТЗ §4.10 В: число прогонов названо ДО запуска."""
-    _confirm(107, 60.0, asked=False)
+    _confirm(107, (30.0, 60.0), asked=False)
     assert "107" in capsys.readouterr().err
 
 
@@ -224,7 +347,7 @@ def test_a_long_sweep_asks_for_a_confirmation(monkeypatch, capsys) -> None:
     """Стережёт: перебор дольше пяти минут не начинается молча."""
     monkeypatch.setattr("builtins.input", lambda _prompt: "нет")
     with pytest.raises(SystemExit, match="отменён"):
-        _confirm(9744, 9000.0, asked=False)
+        _confirm(9744, (3000.0, 9000.0), asked=False)
     assert "9744" in capsys.readouterr().err
 
 
@@ -234,14 +357,31 @@ def test_a_short_sweep_does_not_ask(monkeypatch) -> None:
         raise AssertionError("короткий перебор не должен ничего спрашивать")
 
     monkeypatch.setattr("builtins.input", refuse)
-    _confirm(107, 60.0, asked=False)
+    _confirm(107, (30.0, 60.0), asked=False)
+
+
+def test_the_question_is_asked_by_the_slow_edge_of_the_estimate(monkeypatch, capsys) -> None:
+    """Стережёт `D-075`: согласие спрашивается по верхней границе разброса.
+
+    Быстрый край под пятью минутами, медленный — над ними. Спроси команда
+    по нижней, человек снова решал бы «подожду» по числу, втрое меньшему
+    настоящего. Мутация, обязанная ронять проверку: сравнивать с порогом
+    `fastest` вместо `slowest` в `_confirm`.
+    """
+    monkeypatch.setattr("builtins.input", lambda _prompt: "нет")
+    with pytest.raises(SystemExit, match="отменён"):
+        _confirm(9744, (120.0, 900.0), asked=False)
+    said = capsys.readouterr().err
+    assert "от 2 мин 00 с до 15 мин 00 с" in said, said
 
 
 def test_the_expected_time_grows_with_the_length_of_the_series() -> None:
     """Стережёт оценку времени: она считается от замера, а не берётся постоянной."""
     short = _minutes(date(2026, 6, 15), count=1000)
-    assert _pace(short) == pytest.approx(PACE * 1000)
-    assert _pace(short + short) > _pace(short)
+    fastest, slowest = PACE
+    assert _pace(short) == pytest.approx((fastest * 1000, slowest * 1000))
+    assert fastest < slowest, "разброс времени перебора вывернут наизнанку"
+    assert _pace(short + short)[1] > _pace(short)[1]
 
 
 # -- сквозной запуск ----------------------------------------------------------
@@ -376,12 +516,13 @@ def test_the_notes_do_not_promise_two_months_of_history() -> None:
     отговаривала от уже сделанного. Проверяется не формулировка, а два факта:
     обещания «двух месяцев» в подвале нет, а способ получить длинный ряд
     назван — иначе через месяц строка снова станет неправдой, и никто
-    не заметит.
+    не заметит. Число «280» из строки убрано 28.09.2026 (`D-056`): при
+    глубине по умолчанию ряд уже давал 265, и цифра сама стала неправдой.
     """
     footer = " ".join(_notes(runs=10, spent=1.0, bars=100))
     assert "двух месяцев" not in footer
     assert "--stitch" in footer
-    assert "280" in footer
+    assert "--days" in footer, "не названо, как взять ряд длиннее глубины по умолчанию"
 
 
 def test_the_notes_say_the_stitched_series_is_not_for_trading() -> None:

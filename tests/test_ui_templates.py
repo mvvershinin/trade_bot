@@ -1818,3 +1818,35 @@ def test_an_old_template_with_trailing_but_no_fixing_is_normalised_out_loud(
     assert said and "скользящий уровень" in said[0], (
         f"подмена сделана молча: {loaded.troubles!r}"
     )
+
+
+def test_unknown_keys_of_the_record_survive_a_rewrite(library) -> None:
+    """D-074: ключ записи от более новой сборки переживает перезапись библиотеки.
+
+    Поведение: незнакомый ключ **рядом** с `name` и `saved_at` (не внутри
+    `settings`) при чтении запоминается, а при записи ложится обратно
+    нетронутым. Знакомые ключи записи он перебить не может.
+
+    ⚠️ Мутации: убрать `**one.record_extras` из `_body_of` — ключ пропадает;
+    не заполнять `record_extras` при чтении — то же самое; сложить ключи
+    записи в `unknown` — шаблон перестаёт быть «полным».
+    """
+    library.write((Template(name="Проба", values=Settings(average_period=21)),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["rating"] = {"stars": 4, "by": "новая сборка"}
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = [one for one in library.read().templates if not one.builtin]
+    assert [one.name for one in loaded] == ["Проба"]
+    assert loaded[0].complete, (
+        "незнакомый ключ записи сделал шаблон «применимым с оговорками», "
+        "а к настройкам он отношения не имеет"
+    )
+    assert library.write(library.read().templates) == ""
+
+    stored = json.loads(library.path.read_text(encoding="utf-8"))["templates"][0]
+    assert stored.get("rating") == {"stars": 4, "by": "новая сборка"}, (
+        f"ключ записи от более новой сборки потерян при перезаписи: {stored}"
+    )
+    assert stored["name"] == "Проба"
+    assert stored["settings"]["average_period"] == 21

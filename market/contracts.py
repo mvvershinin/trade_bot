@@ -39,7 +39,7 @@ import logging
 import pathlib
 import re
 import sqlite3
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
@@ -60,6 +60,7 @@ __all__ = [
     "AdoptReport",
     "ChainNotQuarterly",
     "ContractError",
+    "RefreshedRows",
     "ContractLoad",
     "ContractRequest",
     "Expiry",
@@ -297,6 +298,61 @@ def periods_of_chain(
     return rows
 
 
+class RefreshedRows(list[ContractRow]):
+    """Строки таблицы после уточнения — и что человеку сказать сверх них.
+
+    Список, а не новый тип ответа: кто ждёт `list[ContractRow]`, получает его
+    же. `said` — строки для человека: коды, которых биржа не знает (`B-054`).
+    """
+
+    def __init__(self, rows: Iterable[ContractRow], said: Sequence[str] = ()) -> None:
+        super().__init__(rows)
+        self.said: tuple[str, ...] = tuple(said)
+
+
+def _known_last_days(
+    client: IssClient, symbols: Sequence[str], said: list[str]
+) -> dict[str, date | None]:
+    """Последний день обращения по кодам цепочки; незнакомые бирже — с края прочь.
+
+    Незнакомый код с края (дальний, ещё не вышедший, или старый) выпадает
+    вслух, остальные остаются. Посреди цепочки выбросить нельзя: рубеж
+    посчитался бы между несоседними контрактами. Порядок — как в `symbols`.
+
+    :raises ContractError: незнакомый код посреди цепочки либо знакомых нет.
+    """
+    known: dict[str, date | None] = {}
+    unknown: list[str] = []
+    for symbol in symbols:
+        try:
+            known[symbol] = client.last_trade_day(symbol)
+        except IssUnknownInstrument:
+            unknown.append(symbol)
+    if not known:
+        raise ContractError(
+            f"биржа не знает ни одного кода цепочки {', '.join(symbols)}: "
+            "уточнять таблицу контрактов не по чему. Проверьте коды"
+        )
+    kept = list(known)
+    first, last = symbols.index(kept[0]), symbols.index(kept[-1])
+    inside = [symbol for symbol in unknown if first < symbols.index(symbol) < last]
+    if inside:
+        raise ContractError(
+            f"биржа не знает {', '.join(inside)} посреди цепочки "
+            f"{', '.join(symbols)}: рубежи вокруг него не посчитать. "
+            "Проверьте коды"
+        )
+    for symbol in unknown:
+        text = (
+            f"Биржа не знает контракта {symbol}: срок и период по нему "
+            "не уточнены, остальные коды цепочки уточнены. Если это дальний "
+            "контракт, он, вероятно, ещё не вышел в обращение"
+        )
+        log.warning("%s", text)
+        said.append(text)
+    return known
+
+
 def refresh_contracts(
     store: CandleStore,
     client: IssClient,
@@ -304,7 +360,7 @@ def refresh_contracts(
     *,
     market: Market,
     now: datetime | None = None,
-) -> list[ContractRow]:
+) -> RefreshedRows:
     """Уточнить периоды у биржи: последний день обращения и дневные объёмы.
 
     Цепочка может быть короткой — две последние пары хватает, чтобы увидеть
@@ -324,8 +380,14 @@ def refresh_contracts(
     (пустое известное не стирает), и старый ближний так и числился бы
     архивным.
 
+    Код, которого биржа не знает, с края цепочки выпадает, остальные
+    уточняются (`B-054`): чаще всего это дальний контракт, ещё не вышедший
+    в список. Выпавший называется строкой в технический лог и в ответе
+    (`RefreshedRows.said`) — текст для человека.
+
     :raises ChainNotQuarterly: у актива есть месячные контракты.
-    :raises ContractError: коды разных активов либо не квартальные.
+    :raises ContractError: коды разных активов либо не квартальные; биржа
+        не знает кода посреди цепочки либо ни одного кода.
     """
     now = now or datetime.now(MSK)
     today = now.astimezone(MSK).date()
@@ -363,12 +425,11 @@ def refresh_contracts(
                 last_trade_day=refused.last_trade_day,
             ) from failure
         raise refused
+    said: list[str] = []
+    last_days = _known_last_days(client, symbols, said)
     chain: list[tuple[str, dict[date, float]]] = []
-    last_days: dict[str, date | None] = {}
     closed = today - timedelta(days=1)
-    for symbol in symbols:
-        last = client.last_trade_day(symbol)
-        last_days[symbol] = last
+    for symbol, last in last_days.items():
         till = min(closed, last) if last is not None else closed
         chain.append(
             (
@@ -392,7 +453,7 @@ def refresh_contracts(
     ]
     store.put_contracts(rows, now=now)
     wanted = set(symbols)
-    return [row for row in store.contracts() if row.symbol in wanted]
+    return RefreshedRows((row for row in store.contracts() if row.symbol in wanted), said)
 
 
 # ---------------------------------------------------------------------------

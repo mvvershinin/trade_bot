@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import pathlib
 from datetime import datetime, timedelta
@@ -27,8 +28,17 @@ from app import convert
 from app.main import _keep_settings, _stored_settings
 from app.port import HistoryPort
 from app.settings_store import SettingsStore
-from market import MSK, Candle, CandleStore, MarketWorker, Source, Timeframe, redact
-from ui.models import DecisionRow, Mode, Settings
+from market import (
+    MSK,
+    Candle,
+    CandleStore,
+    MarketWorker,
+    PointValue,
+    Source,
+    Timeframe,
+    redact,
+)
+from ui.models import AfterTakeProfit, DecisionRow, Mode, Settings
 
 #: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
 #: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
@@ -394,7 +404,7 @@ def test_the_log_directory_from_the_settings_is_used(loop, database, tmp_path) -
         port = HistoryPort(worker, values=values, days=0, sanitize=redact)
         try:
             _wire_settings_and_log(
-                port, store, store.load(), values,
+                port, store, store.load(), values, database.parent,
                 level=convert.DecisionLevel.WARNING,
             )
             logging.getLogger("terminal").warning("проверочная строка")
@@ -427,7 +437,7 @@ def test_the_journal_says_where_the_log_goes(loop, database, tmp_path) -> None:
         port.decision_appended.connect(said.append)
         try:
             _wire_settings_and_log(
-                port, store, store.load(), values,
+                port, store, store.load(), values, database.parent,
                 level=convert.DecisionLevel.WARNING,
             )
         finally:
@@ -573,3 +583,113 @@ def test_ignored_userdata_line_names_the_database_given_by_the_key(
     (about,) = [row for row in said if row.event == "Папка данных"]
     assert str(database) in about.reason, f"база из ключа не названа: {about.reason}"
     assert "берутся из" not in about.reason, f"названа папка по умолчанию: {about.reason}"
+
+
+# ------------------------------------------- подмена при сборке — не в файл
+
+def _file_settings(store: SettingsStore) -> dict[str, object]:
+    body: dict[str, dict[str, object]] = json.loads(store.path.read_text(encoding="utf-8"))
+    return body["settings"]
+
+
+def _start_with_restore(loop, database, tmp_path, work) -> SettingsStore:
+    """Файл с вариантом, которого движок не принимает; порт собран по нему, как в `main`.
+
+    Биржа — заглушкой: на вопрос о стоимости пункта отвечает новым числом.
+    Это та запись в файл, которую делает сама программа, без человека
+    (`HistoryPort._point_taken`), — ею файл и переписывался при запуске.
+    """
+    store = SettingsStore(tmp_path / "userdata")
+    assert not store.save(
+        Settings(instrument=SYMBOL, after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
+    )
+    loaded = store.load()
+    assert loaded.values.after_take_profit is AfterTakeProfit.RESTORE_AT_ONCE
+
+    async def ask(symbol: str) -> PointValue:
+        return PointValue(symbol=symbol, rubles=7.5, told="биржей — заглушка проверки")
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=loaded.values, days=0, sanitize=redact)
+        _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
+        port.attach_exchange(ask)
+        try:
+            port.refresh("тест")
+            await port.wait()
+            point = port._point.task  # noqa: SLF001 — задача запроса наружу не отдаётся
+            assert point is not None, "порт не спросил биржу о стоимости пункта — проверка вакуумна"
+            await point
+            await port.wait()
+            await work(port)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+    return store
+
+
+def test_the_startup_substitution_does_not_rewrite_the_owners_file(
+    loop, database, tmp_path
+) -> None:
+    """`B-050`: подмена непринимаемого варианта живёт в памяти, а не в файле.
+
+    Сторожит: запуск с `after_take_profit = restore` не меняет в файле ничего,
+    кроме того, что программа пишет туда сама по ответу биржи (стоимость
+    пункта, решение 0041). Полного равенства байтов нет по этой причине:
+    без ответа биржи в файл не пишет никто, и проверка была бы зелёной
+    и на сломанном коде.
+
+    Мутация, которую тест ловит: `_keep_settings` пишет `values`, а не
+    `port.for_file(values)` — в файле `stop`.
+    """
+    async def nothing(port: HistoryPort) -> None:
+        return None
+
+    store = SettingsStore(tmp_path / "userdata")
+    store.save(Settings(instrument=SYMBOL, after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE))
+    before = _file_settings(store)
+
+    store = _start_with_restore(loop, database, tmp_path, nothing)
+
+    after = _file_settings(store)
+    assert after["ruble_per_point"] == 7.5, (
+        "ответ биржи в файл не записан — записи не было, проверка вакуумна"
+    )
+    assert after["after_take_profit"] == "restore", (
+        "файл владельца счёта переписан подменой при запуске, хотя «Применить» "
+        f"никто не нажимал: {after['after_take_profit']}"
+    )
+    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    assert changed <= {"ruble_per_point", "ruble_per_point_source"}, changed
+
+
+def test_opening_the_settings_window_does_not_write_the_substitution(
+    loop, database, tmp_path
+) -> None:
+    """Открытие окна настроек (`request_settings`) — тоже не «Применить»."""
+
+    async def open_window(port: HistoryPort) -> None:
+        port.request_settings()
+
+    store = _start_with_restore(loop, database, tmp_path, open_window)
+
+    assert _file_settings(store)["after_take_profit"] == "restore"
+
+
+def test_the_persons_apply_writes_what_the_window_shows(loop, database, tmp_path) -> None:
+    """Обратная сторона: «Применить» человека — его выбор, и он в файл попадает.
+
+    Мутация, которую тест ловит: подмена не отпускается по «Применить» —
+    файл навсегда остался бы с вариантом, которого робот не умеет.
+    """
+
+    async def apply(port: HistoryPort) -> None:
+        port.apply_settings(port._values)  # noqa: SLF001 — то, что окно показывает
+        await port.wait()
+
+    store = _start_with_restore(loop, database, tmp_path, apply)
+
+    assert _file_settings(store)["after_take_profit"] == "stop"

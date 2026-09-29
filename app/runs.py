@@ -801,8 +801,8 @@ def _library() -> Path:
 #:
 #: База здесь — умолчание (`market.default_db_path`); ключ `--db` доводит
 #: до створки `app/main.py::_templates_read_runs_from` (D-052, 28.09.2026).
-#: ⚠️ Библиотека шаблонов (`userdata=_library`) при `--db` остаётся в папке
-#: по умолчанию — `BACKLOG.md`.
+#: Та же проводка доводит и `userdata`: при `--db` библиотека шаблонов
+#: ложится в `database.parent`, а не в папку по умолчанию (D-129).
 backend.use(backend.Backend(
     changes=convert.settings_diff,
     runs=lambda sets: matching_runs(default_db_path(), sets),

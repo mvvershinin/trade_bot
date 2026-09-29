@@ -385,6 +385,14 @@ def test_inspect_reads_while_the_program_is_open(
 ) -> None:
     """Стережёт `--inspect`: тоже только чтение, тоже без замка."""
     _no_logging(monkeypatch)
+
+    class KnowsEveryCode:
+        """Биржа подставная: `--inspect` спрашивает у неё код (`D-128`)."""
+
+        def secid(self, code: str) -> str:
+            return code
+
+    monkeypatch.setattr("app.fetch.IssClient", KnowsEveryCode)
     database = _empty_database(folder)
     held = OneCopy(folder)
     assert held.take().taken

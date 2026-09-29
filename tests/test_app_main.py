@@ -23,9 +23,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -64,8 +66,10 @@ def _run(*arguments: str) -> subprocess.CompletedProcess[str]:
     return _launch(["-m", "app.main"], arguments)
 
 
-def _launch(entry_point: list[str], arguments) -> subprocess.CompletedProcess[str]:
-    environment = dict(os.environ)
+def _launch(
+    entry_point: list[str], arguments, extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    environment = dict(os.environ) | (extra or {})
     environment["PYTHONPATH"] = str(REPO)
     # ⚠️ Не `pop`, а заведомо негодный плагин, и это **усиление** проверки.
     # Режим снимка не подхватывает платформу из окружения, а **присваивает**
@@ -300,6 +304,70 @@ def test_the_shot_keys_refuse_to_work_without_a_shot() -> None:
     assert args.shot_of == "algorithm"
 
 
+#: Та же программа, тем же `main()`, с тремя подменами — и ни одна из них
+#: не трогает проверяемую проводку, они только **слушают** её.
+#:
+#: 1. Биржа отвечает о стоимости пункта сразу и числом. Это не упрощение,
+#:    а худший для сторожа случай: ответ идёт через `_point_taken` →
+#:    `apply_settings`, а `apply_settings` попутно рассылает каталог. Так
+#:    каталог доезжает до окна ещё до щелчка «Настройки» — той самой
+#:    попутной дорогой, на которой прежний сторож зеленел при снятой проводке.
+#: 2. `HistoryPort.request_settings` обёрнут: пока он исполняется, поднят флаг.
+#: 3. `MainWindow._on_algorithms` обёрнут: каждый приехавший непустой каталог
+#:    записывается как «по просьбе» или «попутно» — по флагу.
+#:
+#: Обёртки зовут подлинные методы, поэтому поведение программы то же самое.
+ALGORITHM_DRIVER = '''
+import os
+import sys
+
+os.environ["QT_API"] = "pyside6"              # до первого импорта qasync
+
+import app.port
+import market.worker
+import ui.main_window
+from market.point import PointValue
+
+arrived = {"asked": 0, "by_the_way": 0}
+state = {"asking": False}
+
+
+async def point_value(self, symbol, **_):
+    return PointValue(symbol=symbol, rubles=1.74, told="подставлено проверкой")
+
+
+_original_request = app.port.HistoryPort.request_settings
+
+
+def request_settings(self):
+    state["asking"] = True
+    try:
+        _original_request(self)
+    finally:
+        state["asking"] = False
+
+
+_original_on_algorithms = ui.main_window.MainWindow._on_algorithms
+
+
+def on_algorithms(self, options):
+    if options:
+        arrived["asked" if state["asking"] else "by_the_way"] += 1
+    _original_on_algorithms(self, options)
+
+
+market.worker.MarketWorker.point_value = point_value
+app.port.HistoryPort.request_settings = request_settings
+ui.main_window.MainWindow._on_algorithms = on_algorithms
+
+from app.main import main
+
+code = main(sys.argv[1:])
+print(f"catalogue asked={arrived['asked']} by_the_way={arrived['by_the_way']}")
+raise SystemExit(code)
+'''
+
+
 @pytest.mark.slow
 def test_the_program_opens_its_own_algorithm_window_and_it_is_not_empty(
     tmp_path: pathlib.Path,
@@ -313,38 +381,58 @@ def test_the_program_opens_its_own_algorithm_window_and_it_is_not_empty(
 
     Окно здесь открывает сама программа, а окно выбора — **щелчок по той
     самой кнопке** (`app/main.py::_shot_of_dialog`). Кнопка выключена, когда
-    каталог не доехал, а `QAbstractButton::click()` на выключенной кнопке
-    не делает ничего: окно не откроется, снимка не будет, программа выйдет
-    кодом 1 и скажет почему. Поэтому существующий файл — доказательство того,
-    что каталог доехал.
+    каталог не доехал, и тогда снимка нет, а программа выходит кодом 1.
 
-    ⚠️ **`--symbol XXZ9` здесь несущий, а не декоративный.** С настоящим
-    тикером проверка **зеленела при снятой проводке** — проверено мутацией
-    09.09.2026. Механизм: порт спрашивает у биржи стоимость пункта, ответ
-    приходит через `_point_taken`, тот кладёт число **через `apply_settings`**,
-    а `apply_settings` заодно отправляет каталог. То есть каталог доезжал
-    до окна случайной попутной дорогой, зависящей от того, ответила ли биржа
-    и успела ли ответить до снимка. Сторож на такой дороге не стережёт ничего.
-    Тикера `XXZ9` на бирже нет: ответа не будет ни при живой сети (пустая
-    карточка), ни при мёртвой (исключение), — обе ветки кончаются
-    `_point_trouble`, а он настроек не применяет.
+    ⚠️ **Существующего снимка мало, и это замерено (`B-042`).** Каталог
+    доезжает до окна и попутной дорогой: ответ биржи о стоимости пункта
+    кладётся через `apply_settings`, а тот рассылает каталог заодно. Прежняя
+    проверка держалась на выдуманном тикере `XXZ9`, у которого ответа нет,
+    и при снятой проводке зеленела на настоящем тикере и при попутной дороге
+    через `_point_trouble` — обе мутации 28.09.2026 дали **1 passed**.
 
-    Мутация, обязанная ронять проверку: снять `self.port.request_settings()`
-    из `MainWindow.open_settings`. Проверено: программа выходит кодом 1
-    и говорит, что окно не открылось.
+    Поэтому здесь попутная дорога открыта **нарочно** (биржа отвечает числом,
+    `ALGORITHM_DRIVER`), а стережётся сам вызов: хотя бы один каталог обязан
+    приехать в окно **внутри** `request_settings`, то есть по просьбе,
+    отправленной открытием настроек. Отдельно проверено, что попутная дорога
+    в этом запуске действительно была: иначе проверка не отличала бы
+    проводку от случая, против которого поставлена.
+
+    Мутации, обязанные ронять проверку: снять `self.port.request_settings()`
+    из `MainWindow.open_settings` (при открытой попутной дороге); то же
+    вместе с `apply_settings` в `_point_trouble`.
     """
     shot = tmp_path / "algorithm.png"
-    outcome = _run(
-        "--db", str(_database(tmp_path / "candles.sqlite3")),
-        "--symbol", "XXZ9",
-        "--shot", str(shot), "--shot-of", "algorithm",
+    driver = tmp_path / "open_algorithm_window.py"
+    driver.write_text(ALGORITHM_DRIVER, encoding="utf-8")
+    outcome = _launch(
+        [str(driver)],
+        [
+            "--db", str(_database(tmp_path / "candles.sqlite3")),
+            "--symbol", "MXU6",
+            "--shot", str(shot), "--shot-of", "algorithm",
+        ],
     )
+    said = outcome.stdout + outcome.stderr
     assert outcome.returncode == 0, (
-        "программа не смогла открыть своё же окно выбора алгоритма:\n"
-        + outcome.stdout + outcome.stderr
+        "программа не смогла открыть своё же окно выбора алгоритма:\n" + said
     )
-    assert shot.exists(), outcome.stdout + outcome.stderr
+    assert shot.exists(), said
     assert shot.stat().st_size > 3000, "снимок подозрительно мал — окно пустое?"
+    report = re.search(r"catalogue asked=(\d+) by_the_way=(\d+)", outcome.stdout)
+    assert report, (
+        "подменная обвязка не отчиталась — проверка не знает, как ехал каталог:\n"
+        + said
+    )
+    asked, by_the_way = int(report[1]), int(report[2])
+    assert by_the_way > 0, (
+        "попутная дорога (ответ биржи → apply_settings) каталога не привезла — "
+        "проверка не воспроизводит случай, против которого поставлена:\n" + said
+    )
+    assert asked > 0, (
+        "каталог приехал в окно только попутно, а не по просьбе открытия "
+        "настроек: проводка `open_settings` → `request_settings` снята, "
+        "и окно показывает то, что осталось от чужого события:\n" + said
+    )
 
 
 # ------------------------------------------------ собранная поставка
@@ -477,4 +565,129 @@ def test_the_templates_window_reads_runs_from_the_database_given_by_key(
         backend.use(before)
     assert str(database) in said, (
         f"окно шаблонов спрашивает прогоны не у базы из ключа --db: {said!r}"
+    )
+
+
+# ------------------------------------------- B-050: окно с настройками порта
+
+#: Программа с файлом настроек, где выбран вариант, которого робот не умеет.
+#: Через полторы секунды после показа окна обвязка делает то, что сделал бы
+#: человек, не открывавший настроек: сохраняет текущие как шаблон, просит
+#: записи настроек в файл (`request_settings` — эхо, которое слушает запись)
+#: и запускает тестер с текущими. Подмен в поведении программы нет: обёрнут
+#: только `_refuse`, чтобы отказы было видно, и `QInputDialog.getText`,
+#: чтобы имя шаблона ввелось без клавиатуры.
+RESTORE_DRIVER = '''
+import hashlib
+import os
+import pathlib
+import sys
+from datetime import datetime
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_API"] = "pyside6"
+
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QInputDialog
+
+import app.port
+import ui.main_window
+from market import MSK
+from ui.models import BacktestRequest
+from ui.templates import Library
+from ui.templates_dialog import TemplatesDialog
+
+refusals = []
+_original_refuse = app.port.HistoryPort._refuse
+
+
+def refuse(self, event, reason):
+    refusals.append(f"{event}: {reason}")
+    _original_refuse(self, event, reason)
+
+
+app.port.HistoryPort._refuse = refuse
+QInputDialog.getText = staticmethod(lambda *_a, **_k: ("проверка", True))
+
+settings_file = pathlib.Path(os.environ["RESTORE_SETTINGS_FILE"])
+library_dir = pathlib.Path(os.environ["RESTORE_LIBRARY_DIR"])
+_original_show = ui.main_window.MainWindow.show
+
+
+def act(window):
+    print(f"window after_take_profit={window._settings.after_take_profit.value}")
+    dialog = TemplatesDialog(Library(library_dir), window._settings, window)
+    dialog.save_current()
+    saved = [one for one in Library(library_dir).read().templates if one.name == "проверка"]
+    print("template after_take_profit="
+          + (saved[0].values.after_take_profit.value if saved else "не сохранён"))
+    window.port.request_settings()
+    print("file md5=" + hashlib.md5(settings_file.read_bytes()).hexdigest())
+    window.port.run_backtest(BacktestRequest(
+        settings=window._settings,
+        since=datetime(2026, 6, 19, 0, 0, tzinfo=MSK),
+        until=datetime(2026, 6, 19, 23, 59, tzinfo=MSK),
+        settings_source="текущие настройки",
+    ))
+    print("tester refused=" + str(any("Настройки не годятся" in one for one in refusals)))
+    window.close()
+
+
+def show(self):
+    _original_show(self)
+    QTimer.singleShot(1500, lambda: act(self))
+
+
+ui.main_window.MainWindow.show = show
+
+from app.main import main
+
+raise SystemExit(main(sys.argv[1:]))
+'''
+
+
+@pytest.mark.slow
+def test_the_window_starts_with_what_the_port_accepted(tmp_path: pathlib.Path) -> None:
+    """`B-050`: окно собирается с настройками порта, а не файла.
+
+    Поведение: файл настроек несёт «Сразу восстановить позицию», которого
+    робот не умеет; порт подменяет его умолчанием. Окно, собранное `main`,
+    с первой секунды держит подменённое: тестер с текущими настройками
+    не отказывает «Настройки не годятся», шаблон «текущих» сохраняется без
+    непринимаемого варианта. Файл владельца при этом не переписан ни байтом,
+    хотя запись в него была запрошена (`request_settings` → эхо → запись
+    через `for_file`) — иначе равенство байтов ничего бы не доказывало.
+
+    ⚠️ Мутация: `app/main.py` собирает `MainWindow(settings=values)` — окно
+    держит `restore`, тестер отказывает, шаблон несёт `restore`.
+    """
+    from app.settings_store import SettingsStore
+    from ui.models import AfterTakeProfit, Settings
+
+    database = _database(tmp_path / "candles.sqlite3")
+    store = SettingsStore(tmp_path)
+    assert not store.save(
+        Settings(instrument="MXU6", after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
+    )
+    before = hashlib.md5(store.path.read_bytes()).hexdigest()
+    library = tmp_path / "library"
+    library.mkdir()
+    driver = tmp_path / "restore_driver.py"
+    driver.write_text(RESTORE_DRIVER, encoding="utf-8")
+    environment = {
+        "RESTORE_SETTINGS_FILE": str(store.path),
+        "RESTORE_LIBRARY_DIR": str(library),
+    }
+    outcome = _launch([str(driver)], ["--db", str(database)], extra=environment)
+    said = outcome.stdout + outcome.stderr
+    assert outcome.returncode == 0, said
+    assert "window after_take_profit=stop" in outcome.stdout, (
+        "окно собрано с непринимаемым вариантом из файла, а не с подменой порта:\n" + said
+    )
+    assert "template after_take_profit=stop" in outcome.stdout, said
+    assert "tester refused=False" in outcome.stdout, (
+        "тестер отказал текущим настройкам окна:\n" + said
+    )
+    assert f"file md5={before}" in outcome.stdout, (
+        "файл владельца переписан подменой, хотя «Применить» никто не нажимал:\n" + said
     )

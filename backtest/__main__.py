@@ -74,9 +74,31 @@ LONG_ENOUGH_TO_ASK = 300.0
 #: как размер свечи: в этом проекте таких шестидесяток две.
 A_MINUTE = 60
 
-#: Сколько времени назад брать историю, если не сказано иное. Больше, чем есть
-#: в базе, — намеренно: лишнее отсеет отбор торговых дней, а не эта цифра.
+#: Сколько времени назад брать историю, если не сказано иное (ключ `--days`).
+#: Выбрано, когда длиннее 71 дня истории не существовало; сшитый ряд длиннее,
+#: и тогда подрезка называется вслух — в поток ошибок и строкой в оговорках
+#: таблицы (`D-056`), а не проходит молча.
 DEPTH = timedelta(days=400)
+
+
+def _depth(text: str) -> timedelta:
+    """Глубина истории из ключа `--days`: целое число дней больше нуля.
+
+    :raises argparse.ArgumentTypeError: ноль, отрицательное или не число.
+        Отказ громкий: нулевая глубина дала бы пустой ряд и отказ «нет
+        свечей», который про ключ ничего не говорит.
+    """
+    try:
+        days = int(text)
+    except ValueError as trouble:
+        raise argparse.ArgumentTypeError(
+            f"глубина истории — целое число дней, а не {text!r}"
+        ) from trouble
+    if days <= 0:
+        raise argparse.ArgumentTypeError(
+            f"глубина истории должна быть больше нуля дней, а не {days}"
+        )
+    return timedelta(days=days)
 
 
 def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -95,6 +117,9 @@ def _arguments(argv: Sequence[str] | None) -> argparse.Namespace:
                         help="проскальзывание в шагах цены")
     parser.add_argument("--price-step", type=float, default=0.0,
                         help="шаг цены инструмента, обязателен при непустом проскальзывании")
+    parser.add_argument("--days", type=_depth, default=DEPTH, dest="depth",
+                        help=f"сколько календарных дней истории брать от сегодня, "
+                             f"по умолчанию {DEPTH.days}; что старше — в перебор не идёт")
     parser.add_argument("--tuning-days", type=int, default=TUNING_DAYS,
                         help="торговых дней на подбор в одном окне")
     parser.add_argument("--checking-days", type=int, default=CHECKING_DAYS,
@@ -131,17 +156,41 @@ def _snapshot(source: pathlib.Path, into: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def _bars(copy: pathlib.Path, symbol: str) -> list[Candle]:
-    """Пятиминутки инструмента из снимка базы, по возрастанию времени."""
+def _since(depth: timedelta) -> datetime:
+    """С какого момента брать историю: «сейчас» по Москве минус глубина."""
+    return datetime.now(tz=in_moscow(datetime.now().astimezone()).tzinfo) - depth
+
+
+def _bars(copy: pathlib.Path, symbol: str, *, depth: timedelta = DEPTH) -> list[Candle]:
+    """Пятиминутки инструмента из снимка базы за `depth` от сегодня, по возрастанию."""
     with CandleStore(copy) as store:
-        since = datetime.now(tz=in_moscow(datetime.now().astimezone()).tzinfo) - DEPTH
-        minutes = store.minutes(symbol, since=since)
+        minutes = store.minutes(symbol, since=_since(depth))
     if not minutes:
         raise SystemExit(
-            f"в базе нет свечей по {symbol} за последние {DEPTH.days} дней. "
+            f"в базе нет свечей по {symbol} за последние {depth.days} дней "
+            "(глубина задаётся ключом --days). "
             "Загрузите историю прежде, чем перебирать настройки"
         )
     return list(build_bars(minutes, M5, on_duplicate="skip"))
+
+
+def _cut(copy: pathlib.Path, symbol: str, *, depth: timedelta = DEPTH) -> str | None:
+    """Строка человеку, если глубина отрезала часть истории из базы; иначе `None`.
+
+    `D-056`: подрезка шла молча, и таблица считалась не на том ряде, который
+    человек собрал, — разницу видел только тот, кто сравнил шапку с описью
+    базы. Теперь отрезанное названо датами и ключом, которым его вернуть.
+    """
+    since = _since(depth)
+    with CandleStore(copy) as store:
+        first = store.coverage(symbol).first
+    if first is None or first >= since:
+        return None
+    return (
+        f"История обрезана: в базе свечи {symbol} есть с {in_moscow(first):%d.%m.%Y}, "
+        f"в перебор взято только с {in_moscow(since):%d.%m.%Y} — последние "
+        f"{depth.days} дней. Взять больше — ключ --days."
+    )
 
 
 def _days_of(bars: Sequence[Candle]) -> tuple[date, ...]:
@@ -179,15 +228,24 @@ def _plan(ground: Ground, *, whole: bool) -> tuple[Block, ...]:
     ),)
 
 
-def _confirm(runs: int, seconds: float, *, asked: bool) -> None:
+def _confirm(runs: int, seconds: tuple[float, float], *, asked: bool) -> None:
     """Сказать, сколько будет прогонов, **до** запуска, и спросить, если долго.
 
     Требование ТЗ §4.10 В. Число печатается всегда; согласие спрашивается
     только тогда, когда перебор идёт дольше пяти минут — иначе вопрос
     превращается в клавишу, которую жмут не читая.
+
+    `seconds` — разброс «от и до» (`D-075`), и спрашивается **по верхней**
+    границе: одно число, снятое на умолчаниях, обещало втрое меньше, чем
+    выходило, и человек решал «подожду» по неверной цифре.
     """
-    print(f"Прогонов: {runs}. Ожидаемое время: {_duration(seconds)}.", file=sys.stderr)
-    if seconds < LONG_ENOUGH_TO_ASK or asked:
+    fastest, slowest = seconds
+    print(
+        f"Прогонов: {runs}. Ожидаемое время: от {_duration(fastest)} "
+        f"до {_duration(slowest)}.",
+        file=sys.stderr,
+    )
+    if slowest < LONG_ENOUGH_TO_ASK or asked:
         return
     answer = input("Это надолго. Продолжать? [д/N] ").strip().lower()
     if answer not in {"д", "да", "y", "yes"}:
@@ -210,10 +268,13 @@ async def _work(args: argparse.Namespace) -> str:
     """Весь прогон: снимок, свечи, дни, сетка, перебор, таблица."""
     with tempfile.TemporaryDirectory(prefix="terminal-sweep-") as room:
         copy = _snapshot(pathlib.Path(args.db), pathlib.Path(room))
-        bars = _bars(copy, args.symbol)
+        bars = _bars(copy, args.symbol, depth=args.depth)
+        cut = _cut(copy, args.symbol, depth=args.depth)
+        if cut is not None:
+            print(cut, file=sys.stderr)
         if args.keep_copy:
             shutil.copy2(copy, pathlib.Path.cwd() / copy.name)
-        return await _table(args, bars)
+        return await _table(args, bars, cut=cut)
 
 
 def _trim(bars: Sequence[Candle], days: Sequence[date]) -> list[Candle]:
@@ -236,7 +297,9 @@ def _trim(bars: Sequence[Candle], days: Sequence[date]) -> list[Candle]:
     ]
 
 
-async def _table(args: argparse.Namespace, bars: Sequence[Candle]) -> str:
+async def _table(
+    args: argparse.Namespace, bars: Sequence[Candle], *, cut: str | None = None
+) -> str:
     """Построить таблицу по готовому ряду свечей."""
     days = _days_of(bars)
     bars = _trim(bars, days)
@@ -245,7 +308,8 @@ async def _table(args: argparse.Namespace, bars: Sequence[Candle]) -> str:
     ground = _ground(args)
     plan = _plan(ground, whole=args.full)
     runs = sum(len(block.points) for block in plan)
-    _confirm(runs, runs * _pace(bars), asked=args.yes)
+    fastest, slowest = _pace(bars)
+    _confirm(runs, (runs * fastest, runs * slowest), asked=args.yes)
 
     periods = _periods(split, folds)
     started = clock.perf_counter()
@@ -258,7 +322,7 @@ async def _table(args: argparse.Namespace, bars: Sequence[Candle]) -> str:
     print(f"\nПрогон занял {_duration(spent)}.", file=sys.stderr)
     return render(study(
         symbol=args.symbol, days=days, split=split, folds=folds, costs=ground.costs,
-        parts=parts, plain=_plain(ground), notes=_notes(runs, spent, len(bars)),
+        parts=parts, plain=_plain(ground), notes=_notes(runs, spent, len(bars), cut=cut),
     ))
 
 
@@ -274,16 +338,23 @@ def _periods(split: Fold, folds: Sequence[Fold]) -> tuple[Period, ...]:
     return tuple(dict.fromkeys(named))
 
 
-#: Замер 05.09.2026 на этом дереве: 15 891 бар, 107 прогонов за 89 секунд
-#: в один поток на Intel i5-13420H. Пересчитывается пропорционально числу
-#: баров — цикл движка по ним линеен, и это проверено вторым замером
-#: (полное произведение, 96 случайных сочетаний, 0,915 с на прогон).
-PACE = 0.83 / 15891
+#: Секунд на бар одного прогона, быстрый и медленный край сетки (`D-075`).
+#: Замер 28.09.2026 на Intel i5-13420H, один поток, сшитый ряд @MX: 55 768
+#: баров, 265 торговых дней, лучшее из трёх. Время прогона растёт с числом
+#: сделок, а не только баров, поэтому одно число, снятое на умолчаниях
+#: (было 0,83 с на 15 891 бар), обещало втрое меньше полного перебора:
+#:   весь день · средняя 9 · тейк 0,2 % · стоп на день     885 сделок  2,1 с — быстрый край
+#:   умолчания                                            527 сделок  2,7 с
+#:   09:30–10:00 · средняя 20 · тейк 1,5 %                 317 сделок  2,7 с
+#:   весь день · средняя 9 · тейк 0,2 % · ждать сигнала 14 818 сделок  6,4 с — медленный край
+#: Пересчитывается пропорционально числу баров: цикл движка по ним линеен.
+PACE = (3.8e-5, 1.14e-4)
 
 
-def _pace(bars: Sequence[Candle]) -> float:
-    """Сколько секунд занимает один прогон на этом ряде. Замер, а не догадка."""
-    return PACE * len(bars)
+def _pace(bars: Sequence[Candle]) -> tuple[float, float]:
+    """Сколько секунд занимает один прогон на этом ряде: от и до. Замер, а не догадка."""
+    fastest, slowest = PACE
+    return fastest * len(bars), slowest * len(bars)
 
 
 def _progress(title: str) -> Callable[[int, int, Point], None]:
@@ -295,7 +366,7 @@ def _progress(title: str) -> Callable[[int, int, Point], None]:
     return told
 
 
-def _notes(runs: int, spent: float, bars: int) -> tuple[str, ...]:
+def _notes(runs: int, spent: float, bars: int, *, cut: str | None = None) -> tuple[str, ...]:
     """Оговорки, которые едут вместе с таблицей.
 
     ⚠️ Последняя оговорка переписана 05.09.2026 (`D-059`). До этого дня она
@@ -305,8 +376,11 @@ def _notes(runs: int, spent: float, bars: int) -> tuple[str, ...]:
     торговых дней. Строка отговаривала от того, что уже сделано, — а оговорка,
     которой нельзя верить, хуже отсутствующей: она обесценивает соседние
     четыре, которые верны.
+
+    `cut` — строка о подрезке истории глубиной (`D-056`); стоит первой,
+    потому что меняет смысл всех чисел таблицы.
     """
-    return (
+    notes = (
         f"Перебрано {runs} сочетаний за {_duration(spent)} на {bars} пятиминутках. "
         "Чем больше сочетаний, тем выше шанс, что лучшее — случайность.",
         "Умолчания программы (тейк 0,5 %, окно 10:05–11:00) подобраны на том же "
@@ -314,17 +388,21 @@ def _notes(runs: int, spent: float, bars: int) -> tuple[str, ...]:
         "Третьего варианта поведения после тейка («сразу восстановить позицию») "
         "в движке нет — обязательная программа ТЗ §8 закрыта не полностью.",
         "Проскальзывание задаётся ключом и по умолчанию нулевое: результат "
-        "систематически лучше настоящего счёта.",
+        "систематически лучше настоящего счёта. Оно меняет не только цены, "
+        "но и состав сделок: уровень тейка считается от цены входа, и "
+        "сдвинутый уровень задевается на другой свече.",
         "Длина истории зависит от того, по чему считали. Один фьючерс живёт "
         "около 70 ликвидных дней, и на такой длине проверка ничего не "
         "различает. Минутные свечи биржа отдаёт за всю жизнь каждого контракта, "
-        "поэтому сшитый ряд ближних контрактов даёт 280 торговых дней: "
+        "поэтому сшитый ряд ближних контрактов даёт сотни торговых дней "
+        "(сколько из них взято — ключ --days и шапка таблицы): "
         "«python3 -m app.fetch --stitch @MX», затем «python -m backtest "
         "--symbol @MX --db userdata/chain.sqlite3» (решение 0049).",
         "Сшитый ряд годится только для замеров: цены на стыках контрактов "
         "не подгоняются, и торговать по нему нельзя. Торговое окно дня стыка "
         "испорчено целиком — средняя считает скачок цены ходом рынка.",
     )
+    return notes if cut is None else (cut, *notes)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

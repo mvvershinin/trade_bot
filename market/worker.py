@@ -81,6 +81,7 @@ from market.candles import Candle, Timeframe
 from market.contracts import (
     ContractLoad,
     ContractRequest,
+    RefreshedRows,
     load_contract_minutes,
     refresh_contracts,
 )
@@ -670,12 +671,13 @@ class MarketWorker:
         market: Market,
         now: datetime | None = None,
         client: IssClient | None = None,
-    ) -> list[ContractRow]:
+    ) -> RefreshedRows:
         """Уточнить таблицу контрактов у биржи: сроки и дневные объёмы.
 
         Ходит в сеть и занимает поток данных, поэтому останавливается
         той же кнопкой, что и загрузка (`stop_loading`). Разбор —
-        `market.contracts.refresh_contracts`.
+        `market.contracts.refresh_contracts`. В ответе — и `said`: что
+        сказать человеку сверх строк (`B-054`); прочесть его обязан зовущий.
         """
         store = await self._ready_store()
         loader = self._loader(client)

@@ -2203,3 +2203,34 @@ def test_the_note_that_there_are_no_money_guards_is_on_screen(dialog) -> None:
 # `ast.Name` и собирала имена лишь из `ast.ImportFrom`, то есть пропускала
 # `ui.main_window.MainWindow(...)` в строке 627 этого самого файла.
 # Теперь разбираются все `tests/test_*.py`, и этот в том числе.
+
+
+def test_the_unfinished_variant_is_shown_but_not_offered(dialog) -> None:
+    """B-050: «Сразу восстановить позицию» виден, выключен и объяснён.
+
+    Поведение: вариант, которого робот не умеет, в списке есть (человек
+    видит, что он задуман), но выбрать его мышкой нельзя, и подсказка
+    говорит почему. Остальные варианты выбираются как прежде.
+
+    ⚠️ Мутации: убрать `setEnabled(False)` в `_choice` — вариант снова
+    выбирается и будет отвергнут при «Применить»; убрать подсказку —
+    выключенный пункт без объяснения.
+    """
+    from PySide6.QtCore import Qt as QtNamespace
+    from PySide6.QtGui import QStandardItemModel
+
+    box = dialog.after_take_profit
+    model = box.model()
+    assert isinstance(model, QStandardItemModel)
+    offered = {
+        box.itemData(index): model.item(index).isEnabled()
+        for index in range(box.count())
+    }
+    assert offered == {
+        AfterTakeProfit.STOP_FOR_THE_DAY: True,
+        AfterTakeProfit.WAIT_FOR_SIGNAL: True,
+        AfterTakeProfit.RESTORE_AT_ONCE: False,
+    }, f"выбирается не то, что умеет робот: {offered}"
+    index = box.findData(AfterTakeProfit.RESTORE_AT_ONCE)
+    why = box.itemData(index, QtNamespace.ItemDataRole.ToolTipRole)
+    assert why and "не сделан" in why, f"выключенный вариант не объяснён: {why!r}"

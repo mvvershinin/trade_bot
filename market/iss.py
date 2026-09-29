@@ -103,6 +103,7 @@ __all__ = [
     "description_url",
     "parse_daily_volumes",
     "parse_last_trade_day",
+    "parse_secid",
 ]
 
 _T = TypeVar("_T")
@@ -542,6 +543,38 @@ def parse_last_trade_day(payload: bytes, *, secid: str) -> date | None:
                     f"последний день обращения {secid!r} не дата: {value!r}"
                 ) from error
     return None
+
+
+def parse_secid(payload: bytes, *, typed: str) -> str:
+    """Настоящий код инструмента (`SECID`) из описания. Чистая функция.
+
+    ISS регистр кода не различает — `siz6`, `SIZ6` и `SiZ6` дают одно
+    описание, где `SECID` = `SiZ6` (живой запрос 29.09.2026), — а база
+    различает: код в чужом регистре лёг бы в неё отдельным инструментом,
+    которого окно не найдёт (`D-128`). Поэтому код, набранный человеком,
+    дальше не идёт — идёт этот.
+
+    :raises IssUnknownInstrument: описание пусто — биржа кода не знает.
+    :raises IssPayloadError: в описании нет строки `SECID`.
+    """
+    columns, rows = _block(_decode(payload), "description")
+    if not rows:
+        raise IssUnknownInstrument(
+            f"биржа не знает инструмента {typed!r}: описание пусто. "
+            "Проверьте тикер: у фьючерса он меняется с каждой экспирацией"
+        )
+    try:
+        name_at, value_at = columns.index("name"), columns.index("value")
+    except ValueError as error:
+        raise IssPayloadError(f"в описании нет обязательной колонки: {error}") from error
+    for row in rows:
+        if isinstance(row, list) and len(row) > max(name_at, value_at) and (
+            row[name_at] == "SECID"
+        ):
+            value = str(row[value_at] or "").strip()
+            if value:
+                return value
+    raise IssPayloadError(f"в описании {typed!r} биржа не назвала код инструмента (SECID)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1038,6 +1071,19 @@ class IssClient:
         return self._fetch(
             description_url(secid, base=self._base),
             lambda body: parse_last_trade_day(body, secid=secid),
+            FetchResult(),
+        )
+
+    def secid(self, code: str) -> str:
+        """Код, набранный человеком, — к настоящему `SECID` биржи (`D-128`).
+
+        Описание, а не карточка рынка: оно отвечает и за истёкший контракт
+        (`description_url`), и за акцию, и за фьючерс одним адресом.
+        """
+        typed = code.strip()
+        return self._fetch(
+            description_url(typed, base=self._base),
+            lambda body: parse_secid(body, typed=typed),
             FetchResult(),
         )
 

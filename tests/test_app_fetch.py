@@ -33,6 +33,7 @@ from app.main import main as program_main
 from market import (
     DEFAULT_DEPTH_DAYS,
     FUTURES,
+    MARKETS,
     MSK,
     Candle,
     CandleStore,
@@ -81,11 +82,35 @@ def session(day: date, count: int) -> list[Candle]:
     return [minute(start + timedelta(minutes=i), open=100.0 + i) for i in range(count)]
 
 
+#: Коды, которые подставная биржа знает, — в её собственном регистре.
+KNOWN = ("MXU6", "MXZ6", "MXM6", "SBER", "SiZ6")
+
+
+def description_body(secid: str | None) -> bytes:
+    """Описание инструмента, как у ISS; `None` — биржа кода не знает."""
+    data = [] if secid is None else [["SECID", "Краткий код", secid, "string"]]
+    return json.dumps(
+        {"description": {"columns": ["name", "title", "value", "type"], "data": data}}
+    ).encode("utf-8")
+
+
+def described(url: str) -> bytes:
+    """Ответ на описание: ISS регистр не различает и называет свой `SECID`.
+
+    Живой запрос 29.09.2026: `siz6`, `SIZ6`, `SiZ6` — одно описание, `SiZ6`.
+    """
+    typed = url.split("/securities/", 1)[1].split(".json", 1)[0]
+    return description_body({code.lower(): code for code in KNOWN}.get(typed.lower()))
+
+
 def exchange(borders: bytes, pages: Sequence[bytes] = ()) -> Callable[[str], bytes]:
     queue = list(pages)
     empty = iss_body([])
 
     def handler(url: str) -> bytes:
+        # ⚠️ До очереди: иначе описание съело бы первую страницу свечей.
+        if "iss.only=description" in url:
+            return described(url)
         if "candleborders" in url:
             return borders
         return queue.pop(0) if queue else empty
@@ -202,6 +227,36 @@ def test_the_market_key_picks_the_market(
     assert seen[0].market.market == "shares"
 
 
+def test_the_fetch_key_keeps_the_case_of_the_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """`--fetch SiZ6` грузит `SiZ6`, а не `SIZ6` (`D-128`).
+
+    ISS регистр не различает и сама отвечает `SiZ6` (живой запрос
+    29.09.2026), а база различает: `SIZ6` лёг бы отдельным инструментом.
+    """
+    seen: list[HistoryRequest] = []
+
+    def spy(database, request, *, out, client=None):
+        seen.append(request)
+        return 0
+
+    monkeypatch.setattr("app.fetch.fetch_history", spy)
+    run_from_arguments(arguments(fetch="SiZ6"), tmp_path / "c.sqlite3", out=io.StringIO())
+    assert seen[0].symbol == "SiZ6"
+
+
+def test_inspect_keeps_the_case_of_the_code(tmp_path: pathlib.Path) -> None:
+    """`--inspect siz6` находит минуты `SiZ6`: код биржи, а не набранный (`D-128`)."""
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("SiZ6", session(DAY, 400), Source.ISS)
+    out = io.StringIO()
+    code = show_inventory(path, "siz6", out=out, client=fake_client(exchange(ALIVE)))
+    assert code == 0, out.getvalue()
+    assert "SiZ6 — что лежит в базе" in out.getvalue()
+
+
 def test_an_unknown_market_is_refused_by_the_key_itself() -> None:
     """Опечатка в рынке — отказ разбора ключей, а не запрос в никуда."""
     with pytest.raises(SystemExit):
@@ -266,10 +321,54 @@ def test_a_typo_in_the_ticker_is_explained_and_the_code_is_not_zero(
     )
     text = out.getvalue()
     assert code == 1, "негодный код принят молча"
-    assert "не знает инструмента" in text
-    assert "--fetch-market shares" in text
+    assert "не знает инструмента 'MXЫ6'" in text
     assert "Traceback" not in text
     assert rows(path, "MXЫ6") == 0
+
+
+def test_a_code_from_another_market_points_at_the_market_key(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Код биржа знает, а на срочном рынке его нет: подсказан ключ рынка."""
+    out = io.StringIO()
+    code = fetch_history(
+        tmp_path / "c.sqlite3",
+        HistoryRequest(symbol="sber", market=FUTURES, until=date(2026, 6, 19),
+                       since=DAY),
+        out=out, client=fake_client(exchange(UNKNOWN)),
+    )
+    assert code == 1
+    assert "--fetch-market shares" in out.getvalue(), out.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("typed", "real", "market"),
+    [("sber", "SBER", "shares"), ("siz6", "SiZ6", "futures"), ("mxu6", "MXU6", "futures")],
+)
+def test_the_typed_code_becomes_the_exchange_code(
+    tmp_path: pathlib.Path, typed: str, real: str, market: str
+) -> None:
+    """Стережёт: `--fetch sber` пишет в базу `SBER`, а не отдельный `sber` (`D-128`).
+
+    Код приводится к `SECID` из ответа биржи, а не поднятием регистра:
+    `siz6` обязан стать `SiZ6`, а не `SIZ6`. Мутация, обязанная ронять
+    проверку: убрать приведение в `fetch_history`.
+    """
+    path = tmp_path / "c.sqlite3"
+    transport = FakeTransport(exchange(ALIVE, [iss_body(session(DAY, 400))]))
+    out = io.StringIO()
+    code = fetch_history(
+        path,
+        HistoryRequest(symbol=typed, market=MARKETS[market], until=date(2026, 6, 19),
+                       since=DAY, now=datetime(2026, 6, 25, tzinfo=MSK)),
+        out=out, client=IssClient(transport, sleep=no_sleep, pause=0),
+    )
+    assert code == 0, out.getvalue()
+    assert rows(path, real) == 400, out.getvalue()
+    assert rows(path, typed) == 0, "свечи легли под набранным кодом"
+    candle_urls = [url for url in transport.urls if "/candles.json" in url]
+    assert candle_urls and all(f"/{real}/" in url for url in candle_urls), candle_urls
+    assert f"Загрузка истории {real} " in out.getvalue()
 
 
 def test_an_empty_period_is_not_reported_as_done(tmp_path: pathlib.Path) -> None:
@@ -291,6 +390,8 @@ def test_a_broken_connection_is_a_phrase_not_a_traceback(
 ) -> None:
     """Обрыв связи: фраза и обещание продолжить, а не трассировка на экран."""
     def handler(url: str) -> bytes:
+        if "iss.only=description" in url:
+            return described(url)
         if "candleborders" in url:
             return ALIVE
         raise IssTransportError("соединение разорвано")
@@ -346,7 +447,7 @@ def test_inspect_prints_the_picture_and_writes_nothing(
         )
     before = path.read_bytes()
     out = io.StringIO()
-    code = show_inventory(path, "mxu6", out=out)
+    code = show_inventory(path, "mxu6", out=out, client=fake_client(exchange(ALIVE)))
     text = out.getvalue()
     assert code == 0
     assert "MXU6 — что лежит в базе" in text
@@ -373,7 +474,7 @@ def test_inspect_of_an_unloaded_instrument_points_at_the_fetch_key(
     with CandleStore(path) as store:
         store.put_minutes("MXU6", session(DAY, 10), Source.ISS)
     out = io.StringIO()
-    code = show_inventory(path, "MXZ6", out=out)
+    code = show_inventory(path, "MXZ6", out=out, client=fake_client(exchange(ALIVE)))
     assert code == 1
     assert "нет ни одной свечи" in out.getvalue()
     assert "--fetch MXZ6" in out.getvalue()
@@ -390,10 +491,101 @@ def test_the_program_takes_the_inspect_key_without_opening_a_window(
     import sys
 
     monkeypatch.setitem(sys.modules, "qasync", None)
+    monkeypatch.setattr("app.fetch.IssClient", lambda: fake_client(exchange(ALIVE)))
     path = tmp_path / "c.sqlite3"
     with CandleStore(path) as store:
         store.put_minutes("MXU6", session(DAY, 400), Source.ISS)
-    assert program_main(["--inspect", "MXU6", "--db", str(path)]) == 0
+    assert program_main(["--inspect", "mxu6", "--db", str(path)]) == 0
+
+
+def test_inspect_of_a_code_the_exchange_does_not_know_is_refused(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Опечатка в `--inspect` — отказ словами, а не «свечей нет»."""
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("MXU6", session(DAY, 10), Source.ISS)
+    out = io.StringIO()
+    code = show_inventory(path, "MXЫ6", out=out, client=fake_client(exchange(ALIVE)))
+    assert code == 1
+    assert "не знает инструмента 'MXЫ6'" in out.getvalue(), out.getvalue()
+
+
+def test_inspect_of_a_stitched_series_does_not_ask_the_exchange(
+    tmp_path: pathlib.Path,
+) -> None:
+    """`@MX` бирже не известен: опись ищет его как набран, в сеть не ходит."""
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("@MX", session(DAY, 400), Source.ISS)
+    transport = FakeTransport(exchange(ALIVE))
+    out = io.StringIO()
+    code = show_inventory(
+        path, "@MX", out=out, client=IssClient(transport, sleep=no_sleep, pause=0)
+    )
+    assert code == 0, out.getvalue()
+    assert transport.urls == []
+
+
+def offline(url: str) -> bytes:
+    """Биржа недоступна: любой запрос — обрыв связи."""
+    raise IssTransportError("соединение разорвано")
+
+
+@pytest.mark.parametrize("typed", ["MXU6", "mxu6"])
+def test_inspect_without_the_exchange_finds_the_code_in_the_base(
+    tmp_path: pathlib.Path, typed: str
+) -> None:
+    """Без связи с биржей верный код находится в базе.
+
+    Опись только читает базу: фраза, что код не сверен, — а не отказ после повторов.
+    """
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("MXU6", session(DAY, 400), Source.ISS)
+    out = io.StringIO()
+    code = show_inventory(path, typed, out=out, client=fake_client(offline))
+    text = out.getvalue()
+    assert code == 0, text
+    assert "MXU6 — что лежит в базе" in text
+    assert "Биржа недоступна" in text
+    assert "не сверен" in text
+
+
+def test_inspect_finds_a_key_stored_in_another_case(tmp_path: pathlib.Path) -> None:
+    """`--inspect siz6` находит `SIZ6` и говорит, что регистр в базе другой.
+
+    Si до `D-128` лежит под `SIZ6`, а биржа называет его `SiZ6`.
+    """
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("SIZ6", session(DAY, 400), Source.ISS)
+    out = io.StringIO()
+    code = show_inventory(path, "siz6", out=out, client=fake_client(exchange(ALIVE)))
+    text = out.getvalue()
+    assert code == 0, text
+    assert "SIZ6 — что лежит в базе" in text
+    assert "в другом регистре: SIZ6" in text
+    assert "SiZ6" in text, "код биржи не назван"
+    with CandleStore(path) as store:
+        assert store.symbols() == ["SIZ6"], "база переименована"
+
+
+def test_inspect_lists_every_key_that_differs_only_in_case(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Два ключа без учёта регистра — не выбор наугад, а перечисление."""
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("SIZ6", session(DAY, 400), Source.ISS)
+        store.put_minutes("Siz6", session(DAY, 10), Source.ISS)
+    out = io.StringIO()
+    code = show_inventory(path, "siz6", out=out, client=fake_client(offline))
+    text = out.getvalue()
+    assert code == 1, text
+    assert "SIZ6" in text
+    assert "Siz6" in text
+    assert "что лежит в базе" not in text
 
 
 # -- сшивка ближних контрактов: `python3 -m app.fetch --stitch` ---------------
@@ -427,6 +619,47 @@ def chain_store(path: pathlib.Path) -> None:
                 ],
                 Source.ISS,
             )
+
+
+def test_stitch_loads_the_legs_under_the_exchange_codes(tmp_path: pathlib.Path) -> None:
+    """Стережёт: `--legs mxm6,mxu6` качает и ищет `MXM6`, `MXU6` (`D-128`).
+
+    Мутация, обязанная ронять проверку: убрать приведение кодов в `build_chain`.
+    """
+    from app.fetch import ChainRequest, build_chain
+
+    path = tmp_path / "chain.sqlite3"
+    transport = FakeTransport(exchange(ALIVE))
+    out = io.StringIO()
+    code = build_chain(
+        path,
+        ChainRequest(symbol="@MX", legs=["mxm6", "mxu6"], depth=3),
+        out=out,
+        client=IssClient(transport, sleep=no_sleep, pause=0),
+    )
+    asked = [url for url in transport.urls if "candleborders" in url]
+    assert any("/MXM6/" in url for url in asked), asked
+    assert any("/MXU6/" in url for url in asked), asked
+    assert not any("/mxm6/" in url or "/mxu6/" in url for url in asked), asked
+    assert code == 1  # свечей подставная биржа не дала
+    assert "нет ни одной свечи по: MXM6, MXU6" in out.getvalue(), out.getvalue()
+
+
+def test_stitch_refuses_a_leg_the_exchange_does_not_know(tmp_path: pathlib.Path) -> None:
+    """Опечатка в `--legs` — отказ словами до первой загрузки."""
+    from app.fetch import ChainRequest, build_chain
+
+    transport = FakeTransport(exchange(ALIVE))
+    out = io.StringIO()
+    code = build_chain(
+        tmp_path / "chain.sqlite3",
+        ChainRequest(symbol="@MX", legs=["MXM6", "MXЫ6"], depth=3),
+        out=out,
+        client=IssClient(transport, sleep=no_sleep, pause=0),
+    )
+    assert code == 1
+    assert "не знает инструмента 'MXЫ6'" in out.getvalue(), out.getvalue()
+    assert not [url for url in transport.urls if "/candles.json" in url]
 
 
 def test_stitch_refuses_an_exchange_code_as_the_name(tmp_path: pathlib.Path) -> None:

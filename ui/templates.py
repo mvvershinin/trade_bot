@@ -127,6 +127,10 @@ _KEY_NAME: Final[str] = "name"
 _KEY_SAVED: Final[str] = "saved_at"
 _KEY_VALUES: Final[str] = "settings"
 _KEY_ORIGIN: Final[str] = "origin"
+#: Ключи записи, которые эта сборка понимает. Остальные бережёт `record_extras`.
+_RECORD_KEYS: Final[frozenset[str]] = frozenset(
+    (_KEY_NAME, _KEY_SAVED, _KEY_VALUES, _KEY_ORIGIN)
+)
 
 #: Имя встроенного шаблона. Он не хранится в файле и не удаляется: это
 #: умолчания продукта, за которыми стоят замеры и сверка с прототипом
@@ -185,6 +189,13 @@ class Template:
     #: Незнакомые настройки целиком — чтобы записать их обратно нетронутыми.
     #: Не участвует в сравнении: два шаблона равны по имени и значениям.
     extras: dict[str, object] = field(default_factory=dict, compare=False, repr=False)
+    #: Незнакомые ключи **самой записи** — рядом с именем, временем и
+    #: происхождением, а не внутри настроек (`D-074`). Отдельно от `extras`
+    #: и от `unknown` намеренно: это не настройки, применять из них нечего,
+    #: и шаблон из-за них не становится «применимым с оговорками».
+    record_extras: dict[str, object] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def complete(self) -> bool:
@@ -321,6 +332,10 @@ def _body_of(templates: Sequence[Template]) -> str:
         _KEY_VERSION: FORMAT_VERSION,
         _KEY_TEMPLATES: [
             {
+                # ⚠️ Незнакомые ключи записи — первыми, по той же причине,
+                # что и незнакомые настройки ниже: перебить известное они
+                # не могут.
+                **one.record_extras,
                 _KEY_NAME: one.name,
                 _KEY_SAVED: (
                     one.saved_at.isoformat() if one.saved_at is not None else ""
@@ -614,6 +629,9 @@ def _template_of(item: object, number: int) -> tuple[Template | None, str]:
             missing=missing,
             unknown=tuple(sorted(extras)),
             extras=extras,
+            record_extras={
+                key: value for key, value in item.items() if key not in _RECORD_KEYS
+            },
         ),
         both_ways,
     )

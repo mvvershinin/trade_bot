@@ -445,6 +445,27 @@ def _engine_gap() -> tuple[str, ...]:
 _ENGINE_GAP: tuple[str, ...] = _engine_gap()
 
 
+def _unavailable_choice(values: Settings) -> str:
+    """Отказ за выбранный вариант, которого робот не умеет. Пусто — таких нет.
+
+    Список «чего движок не принимает» один — `unavailable` у самого значения
+    (`ui/models.py`, `B-050`). По нему же окно выключает вариант в списке,
+    а порт подменяет его при сборке (`port._startup_settings`). Второй список
+    здесь разошёлся бы с ним молча: отказ без пометки не дал бы программе
+    открыться, пометка без отказа — торговлю другим вариантом под этим именем.
+    """
+    for item in dataclasses.fields(values):
+        chosen = getattr(values, item.name)
+        why = getattr(chosen, "unavailable", "") if isinstance(chosen, enum.Enum) else ""
+        if why:
+            others = ", ".join(
+                f"«{other.label}»" for other in type(chosen)
+                if not getattr(other, "unavailable", "")
+            )
+            return f"Вариант «{chosen.label}» выбрать нельзя. {why} Выберите: {others}."
+    return ""
+
+
 def engine_settings(
     values: Settings, mode: Mode, base: EngineSettings | None = None
 ) -> EngineSettings:
@@ -481,13 +502,9 @@ def engine_settings(
             "так нельзя: движок получил бы умолчания вместо того, что выбрано "
             "в окне. Обновите программу целиком."
         )
-    if values.after_take_profit is AfterTakeProfit.RESTORE_AT_ONCE:
-        raise SettingsRefused(
-            "Вариант «Сразу восстановить позицию» после тейк-профита в движке "
-            "пока не сделан: непонятно, в какую сторону и по какой цене "
-            "восстанавливать, и замеров по нему нет. Выберите «Не входить "
-            "до конца дня» или «Ждать нового сигнала средней»."
-        )
+    unavailable = _unavailable_choice(values)
+    if unavailable:
+        raise SettingsRefused(unavailable)
     previous = base if base is not None else EngineSettings()
     fields: dict[str, Any] = {
         name: take(values, mode) for name, take in _ENGINE_FROM_WINDOW.items()

@@ -161,7 +161,7 @@ def test_the_summary_is_plain_text_not_markup(make_choice) -> None:
     window = make_choice(marked)
     window.set_chosen("x")
     assert window.summary.textFormat() == Qt.TextFormat.PlainText
-    assert "<" in window.summary.text()
+    assert window.summary.text() == marked.summary  # дословно: ни обрезки после «<», ни «&lt;»
 
 
 # --------------------------------------------------------- состав каталога

@@ -26,7 +26,23 @@ CALCULATION = {"pandas", "numpy", "scipy", "statistics", "ta", "talib"}
 
 #: Сеть. Ходить в сеть — работа `broker/` и `market/`; `app/` их собирает,
 #: но не разговаривает с брокером сам.
-NETWORK = {"httpx", "websockets", "aiohttp", "urllib", "urllib3", "socket", "requests"}
+#:
+#: Набор тот же, что у окна (`tests/test_ui_no_trading_logic.py::NETWORK`).
+#: До 28.09.2026 здесь было семь имён и сбор одного корня (`D-022`): `ssl`,
+#: `http`, почтовые и `xmlrpc` проходили, а `from PySide6.QtNetwork import …`
+#: сводился к корню `PySide6` — тому же, что у кнопок, — и проходил молча.
+NETWORK = {
+    # клиенты HTTP: свои и чужие
+    "requests", "httpx", "aiohttp", "urllib", "urllib3", "http",
+    # сокеты и то, что поверх них
+    "socket", "socketserver", "ssl",
+    # `websockets` и `websocket-client` — разные пакеты с разными именами
+    "websockets", "websocket",
+    # почта, файлы, вызов процедур
+    "ftplib", "smtplib", "poplib", "imaplib", "telnetlib", "xmlrpc",
+    # сеть самого Qt — полным именем: по корню `PySide6` её от виджета не отличить
+    "PySide6.QtNetwork", "PySide6.QtWebSockets", "PySide6.QtNetworkAuth",
+}
 
 #: Имена библиотек отрисовки. Живут только в `ui/chart/`, иначе замена
 #: отрисовки по ТЗ §6 перестаёт быть заменой одного блока. Ни одного из них
@@ -215,13 +231,38 @@ def parsed() -> list[tuple[pathlib.Path, ast.AST, str]]:
 
 
 def _imports(tree: ast.AST) -> set[str]:
+    """Имена модулей, которые файл втягивает: корень, полное имя и взятое из пакета.
+
+    Корня хватает для `import socket` и `from urllib.request import urlopen`.
+    Полное имя нужно из-за Qt: `PySide6.QtNetwork` по корню не отличить
+    от `PySide6.QtWidgets`. Имя, взятое у пакета (`from PySide6 import
+    QtNetwork`), — тот же модуль, записанный иначе, и считается так же.
+    """
     names: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names.update(alias.name.split(".")[0] for alias in node.names)
+            for alias in node.names:
+                names.add(alias.name)
+                names.add(alias.name.split(".")[0])
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names.add(node.module)
             names.add(node.module.split(".")[0])
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
     return names
+
+
+def _offenders(parsed: list[tuple[pathlib.Path, ast.AST, str]], forbidden: set[str]) -> list[str]:
+    """Файлы, втянувшие что-то из списка запретов, — с именами найденного."""
+    return [
+        f"{path.name}: {sorted(_imports(tree) & forbidden)}"
+        for path, tree, _ in parsed
+        if _imports(tree) & forbidden
+    ]
+
+
+def _planted(source: str) -> list[tuple[pathlib.Path, ast.AST, str]]:
+    """Подсунутый файл в том же виде, в каком проверка получает настоящие."""
+    return [(pathlib.Path("app/planted_probe.py"), ast.parse(source), source)]
 
 
 def _code(tree: ast.AST) -> str:
@@ -294,13 +335,66 @@ def test_the_assembly_computes_nothing(parsed) -> None:
 
 
 def test_the_assembly_never_goes_to_the_network_itself(parsed) -> None:
-    culprits = [
-        f"{path.name}: {sorted(_imports(tree) & NETWORK)}"
-        for path, tree, _ in parsed if _imports(tree) & NETWORK
-    ]
+    culprits = _offenders(parsed, NETWORK)
     assert not culprits, (
         "сеть в app/ мимо broker/ и market/:\n  " + "\n  ".join(culprits)
     )
+
+
+@pytest.mark.parametrize(
+    ("title", "forbidden"),
+    [("NETWORK", NETWORK), ("CALCULATION", CALCULATION)],
+)
+def test_the_forbidden_lists_of_the_assembly_name_modules_not_words(
+    title: str, forbidden: set[str],
+) -> None:
+    """В списке запретов стоят имена модулей: слово в нём не совпадёт ни с чем.
+
+    Дефект настоящий (`D-000`): в наборе окна пять дней лежало «запросы»
+    вместо `requests`, и проверка зеленела при снятой защите.
+    """
+    broken = sorted(
+        item for item in forbidden
+        if not item.isascii() or not all(part.isidentifier() for part in item.split("."))
+    )
+    assert not broken, (
+        f"в списке {title} не имена модулей, а слова: {broken}. Совпасть "
+        "с настоящим импортом они не могут, и проверка ничего не проверяет"
+    )
+    assert forbidden, f"список {title} пуст — проверка стала вакуумной"
+
+
+def test_the_assembly_network_guard_catches_an_import_planted_for_it() -> None:
+    """Канарейка: проверка сети в `app/` ловит подсунутый ей импорт — все виды.
+
+    Без неё опечатка в наборе или поломка разбора делает проверку выше вечно
+    зелёной (`D-022`). Бьёт в тот же `_offenders`, что и проверка дерева,
+    а не в `_imports` отдельно: канарейка мимо общего пути зеленеет при
+    снятой защите (замер 05.09.2026 на такой же проверке окна).
+    """
+    planted = {
+        "прямой импорт": "import requests\n",
+        "импорт с псевдонимом": "import httpx as client\n",
+        "часть модуля": "from urllib.request import urlopen\n",
+        "шифрованный сокет": "import ssl\n",
+        "сеть самого Qt": "from PySide6.QtNetwork import QNetworkAccessManager\n",
+        "сеть Qt, взятая у пакета": "from PySide6 import QtNetwork\n",
+        "отложенный внутри функции": "def load():\n    import socket\n    return socket\n",
+    }
+    missed = [
+        title for title, source in planted.items()
+        if not _offenders(_planted(source), NETWORK)
+    ]
+    assert not missed, f"проверка сети в app/ не замечает: {missed}"
+
+    # И обратно: обычные импорты сборки она не трогает.
+    clean = (
+        "from PySide6.QtWidgets import QApplication\n"
+        "from PySide6 import QtCore\n"
+        "import asyncio\n"
+        "from market import MarketWorker\n"
+    )
+    assert not _offenders(_planted(clean), NETWORK), "проверка сети ловит обычную сборку"
 
 
 def test_the_assembly_does_not_know_what_draws_the_chart(parsed) -> None:

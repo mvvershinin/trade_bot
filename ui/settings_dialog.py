@@ -43,6 +43,7 @@ from collections.abc import Sequence
 from typing import cast
 
 from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, Signal
+from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -237,6 +238,14 @@ def _choice(enumeration) -> QComboBox:
     box = QComboBox()
     for item in enumeration:
         box.addItem(item.label, item)
+        # Вариант, которого робот не умеет, виден, но не выбирается, и
+        # подсказка говорит почему (`B-050`): выбранный, он был бы отвергнут
+        # при «Применить», а из файла настроек — подменён при запуске.
+        why = getattr(item, "unavailable", "")
+        if why:
+            index = box.count() - 1
+            cast(QStandardItemModel, box.model()).item(index).setEnabled(False)
+            box.setItemData(index, why, Qt.ItemDataRole.ToolTipRole)
     return box
 
 
@@ -1113,7 +1122,8 @@ class SettingsDialog(QDialog):
             ("После сработавшего тейка", self.after_take_profit,
              "Что делать остаток дня, когда прибыль уже зафиксирована. «Не входить» — "
              "как сейчас. «Сразу восстановить» — это ваше «всегда должна быть позиция» "
-             "в чистом виде, но и самый дорогой вариант по комиссии."),
+             "в чистом виде, но и самый дорогой вариант по комиссии. В роботе он "
+             "пока не сделан, поэтому в списке виден, но не выбирается."),
         ])
         return box
 

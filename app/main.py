@@ -436,6 +436,24 @@ def _speak_utf8() -> None:
             pass
 
 
+def _named_userdata(args: argparse.Namespace) -> pathlib.Path | None:
+    """Папка данных этого запуска, если её назвали ключом `--db`; иначе `None`.
+
+    Одна функция вместо двух копий одной строки (`main()` и `_run()`) — `D-041`.
+    `None`, а не `database.parent` всегда, потому что `database.parent`
+    и `userdata_dir()` совпадают в бою, но не в прогоне тестов:
+    `tests/conftest.py::logs_go_to_a_temporary_folder` подменяет именно
+    `userdata_dir()` (через `app.logs`/`app.runs`), а не то, что вернёт
+    `market.default_db_path()`. Подставить `database.parent` безусловно
+    значило бы обходить эту подмену стороной и писать лог и библиотеку
+    шаблонов в боевую папку `userdata/` при каждом прямом (не через
+    подпроцесс) вызове программы без `--db` — ровно та потеря, ради которой
+    подмена и заведена.
+    """
+    named = getattr(args, "database", None)  # тесты зовут `_run` с голым Namespace
+    return pathlib.Path(named).parent if named else None
+
+
 def main(argv: list[str] | None = None) -> int:
     """Собрать и запустить программу. Возвращает код возврата процесса."""
     _speak_utf8()
@@ -445,8 +463,13 @@ def main(argv: list[str] | None = None) -> int:
     # слоя летело владельцу счёта в консоль сырым текстом (`D-021`).
     # Здесь же встаёт чистка секретов — тем же вызовом, на все ветки сразу.
     from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
+    from market import default_db_path  # noqa: PLC0415 — Qt не трогает
 
-    setup_logging()
+    # ⚠️ `database` — до первой строки лога, `named_userdata` — её адрес,
+    # см. докстринг `_named_userdata` (`D-041`).
+    named_userdata = _named_userdata(args)
+    database = pathlib.Path(args.database) if args.database else default_db_path()
+    setup_logging(userdata=named_userdata)
 
     if args.fetch or args.inspect or args.runs is not None:
         # ⚠️ Ветка стоит ДО первого касания Qt намеренно: загрузка истории
@@ -470,9 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     # счёта поймал это живьём 06.09.2026: окна нет, вывода нет, Ctrl+C
     # не помогает. Молчание в этой программе — самостоятельный дефект.
     from app.single_instance import OneCopy, Purpose  # noqa: PLC0415 — слои
-    from market import default_db_path  # noqa: PLC0415 — Qt не трогает
 
-    database = pathlib.Path(args.database) if args.database else default_db_path()
     single = OneCopy(database.parent)
     verdict = single.take(Purpose.WINDOW)
     if not verdict.taken:
@@ -639,7 +660,7 @@ async def _run(
     from ui.main_window import MainWindow  # noqa: PLC0415
     from ui.models import DecisionLevel  # noqa: PLC0415
 
-    if not _database_ready(database):
+    if not _database_ready(database, _named_userdata(args)):  # см. её докстринг, D-041/D-129
         return 1
     store, loaded, values, depth = _stored_settings(database.parent, args)
 
@@ -683,7 +704,7 @@ async def _run(
                            until=args.until, sanitize=scrub)
         port.attach_exchange(worker.point_value)
 
-        window = MainWindow(port=port, settings=values, sanitize=scrub)
+        window = MainWindow(port=port, settings=port.values, sanitize=scrub)  # B-050
         window.resize(1440, 900)
 
         closed = asyncio.Event()
@@ -692,7 +713,8 @@ async def _run(
 
         _announce(port, database, level=DecisionLevel.WARNING)
         await _restore_halt(port, database)
-        _wire_settings_and_log(port, store, loaded, values, level=DecisionLevel.WARNING)
+        _wire_settings_and_log(
+            port, store, loaded, values, _named_userdata(args), level=DecisionLevel.WARNING)
         if note:  # папка данных не держит замок «одна копия» (решение 0039)
             port.note("Один экземпляр программы", note, DecisionLevel.WARNING)
         port.refresh("запуск программы")
@@ -733,24 +755,40 @@ async def _restore_halt(port: HistoryPort, database: pathlib.Path) -> None:
     await port.restore_halt()
 
 
-def _database_ready(database: pathlib.Path) -> bool:
+def _database_ready(database: pathlib.Path, named_userdata: pathlib.Path | None) -> bool:
     """Всё, что зависит от места базы, — до сборки окна.
 
     Две вещи: окно шаблонов смотрит в ту же базу, что программа
     (`_templates_read_runs_from`), и папка данных готова к записи
     (`_userdata_ready`, отказ — фразой).
+
+    :param named_userdata: `database.parent`, если папку данных назвали
+        ключом `--db`; иначе `None` (см. `main()`, `D-041`/`D-129`).
     """
-    _templates_read_runs_from(database)
+    _templates_read_runs_from(database, named_userdata)
     return _userdata_ready(database.parent)
 
 
-def _templates_read_runs_from(database: pathlib.Path) -> None:
-    """Окно шаблонов читает прогоны из той базы, с которой запущена программа.
+def _templates_read_runs_from(
+    database: pathlib.Path, named_userdata: pathlib.Path | None
+) -> None:
+    """Окно шаблонов читает прогоны и держит библиотеку там же, где запущена программа.
 
     Створку двери (`ui/backend.py`) вставляет `app/runs.py` при импорте,
     и ключа `--db` он не знает: без этой проводки при `--db FILE` статистика
     шаблонов читалась бы из базы по умолчанию, и человек решил бы, что набор
-    не гонялся (`D-052`).
+    не гонялся (`D-052`). Та же путаница ждала библиотеку шаблонов —
+    `userdata`: она переезжала бы за базой при обычном запуске и оставалась
+    в умолчании при `--db`, то есть у одного запуска получались бы две разные
+    папки данных разом (решение 0003, `D-129`).
+
+    `userdata` в створке переставляется, только когда `named_userdata` не
+    пуст — то есть только когда `--db` действительно назвали. Без ключа
+    исходная `_library` (`app/runs.py`) сама зовёт `userdata_dir()` при
+    каждом обращении, и это то самое место, которое вправе подменить прогон
+    тестов (`tests/conftest.py::logs_go_to_a_temporary_folder`). Переставить
+    её безусловно на `database.parent` значило бы обходить эту подмену
+    стороной при каждом запуске окна без `--db`.
 
     ⚠️ `app.runs` импортируется **здесь, первым**: створка ставится при его
     импорте, и импорт, случившийся позже этой замены, затёр бы её молча.
@@ -761,9 +799,16 @@ def _templates_read_runs_from(database: pathlib.Path) -> None:
     door = backend.current()
     if door is None:
         return
-    backend.use(
-        dataclasses.replace(door, runs=lambda sets: matching_runs(database, sets))
-    )
+    if named_userdata is not None:
+        backend.use(dataclasses.replace(
+            door,
+            runs=lambda sets: matching_runs(database, sets),
+            userdata=lambda: named_userdata,
+        ))
+    else:
+        backend.use(dataclasses.replace(
+            door, runs=lambda sets: matching_runs(database, sets)
+        ))
 
 
 def _userdata_ready(userdata: pathlib.Path) -> bool:
@@ -847,11 +892,12 @@ def _announce(port: HistoryPort, database: pathlib.Path, *, level: DecisionLevel
         port.note("Папка данных", ignored, level)
 
 
-def _wire_settings_and_log(
+def _wire_settings_and_log(  # noqa: PLR0913 — шестой довод это папка лога: `named_userdata` (D-041)
     port: HistoryPort,
     store: SettingsStore,
     loaded: Loaded,
     values: Settings,
+    named_userdata: pathlib.Path | None,
     *,
     level: DecisionLevel,
 ) -> None:
@@ -869,10 +915,21 @@ def _wire_settings_and_log(
     4. **включается запись** применённых настроек.
 
     Перед ними сборка зовёт `_announce`.
+
+    `named_userdata` — умолчание запасной папки лога: `database.parent`,
+    если папку данных назвали ключом `--db`, иначе `None`. Если названная
+    в настройках папка не открылась, лог обязан уехать туда же, куда легла
+    база этого запуска — но **только** когда её действительно назвали
+    ключом; иначе умолчание обязано остаться пустым и дать `setup_logging`
+    самому спросить `userdata_dir()` — то место, которое вправе подменить
+    прогон тестов (`tests/conftest.py::logs_go_to_a_temporary_folder`).
+    Подставить `database.parent` безусловно значило бы обходить эту подмену
+    стороной при каждом запуске окна без `--db` (находка ревью, `D-041`).
     """
     from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
 
-    _say_where_the_log_goes(port, setup_logging(values.log_directory), level=level)
+    setup = setup_logging(values.log_directory, userdata=named_userdata)
+    _say_where_the_log_goes(port, setup, level=level)
     _say_what_was_read(port, loaded, store, level=level)
     _keep_settings(port, store, level=level)
 
@@ -896,7 +953,8 @@ def _keep_settings(
     """
     def remember(values: Settings) -> None:
         port.set_depth(values.depth_days)
-        failure = store.save(values)
+        # Подмена при сборке порта в файл не идёт, пока человек не применил сам (`B-050`).
+        failure = store.save(port.for_file(values))
         if failure:
             port.note("Настройки не сохранены", failure, level)
 
@@ -1032,8 +1090,20 @@ async def _snapshot(
     await port.wait()
     # Прогон рассылает сигналы; окну надо дать их разобрать и разложить
     # виджеты, иначе снимок получится с недорисованным графиком.
+    #
+    # ⚠️ `application.processEvents()` здесь не зовётся — `D-072`. Цикл
+    # asyncio под qasync и есть цикл Qt (`QApplication.exec()`,
+    # `qasync.QEventLoop.run_forever`): каждый `await` уже отдаёт ему
+    # управление, и виджеты раскладываются без ручной прокрутки очереди.
+    # Прямой вызов открывал бы **вложенный** цикл Qt изнутри шага корутины —
+    # ту же мину, что и `B-026`: соседняя задача, которой Qt даёт слово
+    # из вложенного цикла, получает `RuntimeError: Cannot enter into task…`,
+    # потому что эта корутина в этот момент сама числится текущей задачей.
+    # Замер, что мина настоящая: `asyncio.ensure_future` соседа рядом
+    # с `QTimer.singleShot(0, ...)`, открывающим вложенный `QEventLoop`
+    # во время снимка, ронял соседа ровно так, с `processEvents()`
+    # на месте, и переставал ронять без него.
     for _ in range(3):
-        application.processEvents()
         await asyncio.sleep(0)
     shot.target.parent.mkdir(parents=True, exist_ok=True)
     picture = window.grab() if shot.what == "window" else _shot_of_dialog(

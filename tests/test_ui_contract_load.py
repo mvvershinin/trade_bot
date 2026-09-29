@@ -319,6 +319,37 @@ def test_the_contract_load_takes_today_from_the_ports_clock(loop, tmp_path, toda
     assert stamped == {today}, f"журнал датирован не часами порта: {sorted(stamped)}"
 
 
+def test_a_code_the_exchange_does_not_know_at_the_chain_edge_is_said_in_the_journal(
+    loop, tmp_path
+) -> None:
+    """`B-054`, правило 13: дальний код цепочки бирже не известен — строка в журнале.
+
+    Цепочка MXZ6 — MXM6, MXU6, MXZ6, MXH7; биржа не знает MXH7 (ещё не
+    вышел). Слой данных выпускает его без отказа, загрузка идёт по
+    остальным — и человек обязан узнать, что по MXH7 ничего не уточнено.
+
+    Мутация, которую тест ловит: порт не читает `said` у ответа
+    уточнения (`_refresh_chain` без цикла `note`) — загрузка удачна,
+    журнал молчит.
+    """
+    from ui.models import DecisionLevel
+
+    chain = Chain(TODAY)
+    del chain.volumes["MXH7"]
+
+    _, heard = _run(loop, tmp_path / "base.sqlite3", chain, _load("MXZ6"))
+
+    assert heard.finished and heard.finished[-1].ok, heard.finished[-1].trouble
+    warned = [
+        row for row in heard.notes
+        if row.level is DecisionLevel.WARNING and "MXH7" in row.reason
+    ]
+    assert warned, (
+        "биржа не знает MXH7, а журнал окна об этом молчит: "
+        f"{[(row.event, row.reason) for row in heard.notes]}"
+    )
+
+
 def test_a_contract_without_a_roll_is_refused_aloud_and_loads_nothing(loop, tmp_path) -> None:
     """Стережёт 3: рубежа нет — отказ словами, ни одного запроса минут.
 
