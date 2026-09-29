@@ -343,6 +343,11 @@ _WORKS: tuple[_Work, ...] = (
     _Work("halt", "запись остановки робота в базу", STUCK_AFTER),
 )
 
+#: Как часто часы смотрят, не сменились ли сутки с последнего уточнения
+#: таблицы контрактов (`HistoryPort.sync_contracts`). Не торговое число:
+#: на решения робота не влияет, только на то, как быстро узнаётся экспирация.
+_SYNC_LOOK_MS = 60 * 60 * 1000
+
 #: Та же таблица ключом наружу. Собирается из `_WORKS`, а не пишется руками:
 #: два списка одних и тех же работ разошлись бы молча.
 _BY_KEY: dict[str, _Work] = {work.key: work for work in _WORKS}
@@ -408,6 +413,9 @@ class _Backtest:
 
     span: _Span | None = None
     pending: BacktestRequest | None = None
+    #: Последний отказ, случившийся при обещанном отчёте, — им окно узнает,
+    #: почему отчёта не будет (`HistoryPort._forget_report`).
+    trouble: str = ""
     options: asyncio.Task[None] | None = None
 
 
@@ -430,6 +438,26 @@ class _Term:
     #: подключение ждёт первого чтения, а не открывается на код с неизвестным
     #: сроком — он мог давно истечь.
     waiting: bool = False
+    #: Идёт уточнение таблицы у биржи (`sync_contracts`). Пока оно идёт,
+    #: подключение ждёт так же, как ждёт непрочитанной таблицы: прочитанная,
+    #: но не уточнённая (пустая на свежей базе) даёт «срок неизвестен» —
+    #: и поток открылся бы на давно истёкший код. Замер 29.09.2026 на базе
+    #: владельца счёта: ровно так поток встал на MXU6 через 12 дней после
+    #: его экспирации.
+    syncing: bool = False
+    #: Первое уточнение при запуске держит прогоны (`refresh`), а попрошенный
+    #: за это время (`held`) пойдёт после него — уже на том контракте,
+    #: на котором программа останется. Суточное уточнение прогонов не держит.
+    holding: bool = False
+    held: str = ""
+    #: День МСК последнего удавшегося уточнения: раз в сутки, а не на каждом
+    #: взгляде часов. Неудавшееся повторяется на следующем взгляде.
+    synced: date | None = None
+    #: Последний сказанный отказ уточнения: без связи часы смотрят каждый час,
+    #: и повтор той же строки похоронил бы журнал под собой.
+    failed: str = ""
+    #: Часы суточного уточнения; заводит первое `sync_contracts`.
+    daily: QTimer | None = None
 
 
 @dataclass(slots=True)
@@ -1124,6 +1152,11 @@ class HistoryPort(TerminalPort):
             return
         self._history.term.waiting = False
         if on:
+            if self._history.term.syncing:
+                # Таблицу уточняют у биржи — подключение продолжит сам
+                # уточнитель (`_sync`), когда станет ясно, какой код живой.
+                self._history.term.waiting = True
+                return
             if self._history.term.rows is None:
                 # Таблица ещё не прочитана — ждать её, а не подписываться
                 # вслепую: истёкший код отсюда не отличить от живого.
@@ -1345,7 +1378,7 @@ class HistoryPort(TerminalPort):
             convert.expiry_days_of(settings)
             self._check_switch(settings)
         except convert.SettingsRefused as refusal:
-            self._refuse("Настройки не приняты", str(refusal))
+            self._refuse_settings(str(refusal), refusal.field)
             return
         except (ValueError, TypeError) as error:
             # ⚠️ Проверки самих настроек (`__post_init__` движка и торгового
@@ -1353,8 +1386,7 @@ class HistoryPort(TerminalPort):
             # сегодня не приходят, но `apply_settings` — публичная команда
             # порта и зовётся из слота Qt: непойманное исключение здесь
             # означает трассировку в консоль и молчащее окно.
-            self._refuse(
-                "Настройки не приняты",
+            self._refuse_settings(
                 f"Значение не годится: {error}. Прежние настройки остались в силе.",
             )
             return
@@ -1576,16 +1608,15 @@ class HistoryPort(TerminalPort):
         от неудачной попытки.
         """
         if self._task is not None and not self._task.done():
-            self._refuse_busy(
+            self._send(self.backtest_refused, self._refuse_busy(
                 "run",
                 "Прогон на истории не начат",
                 "Дождитесь его конца или нажмите «Отменить» — два прогона "
                 "разом дали бы в окно два разных ответа на один вопрос.",
-            )
+            ))
             return
         if request.until < request.since:
-            self._refuse(
-                "Прогон на истории не начат",
+            self._refuse_backtest(
                 "Конец отрезка раньше его начала. Проверьте даты «от» и «до».",
             )
             return
@@ -1600,14 +1631,14 @@ class HistoryPort(TerminalPort):
             # и запрошенный прогон при непринятых настройках.
             convert.check_demands(request.settings)
         except (convert.SettingsRefused, ValueError, TypeError) as error:
-            self._refuse(
-                "Прогон на истории не начат",
-                f"Настройки не годятся: {error}. Ни отрезок, ни настройки "
-                "не изменились.",
+            self._refuse_backtest(
+                f"Настройки не годятся: {str(error).rstrip('.')}. Ни отрезок, "
+                "ни настройки не изменились.",
             )
             return
         self._back.span = _Span(request.since, request.until, request.settings_source)
         self._back.pending = request
+        self._back.trouble = ""
         self.note(
             "Прогон на истории запрошен",
             f"{convert.instrument_of(request.settings.instrument)}, "
@@ -1921,6 +1952,272 @@ class HistoryPort(TerminalPort):
             self.note("Контракт не уточнён у биржи", text, DecisionLevel.WARNING)
         return rows
 
+    def first_run(self, why: str) -> None:
+        """Запуск: уточнить контракты у биржи, затем первый прогон.
+
+        Прогон ждёт уточнения (`hold`), подключение тоже (`stream`): на коде,
+        который истёк, не рисуется и не подписывается ничего. Зовётся
+        **после** проводки файла настроек — переход на действующий контракт
+        уходит в файл эхом `settings_applied`, и неподключённое эхо потеряло
+        бы его.
+        """
+        self.sync_contracts(why, hold=True)
+        self.refresh(why)
+
+    def sync_contracts(self, why: str, *, hold: bool = False) -> None:
+        """Уточнить у биржи таблицу контрактов актива из настроек — в фоне.
+
+        Зовёт сборка при запуске (`app/main.py`, `hold=True`) и часы раз
+        в сутки. Без этого таблица уточнялась только кнопкой «Загрузить
+        историю», и программа, открытая после экспирации, не знала, что код
+        из настроек истёк: замер 29.09.2026 — график и поток на MXU6 через
+        12 дней после его последнего дня, плашка молчит.
+
+        Идёт в слоте загрузки (`load`): поток данных один, и ручная загрузка
+        в это время получает обычный отказ «занято», а не очередь за спиной.
+        `hold` — первое уточнение держит прогоны (`refresh`) до своего конца:
+        иначе окно сначала нарисовало бы истёкший контракт.
+
+        Код не квартальный или актив месячный — уточнять нечего, молча:
+        у таких кодов цепочки нет (`_chain_of`, `D-127`).
+        """
+        term = self._history.term
+        if term.daily is None:
+            # Часы заводятся всегда, до фильтров: инструмент, сменённый
+            # на квартальный позже, иначе не уточнялся бы до перезапуска.
+            # Первый же взгляд часов после смены уточняет сразу — `synced`
+            # по нему ещё не выставлен.
+            term.daily = QTimer(self)
+            term.daily.setInterval(_SYNC_LOOK_MS)
+            term.daily.timeout.connect(self._daily_sync)
+            term.daily.start()
+        symbol = self._values.instrument.strip()
+        chain = _chain_of(symbol)
+        if not chain or asset_of(symbol) in self._history.monthly:
+            return
+        task = self._history.load
+        if task is not None and not task.done():
+            return  # поток данных занят; часы спросят ещё раз через час
+        term.syncing = True
+        term.holding = term.holding or hold
+        if hold:
+            self._send(self.busy_changed, True, "Уточняю у биржи действующий контракт…")
+        self._history.load = self._begin("load", self._sync(symbol, chain, why))
+
+    def _daily_sync(self) -> None:
+        """Взгляд часов: сутки сменились с последнего уточнения — уточнить снова."""
+        if self._history.term.synced != in_moscow(self._clock()).date():
+            self.sync_contracts("смена суток")
+
+    async def _sync(self, symbol: str, chain: list[str], why: str) -> None:
+        """Уточнить таблицу, при истёкшем коде перейти на действующий, догрузить.
+
+        Порядок — данные решения, а не вкус: сначала биржа (без неё истёкший
+        код не отличить от живого), потом переход, потом отпустить прогон
+        и подключение (`_release_sync`), и только потом загрузка минут —
+        она долгая, и держать ради неё окно пустым незачем.
+        """
+        now = self._clock()
+        today = in_moscow(now).date()
+        term = self._history.term
+        if term.syncing and await self._vouched(symbol):
+            # Таблица в базе уже ручается за код: он живой. Держать окно
+            # пустым на время похода к бирже (замер 29.09.2026: 27 с) незачем —
+            # прогон и подключение идут сразу, биржа — после первого прогона.
+            # ⚠️ Именно после: поток данных один, и уточнение, занявшее его
+            # раньше, задержало бы чтение свечей для графика на те же 27 с.
+            self._release_sync()
+            if self._task is not None:
+                await _quiet(self._task)
+        try:
+            await self._refresh_chain(chain, symbol, now)
+            notice, rows = await self._worker.call(
+                lambda store: (
+                    contract_view.notice_of(store, symbol, today=today),
+                    store.contracts(),
+                )
+            )
+        except asyncio.CancelledError:
+            term.syncing = term.holding = False
+            raise
+        except ChainNotQuarterly as error:
+            self._monthly_found(symbol, error)
+            return
+        except Exception as error:  # нет связи — работа идёт как раньше
+            log.exception("таблица контрактов не уточнена у биржи (%s)", why)
+            text = (
+                f"{_plain(error)}. Программа работает по таблице, что уже есть "
+                "в базе: истёк ли контракт из настроек, она может не знать. "
+                "Уточнение повторится само через час."
+            )
+            if text != term.failed:
+                term.failed = text
+                self.note("Контракты не уточнены у биржи", text, DecisionLevel.WARNING)
+            self._release_sync()
+            return
+        term.failed = ""
+        term.synced = today
+        term.rows = rows
+        switched = self._switch_and_release(symbol, notice, rows)
+        if switched:
+            # Сначала прогон на новом коде (по склейке — то, что уже есть
+            # в базе), потом загрузка: поток данных один, и загрузка, занявшая
+            # его раньше, оставила бы окно пустым на всё своё время (замер
+            # 29.09.2026 на копии базы владельца счёта: 51 с до первого графика).
+            if self._task is not None:
+                await _quiet(self._task)
+            self._history.chunk = None
+            self._history.candles = 0
+            self._history.pages = 0
+            await self._load_contract(
+                HistoryLoadRequest(symbol=switched), chain_around(switched)
+            )
+
+    def _monthly_found(self, symbol: str, error: ChainNotQuarterly) -> None:
+        """Биржа назвала актив месячным: пометить, сказать правду, отпустить.
+
+        Квартальной цепочки у месячного актива нет, и повторять уточнение
+        через час незачем — ответ будет тот же. Актив помечается
+        (`monthly`), и `sync_contracts` его больше не трогает.
+        """
+        self._history.monthly.add(asset_of(symbol))
+        self.note(
+            "Контракты не уточняются у биржи",
+            f"{_plain(error)}. Для месячного актива программа не уточняет "
+            "у биржи действующий контракт и сама на новый код не переходит: "
+            "инструмент в настройках меняется вручную.",
+            DecisionLevel.WARNING,
+        )
+        self._release_sync()
+
+    def _switch_and_release(
+        self, symbol: str, notice: ContractNotice, rows: list[ContractRow]
+    ) -> str:
+        """Переход (`_switch_to_current`), и в любом исходе — отпустить уточнение.
+
+        ⚠️ `_release_sync` — в `finally`: исключение при переходе иначе
+        оставило бы `syncing`/`holding` навсегда — прогон и подключение
+        ждали бы вечно, полоска «Уточняю у биржи…» висела бы молча
+        (правило 13). Исключение — строка в журнал решений.
+        """
+        try:
+            return self._switch_to_current(symbol, notice, rows)
+        except Exception as error:  # окно не должно встать из-за перехода
+            log.exception("переход на действующий контракт не удался")
+            # Строка — по факту, а не по намерению: исключение могло
+            # случиться и после того, как инструмент уже сменён.
+            now_on = self._values.instrument.strip()
+            if notice.current and now_on == notice.current:
+                self.note(
+                    "Переход на действующий контракт не доведён",
+                    f"{_plain(error)}. Инструмент в настройках уже сменён "
+                    f"с {symbol} на {now_on}; история {now_on} загружается.",
+                    DecisionLevel.WARNING,
+                )
+                return now_on
+            self.note(
+                "Переход на действующий контракт не удался",
+                f"{_plain(error)}. Инструмент в настройках остался {now_on}; "
+                "действующий контракт — на плашке, перейти можно кнопкой.",
+                DecisionLevel.WARNING,
+            )
+            return ""
+        finally:
+            self._release_sync()
+
+    async def _vouched(self, symbol: str) -> bool:
+        """Ручается ли таблица в базе, что код живой: срок известен и не истёк.
+
+        Только чтение базы. Базы нет, таблица пуста, срок неизвестен, код
+        истёк или архивный — не ручается: тогда прогон и подключение ждут
+        биржу, иначе окно нарисовало бы истёкший контракт.
+        """
+        if not self._worker.path.exists():
+            return False
+        try:
+            rows = await self._worker.call(lambda store: store.contracts())
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # не прочитали — значит, не ручается; спросим биржу
+            log.exception("таблица контрактов не прочитана перед уточнением")
+            return False
+        kind = expiry_verdict(
+            rows, symbol, today=in_moscow(self._clock()).date(),
+            halt_days=self._values.expiry_halt_days,
+        ).kind
+        if kind not in (Expiry.OK, Expiry.NEAR):
+            return False
+        self._history.term.rows = rows
+        return True
+
+    def _switch_to_current(
+        self, symbol: str, notice: ContractNotice, rows: list[ContractRow]
+    ) -> str:
+        """Код из настроек истёк — перейти на действующий. Ответ — новый код или пусто.
+
+        Решение владельца счёта 29.09.2026 (к решению 0061): инструмент
+        обязан быть действующим, и программа ставит его сама, записью
+        в файл настроек. Решение 0016 при этом в силе целиком: при
+        запущенном роботе или открытой позиции перехода нет — условие то же,
+        что гасит кнопку плашки (`switch_blocked_reason`), и остаётся
+        плашка с кнопкой.
+
+        Сам переходит **только с истёкшего** кода: его последний день
+        обращения прошёл, позиции по нему на счёте быть не может. С
+        **архивного** (период ближнего кончился, но код ещё торгуется до
+        своего последнего дня) — только плашка с кнопкой, как по решению
+        0016 (решение координатора 29.09.2026). Причина: при запуске снимка
+        состояния ещё нет (`_last_state` — `None`), и половина условия «нет
+        позиции» пуста — позиция по ещё торгуемому коду осталась бы без
+        присмотра. Суточная проверка идёт по тому же правилу.
+        """
+        verdict = self._expiry(symbol)
+        if verdict.kind is not Expiry.EXPIRED:
+            return ""
+        current = notice.current
+        if not current or current == symbol or self._values.instrument.strip() != symbol:
+            return ""  # действующий неизвестен, либо человек уже сменил код сам
+        if switch_blocked_reason(self._last_state):
+            return ""  # плашка с кнопкой и причиной — `check_contract`
+        row = next(one for one in rows if one.symbol == symbol)
+        # Вердикт истёкшего обещает поле последнего дня (`expiry_verdict`).
+        gone = f"{symbol} истёк {row.last_trade_day:%d.%m.%Y}"
+        held = self._file_holds.pop("instrument", None)
+        try:
+            self.apply_settings(self._values.replace(instrument=current), by_person=False)
+        finally:
+            # И при отказе, и при исключении придержка файла возвращается.
+            if held is not None and self._values.instrument.strip() != current:
+                self._file_holds["instrument"] = held
+        if self._values.instrument.strip() != current:
+            return ""  # отказ `apply_settings` уже сказан вслух
+        self.note(
+            "Переход на действующий контракт",
+            f"{gone}; перешёл на действующий {current}"
+            + (f" (ближний с {notice.current_since:%d.%m.%Y})" if notice.current_since else "")
+            + ". Инструмент в настройках сменён и записан в файл, история "
+            f"{current} загружается с биржи.",
+            DecisionLevel.WARNING,
+        )
+        return current
+
+    def _release_sync(self) -> None:
+        """Уточнение кончилось: отпустить подключение и прогон, сверить плашку.
+
+        Флаги снимаются **до** чтения таблицы: прочитавшая её задача
+        (`_check_contract`) открывает ждущее подключение, и видеть она
+        обязана уже уточнённую таблицу, а не ворота закрытыми.
+        """
+        term = self._history.term
+        holding, held = term.holding, term.held
+        term.syncing = term.holding = False
+        term.held = ""
+        self.check_contract()
+        if held:
+            self.refresh(held)
+        elif holding:
+            self._send(self.busy_changed, False, "")
+
     def _expiry(self, instrument: str) -> ExpiryVerdict:
         """Срок кода по последней прочитанной таблице контрактов."""
         return expiry_verdict(
@@ -1945,7 +2242,8 @@ class HistoryPort(TerminalPort):
         reason = switch_blocked_reason(self._last_state)
         if reason:
             raise convert.SettingsRefused(
-                f"Инструмент не сменён: {reason} Прежние настройки остались в силе."
+                f"Инструмент не сменён: {reason} Прежние настройки остались в силе.",
+                field="instrument",
             )
 
     def _judge_expiry(self) -> bool:
@@ -2002,8 +2300,9 @@ class HistoryPort(TerminalPort):
         """Сверить инструмент из настроек с действующим контрактом таблицы.
 
         Только чтение базы, в сеть не ходит. Ответ — `contract_checked`.
-        Тикер программа сама не меняет (решение 0016): расхождение уходит
-        в окно плашкой и одной строкой в журнал, выбор за человеком.
+        Тикер здесь не меняется (решение 0016): расхождение уходит в окно
+        плашкой и одной строкой в журнал. Сама программа переходит только
+        с истёкшего кода, после уточнения у биржи (`_switch_to_current`).
         """
         task = self._history.contract
         if task is not None and not task.done():
@@ -2047,8 +2346,9 @@ class HistoryPort(TerminalPort):
                 "Действующий контракт сменился",
                 f"По дневным объёмам биржи действующий контракт — {notice.current}"
                 + (f" с {notice.current_since:%d.%m.%Y}" if notice.current_since else "")
-                + f", а робот настроен на {notice.configured}. Программа тикер сама "
-                "не меняет: переход — вашим подтверждением (кнопка на плашке "
+                + f", а робот настроен на {notice.configured}. Сама программа переходит "
+                "только с истёкшего кода и только при остановленном роботе без "
+                "позиции; здесь переход — вашим подтверждением (кнопка на плашке "
                 "над графиком или поле «Инструмент» в настройках).",
                 DecisionLevel.WARNING,
             )
@@ -2176,6 +2476,12 @@ class HistoryPort(TerminalPort):
 
     def refresh(self, why: str = "") -> None:
         """Поставить прогон в очередь цикла событий. Возврат — немедленный."""
+        if self._history.term.holding:
+            # Первое уточнение контрактов ещё идёт: прогон на коде из файла
+            # показал бы истёкший контракт, а через секунду — другой.
+            # Просьба не теряется: её пустит `_sync`, когда решит, на чём стоять.
+            self._history.term.held = why or "повтор"
+            return
         if self._task is not None and not self._task.done():
             # Два прогона разом дали бы в окно два потока событий и два разных
             # ответа на один вопрос. Но и потерять просьбу нельзя: настройки,
@@ -2303,6 +2609,10 @@ class HistoryPort(TerminalPort):
                 self._point.task, self._growing, self._draw, self._task,
                 self._watch.retiring, self._back.options,
                 self._history.contract, self._halt.saving,
+                # Загрузка — и та, что заводит уточнение контрактов при
+                # запуске (`sync_contracts`): снимок экрана без неё ловил
+                # окно до перехода на действующий контракт.
+                self._history.load,
             ):
                 if task is not None:
                     await _quiet(task)
@@ -2328,6 +2638,8 @@ class HistoryPort(TerminalPort):
         # в окно, которого уже нет.
         if self._stuck.timer is not None:
             self._stuck.timer.stop()
+        if self._history.term.daily is not None:
+            self._history.term.daily.stop()
         # ⚠️ Идущей загрузке истории сначала говорится «остановись», и только
         # потом снимается задача: поток данных занят ею целиком, и отмена
         # `await` не прерывает работу, которая уже идёт в потоке (`market.worker`).
@@ -2373,10 +2685,33 @@ class HistoryPort(TerminalPort):
         self.note(event, reason)
         self.refresh(event)
 
-    def _refuse(self, event: str, reason: str) -> None:
-        """Отказ: и в журнал, и в строку состояния. Молча не отказываем."""
+    def _refuse(self, event: str, reason: str, *, run: bool = False) -> None:
+        """Отказ: и в журнал, и в строку состояния. Молча не отказываем.
+
+        Отказ **прогона** (`run`), случившийся, пока обещан отчёт о прогоне,
+        запоминается: им `_forget_report` объяснит в окне, почему отчёта
+        не будет. Посторонний отказ в это время (загрузка «занято»,
+        подключение) не запоминается — иначе окно назвало бы чужую причину.
+        """
         self.note(event, reason, DecisionLevel.WARNING)
+        if run and self._back.pending is not None:
+            self._back.trouble = reason
         self._send(self.failed, reason)
+
+    def _refuse_settings(self, reason: str, field: str = "") -> None:
+        """«Применить» не принято: в журнал, в строку состояния и окну настроек.
+
+        Окну уходят и **настройки, оставшиеся в силе**: без них оно помнило
+        бы отвергнутый набор как принятый и отдало бы его следующему прогону
+        (дефект 29.09.2026).
+        """
+        self._refuse("Настройки не приняты", reason, run=True)
+        self._send(self.settings_refused, self._values, reason, field)
+
+    def _refuse_backtest(self, reason: str) -> None:
+        """Прогон не начат: в журнал, в строку состояния и окну — закрыть полоску."""
+        self._refuse("Прогон на истории не начат", reason, run=True)
+        self._send(self.backtest_refused, reason)
 
     # ------------------------------------------------- часы долгих работ
 
@@ -2522,7 +2857,7 @@ class HistoryPort(TerminalPort):
         now = time.monotonic()
         return f"{work.title}, идёт уже {_lasting(now - self._stuck.heard.get(key, now))}"
 
-    def _refuse_busy(self, key: str, event: str, what_next: str) -> None:
+    def _refuse_busy(self, key: str, event: str, what_next: str) -> str:
         """Отказ «занято»: что идёт, сколько уже идёт и что будет дальше.
 
         ⚠️ В окно уходит **каждый** отказ, в журнал — один на занятость.
@@ -2538,6 +2873,7 @@ class HistoryPort(TerminalPort):
             self._stuck.refused.add(key)
             self.note(event, reason, DecisionLevel.WARNING)
         self._send(self.failed, reason)
+        return reason
 
     async def _refresh(self, why: str) -> None:
         """Прогон и, если за время прогона просили ещё, следующий за ним.
@@ -2593,7 +2929,7 @@ class HistoryPort(TerminalPort):
         except asyncio.CancelledError:
             raise
         except convert.SettingsRefused as refusal:
-            self._refuse("Настройки не приняты", str(refusal))
+            self._refuse("Настройки не приняты", str(refusal), run=True)
         except Exception as error:  # окно не должно падать вместе с прогоном
             # Человеку — фраза, разработчику — трассировка. ⚠️ Файлового
             # технического лога у программы пока нет (он ставится вместе
@@ -2604,6 +2940,7 @@ class HistoryPort(TerminalPort):
                 "Прогон не удался",
                 f"Не удалось построить прогон по истории: {_plain(error)}. "
                 "Подробность — в выводе программы в консоли.",
+                run=True,
             )
         finally:
             self._forget_report()
@@ -3981,7 +4318,7 @@ class HistoryPort(TerminalPort):
             ChartData(instrument=symbol, timeframe=frame.values.timeframe),
         )
         self._send(self.trades_replaced, (), None)
-        self._refuse("Свечей нет", reason)
+        self._refuse("Свечей нет", reason, run=True)
         self._publish_journal()
         self._publish_state(self._state(frame, symbol, None, None))
 
@@ -4093,8 +4430,14 @@ class HistoryPort(TerminalPort):
         if self._back.pending is None:
             return
         self._back.pending = None
+        trouble, self._back.trouble = self._back.trouble, ""
+        # ⚠️ Своим сигналом, а не `failed`: полоску прогона закрывает окно,
+        # и без этого отказа ей закрыться нечем — прохода могло не быть вовсе
+        # (настройки отвергнуты в `apply_settings`), а значит, не будет
+        # и «работа кончилась».
         self._send(
-            self.failed,
+            self.backtest_refused,
+            f"{trouble} Отчёта о прогоне не будет." if trouble else
             "Отчёта о прогоне не будет: прогон не дошёл до конца. Причина — "
             "последней строкой в журнале решений.",
         )
@@ -4118,7 +4461,7 @@ class HistoryPort(TerminalPort):
             return
         self._back.pending = None
         report = convert.run_report(
-            run, candles, request,
+            run, candles, request, mode=self._mode,
             settings_text=settings_text(
                 self._engine_settings,
                 convert.strategy_settings(self._values),

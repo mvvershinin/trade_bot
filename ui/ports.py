@@ -85,6 +85,8 @@ class TerminalPort(QObject):
     busy_changed = Signal(bool, str)      # идёт длинная операция, что именно
     progress_changed = Signal(int, str)   # 0…100, подпись
     failed = Signal(str)                  # человеческая фраза, не код ошибки
+    settings_refused = Signal(object, str, str)  # Settings в силе, причина, поле
+    backtest_refused = Signal(str)        # прогон не состоится — почему
     stuck_changed = Signal(str)           # работа не отвечает; «» — снять сообщение
     backtest_options_ready = Signal(object)  # BacktestOptions — из чего выбирать
     backtest_finished = Signal(object)    # BacktestReport — что вышло из прогона
@@ -92,6 +94,19 @@ class TerminalPort(QObject):
     history_progress = Signal(int, str)   # 0…100, подпись — ход загрузки истории
     history_finished = Signal(object)     # HistoryLoadOutcome — чем кончилась
     contract_checked = Signal(object)     # ContractNotice — действующий контракт по таблице
+
+    # ⚠️ Два отказа — своими сигналами, а не одним `failed`, и это правило
+    # 13 `CLAUDE.md`. `failed` — фраза в строку состояния на 15 секунд; окно
+    # не может понять по ней, ЧЕМУ отказано. Отсюда два дефекта 29.09.2026:
+    # окно настроек, запомнившее непринятый алгоритм, и полоска прогона,
+    # висевшая вечно после отказа, — прогона нет, закрыть её нечему.
+    #
+    # * `settings_refused` — «Применить» не принято: настройки, которые
+    #   остались в силе, причина и имя поля `Settings`, которое надо
+    #   поменять (пусто — поле не одно). Окно откатывается к первому
+    #   и показывает второе у третьего.
+    # * `backtest_refused` — просьба о прогоне кончилась ничем: не начат
+    #   или оборван. Полоска закрывается, отказ показывается в окне.
 
     # ⚠️ `stuck_changed` — не отказ и не ошибка, поэтому сигнал свой, а не
     # `failed`. Отказ отвечает на нажатие и живёт в строке состояния секунды;

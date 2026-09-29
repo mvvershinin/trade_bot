@@ -33,7 +33,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -152,6 +152,25 @@ WINDOW_HEIGHT = 340
 #: за числом строк и упирается в этот потолок, дальше работает прокрутка.
 ROWS_SHOWN = 6
 
+#: Нижняя граница высоты списка в строках: список в одну строку выглядит
+#: не списком, а подсвеченной полосой (`AlgorithmDialog._fit_the_list`).
+MIN_ROWS = 2
+
+
+def demand_lines(option: AlgorithmOption, captions: Mapping[str, str]) -> tuple[str, ...]:
+    """Требования алгоритма к общим настройкам — строками для списка выбора.
+
+    Пишутся **до** выбора, а не после отказа: человек, выбравший алгоритм,
+    должен знать заранее, что поле «Момент переворота» встанет на нужное
+    значение и закроется (`ui/settings_dialog.py::_sync_demands`).
+    Подписи полей приходят от окна настроек — они живут там.
+    """
+    return tuple(
+        f"Требует: «{captions.get(one.field, one.field)}» — "
+        f"«{getattr(one.value, 'label', one.value.name)}»"
+        for one in option.demands
+    )
+
 
 def details_preamble(option: AlgorithmOption) -> str:
     """Чьи числа стоят в описании — фразой над ним.
@@ -211,8 +230,10 @@ class AlgorithmDialog(QDialog):
         self,
         options: Sequence[AlgorithmOption] = (),
         parent: QWidget | None = None,
+        captions: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(parent)
+        self._captions: Mapping[str, str] = captions or {}
         self.setWindowTitle("Торговый алгоритм")
         self.setModal(True)
         # Высота под содержимое, а не «побольше на всякий случай»: список
@@ -229,7 +250,7 @@ class AlgorithmDialog(QDialog):
         self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.list.setWordWrap(True)
         for option in self._options:
-            item = QListWidgetItem(option.title)
+            item = QListWidgetItem("\n".join((option.title, *demand_lines(option, self._captions))))
             item.setData(Qt.ItemDataRole.UserRole, option.id)
             # Правило одной фразой во всплывающей подсказке — для того, кто
             # ведёт мышью по списку и не жмёт «Подробнее».
@@ -299,12 +320,17 @@ class AlgorithmDialog(QDialog):
         в одну строку выглядит не списком, а подсвеченной полосой: непонятно,
         что это выбор и что в нём можно двигаться стрелками.
         """
-        rows = min(max(len(self._options), 2), ROWS_SHOWN)
-        one = (
-            self.list.sizeHintForRow(0) if self._options
-            else self.list.fontMetrics().height() + 6
-        )
-        self.list.setFixedHeight(rows * one + 2 * self.list.frameWidth() + 6)
+        # Высота — суммой строк, а не «первая × число»: строка алгоритма
+        # с требованием к настройкам занимает две строки текста, и по первой
+        # однострочной список обрезал бы её — снимок 29.09.2026 показывал
+        # одну строку из двух.
+        shown = min(len(self._options), ROWS_SHOWN)
+        heights = [self.list.sizeHintForRow(index) for index in range(shown)]
+        if len(heights) < MIN_ROWS:
+            heights += [heights[0] if heights else self.list.fontMetrics().height() + 6] * (
+                MIN_ROWS - len(heights)
+            )
+        self.list.setFixedHeight(sum(heights) + 2 * self.list.frameWidth() + 6)
 
     def _build_layout(self) -> None:
         """Список и кнопка «Подробнее» в одной строке — она рядом со списком."""
@@ -448,7 +474,15 @@ class AlgorithmDialog(QDialog):
     ) -> str:
         """Сам текст строки под списком. Отдельно — чтобы его можно было читать."""
         if option is not None:
-            return option.summary
+            return "\n\n".join((
+                option.summary,
+                *(
+                    f"Алгоритм {one.reason}. Поле «{self._captions.get(one.field, one.field)}» "
+                    "встанет на нужное значение само и будет закрыто, пока выбран "
+                    "этот алгоритм."
+                    for one in option.demands
+                ),
+            ))
         if not self._options:
             # Выбирать не из чего. Требовать выбора — тупик; здесь говорится
             # только правда о том, что сейчас с настройкой.

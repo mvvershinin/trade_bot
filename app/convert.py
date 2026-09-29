@@ -83,6 +83,7 @@ from ui.formatting import (
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
     AfterTakeProfit,
+    AlgorithmDemand,
     AlgorithmOption,
     BacktestReport,
     BacktestRequest,
@@ -159,7 +160,15 @@ class SettingsRefused(Exception):
 
     Текст исключения показывается владельцу счёта как есть — значит он должен
     быть фразой, а не кодом, и должен говорить, что именно сделать.
+
+    `field` — имя поля `Settings`, которое надо поменять, если отказ его
+    знает: окно настроек показывает отказ у этого поля и открывает его
+    вкладку. Пусто — поле не одно или неизвестно, и отказ идёт общей строкой.
     """
+
+    def __init__(self, text: str, *, field: str = "") -> None:
+        super().__init__(text)
+        self.field = field
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +221,7 @@ _MODES: dict[Mode, EngineMode] = {
     Mode.LONG_ONLY: EngineMode.LONG_ONLY,
     Mode.SHORT_ONLY: EngineMode.SHORT_ONLY,
     Mode.CLOSE_ONLY: EngineMode.CLOSE_ONLY,
+    Mode.ONE_ENTRY_A_DAY: EngineMode.ONE_ENTRY_A_DAY,
 }
 
 _REVERSALS: dict[ReversalMoment, Reversal] = {
@@ -785,7 +795,8 @@ def check_demands(values: Settings) -> None:
         raise SettingsRefused(
             f"Алгоритм «{entry.title}» {demand.reason}. Сейчас выбрано "
             f"«{_choice(current)}», а нужно «{_choice(wanted)}». Прежние "
-            "настройки остались в силе."
+            "настройки остались в силе.",
+            field=demand.outer,
         )
 
 
@@ -904,6 +915,27 @@ def _option(entry: registry.StrategyEntry, values: Settings) -> AlgorithmOption:
         chosen=chosen,
         unused=unused_fields(entry.id),
         refused=bool(refusal),
+        demands=_demands_of(entry),
+    )
+
+
+def _demands_of(entry: registry.StrategyEntry) -> tuple[AlgorithmDemand, ...]:
+    """Требования алгоритма к общим настройкам — значениями окна.
+
+    Имя элемента из реестра переводится в элемент перечисления окна тем же
+    способом, что и в `check_demands`: окно по нему только находит строку
+    своего списка. Сверку «поле и элемент существуют» уже сделал
+    `_demand_gap` при сборке каталога — несовместимая запись сюда
+    не доходит, а дошла бы — упала бы громко, а не выключила требование.
+    """
+    kinds = typing.get_type_hints(Settings)
+    return tuple(
+        AlgorithmDemand(
+            field=demand.outer,
+            value=kinds[demand.outer][demand.value],
+            reason=demand.reason,
+        )
+        for demand in entry.demands
     )
 
 
@@ -2119,6 +2151,7 @@ def run_report(
     request: BacktestRequest,
     *,
     settings_text: str,
+    mode: Mode,
 ) -> BacktestReport:
     """Прогон → отчёт для окна. Ни одно число не считается заново.
 
@@ -2151,4 +2184,60 @@ def run_report(
         summary=trades_summary(run),
         assumptions=run_assumptions(run),
         halted=run.halted,
+        no_trades="" if run.deals else no_trades_reason(mode, request.settings, run),
+    )
+
+
+#: Режимы, в которых робот новых позиций не открывает вовсе. Прогон в них
+#: без сделок — следствие настройки, а не рынка, и отчёт обязан это сказать.
+#: Текст у каждого свой: «Выключен» не закрывает и открытую (шаг 1
+#: `PROTOTYPE.md` §2 обрывает обработку свечи целиком), «Только закрытие» —
+#: закрывает.
+_NO_ENTRY_MODES: Final[dict[Mode, str]] = {
+    Mode.OFF: (
+        "в нём робот не открывает позиций и не закрывает уже открытую — "
+        "свечи только принимаются"
+    ),
+    Mode.CLOSE_ONLY: (
+        "в нём робот только закрывает уже открытую, а на начале отрезка "
+        "открытой позиции не было"
+    ),
+}
+
+
+def no_trades_reason(mode: Mode, values: Settings, run: HistoryRun) -> str:
+    """Почему в прогоне нет ни одной сделки — первой строкой отчёта.
+
+    Правило 13 `CLAUDE.md`: «Сделок: 0» без причины — молчание. 29.09.2026
+    прогон в режиме «Только закрытие» показал пустой отчёт, и понять из него,
+    что так и должно быть, было нельзя.
+
+    Причины — цепочкой, от той, что делает остальные бессмысленными:
+    нет свечей → прогон остановлен → режим без входов → всё прочее.
+    Вину на торговое окно без основания не кладём: прогон без свечей или
+    оборванный остановкой окна не касается (находка ревью 29.09.2026).
+    """
+    if not run.bars:
+        return (
+            "Сделок нет: на выбранном отрезке нет ни одной свечи — считать "
+            "было не на чем. Загрузите историю за этот отрезок или выберите "
+            "другой."
+        )
+    if run.halted:
+        return (
+            "Сделок нет: робот остановлен на прогоне и дальше свечи не "
+            "обрабатывал. Причина — ниже, в блоке «Прогон», строкой "
+            "«Робот остановлен на прогоне»."
+        )
+    if mode in _NO_ENTRY_MODES:
+        return (
+            f"Сделок нет: режим «{mode.label}» новых позиций не открывает — "
+            f"{_NO_ENTRY_MODES[mode]}. Чтобы увидеть сделки, выберите режим "
+            "с входами и прогоните ещё раз."
+        )
+    return (
+        "Сделок нет: на отрезке ни один вход не состоялся. "
+        "Сигналов могло не быть вовсе, либо они пришлись вне торгового окна "
+        f"{values.window_start:%H:%M}–{values.window_end:%H:%M} МСК или "
+        "были отсеяны фильтром — что именно, в журнале решений прогона."
     )

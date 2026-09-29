@@ -726,6 +726,7 @@ def process_closed_candle(
         )
 
     # ---- шаг 9: «стоп после тейка» и тейк уже был сегодня ------------------
+    # (и режим «один вход в день»: выход сегодня уже был — `_day_is_closed`)
     # Здесь только СРАВНЕНИЕ: дата тейка против даты времени ЗАКРЫТИЯ текущей
     # свечи, «начало + таймфрейм». Место шага в порядке значимо — он стоит
     # после закрытия по сигналу и до открытия, то есть выйти из позиции в день
@@ -743,13 +744,10 @@ def process_closed_candle(
     # оба» снято 31.08.2026 разбором журнала прототипа: пути расходятся
     # не на полуночи, а после разрыва в ряде, и путь А даёт там СТАРШУЮ дату.
     steps.append(Step.STOP_AFTER_TAKE)
-    if (
-        settings.stop_after_take_profit
-        and state.take_profit_date is not None
-        and state.take_profit_date == in_moscow(closes_at).date()
-    ):
-        if not orders:
-            writer.quiet(*_stop_after_take(working))
+    closed, note = _day_is_closed(state, working, orders, closes_at, settings)
+    if closed:
+        if note is not None:
+            writer.quiet(*note)
         return _done(
             writer, refused, steps, orders, closes_at, snapshot, inside, trading
         )
@@ -956,6 +954,7 @@ def _closed(
     state = replace(
         state, position=None, pending=pending, closing_bars=0,
         exit_blocked_bars=0, quiet_note="",
+        last_exit_date=in_moscow(fill.at).date(),
         # Результат сделки в рублях, комиссия выхода вычтена. Это и есть
         # «зафиксировано за день», с чем сравнивается дневной лимит убытка.
         day=_day_after(
@@ -2283,6 +2282,62 @@ def _armed_note(position: Position) -> str:
         f". ⚠️ Но выставленный тейк {_price(position.take.level or 0.0)} "
         "остаётся у брокера и может сработать: это заявка на его стороне, "
         "а не расчёт внутри программы. Снять её можно в приложении брокера"
+    )
+
+
+def _day_is_closed(
+    state: EngineState,
+    working: EngineState,
+    orders: list[OrderRequest],
+    closes_at: datetime,
+    settings: EngineSettings,
+) -> tuple[bool, tuple[str, str, str] | None]:
+    """Шаг 9: день закрыт для новых входов. Две причины, проверяются по порядку.
+
+    «Стоп после тейка» — сегодня был тейк. Режим «один вход в день» —
+    сегодня был выход (сделкой) или выход подан на ЭТОЙ свече. Вторая
+    половина нужна перевороту «в одной свече»: сделки выхода ещё нет, дата
+    не записана, а шаг 10 подал бы вход в обратную сторону сразу за выходом.
+    Строка режима пишется и при поданном выходе: строка выхода объясняет
+    выход, а не то, почему за ним не последовал вход.
+
+    Возвращает «закрыт ли день» и строку журнала. Строки может не быть при
+    закрытом дне: «стоп после тейка» молчит, если заявка на свече уже
+    объяснена своей строкой.
+
+    Дата сравнивается с датой ЗАКРЫТИЯ текущей свечи, а пишется из времени
+    сделки — асимметрия прототипа (PROTOTYPE.md §5), см. комментарий шага 9.
+    """
+    today = in_moscow(closes_at).date()
+    if settings.stop_after_take_profit and state.take_profit_date == today:
+        return True, (None if orders else _stop_after_take(working))
+    if settings.mode is Mode.ONE_ENTRY_A_DAY and (
+        state.last_exit_date == today
+        or any(order.action is OrderAction.CLOSE for order in orders)
+    ):
+        return True, _one_entry_day_closed(working)
+    return False, None
+
+
+def _one_entry_day_closed(state: EngineState) -> tuple[str, str, str]:
+    """Шаг 9, режим «один вход в день»: выход сегодня был или подан сейчас.
+
+    С позицией (выход подан, сделки ещё нет) обещать «сделок не будет»
+    нельзя: сделка выхода ещё впереди. Поэтому два текста, как у `_stop_after_take`.
+    """
+    if state.position is not None:
+        return (
+            "one-entry-closing",
+            "Входа в обратную сторону не будет",
+            f"Режим «{Mode.ONE_ENTRY_A_DAY.label}»: позиция "
+            f"({state.position.side.label.lower()}) закрывается без переворота, "
+            "день закрыт — новых входов до конца дня нет",
+        )
+    return (
+        "one-entry-day-closed",
+        "Сделок сегодня больше не будет",
+        f"Режим «{Mode.ONE_ENTRY_A_DAY.label}»: сегодня выход уже был, "
+        "день закрыт — новых входов до конца дня нет",
     )
 
 

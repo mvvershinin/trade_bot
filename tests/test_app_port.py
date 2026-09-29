@@ -200,6 +200,21 @@ def replay_history(loop, database: pathlib.Path, **kwargs):
     return loop.run_until_complete(go())
 
 
+def _close_again(loop, port: HistoryPort) -> None:
+    """Закрыть порт, которым тест пользовался после `replay_history`.
+
+    `replay_history` порт уже закрыл, но новая команда (`apply_settings`)
+    заводит работу заново через `_begin`, а с ней — часы сторожа
+    (`_Stuck.timer`, таймер Qt раз в секунду). Порт, брошенный с идущими
+    часами, уходит в сборку мусора циклом, и сборщик вправе сработать
+    в потоке базы (`MarketWorker`). `~QObject` не в своём потоке таймер
+    не снимает («Timers cannot be stopped from another thread»), запись
+    о нём остаётся в цикле Qt, и следующий тест этого воркера падает
+    SIGSEGV в `QTimerInfoList::activateTimers` (замер 29.09.2026).
+    """
+    loop.run_until_complete(port.aclose())
+
+
 # --------------------------------------------------------------------- норма
 
 def test_candles_and_deals_reach_the_window(loop, database) -> None:
@@ -2966,10 +2981,13 @@ def test_a_change_of_instrument_reaches_the_quote_stream(loop, database) -> None
     asked: list[str] = []
     port.attach_stream(lambda on: None, retarget=asked.append)
 
-    port.apply_settings(replace(Settings(), instrument="SiU6"))
-    port.apply_settings(replace(Settings(), instrument="SiU6"))
-    port.apply_settings(replace(Settings(), instrument="  MXU6  "))
-    loop.run_until_complete(port.wait())
+    try:
+        port.apply_settings(replace(Settings(), instrument="SiU6"))
+        port.apply_settings(replace(Settings(), instrument="SiU6"))
+        port.apply_settings(replace(Settings(), instrument="  MXU6  "))
+        loop.run_until_complete(port.wait())
+    finally:
+        _close_again(loop, port)
 
     assert asked == ["SiU6", "SiU6", "MXU6"], (
         f"звено узнало о смене инструмента не так: {asked}"
@@ -3000,8 +3018,11 @@ def test_a_port_without_a_retarget_handler_still_applies_settings(loop, database
     """
     port, recorded = replay_history(loop, database)
     port.attach_stream(lambda on: None)
-    port.apply_settings(replace(Settings(), instrument="SiU6"))
-    loop.run_until_complete(port.wait())
+    try:
+        port.apply_settings(replace(Settings(), instrument="SiU6"))
+        loop.run_until_complete(port.wait())
+    finally:
+        _close_again(loop, port)
     assert recorded.settings[-1].instrument == "SiU6"
 
 

@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import fields
 from typing import cast
 
 from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, Signal
@@ -428,6 +429,15 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.resize(560, 720)
 
+        #: Строки у полей: требование алгоритма и отказ «Применить». Ключ —
+        #: имя поля `Settings` и вид строки. Создаются по первому требованию
+        #: (`_field_note`): заранее неизвестно, какое поле назовёт алгоритм
+        #: или отказ.
+        self._field_notes: dict[tuple[str, str], QLabel] = {}
+        #: Идёт отправка настроек из этого окна и был ли на неё отказ —
+        #: см. `take_refusal`.
+        self._emitting = False
+        self._refused = False
         self._build_fields()
         self.tabs = self._build_tabs()
 
@@ -449,6 +459,21 @@ class SettingsDialog(QDialog):
         # внутри одной из них: она относится ко всем числам окна сразу,
         # а спрятанная на вкладку читалась бы как оговорка к этой вкладке.
         layout.addWidget(self._notice())
+        #: Отказ «Применить» — крупно над вкладками, а не в строке состояния
+        #: главного окна за этим (дефект 29.09.2026: 15 секунд за модальным
+        #: окном и обрезано на 1440 точках). Спрятан, пока отказа нет.
+        self.refusal_note = _alert("")
+        font = self.refusal_note.font()
+        font.setPointSizeF(font.pointSizeF() + 2.0)
+        self.refusal_note.setFont(font)
+        self.refusal_note.setVisible(False)
+        layout.addWidget(self.refusal_note)
+        #: Программа сама сменила настройки, пока окно открыто (суточный
+        #: переход на действующий контракт): поле обновлено, и это сказано
+        #: словами, а не тихой подменой под рукой человека. См. `take_echo`.
+        self.echo_note = _alert("")
+        self.echo_note.setVisible(False)
+        layout.addWidget(self.echo_note)
         layout.addWidget(self.tabs, 1)
         layout.addWidget(self.buttons)
 
@@ -1362,7 +1387,7 @@ class SettingsDialog(QDialog):
         Отдельная дорога к движку означала бы смену торгового правила
         в обход подтверждения «было → стало».
         """
-        dialog = AlgorithmDialog(self._algorithms, self)
+        dialog = AlgorithmDialog(self._algorithms, self, captions=self.field_captions())
         dialog.set_chosen(self._strategy_id)
         try:
             if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1372,9 +1397,16 @@ class SettingsDialog(QDialog):
             # Без этого окно живёт до конца работы программы: родителем ему
             # назначено окно настроек, а `exec()` его не удаляет.
             dialog.deleteLater()
-        if not chosen:
-            return
-        self._strategy_id = chosen
+        if chosen:
+            self.pick_algorithm(chosen)
+
+    def pick_algorithm(self, strategy_id: str) -> None:
+        """Выбрать алгоритм в окне — то же, что выбор в списке и «Выбрать».
+
+        Ничего не применяет: имя ложится в поля окна, а требования алгоритма
+        к общим настройкам — в свои поля (`_sync_demands`).
+        """
+        self._strategy_id = strategy_id
         self._show_algorithm()
 
     def _show_algorithm(self) -> None:
@@ -1409,6 +1441,7 @@ class SettingsDialog(QDialog):
             CHOOSE_HINT if self._algorithms else CHOOSE_IMPOSSIBLE
         )
         self._sync_unused()
+        self._sync_demands()
         found = self._chosen_option()
         if found is not None:
             self.algorithm_name.setText(found.title)
@@ -1506,6 +1539,199 @@ class SettingsDialog(QDialog):
         self.algorithm_note.setText(text)
         self.algorithm_note.setVisible(bool(text))
 
+    def _widget_of(self, field: str) -> QWidget | None:
+        """Виджет поля `Settings` по таблице `PLACEMENT`. `None` — поля в окне нет."""
+        for name, _tab, attr in PLACEMENT:
+            if name == field:
+                found = getattr(self, attr)
+                return found if isinstance(found, QWidget) else None
+        return None
+
+    def _field_note(self, field: str, kind: str) -> QLabel | None:
+        """Строка прямо под полем. Создаётся один раз и прячется, когда пуста.
+
+        Под полем, а не в общем месте: требование и отказ говорят про одно
+        поле, и человек ищет объяснение там, где поле закрыто или где его
+        надо поменять. `None` — поля в окне нет или оно не в форме.
+        """
+        found = self._field_notes.get((field, kind))
+        if found is not None:
+            return found
+        widget = self._widget_of(field)
+        parent = widget.parentWidget() if widget is not None else None
+        form = parent.layout() if parent is not None else None
+        if widget is None or not isinstance(form, QFormLayout):
+            return None
+        # Строка поля ищется обходом, а не `getWidgetPosition`: у той в PySide6
+        # объявлен возврат `object`, и распаковка его — подавление типов.
+        row = next(
+            index for index in range(form.rowCount())
+            if (item := form.itemAt(index, QFormLayout.ItemRole.FieldRole)) is not None
+            and item.widget() is widget
+        )
+        label = _alert("") if kind == "refusal" else _hint("")
+        label.setVisible(False)
+        form.insertRow(row + 1, label)
+        self._field_notes[(field, kind)] = label
+        return label
+
+    def _sync_demands(self) -> None:
+        """Поставить то, чего требует выбранный алгоритм, закрыть поле, сказать почему.
+
+        Требования объявляет сам алгоритм (`StrategyEntry.demands`), `app/`
+        переводит их в поле и значение окна (`AlgorithmOption.demands`),
+        здесь один цикл по данным — ни имени алгоритма, ни значения поля
+        в этом файле нет. Закрытое поле не даёт собрать сочетание, которое
+        порт всё равно отвергнет (`app/convert.py::check_demands`): до
+        29.09.2026 окно его собирало, отказ уходил в строку состояния
+        за окном, а окно запоминало отвергнутый алгоритм.
+
+        Уход на алгоритм без требования поле открывает, но значение
+        не возвращает: что стоит в поле, человек видит, а «было → стало»
+        покажет подтверждение.
+        """
+        found = self._chosen_option()
+        demanded = {one.field: one for one in (found.demands if found else ())}
+        unused = self._unused_now()
+        for name in sorted({one.field for item in self._algorithms for one in item.demands}):
+            widget = self._widget_of(name)
+            note = self._field_note(name, "demand")
+            # Требование сегодня бывает только к выбору из списка: так его
+            # объявляет реестр (`SettingsDemand.value` — элемент перечисления).
+            if not isinstance(widget, QComboBox) or note is None:
+                continue
+            demand = demanded.get(name)
+            index = widget.findData(demand.value) if demand is not None else -1
+            if demand is not None and index >= 0:
+                widget.setCurrentIndex(index)
+            widget.setEnabled(index < 0 and name not in unused)
+            note.setVisible(demand is not None)
+            if demand is None or found is None:
+                continue
+            note.setText(
+                f"Алгоритм «{found.title}» {demand.reason}. Поэтому здесь стоит "
+                f"«{widget.itemText(index)}», и поле закрыто, пока выбран этот "
+                "алгоритм." if index >= 0 else
+                f"Алгоритм «{found.title}» {demand.reason}, а такого значения "
+                "в этом списке нет. Обновите программу целиком."
+            )
+
+    def take_refusal(self, kept: Settings, reason: str, field: str) -> None:
+        """«Применить» из этого окна не принято: принятым остаётся `kept`, правки — в полях.
+
+        Принятым окно считает то, что осталось в силе: с ним сравнивает
+        подтверждение при следующем «Применить» (до 29.09.2026 окно помнило
+        отвергнутый набор как принятый). Поля **не** откатываются: отказ
+        по одному полю стирал бы все правки разом — период, окно, объём —
+        и человек вводил бы их заново (находка ревью 29.09.2026). Отказ —
+        крупно над вкладками и строкой у названного поля; вкладка поля
+        открывается, фокус — на нём.
+
+        Отказ, пришедший не в ответ на отправку из этого окна, не трогает
+        ни полей, ни окна: правки человека, ещё не отправленные, стирать
+        чужим отказом нельзя.
+        """
+        if not self._emitting:
+            return
+        self._refused = True
+        self._applied = kept
+        widget = self._widget_of(field) if field else None
+        caption = self._caption_of(widget) if widget is not None else ""
+        where = next((tab for name, tab, _attr in PLACEMENT if name == field), "")
+        # Причина целиком — у поля, если поле известно; наверху — куда идти.
+        # Одна и та же фраза дважды на одном экране читалась как два отказа.
+        self.refusal_note.setText(
+            f"Настройки не приняты: поменяйте поле «{caption}» на вкладке "
+            f"«{where}» — причина под полем. В силе прежние настройки; ваши "
+            "правки остались в полях и не применены."
+            if caption else
+            f"Настройки не приняты. {reason} Ваши правки остались в полях "
+            "и не применены."
+        )
+        self.refusal_note.setVisible(True)
+        note = self._field_note(field, "refusal") if field else None
+        if note is not None and widget is not None:
+            note.setText(reason)
+            note.setVisible(True)
+            page = self.page_of(where)
+            if page is not None:
+                self.tabs.setCurrentWidget(page)
+            widget.setFocus()
+
+    def take_echo(self, settings: Settings) -> None:
+        """Настройки, действующие у робота, пришли, пока окно открыто.
+
+        Два источника. Ответ на «Применить» из этого окна (`_emitting`) —
+        тогда это просто новое принятое. И сама программа: суточный переход
+        с истёкшего кода на действующий, подсказанные биржей ₽ за пункт.
+        Во втором случае окно обязано узнать об этом: иначе в полях и
+        в «принятом» остался бы прежний код, подтверждение разницы не
+        показало бы ничего, и «ОК» молча вернул бы робота на истёкший
+        контракт (находка ревью 29.09.2026).
+
+        Слияние — одной таблицей полей `Settings`, без ветки на инструмент:
+        поле, которое человек уже поправил (в окне не то, что было принято),
+        остаётся за ним; остальные берут значение программы. Неотправленные
+        правки чужое эхо не стирает — по той же причине, что и отказ
+        (`take_refusal`).
+        """
+        before = self._applied
+        self._applied = settings
+        if self._emitting or settings == before:
+            return
+        shown = self.values()
+        mine = {
+            one.name: getattr(shown, one.name)
+            for one in fields(Settings)
+            if getattr(shown, one.name) != getattr(before, one.name)
+        }
+        self.set_values(settings.replace(**mine))
+        was, now = before.instrument.strip(), settings.instrument.strip()
+        if was == now:
+            return
+        caption = self.field_captions().get("instrument", "Инструмент")
+        kept = self.instrument.text().strip()
+        self.echo_note.setText(
+            f"Программа перешла с {was} на действующий контракт {now}, пока "
+            f"окно было открыто; причина — в журнале решений. "
+            + (
+                f"Поле «{caption}» обновлено."
+                if kept == now else
+                f"В поле «{caption}» оставлено введённое вами {kept}: "
+                "«Применить» сменит инструмент на него."
+            )
+        )
+        self.echo_note.setVisible(True)
+
+    def note_at(self, field: str, kind: str) -> QLabel | None:
+        """Строка у поля, если она заведена: `kind` — `demand` или `refusal`.
+
+        Только чтение: заводит строки `_field_note`, когда есть что сказать.
+        """
+        return self._field_notes.get((field, kind))
+
+    def field_captions(self) -> dict[str, str]:
+        """Подписи полей так, как их видит человек: имя поля `Settings` → подпись."""
+        found = {}
+        for name, _tab, _attr in PLACEMENT:
+            widget = self._widget_of(name)
+            if widget is not None and (caption := self._caption_of(widget)):
+                found[name] = caption
+        return found
+
+    def _clear_refusal(self) -> None:
+        """Снять прежний отказ перед новой отправкой.
+
+        Заодно и строку о переходе программы (`take_echo`): отправленное
+        уже сравнено с принятым, новость прочитана.
+        """
+        self.refusal_note.setVisible(False)
+        self.refusal_note.setText("")
+        self.echo_note.setVisible(False)
+        for (_field, kind), label in self._field_notes.items():
+            if kind == "refusal":
+                label.setVisible(False)
+
     def page_of(self, tab: str) -> QWidget | None:
         """Страница вкладки по её заголовку. `None` — такой вкладки нет.
 
@@ -1576,7 +1802,6 @@ class SettingsDialog(QDialog):
         self.depth_days.setValue(settings.depth_days)
         self.history_depth_days.setValue(max(settings.history_depth_days, 1))
         self.expiry_halt_days.setValue(settings.expiry_halt_days)
-        self._take_algorithm(settings.strategy_id)
         self.average_period.setValue(settings.average_period)
         self.threshold_percent.setValue(settings.threshold_percent)
         self.confirm_bars.setValue(settings.confirm_bars)
@@ -1646,6 +1871,7 @@ class SettingsDialog(QDialog):
         self._sync_depth()
         self._sync_filter()
         self._sync_window_close()
+        self._take_algorithm(settings.strategy_id)
 
     def _show_timeframe(self, timeframe: str) -> None:
         """Размер свечи в списке. Незнакомый ДОБАВЛЯЕТСЯ, а не подменяется.
@@ -1672,6 +1898,10 @@ class SettingsDialog(QDialog):
         была бы сменой торгового правила без ведома владельца счёта: на экране
         всё выглядело бы исправно, а робот работал бы не тем, что записано
         в настройках.
+
+        ⚠️ В `set_values` зовётся **последним**: списки ставят значения
+        из настроек, а требование выбранного алгоритма (`_sync_demands`)
+        обязано лечь поверх них, а не под них.
         """
         self._strategy_id = strategy_id
         self._show_algorithm()
@@ -2295,9 +2525,18 @@ class SettingsDialog(QDialog):
         values = self.values()
         if not self.confirm(values):
             return False
+        self._clear_refusal()
         self._applied = values
-        self.settings_changed.emit(values)
-        return True
+        # ⚠️ Порт живёт в потоке окна и отвечает внутри этого `emit`
+        # (`ui/ports.py`): отказ приходит в `take_refusal` до возврата.
+        # Отвергнутое «ОК» окно не закрывает — иначе отказ закрылся бы
+        # вместе с ним.
+        self._emitting, self._refused = True, False
+        try:
+            self.settings_changed.emit(values)
+        finally:
+            self._emitting = False
+        return not self._refused
 
     def applied(self) -> Settings:
         """Набор, который робот считает действующим: с ним идёт сравнение.

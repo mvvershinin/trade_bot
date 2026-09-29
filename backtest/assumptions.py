@@ -195,7 +195,14 @@ def _contracts(volume: float) -> str:
 def _facts_of(run: HistoryRun) -> _Facts:
     """Факты прогона. Ни одного числа заново: всё уже посчитано в `Summary`."""
     summary = run.summary
-    known = summary.commission is not None
+    # ⚠️ Без сделок сводка комиссии пуста при любом тарифе (`summarise`
+    # отдаёт `Summary()`), и отсюда 29.09.2026 при тарифе 14 ₽ отчёт писал
+    # «Тариф не назван». Назван ли тариф — вопрос к издержкам прогона,
+    # а не к сумме по сделкам, которых нет.
+    known = (
+        summary.commission is not None if summary.trades
+        else run.costs.per_side is not None
+    )
     days = sorted(in_moscow(deal.entry_time).date() for deal in run.deals)
     return _Facts(
         trades=summary.trades,

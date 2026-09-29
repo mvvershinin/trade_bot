@@ -1102,7 +1102,8 @@ def test_the_orders_of_one_candle_are_a_known_short_list() -> None:
                                     when=when,
                                 )
                                 _check_order_shape(outcome, settings, state, intent)
-    assert seen == 1440, f"перебор выродился: разобрано {seen} случаев"
+    # 288 случаев на режим; режимов шесть с «один вход в день» (29.09.2026).
+    assert seen == 1728, f"перебор выродился: разобрано {seen} случаев"
 
 
 def _check_order_shape(outcome, settings, state, intent) -> None:

@@ -717,7 +717,7 @@ async def _run(
             port, store, loaded, values, _named_userdata(args), level=DecisionLevel.WARNING)
         if note:  # папка данных не держит замок «одна копия» (решение 0039)
             port.note("Один экземпляр программы", note, DecisionLevel.WARNING)
-        port.refresh("запуск программы")
+        port.first_run("запуск программы")
         window.show()
         live = _live_feed(port, worker, database.parent, values, args)
         if args.snapshot:

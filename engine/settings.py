@@ -85,6 +85,12 @@ class Mode(enum.Enum):
     LONG_ONLY = "long_only"
     SHORT_ONLY = "short_only"
     CLOSE_ONLY = "close_only"
+    #: «Лонг и шорт, один вход в день»: вход по средней в любую сторону,
+    #: обратный сигнал позицию закрывает **без** входа в обратную сторону,
+    #: и после любого выхода за календарную дату новых входов нет. Держится
+    #: на шаге 9 рядом со «стопом после тейка» (`engine.pipeline`), своего
+    #: шага в порядке обработки у режима нет.
+    ONE_ENTRY_A_DAY = "one_entry_a_day"
 
     @property
     def label(self) -> str:
@@ -94,6 +100,7 @@ class Mode(enum.Enum):
             Mode.LONG_ONLY: "Только лонг",
             Mode.SHORT_ONLY: "Только шорт",
             Mode.CLOSE_ONLY: "Только закрытие",
+            Mode.ONE_ENTRY_A_DAY: "Лонг и шорт, один вход в день",
         }[self]
 
     @property

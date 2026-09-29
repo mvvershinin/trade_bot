@@ -287,10 +287,24 @@ async def replay_pieces(
 
 
 def _summary_line(title: str, summary: Summary) -> str:
+    """Итог строкой. Без сделок комиссии и чистой нет — «—», а не «тарифа нет».
+
+    Сводка без сделок пуста при любом тарифе (`summarise`), и «тарифа нет»
+    при заданных 14 ₽ за контракт было неправдой (29.09.2026).
+    """
+    if not summary.trades:
+        return (
+            f"{title}: сделок 0, валовая {_money(summary.gross_profit)}, "
+            f"комиссия {EMPTY}, чистая {EMPTY}"
+        )
     return (
         f"{title}: сделок {summary.trades}, валовая {_money(summary.gross_profit)}, "
         f"комиссия {_money(summary.commission, sign=False)}, чистая {_money(summary.net_profit)}"
     )
+
+
+#: Число, которого нет, потому что нет сделок, — как в окне отчёта.
+EMPTY = "—"
 
 
 def stitched_lines(run: StitchedRun) -> list[str]:

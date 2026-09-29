@@ -204,6 +204,30 @@ TIMEFRAME: Final[str] = "M1"
 RETRY_FIRST: Final[float] = 2.0
 RETRY_CAP: Final[float] = 60.0
 
+#: Сколько ждать первого снимка после открытия сокета. У брокера это 3–17 с
+#: (замер `B-007`); потолок паузы повторов берётся с запасом втрое и новым
+#: числом не заводится. Не торговое число: робот по нему не решает ничего,
+#: оно только говорит человеку, что брокер молчит. Замер 29.09.2026: по
+#: истёкшему MXU6 брокер сокет открыл и не прислал ни одного снимка, окно
+#: ждало вечно и молчало (правило 13).
+FIRST_SNAPSHOT_WAIT: Final[float] = RETRY_CAP
+
+
+class SnapshotsLate(BrokerError):
+    """Сокет открыт, а первого снимка нет дольше `FIRST_SNAPSHOT_WAIT`."""
+
+    retryable = True
+
+    def __init__(self, ticker: str, waited: float) -> None:
+        super().__init__(
+            f"Брокер не прислал ни одного снимка по {ticker} за {waited:.0f} с "
+            "после открытия потока. Проверьте, торгуется ли ещё этот контракт: "
+            "по истёкшему коду брокер поток открывает, но котировок не шлёт. "
+            "Бывает и так, что торги по нему сейчас на паузе (клиринг). "
+            "Программа переподключится сама.",
+            f"first snapshot not received in {waited:.0f} s",
+        )
+
 #: Сколько ждать закрытия сокета при завершении программы. Мёртвый сокет
 #: не должен держать завершение (миниплан Э1-5, §4.6): по истечении задача
 #: бросается, транспорт добирает закрытие цикла событий.
@@ -1255,7 +1279,27 @@ class LiveFeed:
             await self._read(socket)
 
     async def _read(self, socket: object) -> None:
-        """Чтение сообщений открытого сокета до обрыва."""
+        """Чтение сообщений открытого сокета до обрыва.
+
+        Первый снимок ждётся не дольше `FIRST_SNAPSHOT_WAIT`: молчащий
+        брокер — отказ вслух и повтор (`SnapshotsLate`), а не вечное
+        «ждём первый снимок». Срок — на первый **снимок**, а не на первое
+        сообщение: служебные ответы брокера котировкой не являются.
+        """
+        waited = FIRST_SNAPSHOT_WAIT
+        deadline = asyncio.timeout(waited)
+        try:
+            async with deadline:
+                await self._read_all(socket, deadline)
+        except TimeoutError:
+            # Срок снят первым снимком — значит, это чужой таймаут изнутри
+            # разбора, и он летит дальше как был.
+            if deadline.when() is not None and deadline.expired():
+                raise SnapshotsLate(self._ticker, waited) from None
+            raise
+
+    async def _read_all(self, socket: object, deadline: asyncio.Timeout) -> None:
+        """Сам разбор сокета; срок первого снимка снимается на первом снимке."""
         first = True
         announced = False
         async for raw in socket:  # type: ignore[attr-defined]
@@ -1263,6 +1307,7 @@ class LiveFeed:
             if snapshot is None:
                 continue
             if first:
+                deadline.reschedule(None)
                 self._complaint = None
                 self._online_since = monotonic()
                 self._phase(LinkPhase.ONLINE)

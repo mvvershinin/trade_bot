@@ -450,6 +450,9 @@ class MainWindow(QMainWindow):
         #: в `_on_algorithms` и `open_settings`.
         self._algorithms: tuple[AlgorithmOption, ...] = ()
         self._settings_dialog: SettingsDialog | None = None
+        #: Окно «прогон не состоялся». Одно на программу: второй отказ
+        #: подряд меняет текст, а не множит окна.
+        self._backtest_refusal: QMessageBox | None = None
         #: Окно собрано целиком. Сторож для `changeEvent`: событие палитры
         #: приходит и в середине сборки, а `apply_theme()` трогает график
         #: и журналы — их в этот момент ещё нет.
@@ -760,6 +763,8 @@ class MainWindow(QMainWindow):
         port.settings_applied.connect(self._on_settings_echo)
         port.algorithms_changed.connect(self._on_algorithms)
         port.failed.connect(self.show_error)
+        port.settings_refused.connect(self._on_settings_refused)
+        port.backtest_refused.connect(self.show_backtest_refusal)
         port.stuck_changed.connect(self.show_stuck)
         port.busy_changed.connect(self._on_busy)
         port.progress_changed.connect(self._on_progress)
@@ -1355,7 +1360,10 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
         if request is None:
             return
-        self._settings = request.settings
+        # ⚠️ Настройки прогона здесь НЕ запоминаются как действующие: их
+        # принимает порт, и принятые придут эхом `settings_applied`. До
+        # 29.09.2026 окно запоминало их сразу, и отвергнутый набор жил
+        # в окне как принятый.
         self._start_progress()
         self.port.run_backtest(request)
 
@@ -1605,7 +1613,53 @@ class MainWindow(QMainWindow):
         self.port.apply_settings(settings)
 
     def _on_settings_echo(self, settings: Settings) -> None:
+        """Эхо порта: действующие настройки. Открытое окно настроек узнаёт их тоже.
+
+        Без передачи окну суточный переход на действующий контракт при
+        открытых настройках терялся: в полях оставался истёкший код,
+        и «ОК» молча возвращал на него (`SettingsDialog.take_echo`).
+        """
         self._settings = settings
+        if self._settings_dialog is not None:
+            self._settings_dialog.take_echo(settings)
+
+    def _on_settings_refused(self, kept: Settings, reason: str, field: str) -> None:
+        """«Применить» не принято: окно остаётся на том, что в силе у порта.
+
+        Отказ показывает само окно настроек — у поля, которое надо поменять
+        (`SettingsDialog.take_refusal`). Строка состояния главного окна
+        за модальным окном настроек не видна.
+        """
+        self._settings = kept
+        if self._settings_dialog is not None:
+            self._settings_dialog.take_refusal(kept, reason, field)
+
+    def show_backtest_refusal(self, reason: str) -> None:
+        """Прогон не состоялся: закрыть полоску и сказать это в окне.
+
+        Полоска закрывается здесь, а не только концом работы (`_on_busy`):
+        отвергнутый прогон работы не начинает, и «работа кончилась» не
+        придёт никогда (дефект 29.09.2026 — «0 %» висело вечно).
+
+        Окно сообщения — немодальное: сигнал может прийти изнутри шага
+        корутины, а модальное окно подняло бы вложенный цикл (`B-026`).
+        """
+        self._close_progress()
+        text = (
+            f"Прогон на истории не состоялся. {reason}\n\n"
+            "На графике и в журнале сделок — то, что было до этой попытки: "
+            "прежний прогон или текущие данные, а не результат этого прогона."
+        )
+        self.statusBar().showMessage("Прогон на истории не состоялся — на экране прежний прогон")
+        box = self._backtest_refusal
+        if box is None:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Прогон на истории")
+            box.setWindowModality(Qt.WindowModality.NonModal)
+            self._backtest_refusal = box
+        box.setText(text)
+        box.show()
 
     def _on_algorithms(self, options: tuple[AlgorithmOption, ...]) -> None:
         """Каталог торговых алгоритмов — от торговой части через порт.

@@ -588,6 +588,28 @@ def test_inspect_lists_every_key_that_differs_only_in_case(
     assert "что лежит в базе" not in text
 
 
+
+def test_inspect_prefers_the_exact_key_to_its_case_twins(tmp_path: pathlib.Path) -> None:
+    """Точный ключ есть — он и показывается, двойник в другом регистре не мешает.
+
+    Поиск без учёта регистра — запасной путь, когда точного ключа нет.
+    Без первенства точного совпадения база с `MXU6` и случайным `mxu6`
+    отказала бы в описи самого обычного кода.
+    Мутация, обязанная ронять (проверено 29.09.2026, до этого теста не
+    ловилась ничем): убрать `if symbol in symbols: return [symbol]`
+    из `_stored_key`.
+    """
+    path = tmp_path / "c.sqlite3"
+    with CandleStore(path) as store:
+        store.put_minutes("MXU6", session(DAY, 400), Source.ISS)
+        store.put_minutes("mxu6", session(DAY, 10), Source.ISS)
+    out = io.StringIO()
+    code = show_inventory(path, "MXU6", out=out, client=fake_client(exchange(ALIVE)))
+    text = out.getvalue()
+    assert code == 0, text
+    assert "MXU6 — что лежит в базе" in text
+    assert "несколько ключей" not in text and "в другом регистре" not in text, text
+
 # -- сшивка ближних контрактов: `python3 -m app.fetch --stitch` ---------------
 #
 # Что стережётся, по строке на тест:

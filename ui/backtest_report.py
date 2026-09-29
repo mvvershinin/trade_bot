@@ -106,6 +106,13 @@ class BacktestReportDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
+        # Первой строкой: «Сделок: 0» без причины читается как поломка
+        # (правило 13 `CLAUDE.md`). Причину называет `app/`, окно показывает.
+        self.no_trades = QLabel(report.no_trades)
+        self.no_trades.setWordWrap(True)
+        self.no_trades.setStyleSheet(f"color: {self._theme.warning}; font-weight: 600;")
+        self.no_trades.setVisible(bool(report.no_trades))
+        layout.addWidget(self.no_trades)
         layout.addWidget(self._head())
         layout.addWidget(self._money())
         layout.addWidget(self._contracts())
