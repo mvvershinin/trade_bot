@@ -121,6 +121,11 @@ jobs:
     container:
       image: ubuntu:22.04
     timeout-minutes: 60
+    # В контейнере оболочка по умолчанию — `sh` (dash): `set -o pipefail`
+    # в нём запрещён, джоб падал на первой строке (тег v0.2.0, 30.09.2026).
+    defaults:
+      run:
+        shell: bash
     env:
       TERMINAL_VERSION: ${{ needs.version.outputs.version }}
     steps:
