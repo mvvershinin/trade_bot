@@ -16,15 +16,28 @@
 Внешних библиотек не требуется: PIL в поставку не входит и тянуть его
 ради одной иконки не за чем.
 
-Запуск:  python tools/make_icon.py
+Запуск:  python tools/make_icon.py           # .ico для Windows (Nuitka)
+         python tools/make_icon.py --png     # ещё и .png для AppImage (Linux)
+
+PNG — тем же путём, без внешних библиотек: `zlib` из стандартной библиотеки
+сжимает построчные данные, тот же холст `_canvas`, что и для `.ico`. Не через
+офскрин-рендер Qt: в контейнере сборки AppImage лишняя зависимость
+от платформенного плагина Qt ради одной иконки не нужна.
 """
 
 from __future__ import annotations
 
+import argparse
 import pathlib
 import struct
+import zlib
 
 OUT = pathlib.Path(__file__).resolve().parent / "terminal.ico"
+PNG_OUT = pathlib.Path(__file__).resolve().parent / "terminal.png"
+
+#: Размер одиночного PNG для AppImage — `appimagetool` требует ровно
+#: один файл поиконки в `AppDir`, не набор размеров как у `.ico`.
+PNG_SIZE = 256
 
 #: Размеры, которые спрашивает проводник Windows: список файлов, рабочий стол,
 #: панель задач и крупные значки.
@@ -88,6 +101,42 @@ def build() -> pathlib.Path:
     return OUT
 
 
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+
+def build_png(size: int = PNG_SIZE) -> pathlib.Path:
+    """PNG, RGBA 8 бит, без фильтрации по строкам.
+
+    Тип фильтра 0 (None) — холст плоский, `zlib` и так убирает однородные
+    области фона без построчной фильтрации.
+    """
+    px = _canvas(size)
+    raw = bytearray()
+    for row in px:  # PNG идёт сверху вниз — в отличие от .ico, не разворачивать
+        raw.append(0)  # filter type 0 = None
+        for b, g, r, a in row:
+            raw += bytes((r, g, b, a))
+    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)  # colour type 6 = RGBA
+    signature = b"\x89PNG\r\n\x1a\n"
+    png = (
+        signature
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        + _png_chunk(b"IEND", b"")
+    )
+    PNG_OUT.write_bytes(png)
+    return PNG_OUT
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--png", action="store_true", help="собрать и .png для AppImage")
+    args = parser.parse_args()
+
     path = build()
     print(f"{path} — {path.stat().st_size} Б, размеры: {', '.join(map(str, SIZES))}")
+    if args.png:
+        png_path = build_png()
+        print(f"{png_path} — {png_path.stat().st_size} Б, {PNG_SIZE}×{PNG_SIZE}")

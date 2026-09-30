@@ -242,12 +242,20 @@ git push origin v0.2.0
    ~70 с) на `ubuntu-24.04`. Тег может стоять на коммите, который никогда
    не гонял обычный CI, — это дешёвая страховка перед тем, как тратить
    десятки минут на сборку под две платформы.
-3. **`build-linux`** (`ubuntu-latest`) и **`build-windows`** (`windows-latest`)
-   — параллельно. Каждый: `uv sync`, подставляет версию из тега в
-   `pyproject.toml` (см. врезку ниже — зачем это отдельный шаг),
-   `tools/build.py`, затем `tools/linux_package.py` или
-   `tools/windows_package.py`, архив — как артефакт workflow (ещё не
-   в Releases).
+3. **`build-linux`** и **`build-windows`** — параллельно.
+   `build-linux` бежит **в контейнере `ubuntu:22.04`** (не `ubuntu-latest`
+   раннера напрямую — та база новее и дала бы бинарь, которому нужен более
+   свежий glibc, чем стоит у заказчика; решение
+   [`0001`](.docs/decisions/0001-packaging-nuitka-portable.md)), одним
+   скриптом `tools/build_appimage.sh` (system-пакеты, `uv`, версия,
+   `tools/build.py`, иконка, `appimagetool`+type2-runtime со сверкой
+   sha256, `tools/appimage_package.py`) — тот же скрипт можно прогнать
+   локально в голом `ubuntu:22.04` для проверки перед тегом. Результат —
+   `dist/Terminal.AppImage`, имя не меняется от релиза к релизу
+   (решение `0002`).
+   `build-windows` (`windows-latest`) — как раньше: `uv sync`, версия
+   из тега в `pyproject.toml`, `tools/build.py`, `tools/windows_package.py`.
+   Оба — архив/файл как артефакт workflow (ещё не в Releases).
 4. **`release`** — только если **обе** платформы собрались: скачивает
    оба архива, подставляет версию в заготовку текста
    ([`.github/RELEASE_TEMPLATE.md`](.github/RELEASE_TEMPLATE.md)),
@@ -305,7 +313,8 @@ GitHub-раннеры дают меньше ядер, поэтому в `release
 | `Зависимости (uv sync --locked --all-groups)` | тег стоит на коммите, где разошлись `pyproject.toml`/`uv.lock` — то же семейство находок, что было в `ci.yml` при заведении (см. `packaging-expert-ci-2026-09-07-1940.md` §0) |
 | `Версия — из тега в pyproject.toml` | `FOUND != VERSION` в сообщении — метаданные пакета не подхватили новую версию; это тревожный сигнал именно о механизме версии, разбирать по врезке выше, не переподставлять руками |
 | `Сборка Nuitka` (Windows) | первая живая проверка MinGW64/кодировок консоли — see warning выше; в логе шага будет видно, что именно упало |
-| `Упаковка` | `tools/linux_package.py`/`tools/windows_package.py` не нашли `build/main.dist` — предыдущий шаг не собрался, смотреть его |
+| `Собрать Terminal.AppImage` (Linux) | смотреть, на каком из семи шагов `tools/build_appimage.sh` упал — apt, uv, версия, Nuitka, иконка, скачивание/sha256 appimagetool/runtime или сама упаковка |
+| `Упаковка` (Windows) | `tools/windows_package.py` не нашёл `build/main.dist` — предыдущий шаг не собрался, смотреть его |
 | `release` | оба архива собрались, но `gh release create` отказал — частая причина: тег уже опубликован как релиз (пересобрать под тем же тегом нельзя; удалить тег и релиз в GitHub UI, перетегировать) |
 
 Повторный прогон одного и того же тега невозможен: `gh release create`
@@ -350,16 +359,24 @@ Terminal/                     ← папка программы, копируе�
 
 ### Запустить готовую программу на Linux
 
-В архив `Terminal-*-linux-x86_64.tar.gz` не входит копия системных
-библиотек Qt — они уже стоят на любом Linux с рабочим столом, кроме
-совсем голых серверных установок. Список ниже — не с потолка и не «на
-всякий случай»: каждая строка добавлена по факту одной конкретной ошибки
-запуска, замер 08.09.2026 на `ubuntu:24.04` (чистый контейнер, без единого
-лишнего пакета), в два прохода:
+В поставку (ни в `Terminal-*-linux-x86_64.tar.gz`, ни в `Terminal.AppImage`)
+не входит копия системных библиотек Qt — они уже стоят на любом Linux
+с рабочим столом, кроме совсем голых серверных установок или голых
+контейнеров. Список ниже — не с потолка и не «на всякий случай»: каждая
+строка добавлена по факту одной конкретной ошибки запуска, замер
+08.09.2026 на `ubuntu:24.04` (чистый контейнер, без единого лишнего
+пакета), в два прохода:
 
-* **без экрана** (`QT_QPA_PLATFORM=offscreen`) — 5 библиотек, тот же список,
+* **без экрана** (`QT_QPA_PLATFORM=offscreen`) — 6 библиотек, тот же список,
   что уже был выверен для CI (`.github/workflows/ci.yml`):
-  `libgl1 libegl1 libxkbcommon0 libglib2.0-0 libdbus-1-3`;
+  `libgl1 libegl1 libxkbcommon0 libglib2.0-0 libdbus-1-3 libfontconfig1`.
+  ⚠️ `libfontconfig1` добавлена в список 30.09.2026: прошлый замер её не
+  поймал, потому что в тестовом контейнере она уже стояла транзитивно
+  (тянулась пакетами `imagemagick`/`xvfb`, использованными для проверки
+  окна). Найдена при первой по-настоящему голой проверке `Terminal.AppImage`
+  (`.docs/packaging/`, отчёт от 30.09.2026): без неё Qt падает сразу же,
+  даже офскрин — `ImportError: libfontconfig.so.1: cannot open shared
+  object file`;
 * **с настоящим окном** (`QT_QPA_PLATFORM=xcb`, реальный сеанс X11 через
   Xvfb — не офскрин) — этого мало: собранный `Terminal` падал на старте
   с сообщением про `xcb-cursor0`, а после её установки `ldd` по плагину
@@ -371,23 +388,24 @@ Terminal/                     ← папка программы, копируе�
 
 ```bash
 sudo apt install libgl1 libegl1 libxkbcommon0 libglib2.0-0 libdbus-1-3 \
-                  libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 \
-                  libxcb-keysyms1 libxcb-xkb1 libwayland-cursor0 libwayland-egl1
+                  libfontconfig1 libxcb-cursor0 libxkbcommon-x11-0 \
+                  libxcb-icccm4 libxcb-keysyms1 libxcb-xkb1 \
+                  libwayland-cursor0 libwayland-egl1
 ```
 
 Fedora:
 
 ```bash
 sudo dnf install mesa-libGL mesa-libEGL libxkbcommon glib2 dbus-libs \
-                  xcb-util-cursor libxkbcommon-x11 xcb-util-wm xcb-util-keysyms \
-                  wayland
+                  fontconfig xcb-util-cursor libxkbcommon-x11 xcb-util-wm \
+                  xcb-util-keysyms wayland
 ```
 
 Arch:
 
 ```bash
-sudo pacman -S mesa libxkbcommon glib2 dbus xcb-util-cursor libxkbcommon-x11 \
-               xcb-util-wm xcb-util-keysyms wayland
+sudo pacman -S mesa libxkbcommon glib2 dbus fontconfig xcb-util-cursor \
+               libxkbcommon-x11 xcb-util-wm xcb-util-keysyms wayland
 ```
 
 ⚠️ Команды для Fedora/Arch — по именам пакетов, предоставляющим те же

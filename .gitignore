@@ -125,6 +125,7 @@ env/
 # В git не хранится — двоичный файл, происхождение которого никто не помнит,
 # хуже тридцати строк, которые его делают.
 /tools/terminal.ico
+/tools/terminal.png
 nuitka-crash-report.xml
 compilation-report.xml
 *.egg-info/

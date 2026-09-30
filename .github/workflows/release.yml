@@ -102,70 +102,59 @@ jobs:
         run: uv run pytest -n auto -q
 
   # ------------------------------------------------------------------
-  # Linux: build.py -> linux_package.py -> tar.gz, загрузить как артефакт
-  # workflow (не сразу в Releases — публикация только после того, как ОБЕ
-  # платформы собрались, см. джоб release ниже).
+  # Linux: AppImage, не tar.gz — решение 0001. Собирается на СТАРОЙ базе
+  # (ubuntu:22.04 в контейнере джоба, а не ubuntu-latest раннера — тот
+  # едет на 24.04/25.xx и дал бы бинарь, которому нужен более свежий
+  # glibc, чем стоит у заказчика) тем же рецептом, что проверялся вручную
+  # 30.09.2026 на чистой машине (.docs/packaging/packaging-expert-
+  # 2026-09-30-1106.md): glibc-потолок 2.35 подтверждён там `objdump -T`.
+  #
+  # Рецепт — один файл `tools/build_appimage.sh`, а не россыпь шагов YAML:
+  # тот же скрипт гоняется и здесь, и локально в голом `ubuntu:22.04`
+  # (`docker run --rm -v ... ubuntu:22.04 sh tools/build_appimage.sh`) —
+  # «проверено локально» и «идёт в CI» буквально одна и та же команда.
   # ------------------------------------------------------------------
   build-linux:
-    name: Сборка — Linux
+    name: Сборка — Linux (AppImage)
     needs: [version, test]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    container:
+      image: ubuntu:22.04
+    timeout-minutes: 60
     env:
       TERMINAL_VERSION: ${{ needs.version.outputs.version }}
     steps:
+      # git ставится ДО checkout: у actions/checkout свой git-клиент,
+      # а в голом ubuntu:22.04 (контейнер джоба) git не установлен вовсе —
+      # без этого шага чекаут откатится на скачивание тарбола без `.git`,
+      # или просто упадёт, в зависимости от версии действия. Остальные
+      # системные пакеты (build-essential, python3.12, ...) — уже внутри
+      # tools/build_appimage.sh, тем же списком, что проверен вручную.
+      - name: git и сертификаты (нужны checkout'у до того, как он запустится)
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git ca-certificates
+
       - name: Забрать код
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Python 3.12
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
-        with:
-          python-version: "3.12"
-
-      - name: uv 0.12.7
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version: "0.12.7"
-          enable-cache: true
-
-      # --all-groups тянет и группу build (Nuitka, patchelf на Linux) —
-      # отдельного шага «поставить Nuitka» не нужно, она уже здесь.
-      - name: Зависимости (uv sync --locked --all-groups)
-        run: uv sync --locked --all-groups
-
-      # Разбор — почему это вообще нужно, и чем каждый шаг проверен —
-      # .docs/packaging/packaging-expert-release-2026-09-08-*.md, раздел
-      # про версию. Коротко: `ui/version.py` печёт версию в окно и в журнал
-      # решений ВО ВРЕМЯ КОМПИЛЯЦИИ Nuitka, читая метаданные пакета "terminal"
-      # из окружения сборки, а не аргументы командной строки. Значит версию
-      # нужно прописать в pyproject.toml и переустановить пакет ДО того,
-      # как начнётся tools/build.py — иначе релиз v0.2.0 покажет владельцу
-      # счёта версию 0.1.0 в заголовке окна, при том что свойства файла
-      # на Windows (см. ниже) уже будут правильными. Расхождение было бы
-      # тем более обидным, что его тяжело заметить.
-      - name: Версия — из тега в pyproject.toml
-        run: |
-          set -euo pipefail
-          python tools/set_version.py "$TERMINAL_VERSION"
-          uv sync --all-groups
-          FOUND="$(uv run --no-sync python -c "from importlib import metadata; print(metadata.version('terminal'))")"
-          echo "importlib.metadata.version('terminal') = $FOUND"
-          if [ "$FOUND" != "$TERMINAL_VERSION" ]; then
-            echo "::error::после правки pyproject.toml метаданные пакета показывают '$FOUND', а ожидалась '$TERMINAL_VERSION' — версия в окне программы и в журнале решений была бы неверной молча. Останавливаюсь, не собираю дальше."
-            exit 1
-          fi
-
-      - name: Сборка Nuitka
-        run: uv run python tools/build.py
-
-      - name: Упаковка — снять userdata, собрать архив
-        run: uv run python tools/linux_package.py
+      # Один скрипт: системные пакеты, python3.12 из deadsnakes (не из
+      # actions/setup-python — версия и сборка Python обязаны быть теми
+      # же, что вчера прошли чистую машину, а не другим Python из другого
+      # источника), uv 0.12.7, версия в pyproject.toml (с той же проверкой
+      # метаданных, что раньше жила прямо в этом файле — разбор см.
+      # .docs/packaging/packaging-expert-release-2026-09-08-*.md), Nuitka,
+      # PNG-иконка, appimagetool + type2-runtime со сверкой sha256, сборка
+      # Terminal.AppImage. Подробности — в самом tools/build_appimage.sh.
+      - name: Собрать Terminal.AppImage
+        run: sh tools/build_appimage.sh
 
       - name: Загрузить артефакт
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-archive
-          path: dist/Terminal-*-linux-x86_64.tar.gz
+          name: linux-appimage
+          path: dist/Terminal.AppImage
           if-no-files-found: error
           retention-days: 7
 
@@ -263,12 +252,18 @@ jobs:
         with:
           path: artifacts
 
+      # ⚠️ Склейка БЕЗУСЛОВНАЯ: если .github/RELEASE_D113_WARNING.md
+      # пропадёт (например, его удалили без правки этого шага, см. рецепт
+      # возврата D-113 в .docs/BACKLOG.md), `cat` на несуществующий файл
+      # упадёт с ненулевым кодом и `set -euo pipefail` остановит джоб —
+      # релиз без предупреждения не выйдет молча (правило 13).
       - name: Собрать текст релиза из заготовки
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          sed "s/__VERSION__/${VERSION}/g" .github/RELEASE_TEMPLATE.md > release-notes.md
+          cat .github/RELEASE_D113_WARNING.md .github/RELEASE_TEMPLATE.md \
+            | sed "s/__VERSION__/${VERSION}/g" > release-notes.md
 
       - name: Опубликовать релиз
         env:
@@ -279,5 +274,5 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "Терминал ${VERSION}" \
             --notes-file release-notes.md \
-            artifacts/linux-archive/*.tar.gz \
+            artifacts/linux-appimage/Terminal.AppImage \
             artifacts/windows-archive/*.zip
