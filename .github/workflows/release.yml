@@ -267,8 +267,15 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          cat .github/RELEASE_D113_WARNING.md .github/RELEASE_TEMPLATE.md \
-            | sed "s/__VERSION__/${VERSION}/g" > release-notes.md
+          # Раздел версии из CHANGELOG.md: нет раздела — выпуск не выходит.
+          python3 tools/changelog_section.py "${VERSION}" > changes.md
+          {
+            cat .github/RELEASE_D113_WARNING.md
+            printf '\n## Что нового в %s\n\n' "${VERSION}"
+            cat changes.md
+            printf '\n'
+            cat .github/RELEASE_TEMPLATE.md
+          } | sed "s/__VERSION__/${VERSION}/g" > release-notes.md
 
       - name: Опубликовать релиз
         env:
