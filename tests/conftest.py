@@ -56,6 +56,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import os
 import pathlib
@@ -895,3 +896,27 @@ def loop(qapp) -> Iterator[Any]:
         asyncio.set_event_loop(None)
         settle_qt(qapp)
         qapp.setQuitOnLastWindowClosed(quits_on_last_window)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def garbage_is_collected_in_the_main_thread() -> Iterator[None]:
+    """Автоматическая сборка мусора выключена, как в программе (`B-057`).
+
+    Иначе сборщик срабатывает в потоке базы или сети `MarketWorker`
+    и разрушает там брошенный объект Qt с таймером, а следующий тест
+    воркера падает SIGSEGV. Замер 01.10.2026: 12 падений из 15 на
+    `test_ui_contract_load.py` + `test_ui_notices.py`; со сборкой
+    в главном потоке — 0 из 8. Собирает `collected_after_each_test`.
+    """
+    gc.disable()
+    yield
+    gc.enable()
+
+
+@pytest.fixture(autouse=True)
+def collected_after_each_test() -> Iterator[None]:
+    """После теста собрать мусор в главном потоке — по порогам, как питон."""
+    yield
+    from app.collector import collect_due
+
+    collect_due()

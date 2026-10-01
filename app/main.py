@@ -58,6 +58,8 @@ import signal
 import sys
 from typing import TYPE_CHECKING
 
+from app.collector import collect_in_main_thread  # Qt внутри, не при ввозе
+
 if TYPE_CHECKING:  # ⚠️ только для подписей: настоящие импорты слоёв идут
     # внутри `_run`, после того как выставлены QT_API и QT_QPA_PLATFORM.
     # Наверху они подняли бы Qt при разборе ключей и при `--help`.
@@ -518,6 +520,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if wants_dark(args):
         _use_dark_palette(application)
+
+    collect_in_main_thread(application)  # сборка мусора — в потоке окна, `B-057`
 
     loop = qasync.QEventLoop(application)
     asyncio.set_event_loop(loop)

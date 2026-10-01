@@ -162,14 +162,27 @@ class _NetThread(concurrent.futures.Executor):
         self._thread.start()
 
     def _serve(self) -> None:
-        while (job := self._jobs.get()) is not None:
-            future, work = job
-            if not future.set_running_or_notify_cancel():
-                continue
-            try:
-                future.set_result(work())
-            except BaseException as error:  # noqa: BLE001 — отдаётся ждущему
-                future.set_exception(error)
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            self._run(*job)
+            # ⚠️ `B-057`: работа держит замыкания окна (`progress` порта).
+            # Ссылка, пережившая работу в этом потоке до следующей, могла
+            # оказаться последней — и `~QObject` с таймером пошёл бы здесь,
+            # а не в потоке окна: SIGSEGV. Тот же приём у `ThreadPoolExecutor`.
+            del job
+
+    @staticmethod
+    def _run(
+        future: concurrent.futures.Future[Any], work: Callable[[], Any]
+    ) -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(work())
+        except BaseException as error:  # noqa: BLE001 — отдаётся ждущему
+            future.set_exception(error)
 
     def submit(
         self, fn: Callable[..., _T], /, *args: object, **kwargs: object
