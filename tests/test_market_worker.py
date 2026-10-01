@@ -976,3 +976,47 @@ def test_the_facade_refuses_to_finish_a_run_that_does_not_exist(
             return first, second
 
     assert in_one_loop(work) == (True, False)
+
+
+@pytest.mark.parametrize("trip", ["sync", "point_value"])
+def test_a_hanging_exchange_does_not_hold_the_database(
+    tmp_path: pathlib.Path, trip: str
+) -> None:
+    """Поход к бирже, повисший на сети, не держит чтение базы.
+
+    Случай 01.10.2026, свежая сборка под Windows: уточнение у биржи при
+    запуске заняло поток базы, и прогон, перерисовка и таблица контрактов
+    встали за ним с плашкой «не отвечает». Здесь биржа не отвечает вовсе,
+    пока тест её не отпустит; чтение обязано пройти за это время.
+    """
+    held = threading.Event()
+    asked = threading.Event()
+
+    def serve(_url: str) -> bytes:
+        asked.set()
+        held.wait(10)
+        page: bytes = iss_body([])
+        return page
+
+    async def scenario() -> int:
+        client = IssClient(FakeTransport(serve), attempts=1, pause=0, sleep=no_sleep)
+        async with MarketWorker(database_path(tmp_path), iss=client) as worker:
+            going: asyncio.Future[object]
+            if trip == "sync":
+                day = date(2026, 8, 26)
+                going = asyncio.ensure_future(worker.sync(
+                    "MXU6", market=FUTURES, since=day, until=day,
+                    now=msk(2026, 8, 27, 9, 0),
+                ))
+            else:
+                going = asyncio.ensure_future(worker.point_value("MXU6"))
+            try:
+                while not asked.is_set():
+                    await asyncio.sleep(0.01)
+                answer: int = await asyncio.wait_for(worker.call(lambda _store: 1), 2)
+                return answer
+            finally:
+                held.set()
+                await asyncio.gather(going, return_exceptions=True)
+
+    assert in_one_loop(scenario) == 1

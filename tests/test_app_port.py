@@ -366,12 +366,16 @@ def test_progress_and_busy_are_shown(loop, long_database) -> None:
 # --------------------------------------------------------------------- отказы
 
 def test_a_missing_database_is_said_in_plain_words(loop, tmp_path) -> None:
-    """Отсутствие базы — не трассировка, а фраза, называющая файл."""
+    """Отсутствие базы — не трассировка, а фраза, называющая кнопку.
+
+    Показ заказчику 01.10.2026: служебное «автозагрузка (Э1-5) ещё не
+    сделана» и путь к файлу человеку не говорили, что нажать.
+    """
     missing = tmp_path / "no-such.sqlite3"
     _, recorded = replay_history(loop, missing, values=Settings(), days=0)
     assert recorded.failures, "программа промолчала о том, что базы нет"
     message = recorded.failures[-1]
-    assert "no-such.sqlite3" in message
+    assert "«Загрузить историю»" in message
     assert "Traceback" not in message
     assert recorded.charts[-1].candles == ()
 
@@ -2714,7 +2718,7 @@ def test_a_base_that_appeared_later_still_gets_its_first_look(
 
     missing, recorded = loop.run_until_complete(go())
 
-    assert missing and "Базы свечей нет" in missing[0], (
+    assert missing and "Свечей ещё нет" in missing[0], (
         f"первый проход прошёл не по ветке «базы нет»: {missing}"
     )
     starts = {candle.opens_at for candle in recorded.charts[-1].candles}

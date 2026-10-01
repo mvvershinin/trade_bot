@@ -361,14 +361,14 @@ class HistoryDialog(QDialog):
 
     def _sync(self, *_: object) -> None:
         """Свести окно к согласованному виду и сказать, что получится."""
-        reloading = self.reload.isChecked()
-        # Для контракта отрезок задаёт рубеж (решение 0061): дата из поля
-        # на загрузку не влияла бы, а доступное поле обещало бы обратное.
-        self.since.setEnabled(reloading and not self._facts.by_contract)
+        # Для контракта дата тоже выбирается: раньше рубежа с прогревом
+        # она прижимается к нему в порту (`HistoryPort._load_contract`).
+        self.since.setEnabled(self.reload.isChecked())
         if self._facts.by_contract:
             self.since.setToolTip(
-                "Для контракта дата не выбирается: заново запрашивается весь "
-                "его период с рубежа и прогрев перед ним."
+                "С какого дня перезапросить минуты контракта. Дата раньше "
+                "рубежа контракта прижимается к нему: минуты до рубежа "
+                "этому контракту не нужны."
             )
         self.reload_note.setText(self._reload_warning())
         self.summary.setText(self._summary_text())
@@ -413,6 +413,20 @@ class HistoryDialog(QDialog):
                 "с рубежа контракта (его день программа уточнит у биржи "
                 "по дневным объёмам перед загрузкой)"
             )
+            if (
+                self.reload.isChecked()
+                and facts.contract_from is not None
+                and since > facts.contract_from
+            ):
+                # Дни от рубежа до выбранной даты отмечены и запрошены
+                # не будут — обещать «с рубежа» значило бы соврать.
+                start = f"с {since:%d.%m.%Y} (рубеж контракта {facts.contract_from:%d.%m.%Y})"
+            if self.reload.isChecked():
+                how = (
+                    f"Отметки «уже спрашивали» будут сняты с {since:%d.%m.%Y} "
+                    "(но не раньше рубежа с прогревом), и эти дни запрошены "
+                    "у биржи заново."
+                )
             return (
                 f"Будет запрошено: {facts.symbol} {start} по {until:%d.%m.%Y} "
                 f"и {facts.warmup_bars} баров прогрева средней перед рубежом. "

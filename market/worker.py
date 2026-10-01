@@ -39,8 +39,8 @@
 
 Что обязан знать вызывающий
 ---------------------------
-* **Обратные вызовы приходят в потоке данных.** `progress` при догрузке
-  выполняется там же, где идёт загрузка. Доставка в окно — только через
+* **Обратные вызовы приходят в потоке сети.** `progress` при догрузке
+  выполняется там же, где идёт загрузка, — не в потоке окна. Доставка в окно — только через
   `Qt.ConnectionType.QueuedConnection`; трогать виджеты из этого потока нельзя.
 * **Отмена `await` не отменяет работу.** Питон не умеет прерывать чужой поток:
   отменённый вызов перестаёт ждать результат, а загрузка или запись доводятся
@@ -53,8 +53,10 @@
   открыл бы **второе** соединение к тому же файлу. Поэтому `self._store`
   присваивается изнутри потока, а `close()` читает его там же: очередь одна,
   порядок сохраняется, гонки нет.
-* **Порядок сохраняется.** Поток один, очередь общая: вызовы исполняются
-  в том порядке, в каком их отправили. Поэтому `close()` закрывает базу
+* **Порядок сохраняется внутри потока.** У базы поток один и очередь общая:
+  вызовы исполняются в том порядке, в каком их отправили. Походы к бирже
+  идут отдельным потоком (`_NetThread`), а их записи встают в ту же
+  очередь базы через `_StoreRelay`. Поэтому `close()` закрывает базу
   после всей ранее отправленной работы, а не поперёк неё.
 * **Остановка не ждёт конца догрузки.** Порядок очереди означал бы, что
   `close()` во время `sync()` стоит за ней: год минуток — это минуты
@@ -72,10 +74,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import pathlib
+import queue
+import threading
 from collections.abc import Callable, Iterable, Sequence
 from datetime import date, datetime
 from types import TracebackType
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 
 from market.candles import Candle, Timeframe
 from market.contracts import (
@@ -133,6 +137,96 @@ class WorkerClosed(RuntimeError):
     """
 
 
+#: Сколько секунд `close()` ждёт поход к бирже, уже попрошенный остановиться.
+#: Не торговое число: на сделки не влияет, только на то, как долго
+#: закрывается программа при повисшей сети.
+CLOSE_WAIT = 5.0
+
+
+class _NetThread(concurrent.futures.Executor):
+    """Один фоновый поток для походов к бирже.
+
+    Не `ThreadPoolExecutor`: его потоки питон ждёт при выходе, и запрос,
+    повисший на мёртвой сети, держал бы закрытую программу до таймаута,
+    а `instance.lock` — повторный запуск. Фоновый поток выход не держит.
+    """
+
+    def __init__(self, name: str) -> None:
+        self._jobs: queue.SimpleQueue[
+            tuple[concurrent.futures.Future[Any], Callable[[], Any]] | None
+        ] = queue.SimpleQueue()
+        self._lock = threading.Lock()
+        self._live: set[concurrent.futures.Future[Any]] = set()
+        self._stopped = False
+        self._thread = threading.Thread(target=self._serve, name=name, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while (job := self._jobs.get()) is not None:
+            future, work = job
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(work())
+            except BaseException as error:  # noqa: BLE001 — отдаётся ждущему
+                future.set_exception(error)
+
+    def submit(
+        self, fn: Callable[..., _T], /, *args: object, **kwargs: object
+    ) -> concurrent.futures.Future[_T]:
+        future: concurrent.futures.Future[_T] = concurrent.futures.Future()
+        with self._lock:
+            # Как у `ThreadPoolExecutor`: после остановки — отказ, а не
+            # работа в очереди, которую уже никто не разберёт.
+            if self._stopped:
+                raise WorkerClosed(_CLOSED)
+            self._live.add(future)
+        future.add_done_callback(self._forget)
+        self._jobs.put((future, lambda: fn(*args, **kwargs)))
+        return future
+
+    def _forget(self, future: concurrent.futures.Future[Any]) -> None:
+        with self._lock:
+            self._live.discard(future)
+
+    def live(self) -> list[concurrent.futures.Future[Any]]:
+        """Работы, ещё не законченные потоком. Отмена `await` их не снимает."""
+        with self._lock:
+            return list(self._live)
+
+    def shutdown(self, wait: bool = False, *, cancel_futures: bool = False) -> None:
+        """Остановить поток после текущей работы. Ждать его — никогда."""
+        del wait, cancel_futures  # подпись задана `Executor`; ждать нельзя
+        with self._lock:
+            self._stopped = True
+        self._jobs.put(None)
+
+
+class _StoreRelay:
+    """База для работы, идущей в потоке сети: каждый вызов — в поток базы.
+
+    Загрузка с биржи чередует сеть и запись. Целиком в потоке базы она
+    держала бы его на всё время сети; здесь поток базы занят только
+    на время самой записи, и чтение для графика проходит между страницами.
+
+    ⚠️ Звать только из потока сети: из потока базы вызов ждал бы сам себя.
+    """
+
+    def __init__(self, store: CandleStore, pool: concurrent.futures.Executor) -> None:
+        self._store = store
+        self._pool = pool
+
+    def __getattr__(self, name: str) -> object:
+        value = getattr(self._store, name)
+        if not callable(value):
+            return value
+
+        def relayed(*args: object, **kwargs: object) -> object:
+            return self._pool.submit(value, *args, **kwargs).result()
+
+        return relayed
+
+
 class MarketWorker:
     """Однопоточный фасад над `CandleStore` и загрузкой с биржи.
 
@@ -176,6 +270,12 @@ class MarketWorker:
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix=thread_name
         )
+        #: Поток сети. Поход к бирже идёт здесь, а не в потоке базы: замер
+        #: 01.10.2026 — уточнение контрактов при запуске на медленной сети
+        #: занимало поток базы на минуту, и прогон, перерисовка и таблица
+        #: контрактов стояли за ним с плашкой «не отвечает». База сюда
+        #: не попадает никогда: её вызовы идут через `_StoreRelay`.
+        self._net = _NetThread(f"{thread_name}-net")
         self._store: CandleStore | None = None
         self._closed = False
         #: Загрузки, идущие прямо сейчас. Трогается только из цикла событий.
@@ -236,9 +336,24 @@ class MarketWorker:
         for loader in list(self._loading):
             loader.stop()
         try:
-            await self._submit(self._close_store)
+            # Остановленная загрузка ещё пишет свой отчёт в базу — его ждём.
+            # Повисший на сети запрос — нет: прерывать чужой поток питон
+            # не умеет, а ждать до таймаута сети значит зависнуть на выходе.
+            # Ждутся работы потока, а не `await` над ними: отменённый
+            # вызывающий перестаёт ждать, а работа идёт дальше.
+            live = self._net.live()
+            if live:
+                await asyncio.wait(
+                    [asyncio.wrap_future(one) for one in live], timeout=CLOSE_WAIT
+                )
         finally:
-            self._pool.shutdown(wait=True)
+            # Отменённое ожидание базу открытой не оставляет.
+            self._net.shutdown()
+            closing = self._pool.submit(self._close_store)
+            try:
+                await asyncio.wrap_future(closing)
+            finally:
+                self._pool.shutdown(wait=True)
 
     def _close_store(self) -> None:
         """Закрыть соединение. **Выполняется в потоке данных**, после всей работы."""
@@ -307,6 +422,25 @@ class MarketWorker:
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._pool, work)
+
+    async def _submit_net(
+        self, work: Callable[[], _T], *, loader: IssClient | None = None
+    ) -> _T:
+        """Отправить поход к бирже в поток сети и дождаться результата.
+
+        `loader` числится идущей загрузкой, пока работа **в потоке** не кончилась,
+        а не пока её ждут: отменённый вызывающий не снимает её с учёта,
+        и `close()` всё равно попросит её остановиться.
+        """
+        going = self._net.submit(work)
+        if loader is not None:
+            self._loading.add(loader)
+            going.add_done_callback(lambda _done: self._loading.discard(loader))
+        return await asyncio.wrap_future(going)
+
+    def _relay(self, store: CandleStore) -> CandleStore:
+        """База для работы в потоке сети: каждый вызов уходит в поток базы."""
+        return cast(CandleStore, _StoreRelay(store, self._pool))
 
     # -- чтение ------------------------------------------------------------
 
@@ -478,25 +612,22 @@ class MarketWorker:
         Поэтому здесь — только сеть и разбор: что сервер отдал, то и вернули.
         Что из этого писать, решает вызывающий.
 
-        ⚠️ Загрузка **занимает поток данных целиком**: `IssClient` синхронный
-        (решение 0005), и записи живого потока встают в очередь за ней.
-        Четверо суток минуток — это дюжина страниц, единицы секунд; глубокая
-        история грузится не отсюда, а `sync`. Идущая загрузка регистрируется,
-        и `close()` попросит её остановиться, вместо того чтобы ждать конца.
+        Загрузка идёт в потоке сети: `IssClient` синхронный (решение 0005),
+        а поток базы ей не нужен вовсе. Четверо суток минуток — это дюжина
+        страниц, единицы секунд; глубокая история грузится не отсюда,
+        а `sync`. Идущая загрузка регистрируется, и `close()` попросит её
+        остановиться, вместо того чтобы ждать конца.
 
         :raises ValueError: период задом наперёд (проверяет `IssClient`).
         """
         await self._ready_store()
         loader = self._loader(client)
-        self._loading.add(loader)
-        try:
-            return await self._submit(
-                lambda: loader.minutes(
-                    symbol, market=market, date_from=since, date_to=until
-                )
-            )
-        finally:
-            self._loading.discard(loader)
+        return await self._submit_net(
+            lambda: loader.minutes(
+                symbol, market=market, date_from=since, date_to=until
+            ),
+            loader=loader,
+        )
 
     async def instrument_spec(
         self,
@@ -511,7 +642,7 @@ class MarketWorker:
         у каждого контракта она своя (`B-021`). Читает её слой данных,
         а не движок: это свойство инструмента, а не торговое правило.
 
-        Идёт в потоке данных, как и всё остальное здесь, — `IssClient`
+        Идёт в потоке сети, как и все походы к бирже здесь, — `IssClient`
         синхронный (решение 0005), и вызов из цикла событий остановил бы
         поток котировок. Запрос один и короткий: карточка — одна строка.
 
@@ -533,7 +664,7 @@ class MarketWorker:
         if self._closed:
             raise WorkerClosed(_CLOSED)
         loader = self._loader(client)
-        return await self._submit(lambda: loader.security(symbol, market=market))
+        return await self._submit_net(lambda: loader.security(symbol, market=market))
 
     async def point_value(
         self,
@@ -565,7 +696,7 @@ class MarketWorker:
         if self._closed:
             raise WorkerClosed(_CLOSED)
         loader = self._loader(client)
-        return await self._submit(
+        return await self._submit_net(
             lambda: ask_point_value(loader, symbol, markets=tuple(markets))
         )
 
@@ -597,36 +728,33 @@ class MarketWorker:
         progress: Callable[[FetchResult], None] | None = None,
         write_report: bool = True,
     ) -> LoadReport:
-        """Догрузить пропущенное с биржи. Сеть и запись — в потоке данных.
+        """Догрузить пропущенное с биржи. Сеть — в потоке сети, запись — в потоке базы.
 
-        ⚠️ `progress` вызывается **в потоке данных**, на каждой странице.
+        ⚠️ `progress` вызывается **в потоке сети**, на каждой странице.
         Доставка в окно — только `QueuedConnection`.
 
         Загрузка запоминается на время работы: `close()` попросит её
         остановиться, вместо того чтобы ждать её конца в очереди.
         """
-        store = await self._ready_store()
+        relay = self._relay(await self._ready_store())
         loader = self._loader(client)
-        self._loading.add(loader)
-        try:
-            return await self._submit(
-                lambda: sync_minutes(
-                    store,
-                    loader,
-                    symbol,
-                    market=market,
-                    since=since,
-                    until=until,
-                    source=source,
-                    now=now,
-                    gap_threshold_minutes=gap_threshold_minutes,
-                    chunk_days=chunk_days,
-                    progress=progress,
-                    write_report=write_report,
-                )
-            )
-        finally:
-            self._loading.discard(loader)
+        return await self._submit_net(
+            lambda: sync_minutes(
+                relay,
+                loader,
+                symbol,
+                market=market,
+                since=since,
+                until=until,
+                source=source,
+                now=now,
+                gap_threshold_minutes=gap_threshold_minutes,
+                chunk_days=chunk_days,
+                progress=progress,
+                write_report=write_report,
+            ),
+            loader=loader,
+        )
 
     async def load_history(
         self,
@@ -645,24 +773,21 @@ class MarketWorker:
         и нужен окну: человек нажал кнопку и обязан узнать, почему свечей нет,
         а не увидеть пустой график.
 
-        ⚠️ Загрузка **занимает поток данных целиком**: `IssClient` синхронный
-        (решение 0005), и записи живого потока встают в очередь за ней. Девяносто
+        Загрузка идёт в потоке сети, а в поток базы уходят только её записи
+        (`_StoreRelay`): чтение для графика проходит между страницами. Девяносто
         дней минуток — это минуты работы. Идущая загрузка регистрируется,
         поэтому её можно остановить: `stop_loading()` для кнопки «Отменить»
         и `close()` при выходе из программы.
 
-        ⚠️ `progress` вызывается **в потоке данных**, на каждой странице.
+        ⚠️ `progress` вызывается **в потоке сети**, на каждой странице.
         Доставка в окно — только `QueuedConnection`.
         """
-        store = await self._ready_store()
+        relay = self._relay(await self._ready_store())
         loader = self._loader(client)
-        self._loading.add(loader)
-        try:
-            return await self._submit(
-                lambda: load_history(store, loader, request, progress=progress)
-            )
-        finally:
-            self._loading.discard(loader)
+        return await self._submit_net(
+            lambda: load_history(relay, loader, request, progress=progress),
+            loader=loader,
+        )
 
     async def refresh_contracts(
         self,
@@ -674,20 +799,17 @@ class MarketWorker:
     ) -> RefreshedRows:
         """Уточнить таблицу контрактов у биржи: сроки и дневные объёмы.
 
-        Ходит в сеть и занимает поток данных, поэтому останавливается
+        Ходит в сеть — в потоке сети, — и останавливается
         той же кнопкой, что и загрузка (`stop_loading`). Разбор —
         `market.contracts.refresh_contracts`. В ответе — и `said`: что
         сказать человеку сверх строк (`B-054`); прочесть его обязан зовущий.
         """
-        store = await self._ready_store()
+        relay = self._relay(await self._ready_store())
         loader = self._loader(client)
-        self._loading.add(loader)
-        try:
-            return await self._submit(
-                lambda: refresh_contracts(store, loader, symbols, market=market, now=now)
-            )
-        finally:
-            self._loading.discard(loader)
+        return await self._submit_net(
+            lambda: refresh_contracts(relay, loader, symbols, market=market, now=now),
+            loader=loader,
+        )
 
     async def load_contract(
         self, request: ContractRequest, *, client: IssClient | None = None
@@ -695,17 +817,14 @@ class MarketWorker:
         """Минуты контракта с его рубежа и прогрев перед ним, без хвоста.
 
         Разбор — `market.contracts.load_contract_minutes`. Ход — через
-        `request.progress`, **в потоке данных**.
+        `request.progress`, **в потоке сети**.
         """
-        store = await self._ready_store()
+        relay = self._relay(await self._ready_store())
         loader = self._loader(client)
-        self._loading.add(loader)
-        try:
-            return await self._submit(
-                lambda: load_contract_minutes(store, loader, request)
-            )
-        finally:
-            self._loading.discard(loader)
+        return await self._submit_net(
+            lambda: load_contract_minutes(relay, loader, request),
+            loader=loader,
+        )
 
     async def contracts(self) -> list[ContractRow]:
         """Таблица контрактов как есть. В сеть не ходит."""

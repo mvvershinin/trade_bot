@@ -27,6 +27,7 @@ import asyncio
 import json
 import math
 import pathlib
+import threading
 import time as time_module
 import urllib.parse
 from collections.abc import Callable, Sequence
@@ -38,6 +39,7 @@ from app.port import HistoryPort
 from market import (
     MINUTE,
     MSK,
+    WARMUP_LOOK_BACK_DAYS,
     CandleStore,
     HttpxTransport,
     IssClient,
@@ -523,10 +525,10 @@ def test_closing_the_program_during_a_load_starts_no_new_work(loop, tmp_path) ->
 def test_loading_anew_re_requests_the_contract_period_and_plain_load_does_not(
     loop, tmp_path
 ) -> None:
-    """«Загрузить заново» для контракта снимает отметки рубежа и прогрева.
+    """«Загрузить заново» для контракта снимает отметки с даты из окна.
 
-    Без него уже загруженные дни не перезапрашиваются. Дата из окна
-    на отрезок не влияет: его задаёт рубеж.
+    Без него уже загруженные дни не перезапрашиваются. Дата раньше рубежа
+    с прогревом прижимается к нему; дата позже рубежа рубеж не трогает.
     """
     chain = Chain(TODAY)
     roll = TODAY - timedelta(days=ROLL_BACK)
@@ -536,8 +538,10 @@ def test_loading_anew_re_requests_the_contract_period_and_plain_load_does_not(
         for name, request in (
             ("first", HistoryLoadRequest(symbol="MXZ6")),
             ("plain", HistoryLoadRequest(symbol="MXZ6")),
+            ("recent", HistoryLoadRequest(symbol="MXZ6", replace=True,
+                                          since=TODAY - timedelta(days=1))),
             ("anew", HistoryLoadRequest(symbol="MXZ6", replace=True,
-                                        since=TODAY - timedelta(days=1))),
+                                        since=TODAY - timedelta(days=3650))),
         ):
             before = len(chain.minute_spans())
             heard.finished.clear()
@@ -553,8 +557,126 @@ def test_loading_anew_re_requests_the_contract_period_and_plain_load_does_not(
 
     assert covers(asked["first"], roll)
     assert not covers(asked["plain"], roll), "догрузка перезапросила загруженный рубеж"
+    assert not covers(asked["recent"], roll), "«заново с даты» не учло дату из окна"
+    assert covers(asked["recent"], TODAY - timedelta(days=1)), (
+        "«заново с даты» не перезапросило выбранный день"
+    )
     assert covers(asked["anew"], roll), "«заново» не перезапросило период контракта"
     assert covers(asked["anew"], roll - timedelta(days=1)), "«заново» забыло прогрев"
+
+
+def test_loading_anew_from_an_old_date_keeps_marks_before_the_roll(loop, tmp_path) -> None:
+    """Дата «заново» раньше рубежа прижимается к рубежу с прогревом.
+
+    Отметки дней раньше этого края загрузка по контракту не восстанавливает:
+    снятые, они остались бы снятыми, и день, за который уже спрашивали,
+    числился бы недокачанным.
+    """
+    chain = Chain(TODAY)
+    roll = TODAY - timedelta(days=ROLL_BACK)
+    old = roll - timedelta(days=WARMUP_LOOK_BACK_DAYS + 5)
+    database = tmp_path / "base.sqlite3"
+    with CandleStore(database) as store:
+        store.mark_days_requested("MXZ6", [old], now=_noon(TODAY)())
+
+    async def work(port: HistoryPort, heard: Heard) -> None:
+        for request in (
+            HistoryLoadRequest(symbol="MXZ6"),
+            HistoryLoadRequest(symbol="MXZ6", replace=True,
+                               since=TODAY - timedelta(days=3650)),
+        ):
+            heard.finished.clear()
+            heard.contracts.clear()
+            port.load_history(request)
+            await _settle(heard)
+
+    _run(loop, database, chain, work, instrument="MXZ6")
+    with CandleStore(database) as store:
+        assert old in store.settled_days("MXZ6"), (
+            "«заново» с давней даты сняло отметки раньше рубежа с прогревом"
+        )
+
+
+def test_a_run_asked_during_the_load_waits_for_it_and_says_so(loop, tmp_path) -> None:
+    """«Применить» посреди загрузки минут: прогон не идёт по недогруженной базе.
+
+    Поток сети отдельно от базы (01.10.2026), и прогон прошёл бы между
+    страницами загрузки — сделки по части периода без пометки. Он
+    откладывается, человеку сказано почему, и идёт сам после загрузки.
+    """
+    chain = Chain(TODAY, delay=0.05)
+
+    async def work(port: HistoryPort, heard: Heard) -> None:
+        port.load_history(HistoryLoadRequest(symbol="MXZ6"))
+        for _ in range(400):
+            if port._history.filling:  # noqa: SLF001
+                break
+            await asyncio.sleep(0.01)
+        assert port._history.filling, "загрузка минут не началась"  # noqa: SLF001
+        port.refresh("проверка")
+        assert port._task is None or port._task.done(), (  # noqa: SLF001
+            "прогон пошёл посреди загрузки минут"
+        )
+        assert any("Прогон пойдёт сам" in note.reason for note in heard.notes), (
+            "отложенный прогон не назван человеку"
+        )
+        await _settle(heard)
+        charts = len(heard.charts)
+        for _ in range(400):
+            if len(heard.charts) > charts or (
+                port._task is not None and not port._task.done()  # noqa: SLF001
+            ):
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("отложенный прогон не пошёл после загрузки")
+
+    _run(loop, tmp_path / "base.sqlite3", chain, work, instrument="MXZ6")
+
+
+def test_a_hanging_exchange_does_not_hold_the_contract_check(loop, tmp_path) -> None:
+    """Биржа повисла на уточнении контрактов — сверка по базе всё равно отвечает.
+
+    Случай 01.10.2026, свежая сборка под Windows: уточнение у биржи заняло
+    поток базы, и «чтение таблицы контрактов», прогон и перерисовка встали
+    за ним с плашкой «не отвечает». Сверка читает только базу и ждать
+    биржу не обязана.
+    """
+    chain = Chain(TODAY)
+    held = threading.Event()
+    asked = threading.Event()
+    answer = chain.answer
+
+    def hanging(url: str) -> bytes:
+        asked.set()
+        held.wait(10)
+        return answer(url)
+
+    chain.transport = _Transport(hanging)
+    chain.client = IssClient(chain.transport, sleep=_no_sleep, pause=0.0)
+    database = tmp_path / "base.sqlite3"
+    CandleStore(database).close()
+
+    async def work(port: HistoryPort, heard: Heard) -> None:
+        try:
+            port.sync_contracts("проверка")
+            for _ in range(200):
+                if asked.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert asked.is_set(), "уточнение у биржи не началось"
+            assert "уточнение контрактов у биржи" in port._busy_with("load"), (  # noqa: SLF001
+                "уточнение контрактов названо человеку чужим именем"
+            )
+            port.check_contract()
+            for _ in range(200):
+                if heard.contracts:
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("сверка контракта ждала повисшую биржу")
+        finally:
+            held.set()
+
+    _run(loop, database, chain, work, instrument="MXZ6")
 
 
 def _seed_mxu6(database: pathlib.Path, backs: Sequence[int], *, wave: float = 0.0) -> None:

@@ -450,6 +450,9 @@ class _Term:
     #: на котором программа останется. Суточное уточнение прогонов не держит.
     holding: bool = False
     held: str = ""
+    #: Слот загрузки занят уточнением у биржи, а не загрузкой минут:
+    #: плашка и отказ «занято» называют работу её именем.
+    asking: bool = False
     #: День МСК последнего удавшегося уточнения: раз в сутки, а не на каждом
     #: взгляде часов. Неудавшееся повторяется на следующем взгляде.
     synced: date | None = None
@@ -482,6 +485,10 @@ class _History:
 
     facts: asyncio.Task[None] | None = None
     load: asyncio.Task[None] | None = None
+    #: Прогон, отложенный на время загрузки: пойдёт, когда она кончится.
+    after_load: str = ""
+    #: Идёт загрузка минут в базу (не уточнение контрактов): прогон ждёт.
+    filling: bool = False
     #: Чтение таблицы контрактов: какой действующий (решение 0061).
     contract: asyncio.Task[None] | None = None
     #: Что про действующий контракт уже сказано в журнал: повтор молчит.
@@ -1813,7 +1820,7 @@ class HistoryPort(TerminalPort):
         try:
             if request.replace:
                 await self._worker.forget_day_marks(symbol, since, until)
-            outcome = await self._worker.load_history(
+            outcome = await self._filling(self._worker.load_history(
                 HistoryRequest(
                     symbol=symbol,
                     market=FUTURES,
@@ -1823,7 +1830,7 @@ class HistoryPort(TerminalPort):
                     timeframe=convert.timeframe_of(self._values.timeframe),
                 ),
                 progress=lambda result: self._load_tick(since, until, result),
-            )
+            ))
         except asyncio.CancelledError:
             raise
         except IssStopped as stopped:
@@ -1878,18 +1885,18 @@ class HistoryPort(TerminalPort):
             assert row.active_from is not None  # проверено `not_started`
             since = row.active_from
             if request.replace:
-                # Заново — весь период контракта и глубина поиска прогрева.
-                # Дата из окна здесь не участвует: отрезок задаёт рубеж, и
-                # окно загрузки для контракта поле даты не даёт (0061).
-                await self._worker.forget_day_marks(
-                    symbol, since - timedelta(days=WARMUP_LOOK_BACK_DAYS), today
-                )
+                # Заново — с даты из окна. Раньше рубежа с глубиной поиска
+                # прогрева не начинается: минуты до него этому контракту
+                # не нужны (0061). Даты нет — весь период контракта.
+                earliest = since - timedelta(days=WARMUP_LOOK_BACK_DAYS)
+                start = max(request.since or earliest, earliest)
+                await self._worker.forget_day_marks(symbol, start, today)
             self.note("Загрузка минут контракта", contract_view.load_lead(row, warmup, today))
-            load = await self._worker.load_contract(ContractRequest(
+            load = await self._filling(self._worker.load_contract(ContractRequest(
                 symbol=symbol, market=FUTURES, until=today, warmup_bars=warmup,
                 timeframe=convert.timeframe_of(self._values.timeframe), now=now,
                 progress=lambda result: self._load_tick(since, today, result),
-            ))
+            )))
         except asyncio.CancelledError:
             raise
         except ChainNotQuarterly as error:
@@ -2030,7 +2037,11 @@ class HistoryPort(TerminalPort):
             if self._task is not None:
                 await _quiet(self._task)
         try:
-            await self._refresh_chain(chain, symbol, now)
+            term.asking = True
+            try:
+                await self._refresh_chain(chain, symbol, now)
+            finally:
+                term.asking = False
             notice, rows = await self._worker.call(
                 lambda store: (
                     contract_view.notice_of(store, symbol, today=today),
@@ -2481,6 +2492,24 @@ class HistoryPort(TerminalPort):
             # показал бы истёкший контракт, а через секунду — другой.
             # Просьба не теряется: её пустит `_sync`, когда решит, на чём стоять.
             self._history.term.held = why or "повтор"
+            self._refuse_busy(
+                "load", "Пересчёт отложен",
+                "Применю после ответа биржи: прогон на коде из файла мог бы "
+                "показать истёкший контракт.",
+            )
+            return
+        load = self._history.load
+        if self._history.filling and load is not None and not load.done():
+            # Поток сети отдельно от базы: прогон прошёл бы между страницами
+            # загрузки и посчитал бы сделки по недогруженной базе без пометки.
+            if not self._history.after_load:
+                load.add_done_callback(lambda _done: self._after_load())
+            self._history.after_load = why or "повтор"
+            self._refuse_busy(
+                "load", "Пересчёт отложен",
+                "Прогон пойдёт сам, когда она закончится: по недогруженной "
+                "базе он посчитал бы не все сделки.",
+            )
             return
         if self._task is not None and not self._task.done():
             # Два прогона разом дали бы в окно два потока событий и два разных
@@ -2495,6 +2524,24 @@ class HistoryPort(TerminalPort):
             )
             return
         self._task = self._begin("run", self._refresh(why))
+
+    async def _filling[T](self, work: Awaitable[T]) -> T:
+        """Загрузка минут: пока она идёт, прогон откладывается (`refresh`)."""
+        self._history.filling = True
+        try:
+            return await work
+        finally:
+            self._history.filling = False
+
+    def _after_load(self) -> None:
+        """Загрузка кончилась — пустить прогон, отложенный на её время."""
+        why, self._history.after_load = self._history.after_load, ""
+        if not why:
+            return
+        if self._task is not None and not self._task.done():
+            self._again = self._again or why
+            return
+        self.refresh(why)
 
     def live_candle(self, symbol: str) -> None:
         """Минута записана в базу: дорисовать свечу, а не гонять прогон заново.
@@ -2638,6 +2685,8 @@ class HistoryPort(TerminalPort):
         # в окно, которого уже нет.
         if self._stuck.timer is not None:
             self._stuck.timer.stop()
+        # Отложенный прогон закрывающейся программе не нужен.
+        self._history.after_load = ""
         if self._history.term.daily is not None:
             self._history.term.daily.stop()
         # ⚠️ Идущей загрузке истории сначала говорится «остановись», и только
@@ -2821,7 +2870,7 @@ class HistoryPort(TerminalPort):
         now = time.monotonic()
         running = False
         stuck: list[tuple[_Work, float]] = []
-        for work in _WORKS:
+        for work in map(self._named, _WORKS):
             task = tasks[work.key]
             if task is None or task.done():
                 self._stuck.heard.pop(work.key, None)
@@ -2846,6 +2895,17 @@ class HistoryPort(TerminalPort):
             self._send(self.stuck_changed, said)
         return running
 
+    def _named(self, work: _Work) -> _Work:
+        """Работа под именем, которое она носит сейчас.
+
+        Слот загрузки делят загрузка минут и уточнение контрактов у биржи;
+        «загрузка истории не отвечает» человеку, ничего не загружавшему,
+        не говорит ничего.
+        """
+        if work.key == "load" and self._history.term.asking:
+            return dataclasses.replace(work, title="уточнение контрактов у биржи")
+        return work
+
     def _busy_with(self, key: str) -> str:
         """Чем порт занят и сколько уже: «прогон робота по истории, 12 с».
 
@@ -2853,7 +2913,7 @@ class HistoryPort(TerminalPort):
         операцией» без названия операции человеку не отвечает ни на что —
         он и так видит, что ничего не происходит.
         """
-        work = _BY_KEY[key]
+        work = self._named(_BY_KEY[key])
         now = time.monotonic()
         return f"{work.title}, идёт уже {_lasting(now - self._stuck.heard.get(key, now))}"
 
@@ -2979,6 +3039,12 @@ class HistoryPort(TerminalPort):
         if self._point.ask is None:
             return
         if self._point.task is not None and not self._point.task.done():
+            return
+        load = self._history.load
+        if load is not None and not load.done():
+            # Поток сети один и занят загрузкой: запрос встал бы за ней
+            # в очередь, и сторож назвал бы его «не отвечает» при исправной
+            # работе. Отметка не ставится — спросим на следующем проходе.
             return
         now = time.monotonic()
         if now - self._point.asked_at.get(symbol, float("-inf")) < POINT_VALUE_GAP:
@@ -4107,8 +4173,9 @@ class HistoryPort(TerminalPort):
             self._empty(
                 frame,
                 symbol,
-                f"Базы свечей нет: файл {path} не найден. Программа не загружает "
-                "историю сама — автозагрузка (Э1-5) ещё не сделана.",
+                "Свечей ещё нет: история не загружалась. Нажмите «Загрузить "
+                "историю» — свечи возьмутся у Московской биржи, токен брокера "
+                "для этого не нужен.",
             )
             return []
         coverage = await self._worker.coverage(symbol)
