@@ -22,7 +22,10 @@
    следующей свечи**; временем сделки записывается **начало** свечи исполнения
    (PROTOTYPE.md §2).
 2. **Сторожимый уровень проверяется внутри бара**, достижение считается
-   по касанию. По какому экстремуму — сказано **в заявке**
+   по касанию. Поданы минутки (`use_minutes`) — касание ищется по отрезкам
+   между точками минуток под баром, и между отрезками движку отдаётся
+   наблюдение цены (`fills_at`, решение 0059 §3); иначе — по размаху бара.
+   По какому экстремуму — сказано **в заявке**
    (`OrderRequest.touch`), а не выведено здесь: `RISE` это `high >= уровень`,
    `FALL` — `low <= уровень`. Это **единственное событие прототипа,
    происходящее не на закрытии свечи** (PROTOTYPE.md §5); без него сделки
@@ -92,6 +95,8 @@
 
 from __future__ import annotations
 
+import bisect
+import enum
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -104,8 +109,10 @@ from engine import (
     MarketCandle,
     OrderAction,
     OrderRequest,
+    PriceSeen,
     Refusal,
     Side,
+    close_time,
 )
 
 __all__ = [
@@ -114,9 +121,12 @@ __all__ = [
     "ExecutionModel",
     "Guard",
     "LevelGaps",
+    "MinuteOrder",
+    "Minutes",
     "OpenLeg",
     "Tariff",
     "commissions_disagree",
+    "minute_points",
     "selling",
 ]
 
@@ -464,6 +474,110 @@ class LevelGaps:
     fall_points: float = 0.0
 
 
+class MinuteOrder(enum.Enum):
+    """В каком порядке цены минутки считаются пройденными — **допущение прогона**.
+
+    Минутка хранит четыре цены и не хранит, в каком порядке они случились.
+    Для неподвижного тейка это безразлично, для скользящего уровня — нет:
+    вершина, пройденная до провала, сдвигает уровень, и провал его задевает;
+    после провала — не задевает. Порядок не следует из данных, поэтому он
+    назван вслух и меняется в настройках прогона, а не зашит в обход.
+
+    ⚠️ Это **не** настройка движка (`EngineSettings`): минутки есть только
+    у истории, в бою цены идут тиками в настоящем порядке.
+
+    * `NEAR_FIRST` — открытие → ближний к открытию экстремум → дальний →
+      закрытие; при равном удалении первым идёт неблагоприятный для позиции.
+      Временное значение (вопрос заказчику в `OPEN-QUESTIONS.md`);
+    * `ADVERSE_FIRST` — открытие → неблагоприятный для позиции экстремум →
+      благоприятный → закрытие. Самое осторожное прочтение минутки.
+    """
+
+    NEAR_FIRST = "near_first"
+    ADVERSE_FIRST = "adverse_first"
+
+
+@dataclass(frozen=True, slots=True)
+class Minutes:
+    """Минутки под пятиминутками прогона и порядок обхода их цен.
+
+    Отдаются **только исполнителю** (`ExecutionModel.use_minutes`): источник
+    свечей и движок их не видят (решение 0059 §3). Порядок входа значения
+    не имеет — исполнитель сортирует по времени сам.
+    """
+
+    candles: Sequence[MarketCandle]
+    order: MinuteOrder = MinuteOrder.NEAR_FIRST
+
+
+@dataclass(frozen=True, slots=True)
+class CoarseBar:
+    """Скользящий уровень включён, а минутки прогону не поданы: свеча крупнее порога.
+
+    B-058: на крупной свече исполнитель отдаёт движку наблюдение на каждую
+    точку минуток, и прогон упирается в предел кругов одного бара. Порог —
+    из настроек окна; что свеча его превысила, решает `app/minutes.py`.
+    Здесь — только факт для допущения прогона: уровень на такой свече
+    двигается лишь на её закрытии, и отчёт обязан сказать это вслух.
+    """
+
+    bar_minutes: int
+    limit_minutes: int
+
+
+def minute_points(
+    minute: MarketCandle, order: MinuteOrder, side: Side
+) -> tuple[float, ...]:
+    """Цены минутки в порядке обхода. Подряд равные схлопываются в одну точку.
+
+    Плоская минутка — одна точка. Сторона позиции нужна, чтобы назвать
+    неблагоприятный экстремум: для лонга это минимум, для шорта — максимум.
+    """
+    adverse, favourable = (
+        (minute.low, minute.high) if side is Side.LONG else (minute.high, minute.low)
+    )
+    first, second = adverse, favourable
+    if order is MinuteOrder.NEAR_FIRST:
+        up = minute.high - minute.open
+        down = minute.open - minute.low
+        if up < down:
+            first, second = minute.high, minute.low
+        elif down < up:
+            first, second = minute.low, minute.high
+    points: list[float] = []
+    for price in (minute.open, first, second, minute.close):
+        if not points or points[-1] != price:
+            points.append(price)
+    return tuple(points)
+
+
+@dataclass(frozen=True, slots=True)
+class _Step:
+    """Один шаг обхода: отрезок от прошлой точки до этой и минутка, где он лежит.
+
+    `start` у первой точки бара — она сама: переход от прошлого бара к открытию
+    этого — разрыв, и судит о нём `_reachable` по закрытию прошлого бара,
+    а не касание. `previous` — цена до отрезка для сторожа `_reachable`.
+    """
+
+    minute: MarketCandle
+    start: float
+    end: float
+    previous: float | None
+
+
+@dataclass(slots=True)
+class _Walk:
+    """Обход точек минуток под одной пятиминуткой и курсор в нём."""
+
+    bar: datetime
+    steps: tuple[_Step, ...]
+    at: int = 0
+    #: Под баром минуток нет — он сторожится по размаху. Запомнен, чтобы
+    #: следующие круги обмена того же бара не считали его заново.
+    bare: bool = False
+
+
 class ExecutionModel:
     """Исполнитель заявок для прогона по истории. Правила — в шапке модуля.
 
@@ -528,6 +642,42 @@ class ExecutionModel:
         #: Разбор этой ошибки — в миниплане `B-046`, раздел 7.
         self._previous_close: float | None = None
         self._current: tuple[datetime, float] | None = None
+        #: Минутки, отсортированные по времени, и их времена для поиска
+        #: по интервалу бара. Пусто — внутрибарные события по размаху бара,
+        #: ровно как до минуток.
+        self._minutes: tuple[MarketCandle, ...] = ()
+        self._minute_times: list[datetime] = []
+        #: Минутки поданы — пусть даже пустым набором. Отдельно от «непусто»:
+        #: пустые минутки за весь отрезок — это каждый бар без минуток,
+        #: и счёт `bars_without_minutes` обязан это сказать, а не промолчать.
+        self.minutes_given = False
+        self.minute_order = MinuteOrder.NEAR_FIRST
+        self._walk: _Walk | None = None
+        #: Бары, под которыми минуток не нашлось, хотя минутки поданы. Такой
+        #: бар сторожится по своему размаху, и наблюдений цены в нём нет —
+        #: скользящий уровень внутри него не едет. Число обязано быть видно.
+        self.bars_without_minutes = 0
+
+    def use_minutes(self, minutes: Minutes) -> None:
+        """Искать внутрибарные события по минуткам, а не по размаху бара.
+
+        Подаётся до первой свечи. Минутка — свеча таймфрейма в одну минуту:
+        пятиминутка, поданная минуткой, дала бы обход по четырём ценам бара,
+        то есть тот же накопленный размах под видом отрезков.
+
+        :raises ValueError: среди минуток есть свеча другого таймфрейма.
+        """
+        for minute in minutes.candles:
+            if minute.timeframe.minutes != 1:
+                raise ValueError(
+                    f"минуткой подана свеча {minute.timeframe.minutes} мин за "
+                    f"{minute.time:%d.%m.%Y %H:%M}: обход по её ценам был бы "
+                    "обходом по размаху бара, а не по минуткам"
+                )
+        self._minutes = tuple(sorted(minutes.candles, key=lambda one: one.time))
+        self._minute_times = [one.time for one in self._minutes]
+        self.minute_order = minutes.order
+        self.minutes_given = True
 
     # -- порт ---------------------------------------------------------------
 
@@ -559,7 +709,7 @@ class ExecutionModel:
         self.submitted_market.append(order)
         self.pending.append(order)
 
-    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill]:
+    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen]:
         """Сделки, случившиеся к моменту закрытия этой свечи и ещё не отданные.
 
         Порядок внутри круга однозначен: сначала исполнения по **открытию**
@@ -568,13 +718,92 @@ class ExecutionModel:
         раньше, чем движок успел его назвать. Требование записано в контракте
         порта (`engine/ports.py`), а не изобретено здесь: боевой адаптер обязан
         придержать внутрибарное событие точно так же.
+
+        С минутками (`use_minutes`) внутрибарные события ищутся обходом точек
+        минуток под этим баром (`_walked`); без них — по размаху бара, как
+        до минуток. Выбор — по наличию минуток **под этим баром**, а не по
+        тому, что вернул обход: исчерпанный обход, свалившийся в размах бара,
+        проверил бы сдвинутый уровень по накопленному размаху.
         """
         self._remember(candle)
         fills = self._market_fills(candle)
         if not fills:
+            walk = self._walk_of(candle)
+            if walk is not None:
+                return self._walked(walk, candle)
             fills = self._level_fills(candle)
         self.fills.extend(fills)
         return fills
+
+    def _walk_of(self, candle: MarketCandle) -> _Walk | None:
+        """Обход этого бара — начатый или новый. `None` — бар идёт по размаху.
+
+        Минутки берутся **строго из интервала бара** — от начала до закрытия,
+        не включая закрытие. Минутка соседнего бара в обходе дала бы
+        наблюдения цен, которых в этом баре не было, и лишние круги обмена.
+
+        Бар старше начатого обхода (повтор после переподключения) — пустой
+        обход: его цены уже пройдены.
+        """
+        if not self.minutes_given:
+            return None
+        walk = self._walk
+        if walk is not None and candle.time <= walk.bar:
+            if candle.time < walk.bar:
+                return _Walk(candle.time, ())
+            return None if walk.bare else walk
+        first = bisect.bisect_left(self._minute_times, candle.time)
+        last = bisect.bisect_left(self._minute_times, close_time(candle))
+        if first == last:
+            self.bars_without_minutes += 1
+            self._walk = _Walk(candle.time, (), bare=True)
+            return None
+        side = Side.LONG if self._open is None else self._open.side
+        steps: list[_Step] = []
+        previous = self._previous_close
+        start: float | None = None
+        for minute in self._minutes[first:last]:
+            for price in minute_points(minute, self.minute_order, side):
+                steps.append(_Step(
+                    minute=minute,
+                    start=price if start is None else start,
+                    end=price,
+                    previous=previous if start is None else start,
+                ))
+                start = price
+        self._walk = _Walk(candle.time, tuple(steps))
+        return self._walk
+
+    def _walked(self, walk: _Walk, candle: MarketCandle) -> list[Fill | PriceSeen]:
+        """Следующее внутрибарное событие обхода: сделки по уровню или наблюдение.
+
+        Шаг обхода — отрезок между соседними точками. Сначала сторожа
+        проверяются по отрезку; задет хоть один — ответ из сделок, и курсор
+        за этой точкой. Не задет, а нога открыта — ответ из **одного**
+        наблюдения цены этой точки (контракт порта): движок пересчитает
+        уровень и подаст вооружение раньше, чем следующий отрезок будет
+        проверен. Наблюдение шлётся при любой открытой ноге, в том числе
+        до вооружения уровня: фильтрует движок, а не исполнитель.
+
+        Наблюдение в `fills` не попадает — это не сделка. Обход кончился —
+        пустой ответ, и обмен по этому бару закончен.
+        """
+        while walk.at < len(walk.steps):
+            step = walk.steps[walk.at]
+            walk.at += 1
+            fills = self._fire(
+                candle,
+                span=step.minute,
+                reach=(min(step.start, step.end), max(step.start, step.end)),
+                ready_at=step.minute.time,
+                previous=step.previous,
+            )
+            if fills:
+                self.fills.extend(fills)
+                return list(fills)
+            if self._open is not None:
+                return [PriceSeen(at=step.minute.time, price=step.end)]
+        return []
 
     def _remember(self, candle: MarketCandle) -> None:
         """Запомнить закрытие предыдущего интервала. Вход сторожа `_reachable`.
@@ -664,10 +893,43 @@ class ExecutionModel:
         проскальзыванием. При нулевом проскальзывании это одно и то же число,
         и ровно так считал прототип: «исполнение ровно по уровню».
         """
+        return self._fire(
+            candle,
+            span=candle,
+            reach=(candle.low, candle.high),
+            ready_at=candle.time,
+            previous=self._previous_close,
+        )
+
+    def _fire(
+        self,
+        candle: MarketCandle,
+        *,
+        span: MarketCandle,
+        reach: tuple[float, float],
+        ready_at: datetime,
+        previous: float | None,
+    ) -> list[Fill]:
+        """Сторожа, задетые в размахе `reach`. Общее для бара и отрезка минуток.
+
+        * `candle` — бар: его начало — время сделки (`Fill.at`), его закрытие —
+          время расчёта (`_level_hit`). Внутри бара у сделки то же время,
+          что без минуток: путь Б «стопа после тейка» берёт дату отсюда;
+        * `span` — свеча, в размахе которой обязан лежать уровень (`_reachable`):
+          бар без минуток, минутка с ними;
+        * `reach` — `(низ, верх)` проверяемых цен: размах бара либо отрезок
+          между соседними точками обхода — **не** накопленный размах минутки;
+        * `ready_at` — сторож проверяется, если подан не позже этого момента
+          (правило 3). Для бара это его начало, для отрезка — начало минутки:
+          уровень, переподанный по наблюдению внутри бара, сторожится
+          со следующего отрезка, а не со следующего бара;
+        * `previous` — цена до проверяемого участка, вход сторожа разрыва.
+        """
+        low, high = reach
         fills: list[Fill] = []
         for order_id, guard in list(self.armed.items()):
             order = guard.order
-            if not self._ready(order, candle):
+            if order.submitted_at > ready_at:
                 continue
             level = order.price
             assert level is not None, "вооружение без уровня — дефект движка"
@@ -676,14 +938,10 @@ class ExecutionModel:
                 "вооружение без стороны касания — дефект движка: догадываться "
                 "о ней здесь запрещено, из этой догадки вырос B-046"
             )
-            hit = (
-                candle.high >= level
-                if touch is LevelTouch.RISE
-                else candle.low <= level
-            )
+            hit = high >= level if touch is LevelTouch.RISE else low <= level
             if not hit:
                 continue
-            self._reachable(order, level, touch, candle)
+            self._reachable(order, level, touch, span, previous)
             del self.armed[order_id]
             at = candle.time
             price = self.costs.fill_price(level, OrderAction.CLOSE, order.side)
@@ -721,8 +979,14 @@ class ExecutionModel:
         level: float,
         touch: LevelTouch,
         candle: MarketCandle,
+        previous: float | None,
     ) -> None:
         """Сторож «цена, которой не было» — плюс счётчик разрывов.
+
+        `candle` — свеча, в размахе которой обязан лежать уровень: бар,
+        а при обходе минуток — минутка. `previous` — цена перед ней: закрытие
+        прошлого бара либо прошлая точка обхода. Разрыв между минутками
+        внутри бара тоже разрыв и считается так же.
 
         Правило, названное владельцем счёта: **цена сделки обязана лежать
         внутри размаха своей свечи**. Исключение ровно одно — настоящий
@@ -757,7 +1021,6 @@ class ExecutionModel:
         """
         if candle.low <= level <= candle.high:
             return
-        previous = self._previous_close
         if previous is None:
             return
         opened = candle.open

@@ -25,6 +25,8 @@ from ui.models import (
     AlgorithmOption,
     AverageKind,
     CalendarDay,
+    MinuteBarLimit,
+    MinutePriceOrder,
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
@@ -2159,6 +2161,8 @@ SAMPLE = Settings(
     ruble_per_point=1.73774,
     ruble_per_point_source="биржа, RIU6, 04.09.2026 07:00",
     slippage_steps=1.5,
+    minute_order=MinutePriceOrder.ADVERSE_FIRST,
+    minute_bar_limit=MinuteBarLimit.FIFTEEN,
     log_directory="/tmp/терминал-логи",
     # ⚠️ Поля календаря в этом окне нет: его правят в своём окне, из меню
     # «Настройки». Но пронести его через обмен окно обязано — иначе «Применить»
@@ -2234,3 +2238,60 @@ def test_the_unfinished_variant_is_shown_but_not_offered(dialog) -> None:
     index = box.findData(AfterTakeProfit.RESTORE_AT_ONCE)
     why = box.itemData(index, QtNamespace.ItemDataRole.ToolTipRole)
     assert why and "не сделан" in why, f"выключенный вариант не объяснён: {why!r}"
+
+
+@pytest.mark.parametrize(
+    ("chosen", "other"),
+    [
+        (MinutePriceOrder.NEAR_FIRST, MinutePriceOrder.ADVERSE_FIRST),
+        (MinutePriceOrder.ADVERSE_FIRST, MinutePriceOrder.NEAR_FIRST),
+    ],
+)
+def test_the_minute_order_chosen_in_the_window_reaches_the_run(
+    dialog, chosen, other
+) -> None:
+    """Стережёт: порядок цен минутки, выбранный мышкой, доезжает до прогона.
+
+    Путь человека: список в окне → «Применить» (`values`) → перевод
+    в `backtest.MinuteOrder` (`convert.minute_order_of`), который подаётся
+    в `Minutes`. Окно открыто на **другом** значении, выбор сделан в самом
+    списке — зашитое в сборщике или в переводе значение роняет один
+    из двух случаев.
+    """
+    from app import convert
+    from backtest import MinuteOrder
+
+    dialog.set_values(Settings(minute_order=other))
+    box = dialog.minute_order
+    box.setCurrentIndex(box.findData(chosen))
+    assert convert.minute_order_of(dialog.values()) is MinuteOrder(chosen.value)
+
+
+@pytest.mark.parametrize(
+    ("chosen", "other"),
+    [
+        (MinuteBarLimit.ONE, MinuteBarLimit.FIFTEEN),
+        (MinuteBarLimit.FIFTEEN, MinuteBarLimit.FIVE),
+        (MinuteBarLimit.FIVE, MinuteBarLimit.ONE),
+    ],
+)
+def test_the_minute_bar_limit_chosen_in_the_window_reaches_the_run(
+    dialog, chosen, other
+) -> None:
+    """Стережёт: порог «наибольшая свеча для проверки по минуткам» доезжает до прогона.
+
+    Путь человека: список на вкладке «Деньги» → «Применить» (`values`) →
+    минуты для того, кто собирает прогон (`convert.minute_bar_limit_of`,
+    `B-058`). Окно открыто на **другом** значении, выбор сделан в самом
+    списке: число, зашитое в сборщике окна или в переводе, роняет хотя бы
+    один из трёх случаев. Ожидаемое число — минуты из подписи размера
+    свечи (`convert.TIMEFRAMES`), а не из самого перечисления.
+    """
+    from app import convert
+
+    dialog.set_values(Settings(minute_bar_limit=other))
+    box = dialog.minute_bar_limit
+    box.setCurrentIndex(box.findData(chosen))
+    assert box.currentText() == chosen.label
+    expected = convert.TIMEFRAMES[box.currentText()].minutes
+    assert convert.minute_bar_limit_of(dialog.values()) == expected

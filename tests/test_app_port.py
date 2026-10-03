@@ -3824,3 +3824,229 @@ def test_the_start_line_about_guards_carries_the_warning_itself(loop, database) 
         assert words in said, (
             f"строка журнала про предохранители не говорит «{words}»: {said!r}"
         )
+
+
+def test_the_window_run_goes_over_minutes_in_the_order_set_in_the_window(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт: прогон окна получает минутки под своими барами и порядок из окна.
+
+    Два поведения, обе мутации обязаны ронять:
+
+    * `app/port.py` зовёт `replay` без `minutes` — скользящий уровень внутри
+      бара в окне перестаёт ехать, а тесты движка и исполнителя зелёные;
+    * смена **только** порядка цен минутки в настройках не перезапускает
+      прогон или перезапускает его с прежним порядком — на экране остаётся
+      прогон, сделанный при другом допущении, а снимок в журнале прогонов
+      называет новый.
+
+    Минутки идут только скользящему уровню на свече не крупнее порога
+    (B-058), поэтому прогон здесь — со скользящим уровнем на пятиминутках
+    при пороге по умолчанию (5 мин): иначе `minutes=None` законен и первая
+    мутация не видна.
+
+    Вход подставной: база во временной папке, минутки ровного ряда.
+    """
+    from app import port as port_module
+    from backtest import MinuteOrder, Minutes
+    from ui.models import MinutePriceOrder
+
+    trailing = Settings().replace(trailing_enabled=True)
+    assert convert.timeframe_of(trailing.timeframe).minutes == 5
+    assert convert.minute_bar_limit_of(trailing) >= 5
+
+    the_real_replay = port_module.replay
+    got: list[Minutes | None] = []
+
+    async def watched_replay(*args, **kwargs):
+        got.append(kwargs.get("minutes"))
+        return await the_real_replay(*args, **kwargs)
+
+    monkeypatch.setattr(port_module, "replay", watched_replay)
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=trailing, days=0, sanitize=redact)
+        try:
+            await _run(port)
+            first = port._run  # noqa: SLF001 — показанный прогон, как его видит окно
+            port.apply_settings(
+                trailing.replace(minute_order=MinutePriceOrder.ADVERSE_FIRST)
+            )
+            await port.wait()
+            return first, port._run  # noqa: SLF001 — то же
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    first, second = loop.run_until_complete(go())
+    assert len(got) == 2, f"прогонов {len(got)}: смена порядка цен минутки не перезапустила прогон"
+    minutes = got[0]
+    assert minutes is not None, "прогон окна пошёл без минуток — по размаху бара"
+    assert len(minutes.candles) == len(_minutes()), "минутки под барами прогона не все"
+    assert minutes.order is MinuteOrder.NEAR_FIRST
+    assert got[1] is not None
+    assert got[1].order is MinuteOrder.ADVERSE_FIRST, (
+        "порядок из окна не дошёл до прогона: перезапущен с прежним"
+    )
+    assert first.minute_order is MinuteOrder.NEAR_FIRST
+    assert second.minute_order is MinuteOrder.ADVERSE_FIRST
+    assert first.bars_without_minutes == 0
+    assert first.coarse_bar is None, "минутки поданы, а итог говорит, что нет"
+
+
+def test_a_coarse_bar_with_a_trailing_level_runs_without_minutes_and_says_so(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт (B-058): свеча крупнее порога — прогон окна без минуток, и это сказано.
+
+    Скользящий уровень на 30 минутах при пороге 5: `replay` получает
+    `minutes=None` (иначе прогон упирается в предел кругов бара), а итог,
+    показанный окном, несёт строку допущения «Свеча 30 мин крупнее порога
+    5 мин…». Две мутации обязаны ронять: условие по порогу снято (минутки
+    поданы) и пометка итога потеряна в `port.py` (молчание, правило 13).
+
+    Вход подставной: база во временной папке, минутки ровного ряда.
+    """
+    from app import port as port_module
+    from backtest import CoarseBar
+
+    the_real_replay = port_module.replay
+    got: list[object] = []
+
+    async def watched_replay(*args, **kwargs):
+        got.append(kwargs.get("minutes"))
+        return await the_real_replay(*args, **kwargs)
+
+    monkeypatch.setattr(port_module, "replay", watched_replay)
+    values = Settings().replace(trailing_enabled=True, timeframe="30 минут")
+    assert convert.minute_bar_limit_of(values) == 5
+    port, _ = replay_history(loop, database, values=values, days=0)
+
+    assert got == [None], f"минутки поданы свече крупнее порога: {got!r}"
+    run = port._run  # noqa: SLF001 — показанный прогон, как его видит окно
+    assert run is not None
+    assert run.coarse_bar == CoarseBar(30, 5)
+    said = [item.short for item in run.assumptions]
+    assert any(
+        line.startswith("Свеча 30 мин крупнее порога 5 мин: скользящий уровень")
+        and "только на закрытии свечи" in line
+        for line in said
+    ), f"о не поданных минутках отчёт молчит: {said!r}"
+
+
+def _shown_run(port: HistoryPort) -> HistoryRun | None:
+    """Прогон, показанный окном. Снимок прогона наружу порт не отдаёт."""
+    return port._run  # noqa: SLF001 — снимок прогона наружу порт не отдаёт
+
+
+def test_a_stitched_run_on_a_coarse_bar_also_says_minutes_were_not_given(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт (B-058, правило 13): ветка склейки в `_replay` тоже помечает итог.
+
+    Скользящий уровень на 30 минутах при пороге 5, прогон идёт веткой
+    склейки (`stitch is not None`). Итог, показанный окном, обязан нести
+    `coarse_bar` и строку допущения «Свеча 30 мин крупнее порога 5 мин…»,
+    как и простой прогон. Сторож выше проходит только простую ветку:
+    пометка, потерянная в ветке склейки, молчала бы.
+
+    Вход подставной: нарезка по контрактам и прогон кусков заменены
+    (`_series` отдаёт ряд базы как «склейку», `stitched_view.run` — простой
+    `replay` по нему). Предмет — только пометка итога в ветке склейки.
+    """
+    from types import SimpleNamespace
+
+    from app import port as port_module
+    from backtest import CoarseBar
+
+    # Подмена обёрткой над настоящим чтением ряда: публичного входа у него нет.
+    real_series = port_module.HistoryPort._series  # noqa: SLF001 — подмена в тесте
+    the_real_replay = port_module.replay
+    reached: list[object] = []
+
+    async def stitched_series(self, frame, symbol, timeframe):
+        candles, _ = await real_series(self, frame, symbol, timeframe)
+        return candles, SimpleNamespace(candles=candles, seams=(), symbols="подставная")
+
+    async def stitched_run(stitch, values, engine):
+        reached.append(stitch)
+        return await the_real_replay(
+            stitch.candles,
+            convert.chosen_algorithm(values).build(convert.strategy_settings(values)),
+            engine,
+            costs=convert.run_costs(values),
+        )
+
+    monkeypatch.setattr(port_module.HistoryPort, "_series", stitched_series)
+    monkeypatch.setattr(port_module.stitched_view, "run", stitched_run)
+    monkeypatch.setattr(port_module.stitched_view, "as_history", lambda run, costs: run)
+    values = Settings().replace(trailing_enabled=True, timeframe="30 минут")
+    assert convert.minute_bar_limit_of(values) == 5
+    port, _ = replay_history(loop, database, values=values, days=0)
+
+    assert reached, "сценарий: прогон не пошёл веткой склейки"
+    run = _shown_run(port)
+    assert run is not None
+    assert run.coarse_bar == CoarseBar(30, 5), "склейка потеряла пометку о минутках"
+    said = [item.short for item in run.assumptions]
+    assert any(
+        line.startswith("Свеча 30 мин крупнее порога 5 мин: скользящий уровень")
+        for line in said
+    ), f"о не поданных минутках отчёт склейки молчит: {said!r}"
+
+
+def test_changing_only_the_minute_bar_limit_reruns_the_window_with_the_new_limit(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт (B-058): порог из окна доезжает до прогона, и смена одного его перезапускает.
+
+    Скользящий уровень на 15 минутах. При пороге 5 свеча крупнее порога:
+    `replay` получает `minutes=None`, итог помечен `CoarseBar(15, 5)`.
+    После `apply_settings`, где изменился **только** порог (15), прогон
+    обязан пройти заново, получить минутки и пометку потерять. Иначе
+    на экране остаётся прогон, сделанный при другом пороге, — или порт
+    берёт порог не из настроек окна, а зашитый: `test_the_limit_comes_from_the_settings`
+    проверяет `minute_plan` отдельно и такую подмену в порту не видит.
+
+    Вход подставной: база во временной папке, минутки ровного ряда.
+    """
+    from app import port as port_module
+    from backtest import CoarseBar
+    from ui.models import MinuteBarLimit
+
+    values = Settings().replace(trailing_enabled=True, timeframe="15 минут")
+    assert convert.timeframe_of(values.timeframe).minutes == 15
+    assert convert.minute_bar_limit_of(values) == 5
+
+    the_real_replay = port_module.replay
+    got: list[object] = []
+
+    async def watched_replay(*args, **kwargs):
+        got.append(kwargs.get("minutes"))
+        return await the_real_replay(*args, **kwargs)
+
+    monkeypatch.setattr(port_module, "replay", watched_replay)
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        try:
+            await _run(port)
+            first = _shown_run(port)
+            port.apply_settings(values.replace(minute_bar_limit=MinuteBarLimit.FIFTEEN))
+            await port.wait()
+            return first, _shown_run(port)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    first, second = loop.run_until_complete(go())
+    assert len(got) == 2, f"прогонов {len(got)}: смена только порога не перезапустила прогон"
+    assert got[0] is None, "при пороге 5 минутки поданы 15-минутной свече"
+    assert got[1] is not None, "порог 15 из окна не дошёл до прогона: минутки не поданы"
+    assert first is not None and second is not None
+    assert first.coarse_bar == CoarseBar(15, 5)
+    assert second.coarse_bar is None, "показан прогон с пометкой прежнего порога"

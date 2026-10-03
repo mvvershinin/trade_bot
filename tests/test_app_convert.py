@@ -1144,3 +1144,72 @@ def _as_bar(candle: Candle):
         open=candle.open, high=candle.high, low=candle.low,
         close=candle.close, volume=candle.volume,
     )
+
+
+def test_the_window_default_minute_order_is_the_run_default() -> None:
+    """Стережёт: умолчание окна и умолчание прогона — одно и то же.
+
+    Два перечисления живут в разных слоях; разъехавшиеся умолчания значили
+    бы, что «как по умолчанию» в окне и в прогоне — разный порядок.
+    """
+    from backtest import Minutes
+
+    assert convert.minute_order_of(Settings()) is Minutes(candles=()).order
+
+
+def test_changing_the_minute_order_is_a_journal_line() -> None:
+    """Стережёт: смена порядка цен минутки — строка в журнале, подписями окна.
+
+    Движок этого допущения не знает, рассказать больше некому: без строки
+    в `_WINDOW_TOLD` смена прошла бы молча («Значения совпали с прежними»).
+    """
+    from ui.models import MinutePriceOrder
+
+    lines = convert.window_changes(
+        Settings(), Settings(minute_order=MinutePriceOrder.ADVERSE_FIRST)
+    )
+    assert lines == [
+        "Порядок цен внутри минуты: Сначала цена, ближняя к открытию → "
+        "Сначала худшая для позиции цена"
+    ], lines
+
+
+# ------------------------------- наибольшая свеча для проверки по минуткам (B-058)
+
+def test_the_minute_bar_limit_offers_only_known_bar_sizes_up_to_fifteen() -> None:
+    """Стережёт: в списке порога — ровно размеры свечей программы не крупнее 15 минут.
+
+    Вход извне — перечень размеров свечей окна (`convert.TIMEFRAMES`).
+    Порог, которого нет среди размеров свечей, не значил бы ничего; порог
+    крупнее 15 минут вернул бы остановку прогона (`B-058`). Подпись порога
+    обязана быть подписью того же размера свечи.
+    """
+    from ui.models import MinuteBarLimit
+
+    expected = {
+        frame.minutes for frame in convert.TIMEFRAMES.values() if frame.minutes <= 15
+    }
+    assert {one.minutes for one in MinuteBarLimit} == expected
+    for one in MinuteBarLimit:
+        assert convert.TIMEFRAMES[one.label].minutes == one.minutes, one
+
+
+def test_the_window_default_minute_bar_limit_is_five_minutes() -> None:
+    """Стережёт: умолчание порога — 5 минут, решение владельца счёта (`B-058`)."""
+    assert convert.minute_bar_limit_of(Settings()) == 5
+
+
+def test_changing_the_minute_bar_limit_is_a_journal_line() -> None:
+    """Стережёт: смена порога — строка в журнале, подписью и значениями окна.
+
+    Движок этого допущения не знает, рассказать больше некому: без строки
+    в `_WINDOW_TOLD` смена прошла бы молча («Значения совпали с прежними»).
+    """
+    from ui.models import MinuteBarLimit
+
+    lines = convert.window_changes(
+        Settings(), Settings(minute_bar_limit=MinuteBarLimit.FIFTEEN)
+    )
+    assert lines == [
+        "Наибольшая свеча для проверки по минуткам: 5 минут → 15 минут"
+    ], lines

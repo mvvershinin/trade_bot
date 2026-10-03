@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Any, cast
 from PySide6.QtCore import QObject, QTimer, SignalInstance
 
 from app import contract_view, convert, stitched_view
+from app.minutes import minute_plan, minutes_under
 from app.observe import LiveObserver
 from app.runs import ProgramFields, RunConditions, RunLog, result_note, settings_text
 from backtest import HistoryRun, Summary, pairs, replay, reversal_entries, summarise
@@ -3934,15 +3935,17 @@ class HistoryPort(TerminalPort):
             until=self._until,
             program=ProgramFields.of(frame.values),
         )
+        # Подавать ли минутки — одно правило с склейкой (B-058, `app/minutes.py`).
+        plan = minute_plan(frame.values, convert.timeframe_of(frame.values.timeframe))
         async with self._runs.around(conditions.record(candles)) as entry:
             if stitch is not None:
                 self._stitched = await stitched_view.run(stitch, frame.values, frame.engine)
-                run = stitched_view.as_history(
+                run = plan.mark(stitched_view.as_history(
                     self._stitched, convert.run_costs(frame.values)
-                )
+                ))
                 entry.note = f"{result_note(run)} Склейка {stitch.symbols}."
                 return run
-            run = await replay(
+            run = plan.mark(await replay(
                 candles,
                 algorithm.build(module),
                 frame.engine,
@@ -3950,8 +3953,13 @@ class HistoryPort(TerminalPort):
                 # каждого исполнения, а значит все деньги отчёта. Умолчание —
                 # ноль шагов, ровно как считал прототип (`app/convert.py`).
                 costs=convert.run_costs(frame.values),
+                # Минутки под барами — уровни внутри бара по ним (решение 0059);
+                # только скользящему уровню на свече не крупнее порога.
+                minutes=None if plan.order is None else await minutes_under(
+                    self._worker, symbol, candles, plan.order
+                ),
                 on_progress=self._progress,
-            )
+            ))
             entry.note = result_note(run)
         return run
 

@@ -43,8 +43,11 @@ from datetime import date, datetime
 
 from backtest.assumptions import Assumption, assumptions, headline
 from backtest.execution import (
+    CoarseBar,
     Costs,
     ExecutionModel,
+    MinuteOrder,
+    Minutes,
     OpenLeg,
     commissions_disagree,
     selling,
@@ -323,6 +326,18 @@ class HistoryRun:
     halted: str = ""
     bars: int = 0
     costs: Costs = Costs()
+    #: Порядок обхода цен минутки, если минутки поданы. `None` — не поданы,
+    #: и уровни сторожились по размаху бара (сверка, перебор, подбор лидеров).
+    minute_order: MinuteOrder | None = None
+    #: Бары, под которыми при поданных минутках их не нашлось: такой бар
+    #: сторожится по размаху, скользящий уровень внутри него не едет.
+    #: Число идёт в допущения прогона (`backtest/assumptions.py`) — молча
+    #: посчитанный по размаху бар неотличим в отчёте от посчитанного по минуткам.
+    bars_without_minutes: int = 0
+    #: Скользящий уровень включён, но минутки не поданы — свеча крупнее
+    #: порога (B-058). Ставит тот, кто решал не подавать (`app/minutes.py`);
+    #: `None` — минутки поданы либо скользящего уровня нет.
+    coarse_bar: CoarseBar | None = None
 
     @property
     def assumptions(self) -> tuple[Assumption, ...]:
@@ -503,11 +518,7 @@ class HistoryExecutor(ExecutionModel):
         Комиссия сделки — **обе стороны**: вход и выход. `None` не превращается
         в ноль ни на одном шаге.
         """
-        reason = (
-            ExitReason.TAKE_PROFIT
-            if order.action is OrderAction.ARM_TAKE_PROFIT
-            else order.exit_reason or ExitReason.SIGNAL
-        )
+        reason = order.exit_reason or ExitReason.SIGNAL
         one_side = self.costs.commission(leg.volume)
         self.deals.append(Deal(
             side=leg.side, volume=leg.volume,
@@ -536,7 +547,8 @@ class HistoryExecutor(ExecutionModel):
         self.level_plans.append(Plan(
             order_id=order.order_id, decided_at=close_time(candle), price=level,
             side=order.side, action=OrderAction.CLOSE,
-            exit_reason=ExitReason.TAKE_PROFIT,
+            # Вид уровня назвал движок в заявке вооружения — не додумывать.
+            exit_reason=order.exit_reason,
         ))
 
 
@@ -804,12 +816,13 @@ def _tariff(value: float | None) -> str:
     return "тарифа нет" if value is None else f"{value} ₽ за контракт на сторону"
 
 
-async def replay(  # noqa: PLR0913 — шестой параметр это издержки, и убрать их некуда: настройки движка проскальзывания не знают, а живость окна задают два оставшихся
+async def replay(  # noqa: PLR0913 — сверх пяти идут издержки и минутки, обе величины только исполнителя: настройки движка их не знают, а живость окна задают два оставшихся
     candles: Sequence[object],
     strategy: Strategy,
     settings: EngineSettings,
     *,
     costs: Costs | None = None,
+    minutes: Minutes | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     breathe_every: int = BREATHE_EVERY,
 ) -> HistoryRun:
@@ -854,6 +867,14 @@ async def replay(  # noqa: PLR0913 — шестой параметр это из
     отвергается вслух (`_one_commission`). Проскальзывание — величина только
     отчёта, у движка её нет вовсе, и сверять её не с чем.
 
+    `minutes` — минутки под барами ряда и порядок обхода их цен. Получает
+    их **только исполнитель** (`ExecutionModel.use_minutes`): источник свечей
+    и движок их не видят, и решения по-прежнему принимаются на закрытии бара.
+    По минуткам исполнитель сторожит уровень по отрезкам между точками
+    и сообщает движку наблюдённые цены — по ним скользящий уровень едет
+    внутри бара (решение 0059 §3). Не заданы — сторож по размаху бара,
+    как до минуток.
+
     :raises ValueError: издержки называют одну комиссию, настройки движка —
         другую.
     """
@@ -867,6 +888,8 @@ async def replay(  # noqa: PLR0913 — шестой параметр это из
         costs=costs,
         ruble_per_point=settings.ruble_per_point,
     )
+    if minutes is not None:
+        executor.use_minutes(minutes)
     source = HistorySource(
         candles, on_progress=on_progress, breathe_every=breathe_every
     )
@@ -914,4 +937,6 @@ async def replay(  # noqa: PLR0913 — шестой параметр это из
         halted=engine.halted,
         bars=seen,
         costs=costs,
+        minute_order=executor.minute_order if executor.minutes_given else None,
+        bars_without_minutes=executor.bars_without_minutes,
     )

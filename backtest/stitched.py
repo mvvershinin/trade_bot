@@ -46,7 +46,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
 
-from backtest.execution import Costs
+from backtest.execution import Costs, Minutes
 from backtest.history import Deal, HistoryRun, Summary, replay, summarise
 from engine import (
     MSK,
@@ -85,6 +85,11 @@ class Piece:
     warmup: tuple[MarketCandle, ...]
     body: tuple[MarketCandle, ...]
     warmup_wanted: int
+    #: Минутки **этого** контракта под барами куска и порядок их обхода.
+    #: `None` — сторож уровня по размаху бара, как до минуток. Чужой
+    #: контракт сюда класть нельзя: цены соседнего контракта на стыке
+    #: другие, и уровень задевался бы ценой, которой у этого не было.
+    minutes: Minutes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,7 +265,10 @@ async def replay_pieces(
         if short is not None:
             problems.append(short)
             journal.append(_warning(close_time(piece.body[0]), "Прогрев неполный", short))
-        run = await replay((*piece.warmup, *piece.body), build(), settings, costs=costs)
+        run = await replay(
+            (*piece.warmup, *piece.body), build(), settings,
+            costs=costs, minutes=piece.minutes,
+        )
         following = "" if run.halted else after
         seam = None
         if following:

@@ -26,6 +26,8 @@ from ui.models import (
     AfterTakeProfit,
     AverageKind,
     CalendarDay,
+    MinuteBarLimit,
+    MinutePriceOrder,
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
@@ -92,6 +94,8 @@ DIFFERENT = Settings(
     ruble_per_point=1.73774,
     ruble_per_point_source="биржа, RIU6, 04.09.2026 07:00",
     slippage_steps=1.5,
+    minute_order=MinutePriceOrder.ADVERSE_FIRST,
+    minute_bar_limit=MinuteBarLimit.FIFTEEN,
     log_directory="/tmp/терминал-логи",
     # Оба вида отметки сразу: «не торгуем» на будний день и «торгуем»
     # на субботу. Один вид проверял бы половину: перевод «да/нет» в файл
@@ -490,7 +494,9 @@ def test_the_written_file_is_readable_text() -> None:
 #: Секретов в файле нет ни одного: настройки — это периоды, проценты и время.
 #:
 #: ⚠️ Поля, заведённые **после** снимка, дописываются сюда с умолчанием
-#: (`strategy_id` — 08.09.2026). Иначе проверка «перезапись не портит файл»
+#: (`strategy_id` — 08.09.2026, `minute_order` и `minute_bar_limit` —
+#: 03.10.2026). Иначе проверка
+#: «перезапись не портит файл»
 #: падала бы на каждом новом поле и сообщала бы не о формате, а о том, что
 #: полей стало больше, — а это и так видно по другим сторожам.
 OWNER_FILE = """{
@@ -517,6 +523,8 @@ OWNER_FILE = """{
     "history_depth_days": 90,
     "instrument": "MXU6",
     "log_directory": "",
+    "minute_bar_limit": 5,
+    "minute_order": "near_first",
     "on_price_equals_average": "skip",
     "price_step": 1.0,
     "reversal_moment": "same_bar",
@@ -719,3 +727,92 @@ def test_a_guard_returned_to_the_build_is_no_longer_called_switched_off() -> Non
         assert guard in said, (
             f"невернувшийся предохранитель «{guard}» больше не назван: {said!r}"
         )
+
+
+# ------------------------------------------------ порядок цен минутки (З9 Ф4)
+
+def test_a_broken_minute_order_is_replaced_out_loud(store: SettingsStore) -> None:
+    """Стережёт: негодный порядок цен минутки в файле — умолчание и оговорка.
+
+    Оговорка идёт в `troubles`, то есть до журнала решений предупреждением;
+    молча подменённое значение — дефект (правило 13).
+    """
+    assert store.save(Settings(minute_order=MinutePriceOrder.ADVERSE_FIRST)) == ""
+    body = json.loads(store.path.read_text(encoding="utf-8"))
+    body["settings"]["minute_order"] = "zigzag"
+    store.path.write_text(json.dumps(body), encoding="utf-8")
+
+    read = SettingsStore(store.path.parent).load()
+
+    assert read.values.minute_order is MinutePriceOrder.NEAR_FIRST
+    assert any("minute_order" in line and "zigzag" in line for line in read.troubles), (
+        read.troubles
+    )
+
+
+def test_a_file_without_the_minute_order_is_read_and_left_as_it_is(
+    store: SettingsStore,
+) -> None:
+    """Стережёт: файл прежней сборки без ключа читается, оговорка — и не переписан.
+
+    Переписать файл настроек имеет право только «Применить» человека.
+    """
+    assert store.save(Settings(average_period=21)) == ""
+    body = json.loads(store.path.read_text(encoding="utf-8"))
+    del body["settings"]["minute_order"]
+    before = json.dumps(body, ensure_ascii=False, indent=2)
+    store.path.write_text(before, encoding="utf-8")
+
+    read = SettingsStore(store.path.parent).load()
+
+    assert read.troubles == (), read.troubles
+    assert read.values.average_period == 21
+    assert read.values.minute_order is MinutePriceOrder.NEAR_FIRST
+    assert any("minute_order" in line for line in read.notes), read.notes
+    assert store.path.read_text(encoding="utf-8") == before
+
+
+# ------------------------------- наибольшая свеча для проверки по минуткам (B-058)
+
+@pytest.mark.parametrize("broken", [30, True, "5", None])
+def test_a_broken_minute_bar_limit_is_replaced_out_loud(
+    store: SettingsStore, broken: object
+) -> None:
+    """Стережёт: негодный порог в файле — умолчание и оговорка с ключом и значением.
+
+    30 — размер свечи, на котором прогон останавливается (`B-058`); `true`
+    для Python равно единице и без отдельной проверки молча стало бы
+    «1 минутой» (`ui/settings_codec.py::_enum_codec`). Молча подменённое
+    значение — дефект (правило 13).
+    """
+    assert store.save(Settings(minute_bar_limit=MinuteBarLimit.FIFTEEN)) == ""
+    body = json.loads(store.path.read_text(encoding="utf-8"))
+    body["settings"]["minute_bar_limit"] = broken
+    store.path.write_text(json.dumps(body), encoding="utf-8")
+
+    read = SettingsStore(store.path.parent).load()
+
+    assert read.values.minute_bar_limit is MinuteBarLimit.FIVE
+    shown_raw = json.dumps(broken)
+    assert any(
+        "minute_bar_limit" in line and shown_raw in line for line in read.troubles
+    ), read.troubles
+
+
+def test_a_file_without_the_minute_bar_limit_is_read_and_left_as_it_is(
+    store: SettingsStore,
+) -> None:
+    """Стережёт: файл прежней сборки без ключа читается с умолчанием и не переписан."""
+    assert store.save(Settings(average_period=21)) == ""
+    body = json.loads(store.path.read_text(encoding="utf-8"))
+    del body["settings"]["minute_bar_limit"]
+    before = json.dumps(body, ensure_ascii=False, indent=2)
+    store.path.write_text(before, encoding="utf-8")
+
+    read = SettingsStore(store.path.parent).load()
+
+    assert read.troubles == (), read.troubles
+    assert read.values.average_period == 21
+    assert read.values.minute_bar_limit is MinuteBarLimit.FIVE
+    assert any("minute_bar_limit" in line for line in read.notes), read.notes
+    assert store.path.read_text(encoding="utf-8") == before

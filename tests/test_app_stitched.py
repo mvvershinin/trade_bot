@@ -14,24 +14,25 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import pathlib
 from collections.abc import Iterator
 from datetime import date, datetime, time, timedelta
 
 import pytest
 
-from app import convert
+from app import convert, stitched_view
 from app.stitched import StitchRequest, load_pieces, run_stitched, uncovered
-from backtest.execution import Costs
+from backtest.execution import Costs, MinuteOrder
 from backtest.stitched import replay_pieces
 from engine import EngineSettings, Mode, TradingWindow
-from market.candles import M5, MSK
+from market.candles import M5, MSK, Timeframe
 from market.chain import Leg
 from market.storage import CandleStore, ContractRow, Source
 from strategies import EmaReverse, EmaReverseSettings
 from tests.market_helpers import minute
+from ui.models import MinutePriceOrder, Settings
 from ui.models import Mode as EngineMode
-from ui.models import Settings
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=MSK)
 SEAM = date(2026, 9, 17)
@@ -144,6 +145,58 @@ def test_the_entry_point_runs_the_window_settings_over_both_contracts(
     assert len(run.pieces[1].piece.warmup) == values.average_period
 
 
+class _Asked(Exception):
+    """Запрос нарезки перехвачен — дальше прогон тесту не нужен."""
+
+
+@pytest.mark.parametrize(
+    ("trailing", "timeframe", "wanted"),
+    [
+        (True, "5 минут", MinuteOrder.ADVERSE_FIRST),
+        (False, "5 минут", None),
+        (True, "30 минут", None),
+    ],
+    ids=["trailing-5", "fixed-take-5", "trailing-30"],
+)
+def test_the_tester_stitch_asks_minutes_only_for_a_trailing_level_on_a_small_bar(
+    store: CandleStore, monkeypatch: pytest.MonkeyPatch, trailing: bool,
+    timeframe: str, wanted: MinuteOrder | None,
+) -> None:
+    """Стережёт (B-058): точка входа тестера `run_stitched` просит минутки по правилу окна.
+
+    Склейка тестера собирает запрос сама (`app/stitched.py`), а не через
+    `stitched_view.request_of`, и сторож `request_of` её не видит. Минутки —
+    только скользящему уровню на свече не крупнее порога (5 мин): без
+    скользящего уровня и на 30 минутах `minute_order` запроса пуст.
+    Первый случай — контроль: скользящий уровень на пятиминутках минутки
+    получает, и в порядке из настроек.
+
+    Вход подставной: `load_pieces` подменён перехватом запроса, база временная.
+    """
+    import app.stitched as stitched_module
+
+    asked: list[StitchRequest] = []
+
+    def caught(store: object, request: StitchRequest) -> object:
+        asked.append(request)
+        raise _Asked
+
+    monkeypatch.setattr(stitched_module, "load_pieces", caught)
+    values = Settings(
+        minute_order=MinutePriceOrder.ADVERSE_FIRST,
+        trailing_enabled=trailing, timeframe=timeframe,
+    )
+    engine = convert.engine_settings(values, EngineMode.REVERSE)
+    with pytest.raises(_Asked):
+        asyncio.run(run_stitched(
+            store, date(2026, 9, 16), SEAM, values, engine,
+        ))
+    assert len(asked) == 1
+    assert asked[0].minute_order is wanted, (
+        f"склейка тестера: минутки {asked[0].minute_order!r}, по правилу B-058 {wanted!r}"
+    )
+
+
 def test_the_window_names_the_same_seam_neighbour_as_the_journal() -> None:
     """MXU6, пустой MXZ6, MXH7: журнал, таблица сделок и отчёт — все «→ MXH7»."""
     from dataclasses import replace
@@ -161,3 +214,93 @@ def test_the_window_names_the_same_seam_neighbour_as_the_journal() -> None:
     quiet = replace(run, pieces=(replace(run.pieces[0], seam=None), *run.pieces[1:]))
     said = [line for line in lines(quiet) if "к стыку позиции не было" in line]
     assert said == ["Смена контракта MXU6 → MXH7 с 17.09.2026: к стыку позиции не было."]
+
+
+def test_each_piece_gets_the_minutes_of_its_own_contract_under_warmup_and_body(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Стережёт: кусок склейки получает минутки **своего** контракта и порядок из запроса.
+
+    Под каждым баром прогрева и тела лежат минутки того же тикера — иначе
+    прогрев целиком ушёл бы в «бары без минуток», а минутки соседнего
+    контракта задевали бы уровень ценами, которых у этого не было. Цены
+    у двух тикеров здесь разные (100 и 200) — иначе подмена тикера была бы
+    неотличима. Без порядка в запросе минуток нет вовсе — по размаху бара.
+    """
+    price = {"MXU6": 100.0, "MXZ6": 200.0}
+    with CandleStore(tmp_path / "own.sqlite3") as store:
+        store.put_contracts(
+            [ContractRow("MXU6", active_from=date(2026, 6, 8), active_to=date(2026, 9, 16)),
+             ContractRow("MXZ6", active_from=SEAM)],
+            now=NOW,
+        )
+        for symbol, days in DAYS.items():
+            for day in days:
+                start = datetime.combine(day, time(10, 0), MSK)
+                store.put_minutes(
+                    symbol,
+                    [minute(start + timedelta(minutes=i), open=price[symbol])
+                     for i in range(BARS_A_DAY * 5)],
+                    Source.ISS,
+                )
+            store.mark_days_requested(symbol, days, now=NOW)
+
+        plain, _ = load_pieces(store, _request(date(2026, 9, 16)))
+        assert [one.minutes for one in plain] == [None, None]
+
+        request = dataclasses.replace(
+            _request(date(2026, 9, 16)), minute_order=MinuteOrder.ADVERSE_FIRST
+        )
+        made, _ = load_pieces(store, request)
+    assert [one.symbol for one in made] == ["MXU6", "MXZ6"]
+    for piece in made:
+        assert piece.minutes is not None, f"{piece.symbol}: кусок без минуток"
+        assert piece.minutes.order is MinuteOrder.ADVERSE_FIRST
+        assert {one.open for one in piece.minutes.candles} == {price[piece.symbol]}, (
+            f"{piece.symbol}: под кусок легли минутки чужого контракта"
+        )
+        bars = (*piece.warmup, *piece.body)
+        times = {one.time for one in piece.minutes.candles}
+        assert all(
+            bar.time + timedelta(minutes=step) in times for bar in bars for step in range(5)
+        ), f"{piece.symbol}: под частью баров прогрева или тела минуток нет"
+
+
+def test_the_stitched_window_run_says_how_it_walked_the_minutes(
+    store: CandleStore,
+) -> None:
+    """Стережёт: итог склейки окна несёт порядок минуток и счёт баров без них.
+
+    `stitched_view.as_history` собирает один `HistoryRun` из кусков; потерянный
+    там порядок или счёт означал бы отчёт склейки, молчащий о том, что часть
+    свечей посчитана по размаху. Порядок — из настроек окна (`request_of`).
+
+    Минутки склейке — по тому же правилу, что окну (B-058): только скользящему
+    уровню и только на свече не крупнее порога. Без скользящего уровня
+    и на 30 минутах `request_of` минуток не просит.
+    """
+    values = Settings(minute_order=MinutePriceOrder.ADVERSE_FIRST, trailing_enabled=True)
+    since = date(2026, 9, 16)
+    assert stitched_view.request_of(
+        dataclasses.replace(values, trailing_enabled=False), M5, since, SEAM, asset="MX"
+    ).minute_order is None, "неподвижному тейку склейка просит минутки"
+    assert stitched_view.request_of(
+        values, Timeframe(30), since, SEAM, asset="MX"
+    ).minute_order is None, "свече крупнее порога склейка просит минутки"
+    request = stitched_view.request_of(values, M5, since, SEAM, asset="MX")
+    assert request.minute_order is MinuteOrder.ADVERSE_FIRST
+    made, notes = load_pieces(store, request)
+    # Под последним баром тела MXZ6 минуток нет — их вырезали из куска.
+    last = made[-1]
+    assert last.minutes is not None
+    cut = tuple(one for one in last.minutes.candles if one.time < last.body[-1].time)
+    made[-1] = dataclasses.replace(
+        last, minutes=dataclasses.replace(last.minutes, candles=cut)
+    )
+    engine = convert.engine_settings(values, EngineMode.REVERSE)
+    stitched = asyncio.run(stitched_view.run(
+        stitched_view.Stitch(pieces=tuple(made), notes=tuple(notes)), values, engine,
+    ))
+    shown = stitched_view.as_history(stitched, convert.run_costs(values))
+    assert shown.minute_order is MinuteOrder.ADVERSE_FIRST
+    assert shown.bars_without_minutes == 1, shown.bars_without_minutes

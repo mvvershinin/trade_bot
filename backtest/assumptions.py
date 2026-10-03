@@ -58,7 +58,9 @@ from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING
 
-from engine import ExitReason, in_moscow
+from backtest.execution import CoarseBar, MinuteOrder
+from engine import in_moscow
+from engine.contracts import LEVEL_REASONS
 
 if TYPE_CHECKING:  # разрыв круга импортов: `history` знает про нас, мы про него — нет
     from backtest.history import HistoryRun
@@ -130,6 +132,12 @@ class _Facts:
     position_left_open: bool
     #: Первый и последний день сделок по Москве. Пусто — сделок не было.
     period: tuple[date, date] | None
+    #: Порядок обхода цен минутки; `None` — минутки прогону не подавались.
+    minute_order: MinuteOrder | None = None
+    bars: int = 0
+    bars_without_minutes: int = 0
+    #: Скользящий уровень без минуток: свеча крупнее порога (B-058).
+    coarse_bar: CoarseBar | None = None
 
 
 #: Ниже этой величины число печатается с десятой долей. Округление 46,7 ₽
@@ -215,11 +223,15 @@ def _facts_of(run: HistoryRun) -> _Facts:
             (deal.ruble_per_point for deal in run.deals), 1.0
         ),
         take_exits=sum(
-            1 for deal in run.deals if deal.exit_reason is ExitReason.TAKE_PROFIT
+            1 for deal in run.deals if deal.exit_reason in LEVEL_REASONS
         ),
         volume=max((deal.volume for deal in run.deals), default=0.0),
         position_left_open=run.position is not None,
         period=(days[0], days[-1]) if days else None,
+        minute_order=run.minute_order,
+        bars=run.bars,
+        bars_without_minutes=run.bars_without_minutes,
+        coarse_bar=run.coarse_bar,
     )
 
 
@@ -383,6 +395,78 @@ def _level_fills_on_a_touch(facts: _Facts) -> Assumption | None:
     )
 
 
+#: Порядок обхода словами — для строки допущения. Своя таблица, а не подпись
+#: окна: `backtest/` окна не импортирует (ARCHITECTURE.md §2).
+_MINUTE_ORDER_WORDS: dict[MinuteOrder, str] = {
+    MinuteOrder.NEAR_FIRST: (
+        "открытие, затем ближний к открытию экстремум, дальний и закрытие"
+    ),
+    MinuteOrder.ADVERSE_FIRST: (
+        "открытие, затем худшая для позиции цена, лучшая и закрытие"
+    ),
+}
+
+
+def _prices_inside_a_minute(facts: _Facts) -> Assumption | None:
+    """Внутри свечи уровни проверялись по минуткам в принятом порядке цен.
+
+    Бары, под которыми минуток не нашлось, названы числом в этой же строке:
+    такой бар сторожился по размаху, и скользящий уровень внутри него
+    не двигался. Молча посчитанный по размаху бар в отчёте неотличим
+    от посчитанного по минуткам (правило 13).
+    """
+    if facts.minute_order is None:
+        return None
+    order = _MINUTE_ORDER_WORDS[facts.minute_order]
+    bare = facts.bars_without_minutes
+    gaps = (
+        f" {_plural(bare, 'свеча', 'свечи', 'свечей')} из {facts.bars} — "
+        "без минуток: по ним уровни проверены по размаху свечи, "
+        "и скользящий уровень внутри них не двигался."
+        if bare else ""
+    )
+    return Assumption(
+        name="Порядок цен внутри минуты",
+        short=f"Внутри свечи цены минуток пройдены в порядке: {order}.{gaps}",
+        text=(
+            "Уровни тейка проверялись не по размаху пятиминутки, а по минуткам "
+            "под ней, отрезками между их ценами. Минутка хранит четыре цены, "
+            f"но не порядок, в котором они случились; принят такой: {order}. "
+            "Для неподвижного тейка порядок безразличен, для скользящего — "
+            "нет: вершина, пройденная до провала, подтягивает уровень, "
+            "и провал его задевает. Порядок меняется в настройках прогона."
+            + gaps
+        ),
+    )
+
+
+def _level_moves_on_the_close(facts: _Facts) -> Assumption | None:
+    """Скользящий уровень на крупной свече двигался только на её закрытии (B-058).
+
+    Минутки такой свече не подавались — свеча крупнее порога из настроек.
+    Молча это не остаётся (правило 13): отчёт по скользящему уровню
+    без минуток неотличим от отчёта по минуткам, а сделки у них разные.
+    """
+    coarse = facts.coarse_bar
+    if coarse is None:
+        return None
+    said = (
+        f"Свеча {coarse.bar_minutes} мин крупнее порога {coarse.limit_minutes} мин: "
+        "скользящий уровень в прогоне двигается только на закрытии свечи."
+    )
+    return Assumption(
+        name="Скользящий уровень без минуток",
+        short=said,
+        text=(
+            said + " Внутри свечи уровень сторожится по её размаху и не "
+            "подтягивается за ценой: вершина, пройденная внутри свечи, "
+            "сдвинет его лишь после закрытия. В бою уровень едет за каждой "
+            "ценой, поэтому сделки по скользящему уровню здесь расходятся "
+            "с боевыми. Порог меняется в настройках прогона."
+        ),
+    )
+
+
 def _volume_does_not_move_the_price(facts: _Facts) -> Assumption | None:
     """Заявка исполняется целиком и по одной цене на любом объёме."""
     if facts.volume <= 1:
@@ -475,6 +559,8 @@ _TABLE: tuple[Callable[[_Facts], Assumption | None], ...] = (
     _slippage_is_counted,
     _position_is_left_open,
     _level_fills_on_a_touch,
+    _prices_inside_a_minute,
+    _level_moves_on_the_close,
     _volume_does_not_move_the_price,
     _nothing_refused_and_nothing_stopped,
     _the_data_are_perfect,

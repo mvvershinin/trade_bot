@@ -574,6 +574,9 @@ async def sweep(
             grid_strategy().build(point.strategy),
             replace(point.engine, commission_per_side=costs.per_side),
             costs=costs,
+            # Минуток нет намеренно (З9 Ф5): сетка скользящий тейк не включает,
+            # а неподвижному порядок цен внутри бара безразличен — замер
+            # 03.10.2026 на MXU6: те же 282 сделки и деньги, время ×1,5.
         )
         trials.append(lay_out(point, run.deals, periods, halted=run.halted))
         if on_progress is not None:

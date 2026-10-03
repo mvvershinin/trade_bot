@@ -32,6 +32,7 @@ from datetime import date, datetime, time
 from typing import cast
 
 from app import convert
+from app.minutes import minute_plan
 from app.stitched import StitchRequest, load_pieces
 from backtest import HistoryRun
 from backtest.execution import Costs
@@ -149,6 +150,8 @@ def request_of(
     return StitchRequest(
         since=since, until=until, timeframe=timeframe,
         warmup_bars=warmup_of(values), asset=asset,
+        # Подавать ли минутки — правило B-058, одно с окном (`app/minutes.py`).
+        minute_order=minute_plan(values, timeframe).order,
     )
 
 
@@ -208,6 +211,15 @@ def as_history(stitched: StitchedRun, costs: Costs) -> HistoryRun:
         halted=stitched.halted,
         bars=sum(len(one.piece.body) for one in stitched.pieces),
         costs=costs,
+        # Порядок у кусков один — из того же набора окна (`request_of`).
+        # Бары без минуток — суммой по кускам: потерянный здесь счёт
+        # означал бы отчёт склейки, молчащий о свечах по размаху.
+        minute_order=next(
+            (one.run.minute_order for one in stitched.pieces
+             if one.run.minute_order is not None),
+            None,
+        ),
+        bars_without_minutes=sum(one.run.bars_without_minutes for one in stitched.pieces),
     )
 
 

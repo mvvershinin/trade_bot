@@ -649,6 +649,8 @@ async def score(
         grid_strategy().build(point.strategy),
         replace(point.engine, commission_per_side=ground.costs.per_side),
         costs=ground.costs,
+        # Минуток нет намеренно (З9 Ф5): основа — умолчания окна, рецепт
+        # скользящий тейк не включает, неподвижному минутки сделок не меняют.
     )
     trial = lay_out(point, run.deals, periods, halted=run.halted)
     return Scored(
@@ -813,6 +815,7 @@ async def legs_of(  # noqa: PLR0913 — шесть доводов: рецепт,
         run = await replay(
             inside, grid_strategy().build(point.strategy),
             replace(point.engine, commission_per_side=costs.per_side), costs=costs,
+            # Без минуток — по той же причине, что `score`.
         )
         made.append(Stretch(period=period, bars=inside, run=run))
     return tuple(made)

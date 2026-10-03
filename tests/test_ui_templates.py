@@ -891,8 +891,12 @@ def test_the_mode_does_not_break_the_match(tmp_path) -> None:
         session = store.open_journal_session(SessionRecord(
             origin=RunOrigin.BACKTEST, symbol=values.instrument,
             timeframe=values.timeframe, strategy="EMA-разворот",
+            # Числа программы — как пишет их прогон окна (`app/port.py`):
+            # порядок цен минутки с З9 Ф5 сличается, и снимок без него
+            # набору не засчитывается.
             settings=runs.settings_text(
-                engine, module, algorithm=convert.chosen_algorithm(values)
+                engine, module, algorithm=convert.chosen_algorithm(values),
+                program=runs.ProgramFields.of(values),
             ),
             note="MXU6, 5 минут: свечей 10, с 01.08.2026 10:05 по 02.08.2026 18:45 МСК.",
         ))

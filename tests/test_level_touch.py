@@ -46,6 +46,8 @@ import pytest
 
 from backtest import Costs, ExecutionModel, HistoryExecutor
 from engine import (
+    EngineSettings,
+    EngineState,
     ExitReason,
     Fill,
     LevelTouch,
@@ -54,6 +56,7 @@ from engine import (
     Position,
     Side,
     TakeProfit,
+    apply_fill,
 )
 from engine.contracts import FIELD_RULES
 from engine.pipeline import _arm_order
@@ -88,7 +91,12 @@ def run(model: ExecutionModel, *steps) -> list[list[Fill]]:
             if isinstance(step, OrderRequest):
                 await model.submit(step)
             else:
-                answers.append(list(await model.fills_at(step)))
+                answer = await model.fills_at(step)
+                fills = [item for item in answer if isinstance(item, Fill)]
+                assert len(fills) == len(answer), (
+                    f"без минуток модель отдала наблюдение цены: {answer}"
+                )
+                answers.append(fills)
 
     asyncio.run(scenario())
     return answers
@@ -244,7 +252,9 @@ def test_the_shadow_executor_guards_a_trailing_level_the_same_way() -> None:
     )
     assert away == [], "в наблюдении уровень позади рынка сработал на росте"
     assert [fill.price for fill in reached] == [99.0]
-    assert model.deals[-1].exit_reason is ExitReason.TAKE_PROFIT
+    assert model.deals[-1].exit_reason is ExitReason.TRAILING_TAKE, (
+        "сработал скользящий уровень, а сделка записана под чужой причиной"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -514,3 +524,62 @@ def test_every_optional_field_of_an_order_has_a_row_in_the_table() -> None:
     assert ruled - optional == set(), (
         f"в таблице правил названо несуществующее поле: {sorted(ruled - optional)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Журнал различает вид уровня (Г5, решение 0060 §2)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    ("trailing", "why", "other"),
+    [
+        (False, ExitReason.TAKE_PROFIT, ExitReason.TRAILING_TAKE),
+        (True, ExitReason.TRAILING_TAKE, ExitReason.TAKE_PROFIT),
+    ],
+    ids=["fixed", "trailing"],
+)
+def test_the_journal_names_the_kind_of_level_that_closed_the_position(
+    trailing: bool, why: ExitReason, other: ExitReason,
+) -> None:
+    """Сделка по уровню записана в журнал под видом этого уровня.
+
+    Путь целиком, как в бою: движок вооружает уровень (`_arm_order`), сделка
+    ссылается на заявку вооружения, разбор сделки пишет строку журнала.
+    Причину называет движок в заявке; разбор её переносит, а не выбирает.
+
+    Признак «вышли по уровню» при этом — по действию заявки: дата «стопа
+    после тейка» ставится для обоих видов уровня (путь Б, PROTOTYPE.md §5).
+    """
+    level = 99.0 if trailing else 100.5
+    held = holding(Side.LONG, level, trailing=trailing)
+    order = _arm_order(held, moment(10, 15), level)
+    assert order.exit_reason is why, "движок назвал в заявке не тот вид уровня"
+
+    outcome = apply_fill(
+        EngineState(position=held, pending=(order,)),
+        Fill(
+            action=OrderAction.CLOSE, side=Side.LONG, volume=1.0, price=level,
+            at=moment(10, 15), order_id=order.order_id,
+        ),
+        EngineSettings(),
+    )
+    said = outcome.journal[0].reason
+    assert why.label in said, f"в журнале не назван вид уровня «{why.label}»: {said}"
+    assert other.label not in said, f"журнал назвал чужой вид уровня: {said}"
+    assert outcome.state.take_profit_date == moment(10, 15).date()
+
+
+@pytest.mark.parametrize("why", [None, ExitReason.SIGNAL, ExitReason.WINDOW_END])
+def test_arming_a_level_names_only_the_kind_of_the_level(why: ExitReason | None) -> None:
+    """У вооружения причина обязательна и бывает только видом уровня.
+
+    Без причины исполнитель записал бы сделку по уровню под причиной,
+    которую додумал сам, — ровно то, от чего уводит решение 0008, пункт 4.
+    """
+    with pytest.raises(ValueError, match="причин"):
+        OrderRequest(
+            action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
+            submitted_at=moment(10, 15), reason="сторожим",
+            order_id="take:long:тест", price=100.5, touch=LevelTouch.RISE,
+            exit_reason=why,
+        )

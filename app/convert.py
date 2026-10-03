@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
-from backtest import Costs, Deal, HistoryRun, Pair, headline
+from backtest import Costs, Deal, HistoryRun, MinuteOrder, Pair, headline
 from engine import (
     DayMarks,
     DayRule,
@@ -94,6 +94,7 @@ from ui.models import (
     LinePoint,
     Marker,
     MarkerKind,
+    MinutePriceOrder,
     Mode,
     ReversalMoment,
     RunAssumption,
@@ -127,6 +128,8 @@ __all__ = [
     "check_demands",
     "strategy_title",
     "run_costs",
+    "minute_order_of",
+    "minute_bar_limit_of",
     "window_changes",
     "guard_changes",
     "all_changes",
@@ -1132,6 +1135,37 @@ def run_costs(values: Settings) -> Costs:
         ) from None
 
 
+#: Порядок цен минутки: окно → прогон. Таблица, а не `MinuteOrder(value.value)`:
+#: совпадение строк двух перечислений — случайность, и переименование одного
+#: из них сломало бы перевод молча. Здесь — громко, `KeyError` на новом члене.
+_MINUTE_ORDERS: dict[MinutePriceOrder, MinuteOrder] = {
+    MinutePriceOrder.NEAR_FIRST: MinuteOrder.NEAR_FIRST,
+    MinutePriceOrder.ADVERSE_FIRST: MinuteOrder.ADVERSE_FIRST,
+}
+
+
+def minute_order_of(values: Settings) -> MinuteOrder:
+    """Настройки окна → порядок обхода цен минутки для прогона по истории.
+
+    Допущение прогона рядом с проскальзыванием (`run_costs`), а не настройка
+    движка: минутки видит только исполнитель тестера. Минутки для `replay`
+    собирает `app/minutes.py` с порядком отсюда, а не из умолчания
+    `Minutes.order`, иначе выбор в окне не значит ничего.
+    """
+    return _MINUTE_ORDERS[values.minute_order]
+
+
+def minute_bar_limit_of(values: Settings) -> int:
+    """Настройки окна → наибольшая свеча (в минутах) для проверки по минуткам.
+
+    Допущение прогона, как и порядок цен минутки: минутки подаются в прогон,
+    только если включён скользящий уровень и свеча не крупнее этого числа;
+    иначе уровень двигается только на закрытии свечи (`B-058`). Решает это
+    тот, кто собирает прогон; здесь только перевод выбора окна в минуты.
+    """
+    return values.minute_bar_limit.minutes
+
+
 # ---------------------------------------------------------------------------
 # Строки журнала об изменении настроек, о которых не расскажет никто другой
 # ---------------------------------------------------------------------------
@@ -1193,6 +1227,12 @@ def _as_switch(value: object) -> str:
     return "включён" if value else "выключен"
 
 
+def _as_label(value: object) -> str:
+    """Выбор из списка — той же подписью, что в окне, а не значением из файла."""
+    label = getattr(value, "label", None)
+    return label if isinstance(label, str) else str(value)
+
+
 def _as_algorithm(value: object) -> str:
     """Имя алгоритма латиницей → его название. Незнакомое — как есть, и вслух.
 
@@ -1240,6 +1280,11 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # разные основания доверять деньгам отчёта.
     "ruble_per_point_source": _Told("Стоимость пункта, источник", _as_source),
     "slippage_steps": _Told("Проскальзывание", _as_steps),
+    # Допущение прогона, движок его не знает — рассказать больше некому.
+    "minute_order": _Told("Порядок цен внутри минуты", _as_label),
+    # Тоже допущение прогона: на свечах крупнее порога скользящий уровень
+    # в прогоне двигается только на закрытии свечи (`B-058`).
+    "minute_bar_limit": _Told("Наибольшая свеча для проверки по минуткам", _as_label),
     "log_directory": _Told("Каталог технического журнала", _as_text),
     # ⚠️ Выключатель фильтра называет **себя**, а числа фильтра называет
     # торговый модуль (`_TOLD_BY_STRATEGY`) — и называет **действующие**:

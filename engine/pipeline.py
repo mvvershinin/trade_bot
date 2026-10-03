@@ -108,6 +108,7 @@ from engine.contracts import (
     OrderRequest,
     Position,
     PositionState,
+    PriceSeen,
     Side,
     Step,
 )
@@ -130,6 +131,7 @@ __all__ = [
     "after_refused_cancel",
     "after_refused_exit",
     "apply_fill",
+    "apply_price",
     "exit_signal",
     "money",
     "order_words",
@@ -289,10 +291,11 @@ class Outcome:
 
 @dataclass(frozen=True, slots=True)
 class FillOutcome:
-    """Что изменилось от сообщения исполнителя о сделке.
+    """Что изменилось от сообщения исполнителя: о сделке или о цене внутри бара.
 
-    `orders` — заявки, **рождённые сделкой**. Сегодня это ровно одно:
-    вооружение тейка сразу при открытии позиции. Уровень считается от цены
+    `orders` — заявки, **рождённые сообщением**. Это ровно одно: вооружение
+    тейка — сразу при открытии позиции (`apply_fill`) или при сдвиге уровня
+    по наблюдённой цене (`apply_price`). Уровень считается от цены
     входа, а цену входа назначает исполнитель — значит раньше сделки его
     не знает никто.
 
@@ -837,6 +840,105 @@ def apply_fill(
     return _closed(state, fill, order, pending, settings)
 
 
+def take_managed(state: EngineState, settings: EngineSettings) -> bool:
+    """Робот ведёт сторожимый уровень позиции: вправе двигать и вооружать его.
+
+    Одна проверка на два места — шаг 5 на закрытии свечи
+    (`_rearm_take_profit`) и наблюдение цены внутри бара (`apply_price`).
+    Две копии условия однажды разошлись: шаг 5 режим соблюдал, наблюдение —
+    нет, и выключенный робот вооружал уровень (risk 2026-10-03-1429 №1).
+
+    Здесь только условия с исходом «не вооружать». Побочные действия шага 5
+    (счёт свечей ожидания выхода, остановка по отказам выхода) остаются
+    в шаге 5, а запрет после первого же отказа выхода — в `apply_price`:
+    он намеренно строже.
+
+    * режим «Выключен» — робот позицией не управляет. На закрытии это шаг 1,
+      он выходит раньше шага 5; «Только закрытие» и «только лонг/шорт»
+      до шага 5 доходят, и тейк в них ведётся;
+    * позиции нет — вести нечего;
+    * позиция закрывается — её тейк снят заявкой на выход (PROTOTYPE.md §5).
+    """
+    if settings.mode is Mode.OFF:
+        return False
+    position = state.position
+    return position is not None and position.is_open
+
+
+def apply_price(
+    state: EngineState, seen: PriceSeen, settings: EngineSettings
+) -> FillOutcome:
+    """Исполнитель сообщил цену внутри бара. Чистая функция, как `apply_fill`.
+
+    Уровень считается **той же арифметикой**, что на закрытии свечи
+    (`TakeProfit.advance`): второй копии правил скользящего тейка нет,
+    и запрет ехать назад, порог включения и шаг подтяжки действуют здесь
+    те же самые. Включение скользящего тейка внутри бара идёт тем же путём.
+
+    Вооружение подаётся, только если сошлись **все** условия — цепочка,
+    где каждое звено отсекает свой случай:
+
+    * робот управляет тейком (`take_managed`) — **та же проверка, что у
+      шага 5**, одна на оба места: режим не «Выключен» и позиция есть
+      и открыта. Закрывающаяся позиция уровня не получает: её тейк уже снят
+      заявкой на выход. ⚠️ Условие шага 5, которого здесь нет: шаг 2
+      (`skip_bar` — прогрев и повтор свечи). Обмен идёт до разбора свечи,
+      решения модуля по ней ещё нет, а состояния прогрева модуль наружу
+      не отдаёт (`BACKLOG.md`);
+    * путь выхода у позиции не сломан (`exit_blocked_bars == 0`). Счётчик
+      растёт на отказе в снятии и в заявке на выход. Две ветки, обе против
+      вооружения: снятие прошло, а выход отклонён (или «нет такой заявки») —
+      уровень погашен ради выхода, и сторож по тику встал бы под заявку
+      на выход, которую движок повторит на закрытии; снятие отклонено
+      как «уровень уже задет» — сторож жив и вот-вот станет сделкой,
+      и двигать его значит менять заявку, которая уже исполняется.
+      ⚠️ Счётчик сбрасывают только выход, смена позиции и её исчезновение:
+      после одного отказа подтяжка внутри бара выключена до конца позиции,
+      шаг 5 на закрытиях продолжает её двигать (`D-140`);
+    * **лучшая цена обновилась**. Неподвижный тейк вершины не имеет вовсе,
+      и это звено держит вторую стену: неподвижный тейк наблюдений не читает
+      даже тогда, когда его уровень погашен отказом, — иначе каждое
+      наблюдение подавало бы вооружение заново;
+    * **уровень сдвинулся**. Шаг подтяжки и запрет ехать назад срабатывают
+      внутри `advance`, а здесь отсекается повтор того же уровня.
+
+    Вершина ложится в состояние при любом ответе исполнителя: она факт
+    истории цен, как и на шаге 5. Уровень ставит принятая заявка (`_after_arm`).
+
+    ⚠️ Время наблюдения идёт в строку журнала и в момент подачи заявки
+    вооружения — и никуда больше. Дату «стопа после тейка», деньги дня
+    и окно оно не трогает: их двигают сделки и закрытия свечей.
+    """
+    position = state.position
+    # ⚠️ Проверка ДО записи вершины, а не только до вооружения: шаг 1 при
+    # «Выключен» выходит раньше шага 5, и вершина на закрытии не движется.
+    # Запомни её здесь — после включения уровень прыгнул бы от цены,
+    # увиденной у выключенного робота, чего шаг 5 не сделал бы никогда.
+    if position is None or not take_managed(state, settings) or state.exit_blocked_bars:
+        return FillOutcome(state)
+    was = position.take.level
+    plan = position.take.advance(
+        position.entry_price, position.side_sign, seen.price
+    )
+    if plan.peak == position.take.peak:
+        return FillOutcome(state)
+    position = replace(position, take=replace(position.take, peak=plan.peak))
+    state = replace(state, position=position)
+    if plan.level is None or plan.level == was:
+        return FillOutcome(state)
+    order = _arm_order(position, seen.at, plan.level)
+    event, reason, importance = _take_event(
+        position, settings, level=plan.level, previous=was
+    )
+    entry = JournalEntry(
+        at=seen.at,
+        event=event,
+        reason=f"{reason}. Сдвиг внутри бара — по цене {_price(seen.price)}",
+        level=importance,
+    )
+    return FillOutcome(state, ((order.order_id, entry),), (order,))
+
+
 def _opened(
     state: EngineState,
     fill: Fill,
@@ -944,8 +1046,11 @@ def _closed(
             "расхождение разбирается сверкой позиции"
         ))
 
+    # Признак «вышли по уровню» — по действию заявки, а не по причине: на нём
+    # путь Б «стопа после тейка». Причина — из заявки, вид уровня назван
+    # в ней движком при вооружении (`_LEVEL_REASON`).
     by_take = order.action is OrderAction.ARM_TAKE_PROFIT
-    reason = ExitReason.TAKE_PROFIT if by_take else order.exit_reason
+    reason = order.exit_reason
     points = (fill.price - position.entry_price) * position.side_sign * position.volume
     # ⚠️ Оба счётчика ожидания обнуляются вместе с позицией. Счётчик,
     # переживающий смену позиции, копит отказы от запуска и однажды
@@ -1119,6 +1224,17 @@ _TOUCH_SIDE: dict[tuple[bool, Side], LevelTouch] = {
     (True, Side.SHORT): LevelTouch.RISE,
 }
 
+#: Причина выхода по уровню — по виду уровня (`position.take.trailing`).
+#:
+#: ⚠️ **Единственный источник этой причины**, как `_TOUCH_SIDE` — стороны
+#: касания: движок называет её в заявке вооружения, разбор сделки и модель
+#: исполнения переносят её из заявки. Вывод по `trailing` где-то ещё был бы
+#: второй копией таблицы.
+_LEVEL_REASON: dict[bool, ExitReason] = {
+    False: ExitReason.TAKE_PROFIT,
+    True: ExitReason.TRAILING_TAKE,
+}
+
 
 def _arm_order(position: Position, at: datetime, level: float) -> OrderRequest:
     """Заявка «сторожи уровень X». Уровень посчитан вызывающим.
@@ -1144,6 +1260,7 @@ def _arm_order(position: Position, at: datetime, level: float) -> OrderRequest:
         order_id=take_order_id(position),
         price=level,
         touch=_TOUCH_SIDE[(position.take.trailing, position.side)],
+        exit_reason=_LEVEL_REASON[position.take.trailing],
     )
 
 
@@ -1226,17 +1343,21 @@ def _rearm_take_profit(
         )
         writer.note("Выход не удаётся", blocked, JournalLevel.ERROR)
         return state, state, f"Выход не удаётся. {blocked}"
+    # Условие шага 5 и наблюдения внутри бара — одно (`take_managed`).
+    # Недостижимо сегодня: «Выключен» вышел на шаге 1, пустая и закрывающаяся
+    # позиция — ветками выше. Не ведём — ни вершины, ни вооружения.
+    managed = take_managed(state, settings)
     was = position.take.level
     plan = position.take.advance(
         position.entry_price, position.side_sign, float(bar.close)  # type: ignore[attr-defined]
     )
-    if plan.peak != position.take.peak:
+    if managed and plan.peak != position.take.peak:
         # В позицию кладётся только вершина: она факт истории цен. Уровень
         # появится, когда вооружение примут (`_after_arm`).
         position = replace(position, take=replace(position.take, peak=plan.peak))
         state = replace(state, position=position)
     refused = state
-    if plan.level is None:
+    if not managed or plan.level is None:
         return state, refused, ""
     order = _arm_order(position, closes_at, plan.level)
     state = _submitted(orders, state, order)

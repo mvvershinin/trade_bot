@@ -76,6 +76,7 @@ def arm(
     at: datetime = DECIDED_AT,
     *,
     touch: LevelTouch = LevelTouch.RISE,
+    why: ExitReason = ExitReason.TAKE_PROFIT,
 ) -> OrderRequest:
     """Вооружение уровня. Имя **устойчиво**: оно не зависит от момента подачи.
 
@@ -93,6 +94,7 @@ def arm(
         action=OrderAction.ARM_TAKE_PROFIT, side=side, volume=1.0,
         submitted_at=at, reason="сторожим уровень",
         order_id=f"take:{side.value}", price=level, touch=touch,
+        exit_reason=why,
     )
 
 
@@ -101,6 +103,10 @@ def run(model: ExecutionModel, *steps: OrderRequest | MarketCandle) -> list[list
 
     Возвращает список ответов порта на каждую показанную свечу — по одному
     на свечу, в том же порядке.
+
+    ⚠️ Модель без минуток наблюдений цены не отдаёт никогда — иначе поведение
+    без минуток уже не «как раньше». Проверяется здесь, на каждом ответе
+    каждого сценария этого файла, а не одним тестом.
     """
     answers: list[list[Fill]] = []
 
@@ -109,7 +115,12 @@ def run(model: ExecutionModel, *steps: OrderRequest | MarketCandle) -> list[list
             if isinstance(step, OrderRequest):
                 await model.submit(step)
             else:
-                answers.append(list(await model.fills_at(step)))
+                answer = await model.fills_at(step)
+                fills = [item for item in answer if isinstance(item, Fill)]
+                assert len(fills) == len(answer), (
+                    f"без минуток модель отдала наблюдение цены: {answer}"
+                )
+                answers.append(fills)
 
     asyncio.run(scenario())
     return answers

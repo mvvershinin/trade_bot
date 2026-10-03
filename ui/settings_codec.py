@@ -219,6 +219,11 @@ def _enum_codec(kind: type[enum.Enum]) -> Codec:
 
     def load(raw: object) -> enum.Enum:
         try:
+            # `true` в файле для Python равно единице, и перечисление
+            # с числовыми значениями (`MinuteBarLimit`) молча приняло бы его
+            # за «1 минуту». Отказ тем же текстом, что у любого чужого значения.
+            if isinstance(raw, bool):
+                raise ValueError(raw)
             return kind(raw)
         except ValueError:
             known = ", ".join(str(item.value) for item in kind)

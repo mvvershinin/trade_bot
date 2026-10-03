@@ -877,14 +877,26 @@ def test_a_run_recorded_without_program_numbers_still_belongs_to_its_set(
 
     Мутация, обязанная ронять проверку: убрать любое из двух чисел
     программы из `_UNCONTROLLED_TITLES`.
+
+    Порядок цен минутки в записи **есть**: с З9 Ф5 он сделки меняет
+    и сличается (`test_a_run_with_another_minute_order_is_not_credited…`),
+    так что прогон без него своим набору не засчитывается — и это верно.
     """
     database = tmp_path / "candles.sqlite3"
     values = Settings()
     engine = convert.engine_settings(values, WindowMode.REVERSE)
-    older = settings_text(
+    whole = settings_text(
         engine, convert.strategy_settings(values),
         algorithm=convert.chosen_algorithm(values),
+        program=runs.ProgramFields.of(values),
     )
+    dropped = (
+        "Остановка перед экспирацией, дней:", "Глубина загрузки истории, дней:",
+    )
+    older = "\n".join(
+        line for line in whole.splitlines() if not line.strip().startswith(dropped)
+    )
+    assert older != whole, "чисел программы в снимке не нашлось — вырезать было нечего"
     with CandleStore(database) as store:
         store.open_journal_session(SessionRecord(
             origin=RunOrigin.BACKTEST, symbol=convert.instrument_of(values.instrument),
@@ -922,4 +934,100 @@ def test_a_run_with_another_expiry_halt_is_credited_to_the_set(tmp_path) -> None
     assert len(found.runs[0]) == 1, (
         "прогон с остановкой за три дня не засчитан набору с остановкой "
         f"за день, хотя сделки у них одни: {found.trouble!r}"
+    )
+
+
+def test_the_run_snapshot_names_the_minute_order() -> None:
+    """Стережёт: порядок цен минутки записан в снимок прогона — подписью окна.
+
+    Два прогона со скользящим уровнем при разном порядке дадут разные
+    сделки (с Ф5 З9), и по записи они обязаны различаться. Что старый снимок
+    без этой строки набору **не** засчитывается (он сделан по размаху бара),
+    стережёт `test_a_run_with_another_minute_order_is_not_credited_to_the_set`.
+    """
+    from ui.models import MinutePriceOrder
+
+    marks = snapshot_marks(
+        runs.snapshot_of(Settings(minute_order=MinutePriceOrder.ADVERSE_FIRST))
+    )
+    assert marks.get("Порядок цен внутри минуты") == (
+        MinutePriceOrder.ADVERSE_FIRST.label
+    ), marks
+
+
+def test_a_run_with_another_minute_order_is_not_credited_to_the_set(tmp_path) -> None:
+    """Стережёт: прогон при другом порядке цен минутки — не прогон этого набора.
+
+    С З9 Ф5 прогон окна идёт по минуткам, и скользящий уровень внутри бара
+    от порядка зависит: при одном порядке вершина подтянула уровень раньше
+    провала, при другом — нет. Засчитать шаблону прогон с чужим порядком
+    значит приписать ему чужие деньги. Прогон без строки порядка (записан
+    до минуток, по размаху бара) тоже не его.
+
+    Мутация, обязанная ронять проверку: вернуть `minute_order`
+    в `_UNCONTROLLED_TITLES`.
+    """
+    from ui.models import MinutePriceOrder
+
+    database = tmp_path / "candles.sqlite3"
+    values = Settings(minute_order=MinutePriceOrder.NEAR_FIRST)
+    other = values.replace(minute_order=MinutePriceOrder.ADVERSE_FIRST)
+    with CandleStore(database) as store:
+        for made in (values, other):
+            store.open_journal_session(SessionRecord(
+                origin=RunOrigin.BACKTEST,
+                symbol=convert.instrument_of(values.instrument),
+                timeframe=values.timeframe, strategy="EMA-разворот",
+                settings=runs.snapshot_of(made), note="прогон прерван",
+            ))
+    found = runs.matching_runs(database, [values, other])
+    assert [len(one) for one in found.runs] == [1, 1], (
+        "прогон при другом порядке цен минутки засчитан набору, хотя сделки "
+        f"у них разные: {[len(one) for one in found.runs]} {found.trouble!r}"
+    )
+
+
+def test_the_run_snapshot_names_the_minute_bar_limit() -> None:
+    """Стережёт: порог «наибольшая свеча для проверки по минуткам» записан в снимок.
+
+    Подписью окна и значением окна: два прогона при разном пороге на одной
+    свече дают разные сделки (`B-058`) и по записи обязаны различаться.
+    """
+    from ui.models import MinuteBarLimit
+
+    marks = snapshot_marks(
+        runs.snapshot_of(Settings(minute_bar_limit=MinuteBarLimit.FIFTEEN))
+    )
+    assert marks.get("Наибольшая свеча для проверки по минуткам") == "15 минут", marks
+
+
+def test_a_run_with_another_minute_bar_limit_is_not_credited_to_the_set(
+    tmp_path,
+) -> None:
+    """Стережёт: прогон при другом пороге минуток — не прогон этого набора.
+
+    Выше порога скользящий уровень в прогоне двигается только на закрытии
+    свечи, ниже — по минуткам; сделки разные. Засчитать шаблону прогон
+    с чужим порогом — приписать ему чужие деньги.
+
+    Мутация, обязанная ронять проверку: внести `minute_bar_limit`
+    в `_UNCONTROLLED_TITLES`.
+    """
+    from ui.models import MinuteBarLimit
+
+    database = tmp_path / "candles.sqlite3"
+    values = Settings(minute_bar_limit=MinuteBarLimit.FIVE)
+    other = values.replace(minute_bar_limit=MinuteBarLimit.FIFTEEN)
+    with CandleStore(database) as store:
+        for made in (values, other):
+            store.open_journal_session(SessionRecord(
+                origin=RunOrigin.BACKTEST,
+                symbol=convert.instrument_of(values.instrument),
+                timeframe=values.timeframe, strategy="EMA-разворот",
+                settings=runs.snapshot_of(made), note="прогон прерван",
+            ))
+    found = runs.matching_runs(database, [values, other])
+    assert [len(one) for one in found.runs] == [1, 1], (
+        "прогон при другом пороге минуток засчитан набору, хотя сделки "
+        f"у них разные: {[len(one) for one in found.runs]} {found.trouble!r}"
     )

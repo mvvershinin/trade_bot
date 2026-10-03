@@ -418,7 +418,9 @@ def test_an_executor_that_never_stops_talking_halts_the_robot() -> None:
     Предохранитель против неисправной реализации: без него цикл свечей завис
     бы молча — робот не торгует, причины нет нигде. Он же ловит порт,
     сливающий очередь по одной сделке за круг: контракт требует отдавать
-    за вызов **всё накопленное**.
+    за вызов **все сделки**. Наблюдения цены идут по одному на ответ
+    и потому добавляют круги — порог выбран с запасом и на них
+    (`engine/runner.py::_MAX_ROUNDS`).
 
     ⚠️ Сделка здесь **сопоставляется** со своей заявкой и отвергается
     по содержанию — сторона другая. Такая сделка заявку в полёте не гасит
@@ -1461,6 +1463,7 @@ def test_the_take_profit_date_is_taken_from_the_time_of_the_deal() -> None:
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
         order_id="take:long:тест", price=level, touch=LevelTouch.RISE,
+        exit_reason=ExitReason.TAKE_PROFIT,
     )
     engine = Engine(
         ScriptedStrategy([]), WORKING,
@@ -2213,6 +2216,7 @@ def test_the_words_for_an_order_name_all_four_actions() -> None:
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим",
         order_id=take_order_id(guarded), price=211_050.0, touch=LevelTouch.RISE,
+        exit_reason=ExitReason.TAKE_PROFIT,
     )
     cancel = OrderRequest(
         action=OrderAction.CANCEL_TAKE_PROFIT, side=Side.LONG, volume=1.0,
@@ -2464,19 +2468,24 @@ def test_an_executor_that_never_reports_a_take_produces_no_take_exits() -> None:
     assert not [deal for deal in executor.deals if deal.exit_reason == "take"]
 
 
-def test_the_behavioural_guard_would_notice_a_cheating_engine() -> None:
-    """Тест на тест: подделанный выход обязан сработать все три проверки.
+@pytest.mark.parametrize("why", [ExitReason.TAKE_PROFIT, ExitReason.TRAILING_TAKE])
+def test_the_behavioural_guard_would_notice_a_cheating_engine(why: ExitReason) -> None:
+    """Тест на тест: подделанный выход по уровню обязан быть пойман.
 
     Первая редакция сторожа была зелёной на нарушающей реализации, и заметить
     это можно было только так — прогнав через те же проверки заведомо
     неправильный результат.
+
+    С тех пор, как причина выхода по уровню стала столбцом `FIELD_RULES`,
+    подделка — рыночный выход с причиной «уровень» — не собирается вовсе:
+    проверка 1 сторожа выше ловит её уже на конструкторе заявки.
     """
-    cheating = OrderRequest(
-        action=OrderAction.CLOSE, side=Side.LONG, volume=1.0,
-        submitted_at=bar(*INSIDE).closes_at, reason="закрытие по уровню",
-        order_id="close:long:подделка", exit_reason=ExitReason.TAKE_PROFIT,
-    )
-    assert cheating.exit_reason is ExitReason.TAKE_PROFIT
+    with pytest.raises(ValueError, match="причина выхода"):
+        OrderRequest(
+            action=OrderAction.CLOSE, side=Side.LONG, volume=1.0,
+            submitted_at=bar(*INSIDE).closes_at, reason="закрытие по уровню",
+            order_id="close:long:подделка", exit_reason=why,
+        )
     assert "тейк-профит" in ExitReason.TAKE_PROFIT.label.lower()
     level = fixed_level(PRICE, 1, 0.5)
     assert level is not None and level != PRICE, (

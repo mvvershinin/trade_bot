@@ -134,7 +134,8 @@ def test_a_closed_position_becomes_a_deal_with_both_legs() -> None:
     assert deal.net == pytest.approx(72.0)
 
 
-def test_a_triggered_level_is_written_down_as_a_calculation_too() -> None:
+@pytest.mark.parametrize("why", [ExitReason.TAKE_PROFIT, ExitReason.TRAILING_TAKE])
+def test_a_triggered_level_is_written_down_as_a_calculation_too(why: ExitReason) -> None:
     """Где робот собирался выйти по тейку — отдельная строка слоя «прогноз».
 
     Заявка вооружения рождается из сделки открытия и до вызывающего не доходит:
@@ -152,7 +153,7 @@ def test_a_triggered_level_is_written_down_as_a_calculation_too() -> None:
         await executor.fills_at(replace(candle(10, 10), open=100.0))
         await executor.submit(_order(
             OrderAction.ARM_TAKE_PROFIT, Side.LONG, placed_at,
-            price=100.5, touch=LevelTouch.RISE,
+            price=100.5, touch=LevelTouch.RISE, exit_reason=why,
         ))
         return await executor.fills_at(
             replace(candle(10, 15), open=100.2, high=101.0, low=99.0, close=100.2)
@@ -160,9 +161,15 @@ def test_a_triggered_level_is_written_down_as_a_calculation_too() -> None:
 
     fills = asyncio.run(go())
     assert [fill.price for fill in fills] == [100.5]
-    assert executor.deals[-1].exit_reason is ExitReason.TAKE_PROFIT
+    # Причина — та, что назвал движок в заявке вооружения, и в сделке,
+    # и в расчёте. Исполнитель вида уровня не знает и не додумывает его.
+    assert executor.deals[-1].exit_reason is why, (
+        "причина сделки по уровню не взята из заявки вооружения"
+    )
     plan = executor.level_plans[-1]
-    assert plan.price == 100.5 and plan.exit_reason is ExitReason.TAKE_PROFIT
+    assert plan.price == 100.5 and plan.exit_reason is why, (
+        "причина расчёта по уровню не взята из заявки вооружения"
+    )
     assert plan.decided_at == datetime(2026, 6, 19, 10, 20, tzinfo=MSK), (
         "у расчёта время — закрытие бара, а не его начало"
     )

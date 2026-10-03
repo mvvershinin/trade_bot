@@ -89,7 +89,7 @@ from strategies import StrategySettings, registry
 from ui import backend
 from ui.backend import RunStats, TemplateRun
 from ui.formatting import fmt_datetime, fmt_money, fmt_share
-from ui.models import Mode, Settings
+from ui.models import MinuteBarLimit, MinutePriceOrder, Mode, Settings
 
 __all__ = [
     "RUNS_KEPT",
@@ -284,6 +284,9 @@ class ProgramFields:
     глубина загрузки — сколько истории программа держала в базе. Оба числа
     пишутся для человека: сделок прогона тестера ни одно не меняет, и при
     сличении набора с прогоном оба пропускаются (`_UNCONTROLLED_TITLES`).
+    Третье и четвёртое поля — порядок цен минутки и наибольшая свеча для
+    проверки по минуткам — сделки прогона меняют (минутки поданы в `replay`
+    с Ф5 задачи З9, `B-058`) и в сличении участвуют.
 
     Поля перечисляются обходом (`_block`), подписи — `_PROGRAM_TITLES`:
     новое поле попадёт в снимок само, а тест держит, что у каждого есть
@@ -292,6 +295,15 @@ class ProgramFields:
 
     expiry_halt_days: int
     history_depth_days: int
+    #: Порядок цен минутки — допущение прогона по истории. ⚠️ Единственное
+    #: поле здесь, которое меняет сделки: прогон окна идёт по минуткам
+    #: (`app/minutes.py`), и скользящий уровень внутри бара от порядка
+    #: зависит. Поэтому в сличении набора с прогоном оно участвует.
+    minute_order: MinutePriceOrder = MinutePriceOrder.NEAR_FIRST
+    #: Наибольшая свеча для проверки по минуткам (`B-058`). Сделки меняет:
+    #: выше порога скользящий уровень двигается только на закрытии свечи.
+    #: Поэтому, как и порядок, в сличении участвует.
+    minute_bar_limit: MinuteBarLimit = MinuteBarLimit.FIVE
 
     @classmethod
     def of(cls, values: Settings) -> ProgramFields:
@@ -306,6 +318,8 @@ class ProgramFields:
 _PROGRAM_TITLES: Mapping[str, str] = {
     "expiry_halt_days": "Остановка перед экспирацией, дней",
     "history_depth_days": "Глубина загрузки истории, дней",
+    "minute_order": "Порядок цен внутри минуты",
+    "minute_bar_limit": "Наибольшая свеча для проверки по минуткам",
 }
 
 
@@ -621,6 +635,12 @@ _UNCONTROLLED_TITLES: frozenset[str] = frozenset(
         # по ней — значит отнять у шаблона его прогоны за то, что в окне
         # стоит другое число дней.
         "expiry_halt_days",
+        # ⚠️ Порядка цен минутки здесь нет намеренно (Ф5 задачи З9): прогон
+        # окна идёт по минуткам, и сделки от порядка зависят. Пропущенный
+        # здесь, он молча засчитал бы шаблону прогоны при другом порядке.
+        # Прежние прогоны (по размаху бара, без подписи) шаблону
+        # не засчитываются — и это верно, они сделаны иначе. То же про
+        # наибольшую свечу для проверки по минуткам (`B-058`).
     )
 )
 

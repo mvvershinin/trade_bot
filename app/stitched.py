@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
 from app import convert
+from app.minutes import minute_plan, minutes_between
+from backtest import MinuteOrder
 from backtest.stitched import Piece, StitchedRun, replay_pieces
 from engine import EngineSettings
 from market.candles import MSK, Candle, Timeframe
@@ -47,6 +49,10 @@ class StitchRequest:
     #: Пусто — не назван, и нарезка отказывает вслух: взять «любую» цепочку
     #: таблицы значило бы прогнать RIZ6 кусками MX.
     asset: str = ""
+    #: Порядок обхода цен минутки. Задан — каждый кусок получает минутки
+    #: **своего** контракта (`Piece.minutes`), и уровни внутри бара
+    #: проверяются по ним; `None` — по размаху бара, как до минуток.
+    minute_order: MinuteOrder | None = None
 
 
 def _moment(day: date) -> datetime:
@@ -100,9 +106,23 @@ def load_pieces(
             until=_moment(leg.until + timedelta(days=1)),
             drop_unsettled=True,
         )
+        # Минутки — по границам куска, а не по прочитанным барам: тело
+        # последнего куска главное окно заменяет своими барами
+        # (`stitched_view.plan`), и они обязаны лечь под те же минутки.
+        # Начало — с первого бара прогрева: иначе прогрев целиком ушёл бы
+        # в `bars_without_minutes`.
+        minutes = None
+        if request.minute_order is not None:
+            minutes = minutes_between(
+                store, leg.symbol,
+                warmup[0].time if warmup else _moment(leg.since),
+                _moment(leg.until + timedelta(days=1)),
+                request.minute_order,
+            )
         made.append(Piece(
             symbol=leg.symbol, since=leg.since, until=leg.until,
             warmup=warmup, body=tuple(body), warmup_wanted=wanted,
+            minutes=minutes,
         ))
     notes = [
         (
@@ -129,11 +149,13 @@ async def run_stitched(
     """
     module = convert.strategy_settings(values)
     algorithm = convert.chosen_algorithm(values)
+    timeframe = convert.timeframe_of(values.timeframe)
     request = StitchRequest(
         since=since, until=until,
-        timeframe=convert.timeframe_of(values.timeframe),
+        timeframe=timeframe,
         warmup_bars=values.average_period,
         asset=asset_of(values.instrument.strip()),
+        minute_order=minute_plan(values, timeframe).order,
     )
     made, notes = load_pieces(store, request)
     return await replay_pieces(

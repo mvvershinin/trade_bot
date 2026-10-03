@@ -81,7 +81,7 @@ from backtest import Costs, Tariff, replay
 from backtest.stitched import Piece, replay_pieces
 from engine import AccountFunds, Engine, EngineSettings, Mode, TradingWindow
 from strategies import EmaReverse, EmaReverseSettings
-from engine import Fill, MarketCandle, OrderAction, OrderRequest
+from engine import Fill, MarketCandle, OrderAction, OrderRequest, PriceSeen
 from tests.engine_helpers import MSK, FakeCandle, FakeTimeframe, NextOpenExecutor
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -276,9 +276,11 @@ class CountingGuards(NextOpenExecutor):
         )
         await super().submit(order)
 
-    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill]:
+    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen]:
         fills = await super().fills_at(candle)
         for fill in fills:
+            if not isinstance(fill, Fill):
+                continue  # наблюдение цены: живых заявок не меняет
             self.live.pop(fill.order_id, None)
             if fill.action is OrderAction.CLOSE and self.live:
                 raise AssertionError(

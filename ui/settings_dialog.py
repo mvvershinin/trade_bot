@@ -77,6 +77,8 @@ from ui.models import (
     AlgorithmOption,
     AverageKind,
     ContractNotice,
+    MinuteBarLimit,
+    MinutePriceOrder,
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
@@ -225,7 +227,16 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     # ("free_funds_reserve_pct", "Деньги", "free_funds_reserve"),
     ("commission_per_side_rub", "Деньги", "commission"),
     ("slippage_steps", "Деньги", "slippage_steps"),
+    ("minute_order", "Деньги", "minute_order"),
+    ("minute_bar_limit", "Деньги", "minute_bar_limit"),
     ("log_directory", "Программа", "log_directory"),
+)
+
+#: Поля-списки: имя поля `Settings` равно имени списка в окне. Одна таблица
+#: на показ (`_show_choices`) и на сбор (`values`).
+_CHOICES: tuple[str, ...] = (
+    "average_kind", "reversal_moment", "after_take_profit",
+    "on_price_equals_average", "minute_order", "minute_bar_limit",
 )
 
 
@@ -713,6 +724,13 @@ class SettingsDialog(QDialog):
         self.slippage_steps = _decimal(0.0, 20.0, 0.5, "")
         self.slippage_steps.setSpecialValueText("0 — не учитывать")
         self.slippage_steps.valueChanged.connect(self._sync_costs)
+
+        # Порядок цен минутки — допущение прогона по истории, рядом
+        # с проскальзыванием: оба говорят, насколько прогон похож на счёт.
+        self.minute_order = _choice(MinutePriceOrder)
+        # Наибольшая свеча для проверки по минуткам — тоже допущение прогона
+        # (`B-058`): выше порога уровень в прогоне двигается на закрытии свечи.
+        self.minute_bar_limit = _choice(MinuteBarLimit)
 
         # Рублей в пункте цены. Пять знаков после запятой не с потолка:
         # у фьючерса на РТС величина 1,73774, и два знака округлили бы её
@@ -1225,6 +1243,31 @@ class SettingsDialog(QDialog):
              "дают +9 908 ₽, один шаг +4 394 ₽, два шага −153 ₽. Умолчание "
              "ноль: так считает ваш нынешний робот, и только на нуле сходится "
              "сверка с ним."),
+            ("Порядок цен внутри минуты", self.minute_order,
+             "Только для прогона по истории, живого робота не касается. "
+             "Минутная свеча помнит четыре цены — открытие, максимум, минимум "
+             "и закрытие, — но не помнит, в каком порядке они были, и прогон "
+             "вынужден это предположить. Для неподвижной цели прибыли порядок "
+             "неважен, для скользящего уровня важен. Пример с покупкой: если "
+             "цена сначала выросла, уровень подтянулся вверх, и следующее "
+             "падение его задело; если сначала упала — уровень ещё стоял ниже "
+             "и задет не был.\n"
+             "• «Сначала цена, ближняя к открытию» — первой считается та из "
+             "двух крайних цен минуты, что ближе к её открытию.\n"
+             "• «Сначала худшая для позиции цена» — первой считается худшая "
+             "для открытой позиции: при покупке минимум, при продаже "
+             "максимум.\n"
+             "⚠️ Умолчание временное: вопрос задан заказчику, ответа пока нет."),
+            ("Наибольшая свеча для проверки по минуткам", self.minute_bar_limit,
+             "Только для прогона по истории и только при включённом "
+             "скользящем уровне. Если свеча не крупнее выбранного размера, "
+             "прогон проверяет уровень по минуткам внутри свечи — ближе "
+             "к тому, как он двигался бы на счёте. Если свеча крупнее, прогон идёт без "
+             "минуток: скользящий уровень в нём двигается только на закрытии "
+             "свечи, и это написано в допущениях прогона.\n"
+             "Крупнее 15 минут выбрать нельзя намеренно: на таких свечах "
+             "проверка по минуткам слишком тяжела, и прогон может "
+             "остановиться, не дойдя до конца."),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
@@ -1785,7 +1828,8 @@ class SettingsDialog(QDialog):
             # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
             # self.daily_loss_limit_enabled, self.daily_loss_limit,
             # self.free_funds_reserve_enabled, self.free_funds_reserve,
-            self.commission, self.slippage_steps,
+            self.commission, self.slippage_steps, self.minute_order,
+            self.minute_bar_limit,
             # «Программа»
             self.log_directory,
         ]
@@ -1794,6 +1838,12 @@ class SettingsDialog(QDialog):
         QWidget.setTabOrder(order[-1], self.buttons)
 
     # ------------------------------------------------------------------ обмен
+
+    def _show_choices(self, settings: Settings) -> None:
+        """Списки выбора — одной таблицей: забытый здесь вернулся бы к первому."""
+        for name in _CHOICES:
+            field = getattr(self, name)
+            field.setCurrentIndex(max(field.findData(getattr(settings, name)), 0))
 
     def set_values(self, settings: Settings) -> None:
         """Показать настройки в полях."""
@@ -1805,13 +1855,7 @@ class SettingsDialog(QDialog):
         self.average_period.setValue(settings.average_period)
         self.threshold_percent.setValue(settings.threshold_percent)
         self.confirm_bars.setValue(settings.confirm_bars)
-        for field, value in (
-            (self.average_kind, settings.average_kind),
-            (self.reversal_moment, settings.reversal_moment),
-            (self.after_take_profit, settings.after_take_profit),
-            (self.on_price_equals_average, settings.on_price_equals_average),
-        ):
-            field.setCurrentIndex(max(field.findData(value), 0))
+        self._show_choices(settings)
         # Выключатели — одной таблицей, как и списки выше. Не ради длины:
         # выключатель, дописанный в поля и забытый здесь, возвращался бы
         # к умолчанию при каждом «Применить» и молча — ровно так жили
@@ -1941,7 +1985,13 @@ class SettingsDialog(QDialog):
         self._sync_guards()
 
     def values(self) -> Settings:
-        """Собрать настройки из полей."""
+        """Собрать настройки из полей.
+
+        Списки выбора — по таблице `_CHOICES`, той же, что и показ: шестой
+        список, собранный только в одном из двух мест, при «Применить» молча
+        возвращался бы к умолчанию.
+        """
+        chosen = {name: getattr(self, name).currentData() for name in _CHOICES}
         return Settings(
             instrument=self.instrument.text().strip(),
             timeframe=self.timeframe.currentText(),
@@ -1962,10 +2012,6 @@ class SettingsDialog(QDialog):
             filter_enabled=self.filter_enabled.isChecked(),
             threshold_percent=self.threshold_percent.value(),
             confirm_bars=self.confirm_bars.value(),
-            average_kind=self.average_kind.currentData(),
-            reversal_moment=self.reversal_moment.currentData(),
-            after_take_profit=self.after_take_profit.currentData(),
-            on_price_equals_average=self.on_price_equals_average.currentData(),
             take_profit_enabled=self.take_profit_enabled.isChecked(),
             take_profit_pct=self.take_profit.value(),
             # ⚠️ Способ уходит наружу только вместе с включённой фиксацией,
@@ -2015,7 +2061,7 @@ class SettingsDialog(QDialog):
             commission_per_side_rub=(
                 None if self.commission.value() <= 0 else self.commission.value()
             ),
-        )
+        ).replace(**chosen)
 
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
     # def _sync_volume_cap(self, *_: object) -> None:
