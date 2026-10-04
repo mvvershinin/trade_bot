@@ -46,6 +46,7 @@ from backtest.execution import (
     CoarseBar,
     Costs,
     ExecutionModel,
+    LimitExits,
     MinuteOrder,
     Minutes,
     OpenLeg,
@@ -338,6 +339,11 @@ class HistoryRun:
     #: порога (B-058). Ставит тот, кто решал не подавать (`app/minutes.py`);
     #: `None` — минутки поданы либо скользящего уровня нет.
     coarse_bar: CoarseBar | None = None
+    #: Судьба заявок на выход с предельной ценой (`TimeExitOrder.LIMIT`):
+    #: по открытию, по касанию предела, не исполнено. Идёт в допущения
+    #: прогона — неисполненный выход останавливает робота, и молча
+    #: посчитанный итог такого прогона неотличим от полного.
+    limit_exits: LimitExits = LimitExits()
 
     @property
     def assumptions(self) -> tuple[Assumption, ...]:
@@ -939,4 +945,7 @@ async def replay(  # noqa: PLR0913 — сверх пяти идут издерж
         costs=costs,
         minute_order=executor.minute_order if executor.minutes_given else None,
         bars_without_minutes=executor.bars_without_minutes,
+        limit_exits=replace(executor.limits, unfilled=sum(
+            1 for order in executor.pending if order.limit_price is not None
+        )),
     )

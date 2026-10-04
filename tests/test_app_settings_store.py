@@ -23,6 +23,7 @@ import pytest
 from app.settings_store import FORMAT_VERSION, SETTINGS_FILE_NAME, SettingsStore
 from strategies import registry
 from ui.models import (
+    FIELD_CAPTIONS,
     AfterTakeProfit,
     AverageKind,
     CalendarDay,
@@ -31,6 +32,7 @@ from ui.models import (
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
+    TimeExitKind,
 )
 from ui.settings_codec import field_codecs
 
@@ -96,6 +98,11 @@ DIFFERENT = Settings(
     slippage_steps=1.5,
     minute_order=MinutePriceOrder.ADVERSE_FIRST,
     minute_bar_limit=MinuteBarLimit.FIFTEEN,
+    # Выход по концу окна (Ф3 задачи З8). Предельная форма — не умолчание
+    # и годится второму алгоритму, которого требует (`_ALWAYS_DEMANDS`).
+    time_exit_order=TimeExitKind.LIMIT,
+    time_exit_limit_steps=7,
+    time_exit_wait_bars=3,
     log_directory="/tmp/терминал-логи",
     # Оба вида отметки сразу: «не торгуем» на будний день и «торгуем»
     # на субботу. Один вид проверял бы половину: перевод «да/нет» в файл
@@ -346,7 +353,7 @@ def test_one_bad_value_does_not_lose_the_other_settings(store: SettingsStore) ->
         "из-за одного негодного поля потерян весь файл"
     )
     assert read.values.window_start == DIFFERENT.window_start
-    assert any("average_period" in trouble for trouble in read.troubles), (
+    assert any(f"«{FIELD_CAPTIONS['average_period']}»" in trouble for trouble in read.troubles), (
         "поле подменено умолчанием молча"
     )
 
@@ -364,7 +371,7 @@ def test_yes_in_a_number_field_is_refused_not_taken_as_one(store: SettingsStore)
 
     read = SettingsStore(store.path.parent).load()
     assert read.values.volume == Settings().volume
-    assert any("volume" in trouble for trouble in read.troubles)
+    assert any(f"«{FIELD_CAPTIONS['volume']}»" in trouble for trouble in read.troubles)
 
 
 def test_an_unknown_value_of_a_choice_is_refused(store: SettingsStore) -> None:
@@ -376,7 +383,7 @@ def test_an_unknown_value_of_a_choice_is_refused(store: SettingsStore) -> None:
 
     read = SettingsStore(store.path.parent).load()
     assert read.values.average_kind is Settings().average_kind
-    assert any("average_kind" in trouble for trouble in read.troubles)
+    assert any(f"«{FIELD_CAPTIONS['average_kind']}»" in trouble for trouble in read.troubles)
 
 
 # --------------------------------------------------- новое и исчезнувшее
@@ -393,7 +400,7 @@ def test_a_setting_missing_from_the_file_takes_its_default_and_says_so(
     read = SettingsStore(store.path.parent).load()
     assert read.values.slippage_steps == Settings().slippage_steps
     assert read.values.price_step == DIFFERENT.price_step
-    assert any("slippage_steps" in note for note in read.notes)
+    assert any(f"«{FIELD_CAPTIONS['slippage_steps']}»" in note for note in read.notes)
 
 
 def test_a_setting_this_build_does_not_know_is_written_back(store: SettingsStore) -> None:
@@ -535,6 +542,9 @@ OWNER_FILE = """{
     "take_profit_enabled": true,
     "take_profit_pct": 0.2,
     "threshold_percent": 0.4,
+    "time_exit_limit_steps": 10,
+    "time_exit_order": "market",
+    "time_exit_wait_bars": 1,
     "timeframe": "5 минут",
     "trailing_enabled": true,
     "trailing_offset_pct": 0.05,
@@ -745,7 +755,8 @@ def test_a_broken_minute_order_is_replaced_out_loud(store: SettingsStore) -> Non
     read = SettingsStore(store.path.parent).load()
 
     assert read.values.minute_order is MinutePriceOrder.NEAR_FIRST
-    assert any("minute_order" in line and "zigzag" in line for line in read.troubles), (
+    caption = f"«{FIELD_CAPTIONS['minute_order']}»"
+    assert any(caption in line and "zigzag" in line for line in read.troubles), (
         read.troubles
     )
 
@@ -768,7 +779,7 @@ def test_a_file_without_the_minute_order_is_read_and_left_as_it_is(
     assert read.troubles == (), read.troubles
     assert read.values.average_period == 21
     assert read.values.minute_order is MinutePriceOrder.NEAR_FIRST
-    assert any("minute_order" in line for line in read.notes), read.notes
+    assert any(f"«{FIELD_CAPTIONS['minute_order']}»" in line for line in read.notes), read.notes
     assert store.path.read_text(encoding="utf-8") == before
 
 
@@ -794,8 +805,9 @@ def test_a_broken_minute_bar_limit_is_replaced_out_loud(
 
     assert read.values.minute_bar_limit is MinuteBarLimit.FIVE
     shown_raw = json.dumps(broken)
+    caption = f"«{FIELD_CAPTIONS['minute_bar_limit']}»"
     assert any(
-        "minute_bar_limit" in line and shown_raw in line for line in read.troubles
+        caption in line and shown_raw in line for line in read.troubles
     ), read.troubles
 
 
@@ -814,5 +826,5 @@ def test_a_file_without_the_minute_bar_limit_is_read_and_left_as_it_is(
     assert read.troubles == (), read.troubles
     assert read.values.average_period == 21
     assert read.values.minute_bar_limit is MinuteBarLimit.FIVE
-    assert any("minute_bar_limit" in line for line in read.notes), read.notes
+    assert any(f"«{FIELD_CAPTIONS['minute_bar_limit']}»" in line for line in read.notes), read.notes
     assert store.path.read_text(encoding="utf-8") == before

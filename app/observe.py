@@ -58,7 +58,7 @@ import logging
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 from backtest import (
@@ -531,6 +531,13 @@ class LiveObserver:
             halted=self._engine.halted or self._failure,
             bars=self._tally.bars,
             costs=self._costs,
+            # Выходы по времени с предельной ценой — тем же счётом, что
+            # у `backtest.replay`: теневой исполнитель наследует модель,
+            # и «по касанию» здесь такое же допущение, как на истории.
+            # Неисполненные — заявки, ждущие сейчас; молчать о них нельзя.
+            limit_exits=replace(self._executor.limits, unfilled=sum(
+                1 for order in self._executor.pending if order.limit_price is not None
+            )),
         )
 
     @property

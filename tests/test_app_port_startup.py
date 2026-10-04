@@ -239,6 +239,13 @@ def test_the_pinned_span_names_its_trading_days(loop, database) -> None:
     with_port(loop, database, work)
 
 
+#: Умолчания с названным шагом цены. Заявка «с предельной ценой» без шага
+#: отвергается, но это не «вариант, которого робот не умеет»: она зависит
+#: от соседнего поля, и её отказ при запуске лечится своей подменой
+#: (`tests/test_time_exit_window.py`). Здесь сверяются сами варианты.
+_BASE = Settings(price_step=25.0)
+
+
 def test_what_the_engine_refuses_is_exactly_what_the_window_does_not_offer() -> None:
     """B-050: движок отвергает ровно те варианты, что окно не даёт выбрать.
 
@@ -259,7 +266,7 @@ def test_what_the_engine_refuses_is_exactly_what_the_window_does_not_offer() -> 
         for value in type(default):
             try:
                 changes: dict[str, Any] = {item.name: value}
-                chosen = dataclasses.replace(Settings(), **changes)
+                chosen = dataclasses.replace(_BASE, **changes)
                 convert.engine_settings(chosen, Mode.REVERSE)
                 refused = False
             except convert.SettingsRefused:
@@ -293,7 +300,7 @@ def test_every_offered_variant_gives_the_engine_its_own_behaviour() -> None:
             if getattr(value, "unavailable", ""):
                 continue
             changes: dict[str, Any] = {item.name: value}
-            chosen = dataclasses.replace(Settings(), **changes)
+            chosen = dataclasses.replace(_BASE, **changes)
             made[value.name] = convert.engine_settings(chosen, Mode.REVERSE)
         if len(set(map(repr, made.values()))) < 2:
             continue  # поле движку безразлично — различать нечего

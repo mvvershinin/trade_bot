@@ -30,6 +30,7 @@ from ui.models import (
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
+    TimeExitKind,
 )
 from ui.settings_dialog import CATALOGUE_NOT_ARRIVED, SettingsDialog
 
@@ -2163,6 +2164,11 @@ SAMPLE = Settings(
     slippage_steps=1.5,
     minute_order=MinutePriceOrder.ADVERSE_FIRST,
     minute_bar_limit=MinuteBarLimit.FIFTEEN,
+    # Выход по концу окна (Ф3 задачи З8). Предельная форма — не умолчание
+    # и годится второму алгоритму, которого требует (`_ALWAYS_DEMANDS`).
+    time_exit_order=TimeExitKind.LIMIT,
+    time_exit_limit_steps=7,
+    time_exit_wait_bars=3,
     log_directory="/tmp/терминал-логи",
     # ⚠️ Поля календаря в этом окне нет: его правят в своём окне, из меню
     # «Настройки». Но пронести его через обмен окно обязано — иначе «Применить»

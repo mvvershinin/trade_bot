@@ -70,7 +70,7 @@ from typing import Final
 
 from strategies import registry
 from ui.models import Settings
-from ui.settings_codec import encode_fields, field_codecs, read_fields
+from ui.settings_codec import caption_of, encode_fields, field_codecs, read_fields
 from ui.userdata_file import write_atomically
 
 __all__ = [
@@ -112,6 +112,11 @@ class Loaded:
     values: Settings
     notes: tuple[str, ...] = ()
     troubles: tuple[str, ...] = ()
+    #: Строки `troubles` про требования алгоритма — с полем, о котором каждая.
+    #: Сборка не печатает такую строку, если порт при запуске снял это поле
+    #: снова (`HistoryPort.startup_substituted`): строка называла бы
+    #: действующим то, что уже не действует, — вторая правда рядом с первой.
+    demanded: tuple[tuple[str, str], ...] = ()
 
 
 def _known_algorithm(values: Settings) -> tuple[Settings, tuple[str, ...]]:
@@ -145,7 +150,9 @@ def _known_algorithm(values: Settings) -> tuple[Settings, tuple[str, ...]]:
     )
 
 
-def _demanded_settings(values: Settings) -> tuple[Settings, tuple[str, ...]]:
+def _demanded_settings(
+    values: Settings, absent: frozenset[str] = frozenset()
+) -> tuple[Settings, dict[str, str]]:
     """Настройки, которых требует выбранный алгоритм: подмена, но вслух.
 
     Требования объявлены записью реестра (`strategies/registry.py`,
@@ -183,9 +190,9 @@ def _demanded_settings(values: Settings) -> tuple[Settings, tuple[str, ...]]:
     try:
         entry = registry.find(values.strategy_id)
     except registry.UnknownStrategy:
-        return values, ()
+        return values, {}
     changes: dict[str, object] = {}
-    said: list[str] = []
+    said: dict[str, str] = {}
     for demand in entry.demands:
         current = getattr(values, demand.outer, None)
         if current is None:
@@ -196,15 +203,22 @@ def _demanded_settings(values: Settings) -> tuple[Settings, tuple[str, ...]]:
         if wanted is None or current is wanted:
             continue
         changes[demand.outer] = wanted
-        said.append(
+        # Поля могло не быть в файле вовсе (файл прежней сборки): тогда
+        # «в файле стояло» — неправда, стояло умолчание программы (`absent`).
+        was = (
+            "этой настройки не было (файл записан прежней сборкой)"
+            if demand.outer in absent else f"стояло «{_choice(current)}»"
+        )
+        said[demand.outer] = (
             f"Алгоритм «{entry.title}» {demand.reason}. В файле настроек "
-            f"стояло «{_choice(current)}» — взято «{_choice(wanted)}». "
+            f"{was} — взято «{_choice(wanted)}». "
             "Робот работает НЕ С ТОЙ настройкой, которая была записана: "
-            "откройте «Настройки» → «Сигнал» и проверьте, что выбрано."
+            "откройте «Настройки» и проверьте, что выбрано, — поле закрыто "
+            "и подписано требованием алгоритма."
         )
     if not changes:
-        return values, ()
-    return values.replace(**changes), tuple(said)
+        return values, {}
+    return values.replace(**changes), said
 
 
 def _one_way_to_take_profit(values: Settings) -> tuple[Settings, tuple[str, ...]]:
@@ -417,22 +431,26 @@ class SettingsStore:
         if missing:
             notes.append(
                 "Настройки, которых в файле нет, взяты по умолчанию: "
-                + ", ".join(missing)
-                + ". Так бывает после обновления программы."
+                + ", ".join(f"«{caption_of(name)}»" for name in missing)
+                + ". Так бывает после обновления программы. Что выбрано, видно "
+                "в окне «Настройки»; в файл они запишутся, когда вы сами "
+                "примените настройки."
             )
         values = start.replace(**changes)
         values, unknown_algorithm = _known_algorithm(values)
         troubles.extend(unknown_algorithm)
         # Порядок значим: требования принадлежат алгоритму, а какой он —
         # решает строка выше.
-        values, unmet_demands = _demanded_settings(values)
-        troubles.extend(unmet_demands)
+        values, unmet_demands = _demanded_settings(values, frozenset(missing))
+        troubles.extend(unmet_demands.values())
         # Порядок с двумя проверками выше безразличен: ни одна из них не трогает
         # полей фиксации прибыли. Стоит последней, потому что читается как
         # продолжение — «а теперь то же самое про способ фиксации».
         values, both_ways = _one_way_to_take_profit(values)
         troubles.extend(both_ways)
-        return Loaded(values, tuple(notes), tuple(troubles))
+        return Loaded(
+            values, tuple(notes), tuple(troubles), tuple(unmet_demands.items())
+        )
 
     def _quarantine(self, error: Exception) -> tuple[str, ...]:
         """Отложить испорченный файл в сторону и сказать, куда именно.

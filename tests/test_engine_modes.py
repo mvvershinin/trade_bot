@@ -50,6 +50,7 @@ from engine import (
     Side,
     Step,
     TakeProfit,
+    TimeExitOrder,
     TradingWindow,
     process_closed_candle,
 )
@@ -344,6 +345,18 @@ _SETTINGS_CHANGE_CASES: list[tuple[dict, str]] = [
         {"exchange_days": DayMarks.of({date(2026, 6, 12): False})},
         "Дни, названные биржей: нет → 12.06.2026 не торгуем",
     ),
+    # Выход по концу окна с предельной ценой (задача З8). Первым ключом —
+    # проверяемое поле: шаг цены нужен форме LIMIT и стоит вторым.
+    (
+        {"time_exit_order": TimeExitOrder.LIMIT, "price_step": 25.0},
+        "Выход по концу окна: По рынку → С предельной ценой",
+    ),
+    ({"time_exit_limit_steps": 4}, "Отступ предельной цены: 10 шагов цены → 4 шага цены"),
+    (
+        {"time_exit_wait_bars": 2},
+        "Ожидание выхода с предельной ценой: 1 свеча → 2 свечи",
+    ),
+    ({"price_step": 25.0}, "Шаг цены инструмента: не задан → 25"),
 ]
 
 

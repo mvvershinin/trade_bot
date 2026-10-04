@@ -90,6 +90,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from strategies import Decision, Intent, check_bar
 
@@ -119,7 +120,7 @@ from engine.contracts import (
 # from engine.guards import DayResult, Sizing, Unchecked, day_result, entry_size, unchecked_guards
 from engine.guards import entry_size
 from engine.ports import Refusal
-from engine.settings import EngineSettings, Mode, Reversal
+from engine.settings import EngineSettings, Mode, Reversal, TimeExitOrder
 from engine.take_profit import covers_commission, target_profit
 from engine.window import DayVerdict, day_verdict, in_moscow, minutes_of_day, verdict_of_day
 
@@ -517,7 +518,9 @@ def process_closed_candle(
         формы стоит здесь, а не только на входе в движок.
     """
     check_bar(bar)
-    at: datetime = bar.closes_at  # type: ignore[attr-defined]
+    # Закрытие нужно только выходу по времени с предельной ценой (шаг 6);
+    # читается здесь одной строкой со временем — свеча уже проверена.
+    at, close = bar.closes_at, float(bar.close)  # type: ignore[attr-defined]
     writer = _Journal(state.quiet_note, at)
     steps: list[Step] = []
     orders: list[OrderRequest] = []
@@ -540,11 +543,7 @@ def process_closed_candle(
             writer.quiet(
                 "off-with-closing",
                 "Робот выключен, заявка на выход осталась у брокера",
-                f"Режим «Выключен»: свеча не разбирается. По позиции "
-                f"({state.position.side.label.lower()}, объём "
-                f"{_volume(state.position.volume)}) заявка на выход уже подана "
-                "и сделки по ней ещё не было. Робот за ней больше не следит — "
-                "проверьте её в приложении брокера",
+                _off_with_closing_words(state, state.position),
                 JournalLevel.WARNING,
             )
         elif state.position is not None:
@@ -663,12 +662,16 @@ def process_closed_candle(
         # другие (PROTOTYPE.md §2, уточнение 2).
         current = working.position
         if snapshot is not None and current is not None and current.is_open:
-            if settings.close_on_time_end or farewell is not None:
+            if settings.closes_by_time or farewell is not None:
                 kind, headline, intent = _leaving(
-                    current, why, farewell, by_time=settings.close_on_time_end
+                    current, why, farewell, by_time=settings.closes_by_time
                 )
+                bound = _time_exit_limit(current.side, close, settings)
                 working = _exit(
-                    orders, working, current, closes_at, kind, intent, armed_before
+                    orders, working, current, closes_at, kind,
+                    intent + (bound[1] if bound is not None else ""),
+                    armed_before,
+                    limit_price=bound[0] if bound is not None else None,
                 )
                 writer.action(
                     headline, orders[-1].reason, key=orders[-1].order_id, intent=intent
@@ -1312,22 +1315,8 @@ def _rearm_take_profit(
         return empty, empty, ""
 
     if not position.is_open:
-        waited = state.closing_bars + 1
-        state = replace(state, closing_bars=waited)
-        if waited <= settings.close_wait_bars:
-            return state, state, ""
-        stuck = (
-            f"Заявка на выход из {position.side.label.lower()}а подана "
-            f"{waited} свечей назад и сделкой так и не стала. Тейк с этой "
-            "позиции уже снят, а закрывающаяся позиция его не получает — "
-            f"значит позиция объёмом {_volume(position.volume)} стоит "
-            "без защиты. Повторить заявку робот не вправе: вторая рыночная "
-            "заявка после исполнения первой открывает позицию в обратную "
-            "сторону. Робот остановлен — проверьте позицию и список заявок "
-            "в приложении брокера"
-        )
-        writer.note("Выход не исполняется", stuck, JournalLevel.ERROR)
-        return state, state, f"Выход не исполняется. {stuck}"
+        state = replace(state, closing_bars=state.closing_bars + 1)
+        return state, state, _closing_wait(state, position, writer, settings)
 
     state = replace(state, closing_bars=0)
     if state.exit_blocked_bars > settings.close_wait_bars:
@@ -1371,6 +1360,127 @@ def _rearm_take_profit(
         )
         writer.note(event, reason, importance, key=order.order_id)
     return state, refused, ""
+
+
+def _closing_wait(
+    state: EngineState,
+    position: Position,
+    writer: "_Journal",
+    settings: EngineSettings,
+) -> str:
+    """Позиция «закрывается»: ждать дальше (пусто) или причина остановки.
+
+    ⚠️ Порог — по **поданной** заявке, а не по текущей настройке формы:
+    рыночный выход ждёт `close_wait_bars`, выход с предельной ценой —
+    `time_exit_wait_bars`. Смена формы посреди ожидания не переносит
+    чужой порог на уже поданную заявку.
+    """
+    waited = state.closing_bars
+    exit_order = _exit_in_flight(state)
+    if exit_order is not None and exit_order.limit_price is not None:
+        if waited <= settings.time_exit_wait_bars:
+            return ""
+        stuck = _limit_stuck_words(position, exit_order.limit_price, waited)
+        writer.note("Выход с предельной ценой не исполнился", stuck, JournalLevel.ERROR)
+        return f"Выход с предельной ценой не исполнился. {stuck}"
+    if waited <= settings.close_wait_bars:
+        return ""
+    stuck = (
+        f"Заявка на выход из {position.side.label.lower()}а подана "
+        f"{waited} свечей назад и сделкой так и не стала. Тейк с этой "
+        "позиции уже снят, а закрывающаяся позиция его не получает — "
+        f"значит позиция объёмом {_volume(position.volume)} стоит "
+        "без защиты. Повторить заявку робот не вправе: вторая рыночная "
+        "заявка после исполнения первой открывает позицию в обратную "
+        "сторону. Робот остановлен — проверьте позицию и список заявок "
+        "в приложении брокера"
+    )
+    writer.note("Выход не исполняется", stuck, JournalLevel.ERROR)
+    return f"Выход не исполняется. {stuck}"
+
+
+def _off_with_closing_words(state: EngineState, position: Position) -> str:
+    """Строка «Выключен» поверх поданной заявки на выход.
+
+    ⚠️ Заявка с предельной ценой называется **вместе с пределом**: она может
+    исполниться и через час, когда цена вернётся, — человек обязан знать,
+    по какой цене её ждать или снимать.
+    """
+    exit_order = _exit_in_flight(state)
+    limit = exit_order.limit_price if exit_order is not None else None
+    form = f" с предельной ценой {_price(limit)}" if limit is not None else ""
+    return (
+        f"Режим «Выключен»: свеча не разбирается. По позиции "
+        f"({position.side.label.lower()}, объём {_volume(position.volume)}) "
+        f"заявка на выход{form} уже подана и сделки по ней ещё не было. "
+        "Робот за ней больше не следит — проверьте её в приложении брокера"
+    )
+
+
+def _exit_in_flight(state: EngineState) -> OrderRequest | None:
+    """Поданная и ещё не исполненная заявка на выход — или `None`."""
+    for order in state.pending:
+        if order.action is OrderAction.CLOSE:
+            return order
+    return None
+
+
+def _limit_stuck_words(position: Position, limit: float, waited: int) -> str:
+    """Почему робот остановился на неисполненном выходе с предельной ценой.
+
+    Вариант А решения 0060 §3 (вопрос 26): заявку не снимать, рыночную
+    не подавать, звать человека. ⚠️ Главное в тексте — порядок рук: сначала
+    снять заявку, потом закрывать. Наоборот — заявка исполнится при возврате
+    цены и откроет позицию в обратную сторону.
+    """
+    deal = "продажу" if position.side is Side.LONG else "покупку"
+    return (
+        f"Заявка на выход из {position.side.label.lower()}а — {deal} "
+        f"с предельной ценой {_price(limit)} — подана {waited} "
+        f"{plural(waited, 'свечу', 'свечи', 'свечей')} назад и сделкой не стала: "
+        "цена ушла за предел. Заявка осталась у брокера и закроет позицию, "
+        "если цена вернётся. Робот остановлен и обратной позиции не откроет. "
+        f"Позиция объёмом {_volume(position.volume)} стоит без тейка. "
+        "Если закрываете руками — СНАЧАЛА снимите эту заявку в приложении "
+        "брокера, потом закрывайте: иначе при возврате цены она исполнится "
+        "и откроет позицию в обратную сторону"
+    )
+
+
+def _time_exit_limit(
+    side: Side, close: float, settings: EngineSettings
+) -> tuple[float, str] | None:
+    """Предел заявки на выход по времени и его объяснение — или `None` (по рынку).
+
+    `предел = close ∓ N × шаг`, округление к сетке шага **от рынка**: продажа
+    (выход из лонга) — вниз, покупка (выход из шорта) — вверх. Так предел
+    не оказывается ближе к рынку, чем названо в настройке.
+
+    Счёт в `Decimal` от строкового вида чисел: `Decimal(0.1)` тащит двоичный
+    хвост, и цена, лежащая ровно на сетке, уехала бы на шаг.
+
+    ⚠️ Предел продажи не опускается ниже одного шага: нулевая или
+    отрицательная цена — не предел. Достижимо только на заведомо негодном
+    отступе, но заявку без цены подавать нельзя.
+    """
+    if settings.time_exit_order is not TimeExitOrder.LIMIT:
+        return None
+    step = Decimal(str(settings.price_step))
+    steps = settings.time_exit_limit_steps
+    selling = side is Side.LONG
+    raw = Decimal(str(close)) + (-1 if selling else 1) * steps * step
+    grid = (raw / step).to_integral_value(
+        rounding=ROUND_FLOOR if selling else ROUND_CEILING
+    )
+    limit = float(max(grid * step, step))
+    words = (
+        f". Заявка с предельной ценой {_price(limit)}: закрытие "
+        f"{_price(close)} {'−' if selling else '+'} {steps} × шаг "
+        f"{_price(settings.price_step)}, к сетке шага "
+        f"{'вниз' if selling else 'вверх'} — "
+        f"{'продажа' if selling else 'покупка'} не хуже предела"
+    )
+    return limit, words
 
 
 def _take_event(
@@ -1484,8 +1594,13 @@ def _exit(
     reason: ExitReason,
     why: str,
     armed_before: bool,
+    *,
+    limit_price: float | None = None,
 ) -> EngineState:
     """Выход из позиции: сначала снять тейк, потом подать заявку на закрытие.
+
+    :param limit_price: предел заявки — только у выхода по времени
+        при `TimeExitOrder.LIMIT`; `None` — по рынку.
 
     :param armed_before: был ли уровень у брокера **до этой свечи**. Только
         тогда снятие имеет смысл и только тогда о нём пишется в журнал.
@@ -1511,7 +1626,9 @@ def _exit(
         position = state.position if state.position is not None else position
     else:
         text = f"{why}. Подаём заявку на выход"
-    return _submitted(orders, state, _close_order(position, at, reason, text))
+    return _submitted(
+        orders, state, _close_order(position, at, reason, text, limit_price)
+    )
 
 
 def _step_close_by_signal(
@@ -2187,7 +2304,11 @@ def _mark_closing(state: EngineState) -> EngineState:
 
 
 def _close_order(
-    position: Position, at: datetime, reason: ExitReason, text: str
+    position: Position,
+    at: datetime,
+    reason: ExitReason,
+    text: str,
+    limit_price: float | None = None,
 ) -> OrderRequest:
     return OrderRequest(
         action=OrderAction.CLOSE,
@@ -2197,6 +2318,7 @@ def _close_order(
         reason=text,
         order_id=f"close:{position.side.value}:{at.isoformat()}",
         exit_reason=reason,
+        limit_price=limit_price,
     )
 
 

@@ -40,7 +40,7 @@ import pytest
 
 from app.observe import RECHECK_BARS, WARMUP_BARS, LiveObserver, LiveSource
 from backtest import Costs, replay
-from engine import EngineSettings, Mode, TradingWindow
+from engine import EngineSettings, Mode, TimeExitOrder, TradingWindow
 from market import MSK, Candle, Timeframe
 from strategies import EmaReverse, EmaReverseSettings, Strategy
 from ui.models import DecisionLevel
@@ -425,6 +425,45 @@ def test_the_live_run_equals_the_history_replay_on_the_same_bars(drive) -> None:
     assert live.halted == history.halted, "остановка разошлась"
     assert live.bars == history.bars, "число баров разошлось"
     assert history.deals, "ряд не дал ни одной сделки — сверять было бы нечего"
+
+
+def test_the_live_run_counts_limit_exits_like_the_history_replay(drive) -> None:
+    """Стережёт: живой ход несёт счёт выходов с предельной ценой, как прогон.
+
+    `LiveObserver.run` собирает `HistoryRun` руками; поле, забытое там,
+    обнуляет счёт, и окно наблюдения молчит о выходе по касанию предела
+    или о заявке, которая ждёт (правило 13). Окно короткое, чтобы выход
+    по его концу случился; шаг цены — чтобы предел было из чего считать.
+
+    ⚠️ Мутация: снять `limit_exits=` в `LiveObserver.run` — счёт нулевой,
+    проверка падает.
+    """
+    series = bars(120)
+    engine = dataclasses.replace(
+        settings(),
+        window=TradingWindow(start=time(7, 30), end=time(10, 0)),
+        time_exit_order=TimeExitOrder.LIMIT,
+        price_step=1.0,
+    )
+    costs = Costs(commission_per_side=14.0)
+
+    async def go():
+        history = await replay(series, EmaReverse(EmaReverseSettings()), engine, costs=costs)
+        watch = LiveObserver(
+            strategy=EmaReverse(EmaReverseSettings()), settings=engine,
+            say=Said(), costs=costs,
+        )
+        await watch.start()
+        live = await watch.feed(series)
+        await watch.aclose()
+        return history, live
+
+    history, live = drive(go)
+    assert history.limit_exits.submitted, "выхода с предельной ценой не было — сверять нечего"
+    assert live.limit_exits == history.limit_exits, (
+        f"счёт выходов разошёлся: живой ход {live.limit_exits}, "
+        f"прогон {history.limit_exits}"
+    )
 
 
 def test_the_live_run_matches_even_when_bars_come_one_at_a_time(drive) -> None:

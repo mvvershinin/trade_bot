@@ -48,6 +48,21 @@
    из «за один вызов отдаётся всё накопленное», и относится оно к обеим
    реализациям. Читать его только здесь нельзя — боевой адаптер пишут
    по тексту порта.
+5. **Заявка на выход с предельной ценой** (`OrderRequest.limit_price`,
+   выход по времени при `TimeExitOrder.LIMIT`) — не рыночная, и по `open`
+   как рыночная не исполняется. На открытии каждой свечи, пока заявка ждёт:
+   `open` не хуже предела (продажа — `open >= предел`, покупка — `open <=
+   предел`, равенство — «не хуже») → сделка по `open`, проскальзывание
+   не выносит цену за предел. Иначе — следующим кругом, наравне со сторожем
+   уровня и тем же путём (`_fire`: размах бара либо отрезки минуток), касание
+   предела → сделка ровно по пределу; не задет — заявка ждёт следующей свечи.
+   Разрыв между минутками внутри свечи — сделка **по пределу**: в непрерывных
+   торгах стоящая заявка исполнилась бы раньше, чем цена её перепрыгнула.
+   Разрыв между свечами, пока заявка ждёт, — сделка **по `open`**: так
+   правильно после перерыва торгов (аукцион), а в непрерывных торгах это
+   ошибка **в нашу пользу**, и потому такие исполнения считаются отдельно
+   (`LimitExits.at_later_open`). Прототипом лимитные заявки
+   не воспроизводились: сверка с ним на этой форме не обещается.
 
 Уровень **движущийся**, а не только неподвижный
 ------------------------------------------------
@@ -99,7 +114,7 @@ import bisect
 import enum
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from engine import (
@@ -121,6 +136,7 @@ __all__ = [
     "ExecutionModel",
     "Guard",
     "LevelGaps",
+    "LimitExits",
     "MinuteOrder",
     "Minutes",
     "OpenLeg",
@@ -474,6 +490,40 @@ class LevelGaps:
     fall_points: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class LimitExits:
+    """Судьба заявок на выход с предельной ценой за прогон (правило 5 шапки).
+
+    Четыре исхода и ни одного общего числа: «исполнилась» по открытию первой
+    свечи, по открытию более поздней свечи и по касанию предела — три разные
+    цены, а неисполненная заявка останавливает робота. Сумма исходов равна
+    `submitted`; неисполненные дописывает прогон (`backtest.history.replay`)
+    — это заявки, оставшиеся в ожидании, когда ряд кончился или робот встал.
+    """
+
+    #: Подано заявок на выход с предельной ценой.
+    submitted: int = 0
+    #: Исполнено по `open` первой свечи после подачи.
+    at_open: int = 0
+    #: Исполнено по `open` более поздней свечи — разрыв через предел, пока
+    #: заявка ждала. Ошибка модели в нашу пользу (правило 5 шапки).
+    at_later_open: int = 0
+    #: Исполнено ровно по пределу — касание внутри свечи.
+    at_touch: int = 0
+    #: Не исполнено к концу прогона.
+    unfilled: int = 0
+
+    def __add__(self, other: LimitExits) -> LimitExits:
+        """Сумма по кускам склейки: потерянный здесь счёт — молчание (правило 13)."""
+        return LimitExits(
+            submitted=self.submitted + other.submitted,
+            at_open=self.at_open + other.at_open,
+            at_later_open=self.at_later_open + other.at_later_open,
+            at_touch=self.at_touch + other.at_touch,
+            unfilled=self.unfilled + other.unfilled,
+        )
+
+
 class MinuteOrder(enum.Enum):
     """В каком порядке цены минутки считаются пройденными — **допущение прогона**.
 
@@ -635,6 +685,11 @@ class ExecutionModel:
         #: случай, когда сторож `_reachable` молчит, и число таких случаев
         #: обязано быть видно.
         self.gaps = LevelGaps()
+        #: Исходы заявок на выход с предельной ценой (`LimitExits`).
+        self.limits = LimitExits()
+        #: Заявки с пределом, чьё первое открытие уже было хуже предела:
+        #: исполнение по `open` для них — разрыв через предел, а не первая свеча.
+        self._limit_waited: set[str] = set()
         self._open: OpenLeg | None = None
         #: Закрытие **предыдущего** интервала и время текущего. Вход сторожа
         #: `_reachable`, взятый ВНЕ условия срабатывания: проверка, собранная
@@ -706,6 +761,8 @@ class ExecutionModel:
             # а не «текущей позиции, какой бы она ни была» (`Guard`).
             self.armed[order.order_id] = Guard(order=order, leg=self._open)
             return
+        if order.limit_price is not None:
+            self.limits = replace(self.limits, submitted=self.limits.submitted + 1)
         self.submitted_market.append(order)
         self.pending.append(order)
 
@@ -841,6 +898,13 @@ class ExecutionModel:
             if not self._ready(order, candle):
                 waiting.append(order)
                 continue
+            if order.limit_price is not None:
+                limit_fill = self._limit_at_open(order, candle)
+                if limit_fill is None:
+                    waiting.append(order)
+                else:
+                    fills.append(limit_fill)
+                continue
             at = candle.time
             price = self.costs.fill_price(candle.open, order.action, order.side)
             if order.action is OrderAction.OPEN:
@@ -971,7 +1035,82 @@ class ExecutionModel:
             self._level_hit(order, level, candle)
             self._closed(price, at, order, order_id)
             fills.append(fill)
+        return fills + self._limit_touches(candle, span, reach, ready_at, previous)
+
+    def _limit_at_open(self, order: OrderRequest, candle: MarketCandle) -> Fill | None:
+        """Заявка с пределом на открытии свечи: сделка по `open` или `None` — ждёт.
+
+        Сделка — только если `open` не хуже предела; проскальзывание сдвигает
+        цену против позиции, но не за предел: лимитная заявка хуже своей цены
+        не исполняется. Касание внутри свечи здесь не ищется — оно идёт
+        следующим кругом (`_limit_touches`), после ответа движка.
+        """
+        limit = order.limit_price
+        assert limit is not None, "заявка без предела — путь рыночной"
+        sell = selling(order.action, order.side)
+        if not (candle.open >= limit if sell else candle.open <= limit):
+            self._limit_waited.add(order.order_id)
+            return None
+        moved = self.costs.fill_price(candle.open, order.action, order.side)
+        price = max(moved, limit) if sell else min(moved, limit)
+        if order.order_id in self._limit_waited:
+            self.limits = replace(
+                self.limits, at_later_open=self.limits.at_later_open + 1
+            )
+        else:
+            self.limits = replace(self.limits, at_open=self.limits.at_open + 1)
+        return self._limit_filled(order, price, candle)
+
+    def _limit_touches(
+        self,
+        candle: MarketCandle,
+        span: MarketCandle,
+        reach: tuple[float, float],
+        ready_at: datetime,
+        previous: float | None,
+    ) -> list[Fill]:
+        """Заявки с пределом, чей предел задет в размахе `reach`: сделка по пределу.
+
+        Тот же вход, что у сторожа уровня (`_fire`), и потому одинаково
+        с минутками и без: без минуток `reach` — размах бара, с ними — отрезок
+        обхода. Сторона касания выводится из направления сделки: продаже
+        предел достаётся снизу вверх (`RISE`), покупке — сверху вниз (`FALL`).
+        Сторож «цены, которой не было» тот же (`_gapped`), но разрыв
+        в `LevelGaps` не пишется: это счётчик уровней тейка.
+
+        Заявка, ещё не прошедшая проверку открытия этой свечи, сюда
+        не попадает: её `submitted_at` позже `ready_at` (правило 3).
+        """
+        low, high = reach
+        fills: list[Fill] = []
+        waiting: list[OrderRequest] = []
+        for order in self.pending:
+            limit = order.limit_price
+            if limit is None or order.submitted_at > ready_at:
+                waiting.append(order)
+                continue
+            sell = selling(order.action, order.side)
+            if not (high >= limit if sell else low <= limit):
+                waiting.append(order)
+                continue
+            touch = LevelTouch.RISE if sell else LevelTouch.FALL
+            self._gapped(order, limit, touch, span, previous)
+            self.limits = replace(self.limits, at_touch=self.limits.at_touch + 1)
+            fills.append(self._limit_filled(order, limit, candle))
+        self.pending = waiting
         return fills
+
+    def _limit_filled(
+        self, order: OrderRequest, price: float, candle: MarketCandle
+    ) -> Fill:
+        """Сделка по заявке с пределом: позиция закрыта, сделка для движка."""
+        self._limit_waited.discard(order.order_id)
+        self._closed(price, candle.time, order, order.order_id)
+        return Fill(
+            action=order.action, side=order.side, volume=order.volume,
+            price=price, at=candle.time, order_id=order.order_id,
+            commission=self.costs.commission(order.volume),
+        )
 
     def _reachable(
         self,
@@ -1019,10 +1158,32 @@ class ExecutionModel:
         :raises AssertionError: сделка записана по цене, которой в свече
             не было, и разрывом это не объясняется.
         """
-        if candle.low <= level <= candle.high:
+        if not self._gapped(order, level, touch, candle, previous):
             return
-        if previous is None:
-            return
+        opened = candle.open
+        if touch is LevelTouch.RISE:
+            self.gaps.rise += 1
+        else:
+            self.gaps.fall += 1
+            self.gaps.fall_points += (level - opened) * order.volume
+
+    def _gapped(
+        self,
+        order: OrderRequest,
+        level: float,
+        touch: LevelTouch,
+        candle: MarketCandle,
+        previous: float | None,
+    ) -> bool:
+        """Уровень вне размаха свечи и объяснён разрывом? Иначе — падение.
+
+        Общая часть сторожа `_reachable` для уровня тейка и предела заявки
+        на выход; что считать разрывом, решает вызывающий.
+
+        :raises AssertionError: уровень вне размаха, и разрыва не было.
+        """
+        if candle.low <= level <= candle.high or previous is None:
+            return False
         opened = candle.open
         gap = (
             previous < level < opened
@@ -1036,11 +1197,7 @@ class ExecutionModel:
             f"{opened}. Касание {touch.value}, заявка {order.order_id}. "
             "Это дефект модели исполнения, а не рынка"
         )
-        if touch is LevelTouch.RISE:
-            self.gaps.rise += 1
-        else:
-            self.gaps.fall += 1
-            self.gaps.fall_points += (level - opened) * order.volume
+        return True
 
     # -- что делают наследники ----------------------------------------------
 

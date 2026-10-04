@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING
 
-from backtest.execution import CoarseBar, MinuteOrder
+from backtest.execution import CoarseBar, LimitExits, MinuteOrder
 from engine import in_moscow
 from engine.contracts import LEVEL_REASONS
 
@@ -138,6 +138,10 @@ class _Facts:
     bars_without_minutes: int = 0
     #: Скользящий уровень без минуток: свеча крупнее порога (B-058).
     coarse_bar: CoarseBar | None = None
+    #: Исходы заявок на выход с предельной ценой.
+    limit_exits: LimitExits = LimitExits()
+    #: Робот остановился — причина словами; пусто — прогон дошёл до конца.
+    halted: str = ""
 
 
 #: Ниже этой величины число печатается с десятой долей. Округление 46,7 ₽
@@ -232,6 +236,8 @@ def _facts_of(run: HistoryRun) -> _Facts:
         bars=run.bars,
         bars_without_minutes=run.bars_without_minutes,
         coarse_bar=run.coarse_bar,
+        limit_exits=run.limit_exits,
+        halted=run.halted,
     )
 
 
@@ -510,6 +516,40 @@ def _position_is_left_open(facts: _Facts) -> Assumption | None:
     )
 
 
+def _time_exit_by_limit(facts: _Facts) -> Assumption | None:
+    """Выход по времени шёл заявкой с предельной ценой: чем она кончилась."""
+    limits = facts.limit_exits
+    if limits.submitted == 0:
+        return None
+    opened = limits.at_open + limits.at_later_open
+    left = (
+        f" Не исполнилось {limits.unfilled}: "
+        + ("робот остановлен — " + facts.halted if facts.halted
+           else "заявка ждала, когда кончился отрезок.")
+        if limits.unfilled else ""
+    )
+    return Assumption(
+        name="Выход по времени с предельной ценой",
+        short=(
+            f"Выходов с предельной ценой {limits.submitted}: по открытию "
+            f"{opened}, по касанию предела {limits.at_touch}, "
+            f"не исполнилось {limits.unfilled}."
+        ),
+        text=(
+            f"Выход по концу окна подавался заявкой с предельной ценой "
+            f"({limits.submitted}). По открытию следующей свечи — "
+            f"{limits.at_open}; по открытию более поздней свечи, когда цена "
+            f"перепрыгнула предел, пока заявка ждала, — {limits.at_later_open} "
+            "(в непрерывных торгах стоящая заявка исполнилась бы по пределу, "
+            "так что это ошибка в вашу пользу); ровно по пределу при касании "
+            f"внутри свечи — {limits.at_touch}.{left} Отступ предела — "
+            "временное значение, ответа заказчика нет: итог такого прогона — "
+            "оценка, рядом с прогонами по рынку его не ставят. Касание "
+            "предела не значит, что очередь дошла до вашей заявки."
+        ),
+    )
+
+
 def _nothing_refused_and_nothing_stopped(_: _Facts) -> Assumption:
     """Предохранителей в прогоне нет: исполнена каждая заявка до единой."""
     return Assumption(
@@ -558,6 +598,7 @@ _TABLE: tuple[Callable[[_Facts], Assumption | None], ...] = (
     _slippage_is_not_counted,
     _slippage_is_counted,
     _position_is_left_open,
+    _time_exit_by_limit,
     _level_fills_on_a_touch,
     _prices_inside_a_minute,
     _level_moves_on_the_close,

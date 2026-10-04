@@ -97,6 +97,7 @@ from ui.settings_dialog import SettingsDialog
 from ui.status_panel import StatusPanel
 from ui.templates import Library, Template
 from ui.templates_dialog import TemplatesDialog
+from ui.settings_banner import SettingsTroubleBar
 from ui.theme import current as current_theme, text_on
 from ui.version import version
 
@@ -485,6 +486,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_panel)
         layout.addWidget(self.halt_banner)
         layout.addWidget(self.stuck_banner)
+        layout.addWidget(self.settings_bar)
         layout.addWidget(self.token_banner)
         layout.addWidget(self.mode_banner)
         layout.addWidget(self.history_banner)
@@ -530,6 +532,9 @@ class MainWindow(QMainWindow):
         #: Действующий контракт по таблице биржи и кнопка перехода (0061, 0016).
         self.contract_bar = ContractBar()
         self.contract_bar.switch_requested.connect(self._switch_contract)
+        #: Настройки из файла приняты не так, как записаны (`settings_trouble`).
+        self.settings_bar = SettingsTroubleBar()
+        self.settings_bar.open_requested.connect(self.open_settings)
 
     # --------------------------------------------------------------- сборка
 
@@ -936,6 +941,7 @@ class MainWindow(QMainWindow):
         # Закреплённый отрезок истории. Плашка не тревожная, а поясняющая:
         # ничего не сломалось, просто показано прошлое. Но сказать это надо
         # крупно — на живом потоке застывший график читается как обрыв связи.
+        self.settings_bar.show_trouble(state.settings_trouble)
         if state.history_span:
             self.history_banner.show_text(state.history_span, self.theme.warning)
         else:
@@ -1204,6 +1210,7 @@ class MainWindow(QMainWindow):
         dialog.set_contract(self.contract_bar.notice)
         dialog.settings_changed.connect(self._on_settings_changed)
         dialog.set_algorithms(self._algorithms)
+        dialog.show_field(self._state.settings_field)  # подмена при запуске — сразу к полю
         self._settings_dialog = dialog
         try:
             dialog.exec()

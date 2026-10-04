@@ -935,11 +935,11 @@ def _wire_settings_and_log(  # noqa: PLR0913 — шестой довод это 
     setup = setup_logging(values.log_directory, userdata=named_userdata)
     _say_where_the_log_goes(port, setup, level=level)
     _say_what_was_read(port, loaded, store, level=level)
-    _keep_settings(port, store, level=level)
+    _keep_settings(port, store, loaded.values, level=level)
 
 
 def _keep_settings(
-    port: HistoryPort, store: SettingsStore, *, level: DecisionLevel
+    port: HistoryPort, store: SettingsStore, read: Settings, *, level: DecisionLevel
 ) -> None:
     """Записывать настройки в файл, как только порт их принял.
 
@@ -954,13 +954,27 @@ def _keep_settings(
     ⚠️ Отказ записи не бросается, а становится строкой журнала. Слот Qt,
     из которого летит исключение, оставляет владельца счёта с трассировкой
     в консоли и молчащим окном.
+
+    ⚠️ Пишется только **изменение**: `read` — то, что прочитано из файла,
+    дальше — то, что записано последним. Эхо приходит и без применения:
+    открытие окна настроек (`request_settings`) отдаёт действующие настройки
+    тем же сигналом. Пока запись шла на каждое эхо, одно открытие окна
+    переписывало файл владельца счёта — дописывало ключи, которых в нём
+    не было, ещё до «ОК» и даже при «Отмене» (находка 04.10.2026).
     """
+    kept = [read]
+
     def remember(values: Settings) -> None:
         port.set_depth(values.depth_days)
         # Подмена при сборке порта в файл не идёт, пока человек не применил сам (`B-050`).
-        failure = store.save(port.for_file(values))
+        wanted = port.for_file(values)
+        if wanted == kept[0]:
+            return
+        failure = store.save(wanted)
         if failure:
             port.note("Настройки не сохранены", failure, level)
+        else:
+            kept[0] = wanted
 
     port.settings_applied.connect(remember)
 
@@ -975,8 +989,16 @@ def _say_what_was_read(
     настройка, вернувшаяся к умолчанию, меняет сделки, а владелец счёта
     об этом не узнает никак иначе.
     """
+    # Строка про требование алгоритма, которое порт при запуске снял снова
+    # (предельная цена без шага, З8), — вторая правда рядом с его строкой
+    # «сейчас идёт „по рынку“». Говорит порт; здесь молчат об этом поле.
+    overridden = {
+        text for field, text in loaded.demanded
+        if field in port.startup_substituted
+    }
     for trouble in loaded.troubles:
-        port.note("Настройки прочитаны не полностью", trouble, level)
+        if trouble not in overridden:
+            port.note("Настройки прочитаны не полностью", trouble, level)
     for note in loaded.notes:
         port.note("Настройки прочитаны", note)
     if not loaded.troubles and not loaded.notes:

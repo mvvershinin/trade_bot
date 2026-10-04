@@ -47,7 +47,7 @@ from dataclasses import dataclass
 from datetime import date, time
 from typing import Final
 
-from ui.models import CalendarDay, Settings
+from ui.models import FIELD_CAPTIONS, CalendarDay, Settings
 
 __all__ = [
     "BadValue",
@@ -226,9 +226,13 @@ def _enum_codec(kind: type[enum.Enum]) -> Codec:
                 raise ValueError(raw)
             return kind(raw)
         except ValueError:
-            known = ", ".join(str(item.value) for item in kind)
+            # Варианты — подписями окна, а не кодами файла: коды — латиница
+            # человеку (правило 6), а выбирает он в окне, не в файле.
+            known = ", ".join(
+                f"«{getattr(item, 'label', item.value)}»" for item in kind
+            )
             raise BadValue(
-                f"значение {shown(raw)} программе неизвестно; она знает: {known}"
+                f"значение {shown(raw)} программе неизвестно; в окне на выбор: {known}"
             ) from None
 
     return Codec(dump=_dump_enum, load=load)
@@ -277,11 +281,36 @@ def read_fields(
             changes[name] = codec.load(raw[name])
         except BadValue as error:
             refused.append(
-                f"Настройка «{name}» в файле негодная: {error}. Взято прежнее "
-                f"значение {getattr(start, name)!r}; остальные настройки "
-                "прочитаны."
+                f"Настройка «{caption_of(name)}» в файле негодная: {error}. "
+                f"Взято прежнее значение «{human_value(getattr(start, name))}»; "
+                "остальные настройки прочитаны."
             )
     return changes, refused, missing
+
+
+def caption_of(name: str) -> str:
+    """Подпись поля из окна настроек; имя поля — только если подписи нет.
+
+    Имя поля — латиница человеку (правило 6). Подписи нет только у поля,
+    которого нет в `FIELD_CAPTIONS`, а полноту таблицы стережёт тест.
+    """
+    return FIELD_CAPTIONS.get(name, name)
+
+
+def human_value(value: object) -> str:
+    """Значение настройки словами окна, а не `repr` Питона."""
+    label = getattr(value, "label", None)
+    if isinstance(label, str):
+        return label
+    if isinstance(value, bool):
+        return "включено" if value else "выключено"
+    if isinstance(value, time):
+        return value.strftime("%H:%M")
+    if isinstance(value, tuple):
+        return f"{len(value)} шт."
+    if isinstance(value, float):
+        return f"{value:g}".replace(".", ",")
+    return str(value) if value != "" else "пусто"
 
 
 def encode_fields(values: Settings) -> dict[str, object]:

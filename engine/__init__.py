@@ -136,6 +136,7 @@ from engine.settings import (
     Mode,
     PartialCandles,
     Reversal,
+    TimeExitOrder,
 )
 from engine.take_profit import (
     TakeProfit,
@@ -176,6 +177,7 @@ __all__ = [
     "Mode",
     "Reversal",
     "PartialCandles",
+    "TimeExitOrder",
     # значения
     "Side",
     "Position",

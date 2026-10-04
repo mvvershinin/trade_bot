@@ -43,7 +43,7 @@ from collections.abc import Sequence
 from dataclasses import fields
 from typing import cast
 
-from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, Signal
+from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -73,6 +73,7 @@ from ui.algorithm_dialog import AlgorithmDialog
 from ui.confirm_changes import confirm_changes
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
+    MAX_TIME_EXIT_WAIT_BARS,
     AfterTakeProfit,
     AlgorithmOption,
     AverageKind,
@@ -82,6 +83,7 @@ from ui.models import (
     OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
+    TimeExitKind,
 )
 from ui.theme import current as current_theme
 from ui.wheel_guard import guard_wheel
@@ -216,6 +218,9 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("window_start", "Торговое окно", "window_start"),
     ("window_end", "Торговое окно", "window_end"),
     ("close_on_time_end", "Торговое окно", "close_on_time_end"),
+    ("time_exit_order", "Торговое окно", "time_exit_order"),
+    ("time_exit_limit_steps", "Торговое окно", "time_exit_limit_steps"),
+    ("time_exit_wait_bars", "Торговое окно", "time_exit_wait_bars"),
     ("calendar", "Торговое окно", "calendar_note"),
     ("volume", "Деньги", "volume"),
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
@@ -237,6 +242,7 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
 _CHOICES: tuple[str, ...] = (
     "average_kind", "reversal_moment", "after_take_profit",
     "on_price_equals_average", "minute_order", "minute_bar_limit",
+    "time_exit_order",
 )
 
 
@@ -713,7 +719,10 @@ class SettingsDialog(QDialog):
         # Шаг цены инструмента и проскальзывание в шагах (ТЗ §4.4 Ж).
         # Четыре знака после запятой: у фьючерса на индекс шаг целый, у акций
         # он копеечный, и округление до сотых сделало бы поле негодным для них.
-        self.price_step = _decimal(0.0, 1_000_000.0, 1.0, " ₽", decimals=4)
+        # Единица — пункты цены, а не рубли: шаг умножается на число шагов
+        # и прибавляется к цене (`backtest.Costs.slippage`, предел заявки
+        # движка). Рубли за пункт — соседнее поле.
+        self.price_step = _decimal(0.0, 1_000_000.0, 1.0, " пункт.", decimals=4)
         self.price_step.setSpecialValueText("не задан")
         self.price_step.valueChanged.connect(self._sync_costs)
 
@@ -778,6 +787,24 @@ class SettingsDialog(QDialog):
         self.close_on_time_end = QCheckBox("Закрывать позицию в конце окна")
         self.close_on_time_end.toggled.connect(self._sync_window_close)
         self.window_close_note = _alert()
+
+        # Заявка на выход по концу окна и два её числа (решение 0060 §3).
+        # Числа гаснут при рыночной заявке: они читаются только предельной.
+        self.time_exit_order = _choice(TimeExitKind)
+        self.time_exit_order.currentIndexChanged.connect(self._sync_window_close)
+        # Верхняя граница поля — не правило, а предел ввода: у движка отступ
+        # сверху не ограничен. Тысяча шагов — 25 000 пунктов на фьючерсе
+        # на индекс, дальше любой предел уже не предел.
+        self.time_exit_limit_steps = _whole(0, 1000, " × шаг цены")
+        self.time_exit_wait_bars = _whole(1, MAX_TIME_EXIT_WAIT_BARS, " св.")
+        # Шаг цены живёт на другой вкладке, а нужен предельной цене здесь:
+        # его правка обязана перерисовать строку и здесь.
+        self.price_step.valueChanged.connect(self._sync_window_close)
+        self.time_exit_note = _alert()
+        # Та же строка — под полем шага цены: чинить её там, а человек,
+        # открывший окно на первой вкладке, иначе видел бы погасшие кнопки
+        # без причины (снимок 04.10.2026).
+        self.step_note = _alert()
 
         # Календарь нерабочих дней своего поля здесь не имеет: его правят
         # в отдельном окне из меню «Настройки». Но указатель на вкладке
@@ -1052,10 +1079,14 @@ class SettingsDialog(QDialog):
         """
         box = self._group("Свойства инструмента", [
             ("Шаг цены инструмента", self.price_step,
-             "Наименьшее движение цены этого инструмента — из карточки "
-             "инструмента на сайте биржи. Нужен для поправки на "
-             "проскальзывание на вкладке «Деньги»: она задаётся в шагах, "
-             "потому что «полшага» на фьючерсе и на акции — разные деньги."),
+             "Наименьшее движение цены этого инструмента, в пунктах цены — "
+             "из карточки инструмента на сайте биржи; программа его сама "
+             "не подставляет. Нужен в двух местах: поправке на "
+             "проскальзывание на вкладке «Деньги» (она задаётся в шагах, "
+             "потому что «полшага» на фьючерсе и на акции — разные деньги) "
+             "и предельной цене заявки на выход по концу окна на вкладке "
+             "«Торговое окно» (отступ тоже в шагах). При заявке «с предельной "
+             "ценой» без шага настройки не применятся."),
             ("Рублей в пункте цены", self.ruble_per_point,
              "На сколько рублей меняется ваш результат, когда цена проходит "
              "один пункт. Программа спрашивает это число у биржи и подставляет "
@@ -1067,6 +1098,8 @@ class SettingsDialog(QDialog):
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
+            row = cast("tuple[int, object]", layout.getWidgetPosition(self.price_step))
+            layout.insertRow(row[0] + 1, self.step_note)
             layout.addRow(self.point_note)
         return box
 
@@ -1289,11 +1322,38 @@ class SettingsDialog(QDialog):
              "на графике. Галочка снята — держим до сигнала средней, тейка или "
              "переворота, и позиция может остаться открытой на ночь и на "
              "выходные. ⚠️ Все замеры проекта и сверка с вашим нынешним "
-             "роботом сделаны с поставленной галочкой."),
+             "роботом сделаны с поставленной галочкой. При заявке «с предельной "
+             "ценой» ниже галочка не действует: позиция закрывается всегда."),
+            ("Заявка на выход по концу окна", self.time_exit_order,
+             "Какой заявкой робот закрывает позицию по концу окна и перед "
+             "нерабочим днём. «По рынку» — по любой цене, сразу; так работает "
+             "ваш нынешний робот, и на этом стоят все замеры. «С предельной "
+             "ценой» — робот назначает цену, хуже которой не закроет: от "
+             "закрытия последней свечи на несколько шагов цены в вашу сторону. "
+             "Позиция при этом закрывается всегда, галочка выше не действует. "
+             "Выход по сигналу средней остаётся рыночным в обоих случаях."),
+            ("Отступ предельной цены", self.time_exit_limit_steps,
+             "На сколько шагов цены предельная цена отстоит от закрытия "
+             "последней свечи — в сторону, худшую для вас: при закрытии лонга "
+             "ниже, при закрытии шорта выше. Больше отступ — заявка "
+             "исполняется надёжнее, но может исполниться хуже. Шаг цены "
+             "берётся из поля «Шаг цены инструмента» на вкладке «Инструмент "
+             "и данные». Действует только при заявке «с предельной ценой»."),
+            ("Ждать исполнения", self.time_exit_wait_bars,
+             "Сколько закрытых свечей ждать, пока заявка с предельной ценой "
+             "исполнится. Не исполнилась — робот останавливается, заявку "
+             "оставляет и зовёт вас: её надо снять или дождаться, прежде чем "
+             "закрывать позицию руками. Действует только при заявке "
+             "«с предельной ценой»."),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
             layout.addRow(self.window_close_note)
+            # Отказ «предельная цена без шага» — сразу под выбором заявки,
+            # а не в хвосте вкладки: в хвосте он уходит под прокрутку,
+            # и человек видит погасшие кнопки без причины (снимок 04.10).
+            row = cast("tuple[int, object]", layout.getWidgetPosition(self.time_exit_order))
+            layout.insertRow(row[0] + 1, self.time_exit_note)
             layout.addRow(self.calendar_note)
         return box
 
@@ -1485,6 +1545,9 @@ class SettingsDialog(QDialog):
         )
         self._sync_unused()
         self._sync_demands()
+        # Требование могло закрыть выбор заявки, не сменив его: строка про
+        # шаг цены тогда перестаёт советовать «по рынку» только здесь.
+        self._sync_window_close()
         found = self._chosen_option()
         if found is not None:
             self.algorithm_name.setText(found.title)
@@ -1775,6 +1838,29 @@ class SettingsDialog(QDialog):
             if kind == "refusal":
                 label.setVisible(False)
 
+    def show_field(self, field: str) -> None:
+        """Открыть вкладку поля `Settings`, прокрутить к нему и дать фокус.
+
+        Зовёт главное окно, когда настройки из файла при запуске приняты
+        не так, как записаны (`RobotState.settings_field`): человек приходит
+        чинить одно поле, и искать его по вкладкам и под прокруткой — ровно
+        то, на чём отказ терялся (находка 04.10.2026). Пустое или
+        незнакомое имя — ничего не делать.
+
+        Прокрутка — следующим ходом цикла событий: до показа окна у полей
+        ещё нет мест, и прокручивать не к чему.
+        """
+        widget = self._widget_of(field) if field else None
+        where = next((tab for name, tab, _attr in PLACEMENT if name == field), "")
+        page = self.page_of(where)
+        if widget is None or page is None:
+            return
+        self.tabs.setCurrentWidget(page)
+        widget.setFocus()
+        if isinstance(page, QScrollArea):
+            # Запас снизу — под строку причины, которая стоит под полем.
+            QTimer.singleShot(0, page, lambda: page.ensureWidgetVisible(widget, 50, 160))
+
     def page_of(self, tab: str) -> QWidget | None:
         """Страница вкладки по её заголовку. `None` — такой вкладки нет.
 
@@ -1820,6 +1906,8 @@ class SettingsDialog(QDialog):
             self.trailing_start, self.trailing_offset, self.trailing_step,
             # «Торговое окно»
             self.window_start, self.window_end, self.close_on_time_end,
+            self.time_exit_order, self.time_exit_limit_steps,
+            self.time_exit_wait_bars,
             # «Деньги»
             # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): потолка в обходе нет. При
             # возврате раскомментировать строку ниже и удалить живую замену под ней.
@@ -1905,6 +1993,8 @@ class SettingsDialog(QDialog):
         # «закрывать в конце окна» и фильтр против пилы.
         self._calendar = settings.calendar
         self.slippage_steps.setValue(settings.slippage_steps)
+        self.time_exit_limit_steps.setValue(settings.time_exit_limit_steps)
+        self.time_exit_wait_bars.setValue(settings.time_exit_wait_bars)
         self.log_directory.setText(settings.log_directory)
         self.window_start.setTime(QTime(settings.window_start.hour, settings.window_start.minute))
         self.window_end.setTime(QTime(settings.window_end.hour, settings.window_end.minute))
@@ -2032,6 +2122,8 @@ class SettingsDialog(QDialog):
             window_start=self.window_start.time().toPython(),
             window_end=self.window_end.time().toPython(),
             close_on_time_end=self.close_on_time_end.isChecked(),
+            time_exit_limit_steps=self.time_exit_limit_steps.value(),
+            time_exit_wait_bars=self.time_exit_wait_bars.value(),
             price_step=self.price_step.value(),
             ruble_per_point=self.ruble_per_point.value(),
             # ⚠️ Происхождение числа переживает обмен, но **не переживает
@@ -2244,7 +2336,7 @@ class SettingsDialog(QDialog):
     def _sync_buttons(self) -> None:
         """«ОК» и «Применить» гаснут, пока хоть одна проверка не пройдена.
 
-        Проверок теперь две — тейк и издержки, — и решение о кнопках
+        Проверок три — тейк, издержки, выход по концу окна, — и решение о кнопках
         принимается в одном месте. Врозь они гасили бы кнопки по очереди:
         последняя сработавшая включала бы их обратно, отменяя чужой запрет.
 
@@ -2255,14 +2347,19 @@ class SettingsDialog(QDialog):
         buttons = getattr(self, "buttons", None)
         if buttons is None:
             return
-        allowed = not (self.take_error() or self.costs_error())
+        # Первая непройденная проверка — и запрет, и подсказка серой кнопки:
+        # погасшая «ОК» без слова «почему» выглядит сломанной (находка
+        # 04.10.2026 — причина стояла под полем, уехавшим под прокрутку).
+        reason = self.take_error() or self.costs_error() or self.time_exit_error()
+        hint = f"Недоступно: {reason}" if reason else ""
         for standard in (
             QDialogButtonBox.StandardButton.Ok,
             QDialogButtonBox.StandardButton.Apply,
         ):
             button = buttons.button(standard)
             if button is not None:
-                button.setEnabled(allowed)
+                button.setEnabled(not reason)
+                button.setToolTip(hint)
 
     @staticmethod
     def _paint_note(label: QLabel, *, alarming: bool) -> None:
@@ -2419,9 +2516,59 @@ class SettingsDialog(QDialog):
             "по построению — у вашего робота фильтра нет."
         )
 
+    def time_exit_error(self) -> str:
+        """Почему выход по концу окна с такими числами не собрать. Пусто — можно.
+
+        Не торговое правило, а то же условие, что держит движок
+        (`EngineSettings._check_time_exit`) и граница применения
+        (`app/convert.py::engine_settings`): повторено здесь, чтобы человек
+        увидел отказ в момент ввода, а не после «ОК». Источник правды один.
+        """
+        limit = self.time_exit_order.currentData() is TimeExitKind.LIMIT
+        if limit and self.price_step.value() <= 0:
+            # Поле, закрытое требованием алгоритма, «по рынку» не даст:
+            # совет выбрать его был бы советом сделать невозможное.
+            other = (
+                " или выберите заявку «по рынку»"
+                if self.time_exit_order.isEnabled() else ""
+            )
+            # Что действует сейчас — первым, той же правдой, что в журнале
+            # и на плашке главного окна: в поле стоит предельная цена,
+            # а прогон идёт «по рынку», и одно без другого читалось бы ложью.
+            applied = getattr(self, "_applied", None)
+            now = (
+                "Сейчас прогон идёт с выходом «по рынку»: "
+                if applied is not None
+                and applied.time_exit_order is not TimeExitKind.LIMIT else ""
+            )
+            return (
+                f"{now}выбрана заявка с предельной ценой, а шаг цены инструмента "
+                "не задан — предельную цену не посчитать. Впишите шаг цены "
+                "на вкладке «Инструмент и данные» (он есть в карточке "
+                f"инструмента на сайте биржи){other}."
+            )
+        return ""
+
     def _sync_window_close(self, *_: object) -> None:
-        """Строка про выход по концу окна. Тревожная только когда галочка снята."""
-        if self.close_on_time_end.isChecked():
+        """Строки про выход по концу окна: форма заявки, её числа, галочка.
+
+        ⚠️ При заявке «с предельной ценой» галочка не действует
+        (`engine.TimeExitOrder`): позиция закрывается всегда. Строка
+        «закрытие по времени выключено» под снятой галочкой была бы тогда
+        неправдой, поэтому галочка гаснет, а строка молчит.
+        """
+        limit = self.time_exit_order.currentData() is TimeExitKind.LIMIT
+        self.close_on_time_end.setEnabled(not limit)
+        self.time_exit_limit_steps.setEnabled(limit)
+        self.time_exit_wait_bars.setEnabled(limit)
+        error = self.time_exit_error()
+        self._sync_buttons()
+        # Пустая строка прячется, а не только стирается: иначе на месте
+        # отказа оставалась дыра в полвкладки (снимок 04.10.2026).
+        for note in (self.time_exit_note, self.step_note):
+            note.setText("⚠️ " + error if error else "")
+            note.setVisible(bool(error))
+        if limit or self.close_on_time_end.isChecked():
             self.window_close_note.setText("")
             return
         self.window_close_note.setText(

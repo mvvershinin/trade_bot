@@ -56,6 +56,7 @@ from engine import (
     JournalLevel,
     OrderAction,
     Reversal,
+    TimeExitOrder,
     TradingWindow,
     close_time,
     day_verdict,
@@ -103,6 +104,7 @@ from ui.models import (
     Shade,
     ShadeKind,
     Side,
+    TimeExitKind,
     TradePath,
     TradeRow,
     TradesSummary,
@@ -313,6 +315,16 @@ def stored_origin(origin: RunOrigin) -> StoredRunOrigin:
     return _STORED_OF_ORIGINS[origin]
 
 
+#: Форма заявки на выход по концу окна: окно → движок. Таблица, а не
+#: `TimeExitOrder(value.value)`: совпадение строк двух перечислений —
+#: случайность, и переименование одного из них сломало бы перевод молча.
+#: Здесь — громко, `KeyError` на новом члене.
+_TIME_EXIT_ORDERS: dict[TimeExitKind, TimeExitOrder] = {
+    TimeExitKind.MARKET: TimeExitOrder.MARKET,
+    TimeExitKind.LIMIT: TimeExitOrder.LIMIT,
+}
+
+
 #: Откуда движок берёт каждое своё поле, если оно **приходит из окна**.
 #:
 #: Таблица, а не перечисление в конструкторе, и по той же причине, что
@@ -349,6 +361,15 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     # (`market.iss.InstrumentSpec`) и подставляют в поле, а владелец счёта
     # вправе перебить. Здесь только перекладка.
     "ruble_per_point": lambda values, _mode: values.ruble_per_point,
+    # Шаг цены — **одно** поле окна на всю программу (решение владельца счёта
+    # 04.10.2026): из него же издержки тестера считают проскальзывание
+    # (`_costs`). Движку он нужен для предела заявки на выход по времени.
+    "price_step": lambda values, _mode: values.price_step,
+    # Выход по концу окна с предельной ценой (Э5, задача З8, Ф3): три поля
+    # окна на вкладке «Торговое окно». Форма — таблицей `_TIME_EXIT_ORDERS`.
+    "time_exit_order": lambda values, _mode: _TIME_EXIT_ORDERS[values.time_exit_order],
+    "time_exit_limit_steps": lambda values, _mode: values.time_exit_limit_steps,
+    "time_exit_wait_bars": lambda values, _mode: values.time_exit_wait_bars,
     # Календарь владельца счёта: отметки окна → набор дат движка. Перевод,
     # а не правило: что значит отметка, решает `engine/window.py`.
     "calendar": lambda values, _mode: DayMarks.of(
@@ -479,6 +500,43 @@ def _unavailable_choice(values: Settings) -> str:
     return ""
 
 
+def limit_demanded_by(values: Settings) -> str:
+    """Название алгоритма, который требует выхода с предельной ценой. Пусто — не требует.
+
+    Незнакомый алгоритм считается требующим: обещать «можно по рынку»
+    про алгоритм, которого в сборке нет, нечем.
+    """
+    try:
+        entry = registry.find(values.strategy_id)
+    except registry.UnknownStrategy:
+        return values.strategy_id
+    demanded = any(demand.outer == "time_exit_order" for demand in entry.demands)
+    return entry.title if demanded else ""
+
+
+def limit_without_step(values: Settings) -> str:
+    """Отказ «предельная цена без шага цены» — одна фраза на все пути.
+
+    Окно, «Применить», запрос прогона, сборка порта при запуске. Совет
+    выбрать заявку «по рынку» даётся, **только если алгоритм её позволяет**:
+    у алгоритма, требующего предельной цены (`demands` реестра), такой
+    совет — совет сделать невозможное (находка 04.10.2026: «если алгоритм
+    позволяет» стояло в журнале у алгоритма, который не позволяет). Тем же
+    правилом говорит строка под полем в окне настроек
+    (`SettingsDialog.time_exit_error`).
+    """
+    other = (
+        "" if limit_demanded_by(values) else
+        " или выберите заявку «по рынку» на вкладке «Торговое окно»"
+    )
+    return (
+        "Выход по концу окна выбран заявкой с предельной ценой, а шаг цены "
+        "инструмента не задан — предельную цену не посчитать. Впишите шаг цены "
+        "на вкладке «Инструмент и данные» (он есть в карточке инструмента "
+        f"на сайте биржи){other}."
+    )
+
+
 def engine_settings(
     values: Settings, mode: Mode, base: EngineSettings | None = None
 ) -> EngineSettings:
@@ -518,6 +576,13 @@ def engine_settings(
     unavailable = _unavailable_choice(values)
     if unavailable:
         raise SettingsRefused(unavailable)
+    # ⚠️ То же условие, что у движка (`EngineSettings._check_time_exit`), —
+    # но здесь отказ называет поле и говорит человеку, что делать. Голый
+    # `ValueError` движка мимо `SettingsRefused` пролетал бы сборку порта
+    # (`app/port.py::_startup_settings`) и ронял программу при запуске
+    # с таким файлом настроек (правило 13).
+    if values.time_exit_order is TimeExitKind.LIMIT and values.price_step <= 0:
+        raise SettingsRefused(limit_without_step(values), field="price_step")
     previous = base if base is not None else EngineSettings()
     fields: dict[str, Any] = {
         name: take(values, mode) for name, take in _ENGINE_FROM_WINDOW.items()
@@ -1272,7 +1337,9 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # владелец счёта поменял (`D-068`).
     "history_depth_days": _Told("Глубина загрузки истории", _as_load_days),
     "expiry_halt_days": _Told("Остановка перед экспирацией", _as_expiry_days),
-    "price_step": _Told("Шаг цены инструмента", fmt_number),
+    # Шаг цены здесь больше не рассказывается: с Ф3 задачи З8 он поле
+    # движка (`EngineSettings.price_step`, предел заявки на выход), и строку
+    # пишет движок. Две строки об одном изменении быть не должно.
     # ⚠️ Само число рассказывает движок (`ruble_per_point` — его поле).
     # Здесь — только **происхождение**: «подсказано биржей» или «ввод руками».
     # Отдельная строка нужна потому, что величина плавающая: одно и то же
@@ -1324,6 +1391,9 @@ _TOLD_BY_ENGINE: frozenset[str] = frozenset({
     "trailing_enabled", "trailing_start_pct", "trailing_offset_pct",
     "trailing_step_pct", "after_take_profit", "commission_per_side_rub",
     "ruble_per_point",
+    # Выход по концу окна и шаг цены (Ф3 задачи З8): поля движка.
+    "time_exit_order", "time_exit_limit_steps", "time_exit_wait_bars",
+    "price_step",
     # Календарь нерабочих дней: отметки уезжают в `EngineSettings.calendar`,
     # и строку «Календарь нерабочих дней: нет → 12.06.2026 не торгуем» пишет
     # движок. Своей строки в окне у него нет намеренно — двух строк об одном
@@ -1969,7 +2039,7 @@ def _quiet(settings: EngineSettings, outside: bool, rules: set[DayRule]) -> str:
             text for rule, text in _QUIET_OF_RULE.items() if rule in rules
         )
         return f"Нерабочий день: {why}, входов нет"
-    if settings.close_on_time_end:
+    if settings.closes_by_time:
         return "Вне торгового окна: входов нет, позиция закрывается по концу окна"
     return (
         "Вне торгового окна: входов нет. «Закрывать в конце окна» выключено — "

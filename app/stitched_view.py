@@ -35,7 +35,7 @@ from app import convert
 from app.minutes import minute_plan
 from app.stitched import StitchRequest, load_pieces
 from backtest import HistoryRun
-from backtest.execution import Costs
+from backtest.execution import Costs, LimitExits
 from backtest.stitched import Piece, StitchedRun, replay_pieces, stitched_lines
 from engine import EngineSettings
 from market import MSK, MarketWorker, Timeframe
@@ -220,6 +220,10 @@ def as_history(stitched: StitchedRun, costs: Costs) -> HistoryRun:
             None,
         ),
         bars_without_minutes=sum(one.run.bars_without_minutes for one in stitched.pieces),
+        # Выходы по времени с предельной ценой — суммой по кускам. Потерянный
+        # здесь счёт убрал бы из допущений склейки неисполненную заявку,
+        # остановившую робота (правило 13).
+        limit_exits=sum((one.run.limit_exits for one in stitched.pieces), LimitExits()),
     )
 
 

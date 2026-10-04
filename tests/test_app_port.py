@@ -50,6 +50,7 @@ from ui.models import (
     Layer,
     Mode,
     Settings,
+    TimeExitKind,
 )
 
 from app import convert
@@ -760,12 +761,24 @@ def _with_demands(values: Settings) -> Settings:
     try:
         entry = registry.find(values.strategy_id)
     except registry.UnknownStrategy:
-        return values
+        return _with_step(values)
     changes = {
         demand.outer: getattr(type(getattr(values, demand.outer)), demand.value)
         for demand in entry.demands
     }
-    return values.replace(**changes) if changes else values
+    return _with_step(values.replace(**changes) if changes else values)
+
+
+def _with_step(values: Settings) -> Settings:
+    """Заявке с предельной ценой — шаг цены: без него настройки отвергаются.
+
+    ⚠️ С Ф3 задачи З8 выход «с предельной ценой» без шага цены — отказ
+    (`app/convert.py::limit_without_step`). Тест на путь журнала проверял бы
+    без этого путь отказа — тот же довод, что у требований выше.
+    """
+    if values.time_exit_order is TimeExitKind.LIMIT and values.price_step <= 0:
+        return values.replace(price_step=25.0)
+    return values
 
 
 def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:

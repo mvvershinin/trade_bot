@@ -44,6 +44,7 @@ __all__ = [
     "Mode",
     "Reversal",
     "PartialCandles",
+    "TimeExitOrder",
     "EngineSettings",
     "MAX_CLOSE_WAIT_BARS",
     "MAX_GUARD_PERCENT",
@@ -192,6 +193,35 @@ class PartialCandles(enum.Enum):
         }[self]
 
 
+class TimeExitOrder(enum.Enum):
+    """Форма заявки на выход «по времени»: по концу окна и перед нерабочим днём.
+
+    **По рынку** — умолчание и поведение прототипа: на нём стоит сверка
+    127 из 127, и алгоритм №1 ходит этим путём байт в байт.
+
+    **С предельной ценой** — «жёсткое закрытие» (решение 0060 §3): заявка
+    несёт предел `close сигнальной свечи ∓ N шагов цены`, округлённый к сетке
+    шага **от рынка**. Выбор этой формы сам означает «закрывать по концу окна
+    всегда»: галочка «Закрывать в конце окна» при нём не действует
+    (`EngineSettings.closes_by_time`). Иначе алгоритм, которому нужен жёсткий
+    выход, слушался бы снятой галочки.
+
+    ⚠️ Выход **по сигналу средней** этой настройкой не затрагивается никогда:
+    он остаётся рыночным.
+    """
+
+    MARKET = "market"
+    LIMIT = "limit"
+
+    @property
+    def label(self) -> str:
+        """Подпись для окна и журнала."""
+        return {
+            TimeExitOrder.MARKET: "По рынку",
+            TimeExitOrder.LIMIT: "С предельной ценой",
+        }[self]
+
+
 #: Поле → (ожидаемый тип, фраза для отказа). Все четыре проверки одной формы:
 #: `isinstance` и написанная фраза, различаются только типом и словом.
 #: В отличие от шести числовых правил `EngineSettings.__post_init__`, здесь
@@ -202,6 +232,7 @@ _ENUM_FIELD_CHECKS: tuple[tuple[str, type, str], ...] = (
     ("window", TradingWindow, "торговое окно — engine.TradingWindow"),
     ("reversal", Reversal, "момент переворота — engine.Reversal"),
     ("partial_candles", PartialCandles, "поведение с неполной свечой — engine.PartialCandles"),
+    ("time_exit_order", TimeExitOrder, "форма выхода по времени — engine.TimeExitOrder"),
 )
 
 
@@ -377,6 +408,34 @@ class EngineSettings:
     #: означает «не знаем», и это НЕ «закрыто»: программа ведёт себя так же,
     #: как вела до появления расписания.
     exchange_days: DayMarks = NO_MARKS
+    #: Форма заявки на выход по концу окна и перед нерабочим днём
+    #: (`TimeExitOrder`). Умолчание — по рынку, как у прототипа.
+    time_exit_order: TimeExitOrder = TimeExitOrder.MARKET
+    #: Отступ предельной цены от закрытия сигнальной свечи — **в шагах цены**
+    #: и только в них (решение владельца счёта 04.10.2026). ⚠️ Десять шагов —
+    #: временное значение, вопрос 26 в `OPEN-QUESTIONS.md` открыт.
+    time_exit_limit_steps: int = 10
+    #: Сколько закрытых свечей ждать исполнения выхода **с предельной ценой**,
+    #: прежде чем остановиться и позвать человека. Не путать
+    #: с `close_wait_bars`: тот — порог рыночного выхода. Какой из двух
+    #: действует, решает **поданная заявка**, а не текущая настройка: смена
+    #: формы посреди ожидания не должна переносить чужой порог.
+    time_exit_wait_bars: int = 1
+    #: Шаг цены инструмента, в пунктах цены. Число задано биржей, и в окне
+    #: оно **одно** на всю программу — то же поле, из которого издержки тестера
+    #: считают проскальзывание (решение владельца счёта 04.10.2026). Ноль —
+    #: «шаг неизвестен»; при выходе с предельной ценой это отказ, а не ноль
+    #: в формуле: предел без шага совпал бы с закрытием свечи молча.
+    price_step: float = 0.0
+
+    @property
+    def closes_by_time(self) -> bool:
+        """Закрывается ли позиция по концу окна. Одно место для всех читающих.
+
+        Галочка «Закрывать в конце окна» **или** выход с предельной ценой:
+        жёсткое закрытие не выключается галочкой (`TimeExitOrder`).
+        """
+        return self.close_on_time_end or self.time_exit_order is TimeExitOrder.LIMIT
 
     def plan(self) -> TakeProfit:
         """План тейка для следующей сделки — то, что заморозится на входе.
@@ -417,6 +476,7 @@ class EngineSettings:
         self._check_min_exit_profit()
         self._check_ruble_per_point()
         self._check_close_wait_bars()
+        self._check_time_exit()
         # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): полей нет — проверять нечего.
         # self._check_volume_cap()
         # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): процентов нет.
@@ -621,6 +681,48 @@ class EngineSettings:
                 f"считает живым. Получено {self.close_wait_bars!r}"
             )
 
+    def _check_time_exit(self) -> None:
+        """Выход с предельной ценой: шаг цены, отступ в шагах, ожидание.
+
+        ⚠️ Шаг цены, равный нулю, при `LIMIT` — **отказ вслух**, а не ноль
+        в формуле: предел совпал бы с закрытием свечи, и заявка выглядела бы
+        посчитанной с отступом, которого в ней нет (правило 13).
+        """
+        step = self.price_step
+        if isinstance(step, bool) or not isinstance(step, (int, float)):
+            raise TypeError(f"шаг цены — число, получено {step!r}")
+        if not math.isfinite(step) or step < 0:
+            raise ValueError(f"шаг цены не может быть отрицательным или не числом: {step!r}")
+        steps = self.time_exit_limit_steps
+        if isinstance(steps, bool) or not isinstance(steps, int):
+            raise TypeError(
+                f"отступ предельной цены — целое число шагов цены, получено {steps!r}"
+            )
+        if steps < 0:
+            raise ValueError(
+                f"отступ предельной цены не может быть отрицательным: {steps!r}. "
+                "Отрицательный отступ ставил бы предел по ту сторону рынка"
+            )
+        wait = self.time_exit_wait_bars
+        if isinstance(wait, bool) or not isinstance(wait, int):
+            raise TypeError(
+                f"ожидание выхода с предельной ценой — целое число свечей, получено {wait!r}"
+            )
+        if not 1 <= wait <= MAX_CLOSE_WAIT_BARS:
+            raise ValueError(
+                "ожидание выхода с предельной ценой — от 1 до "
+                f"{MAX_CLOSE_WAIT_BARS} свечей, получено {wait!r}: ноль "
+                "останавливал бы робота на каждом выходе, больше границы — "
+                "держал бы позицию без управления дольше окна"
+            )
+        if self.time_exit_order is TimeExitOrder.LIMIT and step <= 0:
+            raise ValueError(
+                "выход по концу окна с предельной ценой выбран, а шаг цены "
+                "инструмента неизвестен — предел не посчитать. Дождитесь "
+                "карточки инструмента или впишите шаг цены в настройках "
+                "(у фьючерса на индекс МосБиржи это 25)"
+            )
+
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
     # def _check_volume_cap(self) -> None:
     #     """Потолок объёма: `None` разрешён явно, иначе число, конечное, больше нуля.
@@ -688,9 +790,9 @@ class EngineSettings:
         Одна строка кода на поле, а не одна строка на поле руками: список
         `_CHANGE_ROWS` — единственное место, где поле называется, порядок
         строк журнала — порядок этого списка. Компаратор у каждого поля
-        свой и с полем не путается: три перечисления (`mode`, `reversal`,
-        `partial_candles`) сравниваются тождеством — их значения синглтоны,
-        и это безопасно, — четырнадцать остальных сравниваются на равенство,
+        свой и с полем не путается: четыре перечисления (`mode`, `reversal`,
+        `partial_candles`, `time_exit_order`) сравниваются тождеством — их
+        значения синглтоны, и это безопасно, — остальные сравниваются на равенство,
         потому что `app/convert.py:277` пересобирает `volume` заново при
         каждом вызове (`float(values.volume)`): тождество увидело бы смену
         там, где значение то же самое
@@ -742,15 +844,17 @@ def _sides(value: float) -> str:
     return f"{value:g}".replace(".", ",") + " комиссии"
 
 
-def _bars(count: int) -> str:
-    """Свечи для журнала: «1 свеча», «3 свечи», «12 свечей»."""
+def _word(count: int, one: str, few: str, many: str) -> str:
+    """Слово в форме, согласованной с числом: 1 свеча, 3 свечи, 12 свечей."""
     tail = abs(count) % 100
     if 11 <= tail <= 14:
-        return f"{count} свечей"
-    return {
-        1: f"{count} свеча", 2: f"{count} свечи",
-        3: f"{count} свечи", 4: f"{count} свечи",
-    }.get(tail % 10, f"{count} свечей")
+        return many
+    return {1: one, 2: few, 3: few, 4: few}.get(tail % 10, many)
+
+
+def _bars(count: int) -> str:
+    """Свечи для журнала: «1 свеча», «3 свечи», «12 свечей»."""
+    return f"{count} {_word(count, 'свеча', 'свечи', 'свечей')}"
 
 
 def _volume(value: float) -> str:
@@ -760,15 +864,29 @@ def _volume(value: float) -> str:
     return f"{value:g}".replace(".", ",")
 
 
-def _label(value: Mode | Reversal | PartialCandles | TradingWindow | DayMarks) -> str:
+def _steps(value: int) -> str:
+    """Отступ в шагах цены для журнала: «1 шаг цены», «10 шагов цены»."""
+    return f"{value} {_word(value, 'шаг', 'шага', 'шагов')} цены"
+
+
+def _step(value: float) -> str:
+    """Шаг цены для журнала. Ноль — словами: «не задан» читается однозначно."""
+    if value <= 0:
+        return "не задан"
+    return f"{value:g}".replace(".", ",")
+
+
+def _label(
+    value: Mode | Reversal | PartialCandles | TimeExitOrder | TradingWindow | DayMarks,
+) -> str:
     """Подпись перечисления, окна или календаря для журнала — общий рендер."""
     return value.label
 
 
 #: Одна строка на поле `EngineSettings`, в порядке журнала (не в порядке
 #: объявления полей класса: `engine/runner.py:371` склеивает строки текстом,
-#: и порядок виден человеку). `by_identity=True` — три перечисления, где
-#: значения синглтоны и сравнение тождеством безопасно; остальные четырнадцать
+#: и порядок виден человеку). `by_identity=True` — четыре перечисления, где
+#: значения синглтоны и сравнение тождеством безопасно; остальные
 #: сравниваются на равенство (см. `changes_from`).
 #:
 #: ⚠️ Два поля в хвосте — `ruble_per_point` и `close_wait_bars` — в окне
@@ -803,4 +921,8 @@ _CHANGE_ROWS: tuple[tuple[str, str, bool, Callable[[Any], str]], ...] = (
     ("close_wait_bars", "Ожидание исполнения выхода", False, _bars),
     ("calendar", "Календарь нерабочих дней", False, _label),
     ("exchange_days", "Дни, названные биржей", False, _label),
+    ("time_exit_order", "Выход по концу окна", True, _label),
+    ("time_exit_limit_steps", "Отступ предельной цены", False, _steps),
+    ("time_exit_wait_bars", "Ожидание выхода с предельной ценой", False, _bars),
+    ("price_step", "Шаг цены инструмента", False, _step),
 )

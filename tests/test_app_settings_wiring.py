@@ -338,7 +338,7 @@ def test_applied_settings_reach_the_file(loop, database, tmp_path) -> None:
         worker = MarketWorker(database)
         await worker.open()
         port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
-        _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
+        _keep_settings(port, store, Settings(), level=convert.DecisionLevel.WARNING)
         try:
             port.apply_settings(Settings(instrument=SYMBOL, volume=3, depth_days=12))
             await port.wait()
@@ -362,7 +362,7 @@ def test_a_depth_change_reaches_the_port_without_a_restart(loop, database, tmp_p
         await worker.open()
         port = HistoryPort(worker, values=Settings(depth_days=0), days=0, sanitize=redact)
         port.trades_replaced.connect(lambda rows, total: seen.append((rows, total)))
-        _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
+        _keep_settings(port, store, Settings(depth_days=0), level=convert.DecisionLevel.WARNING)
         try:
             port.refresh("тест")
             await port.wait()
@@ -482,7 +482,10 @@ def test_the_new_window_fields_have_a_journal_line() -> None:
         depth_days=30, price_step=25.0, slippage_steps=1.0,
         log_directory="/tmp/логи",
     )
-    lines = convert.window_changes(before, after)
+    # ⚠️ С Ф3 задачи З8 шаг цены — поле движка, и строку о нём пишет
+    # движок; поэтому собирается всё, что видит журнал, а не только окно.
+    lines, refused = convert.all_changes(before, after)
+    assert not refused, refused
     joined = " | ".join(lines)
     for word in ("Глубина показа", "Шаг цены", "Проскальзывание", "Каталог"):
         assert word in joined, f"про «{word}» в журнале не сказано: {joined}"
@@ -613,7 +616,7 @@ def _start_with_restore(loop, database, tmp_path, work) -> SettingsStore:
         worker = MarketWorker(database)
         await worker.open()
         port = HistoryPort(worker, values=loaded.values, days=0, sanitize=redact)
-        _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
+        _keep_settings(port, store, loaded.values, level=convert.DecisionLevel.WARNING)
         port.attach_exchange(ask)
         try:
             port.refresh("тест")

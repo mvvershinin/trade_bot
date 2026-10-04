@@ -22,7 +22,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, fields
 from datetime import date, datetime, time, timedelta
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -43,7 +43,15 @@ from app.runs import (
     snapshot_marks,
 )
 from backtest import Costs
-from engine import DayMarks, EngineSettings, Mode, PartialCandles, Reversal, TradingWindow
+from engine import (
+    DayMarks,
+    EngineSettings,
+    Mode,
+    PartialCandles,
+    Reversal,
+    TimeExitOrder,
+    TradingWindow,
+)
 from market import (
     BACKTEST_SESSIONS_KEPT,
     MSK,
@@ -65,7 +73,7 @@ from strategies import (
     registry,
 )
 from ui.models import Mode as WindowMode
-from ui.models import ReversalMoment, Settings
+from ui.models import ReversalMoment, Settings, TimeExitKind
 from ui.models import RunOrigin as WindowOrigin
 
 #: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
@@ -309,6 +317,12 @@ _ANOTHER_ENGINE: dict[str, object] = {
     # "free_funds_reserve_percent": 25.0,
     "calendar": DayMarks.of({date(2026, 6, 12): False}),
     "exchange_days": DayMarks.of({date(2026, 6, 12): False}),
+    # Предельная форма законна только при известном шаге — шаг стоит
+    # в основе (см. следующий тест), как тариф для порога выхода.
+    "time_exit_order": TimeExitOrder.LIMIT,
+    "time_exit_limit_steps": 3,
+    "time_exit_wait_bars": 2,
+    "price_step": 10.0,
 }
 
 _ANOTHER_STRATEGY: dict[str, object] = {
@@ -340,7 +354,7 @@ def test_changing_any_engine_setting_changes_the_snapshot(name: str) -> None:
     основа с тарифом не влияет — сравниваются два снимка, и тариф в обоих
     одинаков.
     """
-    base = EngineSettings(commission_per_side=14.0)
+    base = EngineSettings(commission_per_side=14.0, price_step=5.0)
     other = base.replace(**{name: _ANOTHER_ENGINE[name]})
     assert settings_text(
         base, EmaReverseSettings(), algorithm=registry.default_entry()
@@ -984,6 +998,52 @@ def test_a_run_with_another_minute_order_is_not_credited_to_the_set(tmp_path) ->
     assert [len(one) for one in found.runs] == [1, 1], (
         "прогон при другом порядке цен минутки засчитан набору, хотя сделки "
         f"у них разные: {[len(one) for one in found.runs]} {found.trouble!r}"
+    )
+
+
+#: Выход по концу окна с предельной ценой (З8): набор и его сосед, отличающийся
+#: ровно одним полем. Шаг цены стоит в обоих — предел без шага не собрать.
+_TIME_EXIT_PAIRS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
+    "time_exit_order": (
+        {"time_exit_order": TimeExitKind.LIMIT}, {"time_exit_order": TimeExitKind.MARKET},
+    ),
+    "time_exit_limit_steps": (
+        {"time_exit_limit_steps": 10}, {"time_exit_limit_steps": 3},
+    ),
+    "time_exit_wait_bars": ({"time_exit_wait_bars": 1}, {"time_exit_wait_bars": 2}),
+    "price_step": ({"price_step": 25.0}, {"price_step": 10.0}),
+}
+
+
+@pytest.mark.parametrize("field", list(_TIME_EXIT_PAIRS))
+def test_a_run_with_another_time_exit_is_not_credited_to_the_set(
+    tmp_path, field: str
+) -> None:
+    """Стережёт: прогон с другой формой, отступом, ожиданием или шагом — не этого набора.
+
+    Все четыре меняют сделки: форма — рынок или предел, отступ и шаг —
+    сам предел, ожидание — когда робот встанет. Засчитать шаблону прогон
+    с чужим числом — приписать ему чужие деньги.
+
+    Мутация, обязанная ронять проверку: внести любое из четырёх полей
+    в `_UNCONTROLLED_TITLES`.
+    """
+    database = tmp_path / "candles.sqlite3"
+    base = Settings(time_exit_order=TimeExitKind.LIMIT, price_step=25.0)
+    mine, theirs = _TIME_EXIT_PAIRS[field]
+    values, other = base.replace(**mine), base.replace(**theirs)
+    with CandleStore(database) as store:
+        for made in (values, other):
+            store.open_journal_session(SessionRecord(
+                origin=RunOrigin.BACKTEST,
+                symbol=convert.instrument_of(values.instrument),
+                timeframe=values.timeframe, strategy="EMA-разворот",
+                settings=runs.snapshot_of(made), note="прогон прерван",
+            ))
+    found = runs.matching_runs(database, [values, other])
+    assert [len(one) for one in found.runs] == [1, 1], (
+        f"прогон с другим «{field}» засчитан набору, хотя сделки у них разные: "
+        f"{[len(one) for one in found.runs]} {found.trouble!r}"
     )
 
 

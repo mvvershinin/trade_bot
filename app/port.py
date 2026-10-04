@@ -109,6 +109,7 @@ from ui.models import (
     RunOrigin,
     Settings,
     TakeGuard,
+    TimeExitKind,
     TradeRow,
     switch_blocked_reason,
 )
@@ -1071,8 +1072,35 @@ class HistoryPort(TerminalPort):
             if given is not None
             and getattr(given, item.name) != getattr(self._values, item.name)
         }
+        #: Подмена при запуске словами и поле, которое её лечит, — для плашки
+        #: главного окна (`RobotState.settings_trouble`). Строка журнала одна
+        #: и обрезается колонкой; плашка с кнопкой «Открыть настройки» стоит,
+        #: пока человек не применил настройки сам. Пусто — подмены нет.
+        self._trouble = (refused, self._trouble_field()) if refused else ("", "")
         if refused:
             self.note("Настройки не приняты", refused, DecisionLevel.ERROR)
+
+    def _trouble_field(self) -> str:
+        """Поле окна, правкой которого лечится подмена при запуске.
+
+        Предельная цена без шага (З8) лечится **шагом**, а не формой заявки:
+        форму у алгоритма №2 выбрать нельзя, она закрыта требованием. Иначе —
+        само подменённое поле.
+        """
+        held = self._file_holds
+        if "time_exit_order" in held and self._values.price_step <= 0:
+            return "price_step"
+        return next(iter(held), "")
+
+    @property
+    def startup_substituted(self) -> frozenset[str]:
+        """Поля, которые порт при запуске поставил не так, как прочитано из файла.
+
+        Нужны сборке (`app/main.py::_say_what_was_read`): строка чтения
+        файла про такое поле говорит о значении, которое уже не действует,
+        и рядом со строкой порта читалась бы как вторая правда.
+        """
+        return frozenset(self._file_holds)
 
     # ------------------------------------------------------- выход наружу
 
@@ -1411,6 +1439,7 @@ class HistoryPort(TerminalPort):
         self._engine_settings = fresh
         if by_person:  # применённое человеком — его выбор, и в файл идёт оно
             self._file_holds.clear()
+            self._trouble = ("", "")
         self._follow_instrument(settings.instrument)
         self._send(self.settings_applied, settings)
         self._send(self.algorithms_changed, convert.algorithms(settings))
@@ -4649,6 +4678,8 @@ class HistoryPort(TerminalPort):
                 None if candles is None or self._back.span is None
                 else convert.run_days(candles),
             ),
+            settings_trouble=self._trouble[0],
+            settings_field=self._trouble[1],
             day_profit_rub=day.net_profit if day is not None else None,
             day_commission_rub=day.commission if day is not None else None,
             day_trades=day.trades if day is not None else None,
@@ -4911,6 +4942,11 @@ def _startup_settings(
     подменять не пришлось. Причина берётся из самого отказа движка: вторая
     формулировка одной причины разошлась бы с первой.
 
+    Второй случай той же формы — заявка на выход «с предельной ценой» при
+    неизвестном шаге цены (Э5, Ф3 задачи З8): форма ставится «по рынку»,
+    вслух. У алгоритма, который требует предельную цену, первое же
+    «Применить» без шага цены будет отвергнуто — это и есть напоминание.
+
     ⚠️ Отказ, который подменой не лечится (программа собрана несогласованно,
     `convert._ENGINE_GAP`), не глотается: чинить его значениями настроек
     нечем, и работать с ним нельзя.
@@ -4918,6 +4954,11 @@ def _startup_settings(
     values = given or Settings()
     try:
         return values, convert.engine_settings(values, mode), ""
+    except (ValueError, TypeError):
+        # Число из файла, которого движок не принимает (с Ф3 задачи З8 —
+        # отступ и ожидание выхода с предельной ценой). Окно такое не даст:
+        # границы полей; файл, правленный руками или прежней сборкой, — даст.
+        return _numbers_repaired(values, mode)
     except convert.SettingsRefused as refusal:
         defaults = Settings()
         fixed = {
@@ -4925,20 +4966,106 @@ def _startup_settings(
             for item in dataclasses.fields(values)
             if getattr(getattr(values, item.name), "unavailable", "")
         }
+        # Предельная цена без шага цены (Э5, Ф3 задачи З8): подменяется
+        # форма заявки, а не шаг. Шаг — свойство инструмента, и выдумать его
+        # программа не вправе (решение владельца счёта 04.10.2026: из карточки
+        # не подставлять). Узнаётся по полю отказа, а не по тексту.
+        stepless = (
+            refusal.field == "price_step"
+            and values.time_exit_order is TimeExitKind.LIMIT
+        )
+        if stepless:
+            fixed["time_exit_order"] = TimeExitKind.MARKET
         if not fixed:
             raise
         repaired = dataclasses.replace(values, **fixed)
+        # Негодное число в том же файле всплывает только после этой подмены:
+        # отказ выше случился раньше, чем движок дошёл до чисел.
+        try:
+            engine, more = convert.engine_settings(repaired, mode), ""
+        except (ValueError, TypeError):
+            repaired, engine, more = _numbers_repaired(repaired, mode)
+        if stepless:
+            return repaired, engine, " ".join(
+                part for part in (_stepless_note(refusal, repaired), more) if part
+            )
         chosen = ", ".join(
             f"«{getattr(value, 'label', value)}»" for value in fixed.values()
         )
-        return repaired, convert.engine_settings(repaired, mode), (
+        return repaired, engine, " ".join(part for part in ((
             f"В файле настроек выбрано то, чего робот не умеет. {refusal} "
             f"Вместо этого поставлено умолчание программы: {chosen}; остальные "
             "настройки из файла в силе. Файл настроек не изменён: умолчание "
             "запишется в него, когда вы сами измените настройки — «Применить», "
             "шаблон, день в календаре, переход на контракт. Другой вариант "
             "выбирается в окне настроек."
-        )
+        ), more) if part)
+
+
+def _numbers_repaired(values: Settings, mode: Mode) -> tuple[Settings, EngineSettings, str]:
+    """Поля файла, которых движок не принимает, — в умолчание, вслух.
+
+    Какое поле негодно, решает **правило движка**, а не список здесь: поле
+    проверяется в одиночку на умолчаниях программы, и отказ движка
+    на нём — это и есть причина, которая уходит в журнал. Второй
+    формулировки тех же границ в программе не появляется.
+    """
+    defaults = Settings()
+    fixed: dict[str, Any] = {}
+    reasons: list[str] = []
+    for item in dataclasses.fields(values):
+        value = getattr(values, item.name)
+        if value == getattr(defaults, item.name):
+            continue
+        try:
+            convert.engine_settings(defaults.replace(**{item.name: value}), mode)
+        except (ValueError, TypeError) as error:
+            fixed[item.name] = getattr(defaults, item.name)
+            reasons.append(str(error))
+        except convert.SettingsRefused:
+            continue  # зависит от соседнего поля — не этот случай
+    if not fixed:
+        raise ValueError("настройки из файла не собрать, и подменить нечего")
+    repaired = dataclasses.replace(values, **fixed)
+    return repaired, convert.engine_settings(repaired, mode), (
+        "В файле настроек числа, которых робот не принимает: "
+        + "; ".join(reasons)
+        + ". Вместо них поставлены умолчания программы; остальные настройки "
+        "из файла в силе, файл не изменён. Значения выбираются в окне настроек."
+    )
+
+
+def _stepless_note(refusal: convert.SettingsRefused, repaired: Settings) -> str:
+    """Строка журнала: предельная цена без шага при запуске, подменена на «по рынку».
+
+    Одна правда, и начинается она с того, что **действует сейчас**, а потом —
+    что сделать: колонка журнала обрезает хвост, и обрезанное «Впишите ша…»
+    без первой половины ничего не говорило (находка 04.10.2026). Строку
+    чтения файла про то же поле сборка при этом не печатает
+    (`app/main.py::_say_what_was_read`): она называла действующим значение,
+    которое порт тут же снял.
+
+    Совет «или выберите „по рынку“» — только если алгоритм его позволяет
+    (`convert.limit_without_step`): у алгоритма, требующего предельной
+    цены, это совет сделать невозможное.
+    """
+    del refusal  # причина та же, но сказана здесь своими словами — см. выше
+    title = convert.limit_demanded_by(repaired)
+    demand = (
+        f"хотя алгоритм «{title}» требует предельной цены" if title
+        else "хотя в файле настроек выбрана заявка с предельной ценой"
+    )
+    other = (
+        "" if title else
+        " — или выберите заявку «по рынку» на вкладке «Торговое окно»"
+    )
+    return (
+        f"Сейчас прогон идёт с выходом по концу окна «по рынку», {demand}: "
+        "шаг цены инструмента не задан, и предельную цену не посчитать. "
+        "Что сделать: впишите шаг цены в «Настройки» → «Инструмент и данные» "
+        f"(он есть в карточке инструмента на сайте биржи){other} и нажмите «ОК». "
+        "Остальные настройки из файла в силе, файл не изменён."
+    )
 
 
 def _span_note(span: _Span | None, days: int | None = None) -> str:

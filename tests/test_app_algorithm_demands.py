@@ -59,6 +59,7 @@ from ui.models import (
     DecisionRow,
     ReversalMoment,
     Settings,
+    TimeExitKind,
 )
 
 #: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
@@ -71,8 +72,14 @@ SYMBOL = Settings().instrument
 ALWAYS = "ma_reverse_always"
 
 #: Настройки, при которых пара сходится, и при которых нет.
-GOOD = Settings(strategy_id=ALWAYS, reversal_moment=ReversalMoment.SAME_BAR)
-BAD = Settings(strategy_id=ALWAYS, reversal_moment=ReversalMoment.NEXT_BAR)
+#: ⚠️ С Ф3 задачи З8 у алгоритма два требования: переворот в одной свече
+#: и выход по концу окна с предельной ценой (а ей нужен шаг цены). `BAD`
+#: нарушает ровно одно — момент переворота: это файл про него.
+GOOD = Settings(
+    strategy_id=ALWAYS, reversal_moment=ReversalMoment.SAME_BAR,
+    time_exit_order=TimeExitKind.LIMIT, price_step=25.0,
+)
+BAD = GOOD.replace(reversal_moment=ReversalMoment.NEXT_BAR)
 
 
 class Recorded:
@@ -263,12 +270,11 @@ def test_the_requirement_is_declared_by_the_registry_record() -> None:
     Стережёт: возврат к рукописному `if` по имени алгоритма. Третий такой
     отказ был бы ветвлением, которое обязано быть таблицей (правило 9).
     """
-    demands = registry.find(ALWAYS).demands
-    assert len(demands) == 1, f"требований у «{ALWAYS}» стало {len(demands)}"
-    only = demands[0]
-    assert only.outer == "reversal_moment", (
-        f"требование названо про другую настройку: {only.outer}"
+    demands = {one.outer: one for one in registry.find(ALWAYS).demands}
+    assert set(demands) == {"reversal_moment", "time_exit_order"}, (
+        f"требования у «{ALWAYS}» стали другими: {sorted(demands)}"
     )
+    only = demands["reversal_moment"]
     assert only.value == "SAME_BAR", (
         f"требуется другое значение момента переворота: {only.value}"
     )

@@ -23,7 +23,8 @@ import pytest
 
 from app import convert, stitched_view
 from app.stitched import StitchRequest, load_pieces, run_stitched, uncovered
-from backtest.execution import Costs, MinuteOrder
+from backtest.assumptions import assumptions
+from backtest.execution import Costs, LimitExits, MinuteOrder
 from backtest.stitched import replay_pieces
 from engine import EngineSettings, Mode, TradingWindow
 from market.candles import M5, MSK, Timeframe
@@ -304,3 +305,42 @@ def test_the_stitched_window_run_says_how_it_walked_the_minutes(
     shown = stitched_view.as_history(stitched, convert.run_costs(values))
     assert shown.minute_order is MinuteOrder.ADVERSE_FIRST
     assert shown.bars_without_minutes == 1, shown.bars_without_minutes
+
+
+def test_the_stitched_run_keeps_the_limit_exits_of_every_piece(
+    store: CandleStore,
+) -> None:
+    """Стережёт: итог склейки несёт счёт выходов с предельной ценой всех кусков.
+
+    `stitched_view.as_history` собирает `HistoryRun` руками; поле, забытое
+    там, обнуляет счёт — и неисполненная заявка, остановившая робота,
+    пропадает из допущений склеенного прогона (правило 13).
+
+    Вход подставной: счёт кусков вписан в их прогоны, проверяется сборка
+    итога, а не модель исполнения (её стережёт `tests/test_backtest_limit_exit.py`).
+
+    ⚠️ Мутация: снять строку `limit_exits=` в `as_history` — допущения
+    «Выход по времени с предельной ценой» нет, проверка падает.
+    """
+    values = Settings()
+    request = stitched_view.request_of(values, M5, date(2026, 9, 16), SEAM, asset="MX")
+    made, notes = load_pieces(store, request)
+    engine = convert.engine_settings(values, EngineMode.REVERSE)
+    stitched = asyncio.run(stitched_view.run(
+        stitched_view.Stitch(pieces=tuple(made), notes=tuple(notes)), values, engine,
+    ))
+    assert len(stitched.pieces) == 2, "склейка без двух кусков сумму не проверяет"
+    counted = (
+        LimitExits(submitted=2, at_open=1, unfilled=1),
+        LimitExits(submitted=1, at_touch=1),
+    )
+    stitched = dataclasses.replace(stitched, pieces=tuple(
+        dataclasses.replace(one, run=dataclasses.replace(one.run, limit_exits=count))
+        for one, count in zip(stitched.pieces, counted, strict=True)
+    ))
+    shown = stitched_view.as_history(stitched, convert.run_costs(values))
+    assert shown.limit_exits == LimitExits(submitted=3, at_open=1, at_touch=1, unfilled=1)
+    named = [one for one in assumptions(shown)
+             if one.name == "Выход по времени с предельной ценой"]
+    assert named, "неисполненный выход с предельной ценой пропал из допущений склейки"
+    assert "не исполнилось 1" in named[0].short, named[0].short
