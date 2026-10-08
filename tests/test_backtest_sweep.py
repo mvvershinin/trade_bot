@@ -43,8 +43,8 @@ from backtest.sweep import (
     trials_shown,
 )
 from backtest.table import THOUSANDS, both_columns_filled, money, plural, render
-from engine import EngineSettings, ExitReason, Side, TradingWindow
-from strategies import EmaReverseSettings, registry
+from engine import EngineSettings, ExitReason, Reversal, Side, TradingWindow
+from strategies import MaReverseAlwaysSettings, registry
 from tests.engine_helpers import MSK, candle
 
 TUNING = Period(date(2026, 6, 1), date(2026, 6, 30))
@@ -69,7 +69,7 @@ def a_point(label: str, *, take: float = 0.5, period: int = 15) -> Point:
     return Point(
         label=label,
         engine=trading_mode(EngineSettings(commission_per_side=14.0, take_profit_percent=take)),
-        strategy=EmaReverseSettings(period=period),
+        strategy=MaReverseAlwaysSettings(period=period),
         axes=(("take", take),),
     )
 
@@ -283,7 +283,11 @@ def test_a_verdict_without_neighbours_is_a_dash_not_a_word() -> None:
 
 def _ground() -> Ground:
     return Ground(
-        engine=trading_mode(EngineSettings(commission_per_side=14.0)),
+        # Переворот в одной свече — как у `backtest/__main__.py::_ground`:
+        # его требует единственный алгоритм (решение 0063).
+        engine=trading_mode(EngineSettings(
+            commission_per_side=14.0, reversal=Reversal.SAME_BAR,
+        )),
         costs=Costs(commission_per_side=14.0),
     )
 
@@ -341,7 +345,8 @@ def test_the_defaults_row_repeats_in_every_block() -> None:
 def test_the_full_cross_is_the_product_of_every_axis() -> None:
     """Стережёт число прогонов: полное произведение считается, а не оценивается."""
     windows = len(WINDOW_STARTS) * len(WINDOW_DURATIONS) + 2
-    assert len(full_cross(_ground())) == windows * 3 * 14 * 2 * 2
+    # Момент переворота на сетке один — в одной свече (решение 0063).
+    assert len(full_cross(_ground())) == windows * 3 * 14 * 1 * 2
 
 
 def test_the_number_of_runs_is_said_before_the_run() -> None:
@@ -500,7 +505,7 @@ def test_a_deal_outside_every_period_is_counted_apart() -> None:
 def test_a_row_outside_the_grid_gets_no_verdict_instead_of_a_bad_one() -> None:
     """Стережёт: у «всего дня» соседей нет, и это не приговор «шум»."""
     off = Point(label="весь день", engine=a_point("сетка").engine,
-                strategy=EmaReverseSettings(period=20))
+                strategy=MaReverseAlwaysSettings(period=20))
     on_grid = a_point("на сетке", take=0.4)
     trials = (a_trial(off, tuning=1.0, checking=-9000.0),
               a_trial(on_grid, tuning=2.0, checking=3000.0))
@@ -524,7 +529,7 @@ def test_the_grid_names_an_algorithm_that_really_exists() -> None:
     настоящее и оно именно то, чьё поле сетка меняет.
     """
     entry = registry.find(GRID_STRATEGY_ID)
-    assert entry.settings_type is EmaReverseSettings
+    assert entry.settings_type is MaReverseAlwaysSettings
     replaced = {name for name, _ in _GRID_REPLACES}
     known = {one.name for one in entry.fields}
     assert replaced <= known, (
@@ -559,7 +564,7 @@ def test_a_foreign_algorithm_is_refused_with_a_reason_a_human_can_read() -> None
     по ним настройки.
     """
     with pytest.raises(ForeignStrategy) as refusal:
-        refuse_foreign_strategy("atr_channel", EmaReverseSettings())
+        refuse_foreign_strategy("atr_channel", MaReverseAlwaysSettings())
     said = str(refusal.value)
     assert "atr_channel" in said
     assert registry.find(GRID_STRATEGY_ID).title in said

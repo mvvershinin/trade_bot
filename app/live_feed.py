@@ -2034,6 +2034,11 @@ class LiveLink:
             if self._funds is not None:
                 self._funds.request_stop()
             return None
+        if self._session is not None:
+            # Нажатие — то самое действие человека, после которого отвергнутый
+            # брокером токен снова пробуют (`B-062`): сам цикл переподключения
+            # и опрос счёта к сервису авторизации после `invalid_grant` не ходят.
+            self._session.allow_token_retry()
         try:
             feed = self._feed or self._build()
         except BrokerError as error:
@@ -2144,6 +2149,9 @@ class LiveLink:
                 "кто-то ещё, выпустите новый токен в личном кабинете БКС.",
                 DecisionLevel.WARNING,
             )
+        scope_notice = stored.scope_notice
+        if scope_notice is not None:
+            self._port.note("Тип токена", scope_notice, DecisionLevel.WARNING)
         self._hours = Schedule(self._session)
         self._backfill = self._backfiller(self._session)
         if self._funds_to is not None and self._funds is None:

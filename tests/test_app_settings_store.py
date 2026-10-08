@@ -29,7 +29,6 @@ from ui.models import (
     CalendarDay,
     MinuteBarLimit,
     MinutePriceOrder,
-    OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
     TimeExitKind,
@@ -46,28 +45,15 @@ DIFFERENT = Settings(
     depth_days=45,
     history_depth_days=120,
     expiry_halt_days=5,
-    # ⚠️ Второй алгоритм сборки, а при одном — тот же самый. Набор значений
-    # этого поля **закрыт**: чтение отвергает имя, которого нет в реестре
-    # (`SettingsStore._known_algorithm`), и подставить сюда выдуманное значит
-    # проверять не перезапуск, а отказ. Отказ проверяется отдельно.
-    # ⚠️ Откат на умолчание здесь **тихий**, и сторожит его не этот кусок,
-    # а `test_the_sample_differs_from_the_defaults_in_every_field`: он падает
-    # вслух, как только в реестре остаётся один алгоритм.
-    strategy_id=(
-        next(
-            (name for name in registry.known_ids()
-             if name != Settings().strategy_id),
-            Settings().strategy_id,
-        )
-    ),
+    # Алгоритм в сборке один (решение 0063): поле совпадает с умолчанием
+    # и стережётся отдельно, на подставном втором (`_COVERED_APART`).
+    strategy_id=Settings().strategy_id,
     average_period=21,
     average_kind=AverageKind.SMA,
-    filter_enabled=True,
-    threshold_percent=0.35,
-    confirm_bars=3,
+    # Требования алгоритма — они же умолчания (решение 0063): при чтении
+    # файла другое значение выставляется обратно. Стережётся отдельно.
     reversal_moment=ReversalMoment.SAME_BAR,
     after_take_profit=AfterTakeProfit.WAIT_FOR_SIGNAL,
-    on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_LONG,
     # ⚠️ Фиксация прибыли включена, хотя умолчание тоже «включена»,
     # и это вынужденно: пара «фиксация / способ» выражает ОДИН выбор из трёх,
     # и сочетания «не фиксируем + скользящий уровень» у настроек не бывает
@@ -98,8 +84,8 @@ DIFFERENT = Settings(
     slippage_steps=1.5,
     minute_order=MinutePriceOrder.ADVERSE_FIRST,
     minute_bar_limit=MinuteBarLimit.FIFTEEN,
-    # Выход по концу окна (Ф3 задачи З8). Предельная форма — не умолчание
-    # и годится второму алгоритму, которого требует (`_ALWAYS_DEMANDS`).
+    # Выход по концу окна (Ф3 задачи З8). Предельная форма — требование
+    # алгоритма и умолчание; стережётся отдельно (`_COVERED_APART`).
     time_exit_order=TimeExitKind.LIMIT,
     time_exit_limit_steps=7,
     time_exit_wait_bars=3,
@@ -134,7 +120,39 @@ def _names() -> list[str]:
 #: и мутация «подменять выбранное при каждом старте» не роняла ничего.
 _COVERED_APART = {
     "take_profit_enabled": "test_the_take_switch_survives_a_restart_on_its_own",
+    "strategy_id": "test_the_algorithm_and_its_demanded_fields_survive_a_restart",
+    "reversal_moment": "test_the_algorithm_and_its_demanded_fields_survive_a_restart",
+    "time_exit_order": "test_the_algorithm_and_its_demanded_fields_survive_a_restart",
 }
+
+
+def test_the_algorithm_and_its_demanded_fields_survive_a_restart(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Имя алгоритма и поля, которых он требует, переживают перезапуск.
+
+    Алгоритм в сборке один (решение 0063), и его требования — умолчания:
+    в общем образце этим трём полям не досталось второго значения. Здесь
+    реестр получает **подставной** второй алгоритм без требований (`D-078`:
+    настоящая таблица не трогается), и файл с ним читается как записан.
+
+    Мутации, обязанные ронять проверку: подменять выбранный алгоритм
+    умолчанием при каждом старте; не сохранять момент переворота или форму
+    заявки на выход.
+    """
+    twin = dataclasses.replace(registry.default_entry(), id="twin", demands=())
+    monkeypatch.setattr(registry, "_ENTRIES", (registry.default_entry(), twin))
+    values = Settings(
+        strategy_id="twin", reversal_moment=ReversalMoment.NEXT_BAR,
+        time_exit_order=TimeExitKind.MARKET,
+    )
+    store = SettingsStore(tmp_path)
+    assert store.save(values) == ""
+    read = SettingsStore(tmp_path).load()
+    assert read.troubles == (), read.troubles
+    assert read.values.strategy_id == "twin"
+    assert read.values.reversal_moment is ReversalMoment.NEXT_BAR
+    assert read.values.time_exit_order is TimeExitKind.MARKET
 
 
 def test_the_take_switch_survives_a_restart_on_its_own(store: SettingsStore) -> None:
@@ -159,21 +177,10 @@ def test_the_sample_differs_from_the_defaults_in_every_field() -> None:
     совпавшее с умолчанием, «переживает перезапуск» и при полностью
     потерянном файле.
     """
-    # ⚠️ Условие, а не поимённое исключение, и правка эта от 14.09.2026.
-    # Прежняя редакция при одном алгоритме в реестре **молча** вычёркивала
-    # `strategy_id` из списка совпавших: у поля закрытый набор значений, и
-    # отличающегося значения не существовало. Вычёркивание было тихим — то
-    # есть проверка сохранения имени алгоритма отключалась сама, и мутация
-    # «при каждом старте подменять выбранный алгоритм первым»
-    # (`app/settings_store.py::_known_algorithm`) не роняла ничего. Теперь
-    # алгоритмов два и вычёркивать нечего; вернётся один — об этом будет
-    # сказано вслух, а не сделано молча (`CLAUDE.md` №13).
-    assert len(registry.known_ids()) > 1, (
-        "в сборке один торговый алгоритм: отличающегося от умолчания значения "
-        "у поля strategy_id не существует, и проверка сохранения этого поля "
-        "вакуумна. Это не повод выключить её молча — пока алгоритм один, "
-        "подмена выбранного алгоритма при чтении файла не ловится ничем"
-    )
+    # ⚠️ С 05.10.2026 алгоритм в сборке один (решение 0063), и поле
+    # `strategy_id` с умолчанием совпадает. Это сказано вслух, а не вычеркнуто
+    # молча: поле стоит в `_COVERED_APART`, и его сохранение стережёт
+    # отдельная проверка на подставном втором алгоритме.
     default = Settings()
     same = [name for name in _names() if getattr(DIFFERENT, name) == getattr(default, name)]
     assert sorted(same) == sorted(_COVERED_APART), (
@@ -560,6 +567,56 @@ OWNER_FILE = """{
 """
 
 
+def _migrated(text: str) -> str:
+    """Файл владельца в нынешнем виде: так его запишет «ОК» после чтения.
+
+    Поля убранного алгоритма уходят, имя алгоритма и форма выхода — те,
+    что выставлены при чтении (решение 0063). Строками, а не через `json`:
+    проверка ниже сверяет файл знак в знак.
+    """
+    gone = ('"confirm_bars"', '"filter_enabled"', '"on_price_equals_average"',
+            '"threshold_percent"')
+    lines = [line for line in text.split("\n") if not line.strip().startswith(gone)]
+    return (
+        "\n".join(lines)
+        .replace('"strategy_id": "ema_reverse"', '"strategy_id": "ma_reverse_always"')
+        .replace('"time_exit_order": "market"', '"time_exit_order": "limit"')
+    )
+
+
+#: Тот же файл, переписанный нынешней сборкой.
+OWNER_FILE_NOW = _migrated(OWNER_FILE)
+
+
+def test_an_old_file_with_the_removed_algorithm_reads_as_the_only_one(tmp_path) -> None:
+    """Стережёт: файл с `ema_reverse` читается как «Реверс с постоянной позицией».
+
+    Решение 0063. Три поведения: имя выставлено, строка про убранный алгоритм
+    ушла в журнал (`troubles`), файл при чтении **не переписан** — ни байтом,
+    ни временем записи. Переписывает его только «ОК».
+
+    Мутации, обязанные ронять проверку: отказ вместо подмены (тогда строка
+    «в этой сборке нет»), подмена молча, запись файла при чтении.
+    """
+    path = tmp_path / SETTINGS_FILE_NAME
+    path.write_text(OWNER_FILE, encoding="utf-8")
+    before = path.stat().st_mtime_ns
+    loaded = SettingsStore(tmp_path).load()
+    assert loaded.values.strategy_id == "ma_reverse_always"
+    said = " ".join(loaded.troubles)
+    assert (
+        "Алгоритм «Реверс по скользящей средней» убран, работает "
+        "«Реверс с постоянной позицией»."
+    ) in said, said
+    assert "в этой сборке нет" not in said, said
+    assert loaded.values.time_exit_order is TimeExitKind.LIMIT
+    assert not any("threshold_percent" in note for note in loaded.notes), (
+        f"поля убранного алгоритма названы незнакомыми: {loaded.notes}"
+    )
+    assert path.read_text(encoding="utf-8") == OWNER_FILE, "файл переписан при чтении"
+    assert path.stat().st_mtime_ns == before, "файл записан при чтении"
+
+
 def test_a_real_settings_file_survives_a_read_and_a_write(tmp_path) -> None:
     """Стережёт: настоящий файл владельца счёта не портится чтением и записью.
 
@@ -570,7 +627,7 @@ def test_a_real_settings_file_survives_a_read_and_a_write(tmp_path) -> None:
     порядок, отступ или вид времени — и файл перестанет совпадать.
     """
     path = tmp_path / SETTINGS_FILE_NAME
-    path.write_text(OWNER_FILE, encoding="utf-8")
+    path.write_text(OWNER_FILE_NOW, encoding="utf-8")
     store = SettingsStore(tmp_path)
 
     loaded = store.load()
@@ -589,7 +646,7 @@ def test_a_real_settings_file_survives_a_read_and_a_write(tmp_path) -> None:
     assert len(loaded.values.calendar) == 3
 
     assert store.save(loaded.values) == ""
-    assert path.read_text(encoding="utf-8") == OWNER_FILE, (
+    assert path.read_text(encoding="utf-8") == OWNER_FILE_NOW, (
         "перезапись изменила файл настроек владельца счёта"
     )
 

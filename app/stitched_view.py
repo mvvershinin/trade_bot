@@ -26,7 +26,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 from typing import cast
@@ -181,12 +181,27 @@ def live_series(
     return [*before[len(before) - min(warmup, len(before)):], *after]
 
 
-async def run(stitch: Stitch, values: Settings, engine: EngineSettings) -> StitchedRun:
-    """Прогнать куски. Торговый модуль — свежий на каждый кусок."""
+async def run(
+    stitch: Stitch,
+    values: Settings,
+    engine: EngineSettings,
+    *,
+    steps: Mapping[str, float] | None = None,
+) -> StitchedRun:
+    """Прогнать куски. Торговый модуль — свежий на каждый кусок.
+
+    `steps` — шаг цены каждого контракта по его карточке биржи; контракт
+    без шага идёт с шагом из `values` (`replay_pieces`).
+    """
     module = convert.strategy_settings(values)
     algorithm = convert.chosen_algorithm(values)
+    known = steps or {}
+    pieces = tuple(
+        replace(piece, price_step=known[piece.symbol]) if piece.symbol in known else piece
+        for piece in stitch.pieces
+    )
     return await replay_pieces(
-        stitch.pieces, lambda: algorithm.build(module), engine,
+        pieces, lambda: algorithm.build(module), engine,
         convert.run_costs(values), stitch.notes,
     )
 

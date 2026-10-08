@@ -38,7 +38,8 @@ from market import (
     Timeframe,
     redact,
 )
-from ui.models import AfterTakeProfit, DecisionRow, Mode, Settings
+from tests.exchange_card import exchange
+from ui.models import AfterTakeProfit, DecisionRow, Mode, Settings, TimeExitKind
 
 #: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
 #: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
@@ -83,6 +84,11 @@ def _replay(loop, database: pathlib.Path, values: Settings, **kwargs):
         worker = MarketWorker(database)
         await worker.open()
         port = HistoryPort(worker, values=values, sanitize=redact, **kwargs)
+        if values.price_step > 0:
+            # Шаг цены порт берёт только у биржи (05.10.2026): подставная
+            # карточка с шагом из настроек проверки, рубль в пункте — как
+            # у умолчания, чтобы деньги отличались только шагом.
+            port.attach_exchange(exchange(values.price_step))
         port.trades_replaced.connect(lambda rows, summary: seen.append((rows, summary)))
         try:
             port.refresh("тест")
@@ -249,35 +255,20 @@ def test_closing_at_the_window_end_comes_from_the_window() -> None:
     previous = convert.engine_settings(Settings(), Mode.REVERSE)
     assert previous.close_on_time_end is True, "умолчание изменилось без замера"
 
+    # Галочка действует только при выходе «по рынку»: предельная цена сама
+    # значит «закрывать всегда» (`test_owner_file_without_step.py::
+    # test_an_old_unticked_window_close_still_closes_before_and_after_the_card`).
+    market = Settings(time_exit_order=TimeExitKind.MARKET)
     off = convert.engine_settings(
-        Settings(close_on_time_end=False), Mode.REVERSE, previous
+        market.replace(close_on_time_end=False), Mode.REVERSE, previous
     )
     assert off.close_on_time_end is False, (
         "снятая галочка не доехала до движка: выход по времени остался включён"
     )
-    back = convert.engine_settings(Settings(), Mode.REVERSE, off)
+    back = convert.engine_settings(market, Mode.REVERSE, off)
     assert back.close_on_time_end is True, (
         "поставленная галочка не доехала: значение тащится из прежних настроек"
     )
-
-
-def test_the_saw_filter_is_not_reset_by_applying_settings() -> None:
-    """Включённый фильтр против пилы переживает применение настроек (`D-029`).
-
-    ⚠️ `filter_enabled=True` здесь обязателен и не является поблажкой тесту:
-    05.09.2026 у фильтра появился выключатель, и при снятой галочке
-    до модуля доходят его умолчания. Без галочки этот тест проверял бы
-    ровно обратное тому, ради чего написан.
-    """
-    from strategies import EmaReverseSettings
-
-    values = Settings(filter_enabled=True, threshold_percent=0.4, confirm_bars=3)
-    module = convert.strategy_settings(values)
-    assert isinstance(module, EmaReverseSettings)
-    assert module.threshold_percent == pytest.approx(0.4), (
-        "порог фильтра сброшен в «выключено» при переводе настроек"
-    )
-    assert module.confirm_bars == 3, "подтверждение сброшено в «выключено»"
 
 
 def test_a_new_field_of_the_strategy_cannot_be_forgotten() -> None:
@@ -489,7 +480,11 @@ def test_the_new_window_fields_have_a_journal_line() -> None:
     joined = " | ".join(lines)
     for word in ("Глубина показа", "Шаг цены", "Проскальзывание", "Каталог"):
         assert word in joined, f"про «{word}» в журнале не сказано: {joined}"
-    assert joined.count("→") == 4, f"строк меньше, чем изменений: {joined}"
+    # Пятая строка — от движка: с шагом цены выход по концу окна становится
+    # «с предельной ценой» (умолчание с 05.10.2026, решение 0063); без шага
+    # движок получает «по рынку».
+    assert joined.count("→") == 5, f"строк меньше, чем изменений: {joined}"
+    assert "Выход по концу окна" in joined, joined
     assert "вся история" not in joined, "ноль дней подписан не тем словом"
 
 
@@ -637,36 +632,34 @@ def _start_with_restore(loop, database, tmp_path, work) -> SettingsStore:
 def test_the_startup_substitution_does_not_rewrite_the_owners_file(
     loop, database, tmp_path
 ) -> None:
-    """`B-050`: подмена непринимаемого варианта живёт в памяти, а не в файле.
+    """`B-050`: ни подмена при запуске, ни ответ биржи файл владельца не трогают.
 
-    Сторожит: запуск с `after_take_profit = restore` не меняет в файле ничего,
-    кроме того, что программа пишет туда сама по ответу биржи (стоимость
-    пункта, решение 0041). Полного равенства байтов нет по этой причине:
-    без ответа биржи в файл не пишет никто, и проверка была бы зелёной
-    и на сломанном коде.
+    Сторожит: запуск с `after_take_profit = restore`, биржа ответила новой
+    стоимостью пункта, «Применить» никто не нажимал — байты файла те же.
+    Канарейка — ответ биржи **в памяти**: без неё равенство байтов
+    зеленело бы и тогда, когда ответа не было вовсе.
 
-    Мутация, которую тест ловит: `_keep_settings` пишет `values`, а не
-    `port.for_file(values)` — в файле `stop`.
+    Мутации, которые тест ловит: `_keep_settings` снова пишет по эху
+    `settings_applied`; порт шлёт `settings_to_file` и при `by_person=False`.
     """
-    async def nothing(port: HistoryPort) -> None:
-        return None
+    seen: dict[str, float] = {}
 
-    store = SettingsStore(tmp_path / "userdata")
-    store.save(Settings(instrument=SYMBOL, after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE))
-    before = _file_settings(store)
+    async def remember(port: HistoryPort) -> None:
+        seen["rubles"] = port.values.ruble_per_point
 
-    store = _start_with_restore(loop, database, tmp_path, nothing)
-
-    after = _file_settings(store)
-    assert after["ruble_per_point"] == 7.5, (
-        "ответ биржи в файл не записан — записи не было, проверка вакуумна"
+    path = tmp_path / "userdata" / "settings.json"
+    store = _start_with_restore(loop, database, tmp_path, remember)
+    assert store.path == path
+    before = SettingsStore(tmp_path / "before")
+    assert not before.save(
+        Settings(instrument=SYMBOL, after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
     )
-    assert after["after_take_profit"] == "restore", (
-        "файл владельца счёта переписан подменой при запуске, хотя «Применить» "
-        f"никто не нажимал: {after['after_take_profit']}"
+
+    assert seen["rubles"] == 7.5, "ответ биржи не дошёл до настроек в памяти — проверка вакуумна"
+    assert store.path.read_bytes() == before.path.read_bytes(), (
+        "файл владельца счёта переписан без «ОК»: "
+        f"{_file_settings(store)}"
     )
-    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
-    assert changed <= {"ruble_per_point", "ruble_per_point_source"}, changed
 
 
 def test_opening_the_settings_window_does_not_write_the_substitution(

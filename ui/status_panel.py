@@ -174,14 +174,14 @@ class StatusPanel(QFrame):
         if state.simulation:
             self.regime.setText("  СИМУЛЯЦИЯ  ")
             self.regime.setStyleSheet(
-                f"color: {theme.background}; background: {theme.text_dim};"
+                f"color: {theme.background}; background: {theme.badge_quiet};"
                 " border-radius: 3px; padding: 4px 10px;"
             )
             self.regime.setToolTip("Заявки на биржу не отправляются.")
         else:
             # ⚠️ Цвет надписи считается по заливке, а не берётся белым.
             # Белым по `danger` тёмной темы (`#ef5350`) контраст 3,49:1,
-            # тёмным — 5,31:1. Отметка «СИМУЛЯЦИЯ» идёт по `text_dim` и даёт
+            # тёмным — 5,31:1. Отметка «СИМУЛЯЦИЯ» идёт по `badge_quiet` и даёт
             # 7,06:1, то есть безопасное состояние читалось лучше опасного,
             # а спутать их нельзя (ТЗ §4.4 З).
             self.regime.setText("  БОЕВОЙ РЕЖИМ  ")

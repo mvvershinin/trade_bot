@@ -92,15 +92,18 @@ def window(qapp) -> Iterator[ui.main_window.MainWindow]:
 # --------------------------------------------------------------------------
 
 
-def test_choosing_the_algorithm_sets_and_locks_the_reversal(dialog) -> None:
-    """Выбор алгоритма №2 ставит «В той же свече», закрывает поле и говорит почему.
+def test_choosing_the_algorithm_sets_and_locks_the_reversal(qapp) -> None:
+    """Алгоритм ставит «В той же свече», закрывает поле и говорит почему.
 
-    Стережёт: окно, в котором отвергаемую пару можно собрать мышкой.
+    Окно открыто на настройках с переворотом через свечу (старый файл):
+    каталог пришёл — поле выставлено и закрыто.
+    Стережёт: окно, в котором несовместимую пару можно собрать мышкой.
     Мутация, обязанная ронять: убрать вызов `_sync_demands` из
     `SettingsDialog._show_algorithm`.
     """
+    dialog = Agreeing(Settings(reversal_moment=ReversalMoment.NEXT_BAR))
     assert dialog.reversal_moment.currentData() is ReversalMoment.NEXT_BAR
-    dialog.pick_algorithm(ALWAYS)
+    dialog.set_algorithms(_catalogue(Settings()))
     assert dialog.reversal_moment.currentData() is ReversalMoment.SAME_BAR, (
         "алгоритм выбран, а момент переворота остался «через свечу» — "
         "порт такое сочетание отвергнет"
@@ -113,17 +116,6 @@ def test_choosing_the_algorithm_sets_and_locks_the_reversal(dialog) -> None:
         f"поле закрыто молча — не сказано, какой алгоритм и почему: «{note.text()}»"
     )
     assert dialog.values().reversal_moment is ReversalMoment.SAME_BAR
-
-
-def test_leaving_the_algorithm_opens_the_field_again(dialog) -> None:
-    """Уход на алгоритм без требования открывает поле и прячет строку.
-
-    Мутация, обязанная ронять: `widget.setEnabled(False)` без условия.
-    """
-    dialog.pick_algorithm(ALWAYS)
-    dialog.pick_algorithm(Settings().strategy_id)
-    assert dialog.reversal_moment.isEnabled()
-    assert _note(dialog, "reversal_moment", "demand").isHidden()
 
 
 def test_settings_arriving_with_the_algorithm_keep_the_field_locked(dialog) -> None:
@@ -473,26 +465,27 @@ def _with_refusals(port) -> tuple[list, list]:
     return settings, backtests
 
 
-def test_the_port_names_the_field_and_the_kept_settings(loop, tmp_path) -> None:
-    """Отказ «Применить» уходит с настройками в силе и именем поля.
+def test_the_port_names_the_kept_settings(loop, tmp_path) -> None:
+    """Отказ «Применить» уходит своим сигналом с настройками в силе.
 
-    Мутации, обязанные ронять: `_refuse` вместо `_refuse_settings` в
-    `HistoryPort.apply_settings`; убрать `field=demand.outer` в `check_demands`.
+    Негодное значение — срок остановки перед экспирацией вне пределов.
+    Мутация, обязанная ронять: `_refuse` вместо `_refuse_settings` в
+    `HistoryPort.apply_settings`.
     """
     caught: dict[str, list] = {}
 
     def work(port) -> None:
         caught["settings"], caught["backtests"] = _with_refusals(port)
-        port.apply_settings(BAD)
+        port.apply_settings(Settings(expiry_halt_days=10_000))
 
     drive(loop, tmp_path, Settings(), work)
     assert caught["settings"], "отказ «Применить» не дошёл до окна своим сигналом"
-    kept, reason, field = caught["settings"][0]
-    assert kept == Settings() and field == "reversal_moment" and reason
+    kept, reason, _field = caught["settings"][0]
+    assert kept == Settings() and "экспирацией" in reason
 
 
 def test_the_port_refuses_a_backtest_out_loud(loop, tmp_path) -> None:
-    """Прогон с несовместимой парой: `backtest_refused`, полоску есть чем закрыть.
+    """Прогон с незнакомым алгоритмом: `backtest_refused`, полоску есть чем закрыть.
 
     Мутация, обязанная ронять: `_refuse` вместо `_refuse_backtest`
     в предпроверке `HistoryPort.run_backtest`.
@@ -502,11 +495,14 @@ def test_the_port_refuses_a_backtest_out_loud(loop, tmp_path) -> None:
 
     def work(port) -> None:
         caught["settings"], caught["backtests"] = _with_refusals(port)
-        port.run_backtest(BacktestRequest(settings=BAD, since=since, until=until))
+        port.run_backtest(BacktestRequest(
+            settings=Settings(strategy_id="no_such_algorithm"),
+            since=since, until=until,
+        ))
 
     drive(loop, tmp_path, Settings(), work)
     assert len(caught["backtests"]) == 1, caught["backtests"]
-    assert _title() in caught["backtests"][0]
+    assert "no_such_algorithm" in caught["backtests"][0]
 
 
 def test_a_backtest_refused_after_the_precheck_is_said_too(loop, tmp_path) -> None:

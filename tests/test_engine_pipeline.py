@@ -38,8 +38,8 @@ from engine import (
     exit_signal,
     process_closed_candle,
 )
-from strategies import EmaReverseSettings, FactKind, Intent
-from strategies.ema_reverse import describe
+from strategies import FactKind, Intent, MaReverseAlwaysSettings
+from strategies.ma_reverse_always import describe
 from tests.engine_helpers import MSK, bar, decision, position
 
 WINDOW = TradingWindow(time(10, 5), time(11, 0))
@@ -390,7 +390,7 @@ def test_the_engine_cancels_an_intent_as_the_module_promises() -> None:
     )
     assert outcome.last_step is Step.WINDOW
 
-    fact = describe(EmaReverseSettings()).fact(FactKind.ENGINE_MAY_OVERRIDE)
+    fact = describe(MaReverseAlwaysSettings()).fact(FactKind.ENGINE_MAY_OVERRIDE)
     assert fact is not None, (
         "модуль перестал объявлять факт про общие настройки — описание "
         "правила читалось бы как полное правило поведения робота"

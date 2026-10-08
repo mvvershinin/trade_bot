@@ -52,7 +52,7 @@ from backtest.split import (
 )
 from backtest.sweep import Block, Ground, Point, blocks, full_cross, sweep, trading_mode
 from backtest.table import render
-from engine import EngineSettings, in_moscow
+from engine import EngineSettings, Reversal, in_moscow
 from market.aggregate import build_bars
 from market.candles import M5, Candle
 from market.paths import default_db_path, say_ignored_override
@@ -211,7 +211,10 @@ def _ground(args: argparse.Namespace) -> Ground:
         price_step=args.price_step,
         slippage_steps=args.slippage,
     )
-    engine = trading_mode(EngineSettings(commission_per_side=args.commission))
+    # Переворот в одной свече: его требует единственный алгоритм (решение 0063).
+    engine = trading_mode(EngineSettings(
+        commission_per_side=args.commission, reversal=Reversal.SAME_BAR,
+    ))
     return Ground(engine=engine, costs=costs)
 
 

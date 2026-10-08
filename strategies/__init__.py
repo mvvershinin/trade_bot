@@ -56,13 +56,8 @@ from strategies.contracts import (
     StrategySettings,
     check_bar,
 )
-from strategies.ema_reverse import (
-    DEFAULT_PERIOD,
-    EmaReverse,
-    EmaReverseSettings,
-    OnPriceEqualsAverage,
-)
 from strategies.ma_reverse_always import (
+    DEFAULT_PERIOD,
     MaReverseAlways,
     MaReverseAlwaysSettings,
 )
@@ -100,14 +95,8 @@ __all__ = [
     "AverageKind",
     "MovingAverage",
     "average_series",
-    "EmaReverse",
-    "EmaReverseSettings",
-    "OnPriceEqualsAverage",
     "DEFAULT_PERIOD",
-    # Алгоритм №2: то же правило, своё название и узкие настройки — период
-    # и тип средней. Наследник первого, а не вторая реализация правила:
-    # сверкой с прототипом покрыт один расчёт, и копия рядом разошлась бы
-    # с ним молча (`strategies/ma_reverse_always.py`).
+    # Единственный алгоритм программы (решение 0063): период и тип средней.
     "MaReverseAlways",
     "MaReverseAlwaysSettings",
     # Реестр берётся модулем целиком (`registry.find(...)`, `registry.entries()`),

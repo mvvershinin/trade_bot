@@ -160,6 +160,7 @@ def test_the_window_wiring_forwards_the_named_userdata_to_the_log(
         def __init__(self) -> None:
             self.notes: list[tuple[str, str]] = []
             self.settings_applied = _FakeSignal()
+            self.settings_to_file = _FakeSignal()
 
         def note(self, title: str, text: str, level: object = None) -> None:
             self.notes.append((title, text))

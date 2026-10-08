@@ -10,15 +10,14 @@
 from __future__ import annotations
 
 from datetime import date, time
-
 from pathlib import Path
 
 import pytest
+from helpers import RecordingPort, settle_qt
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel
 
 import ui.main_window
 import ui.settings_dialog
-from helpers import RecordingPort, settle_qt
 from market import redact
 from ui.models import (
     AfterTakeProfit,
@@ -27,7 +26,6 @@ from ui.models import (
     CalendarDay,
     MinuteBarLimit,
     MinutePriceOrder,
-    OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
     TimeExitKind,
@@ -183,7 +181,6 @@ def test_settings_survive_a_round_trip(dialog) -> None:
         average_kind=AverageKind.SMA,
         reversal_moment=ReversalMoment.SAME_BAR,
         after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE,
-        on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_SHORT,
         take_profit_enabled=True,
         take_profit_pct=0.8,
         trailing_enabled=True,
@@ -224,7 +221,6 @@ def test_every_field_explains_itself_in_plain_russian(dialog) -> None:
     fields = [
         dialog.instrument, dialog.timeframe, dialog.average_period,
         dialog.average_kind, dialog.reversal_moment, dialog.after_take_profit,
-        dialog.on_price_equals_average,
         dialog.take_profit_enabled, dialog.take_profit,
         dialog.trailing_enabled, dialog.trailing_start, dialog.trailing_offset,
         dialog.trailing_step,
@@ -922,7 +918,7 @@ def test_change_travels_from_window_to_engine(qapp, monkeypatch, make_window) ->
 
 
 def _option(
-    strategy_id: str = "ema_reverse",
+    strategy_id: str = "ma_reverse_always",
     title: str = "Реверс по средней",
     *,
     chosen: bool = True,
@@ -1079,7 +1075,7 @@ def test_a_refused_choice_changes_nothing(dialog, monkeypatch) -> None:
 
     monkeypatch.setattr(ui.settings_dialog, "AlgorithmDialog", Refuses)
     dialog.choose_algorithm()
-    assert dialog.values().strategy_id == "ema_reverse"
+    assert dialog.values().strategy_id == "ma_reverse_always"
 
 
 def test_the_catalogue_reaches_the_open_window_from_the_port(
@@ -1108,7 +1104,7 @@ def test_the_catalogue_reaches_the_open_window_from_the_port(
         def apply_settings(self, settings: Settings) -> None:
             super().apply_settings(settings)
             self.algorithms_changed.emit((AlgorithmOption(
-                id="ema_reverse",
+                id="ma_reverse_always",
                 title="Реверс по средней",
                 summary="Правило одной фразой.",
                 details=f"Закрытие выше EMA({settings.average_period}) — лонг.",
@@ -1132,7 +1128,7 @@ def test_the_catalogue_reaches_the_open_window_from_the_port(
     port = PortThatAnswers()
     window = make_window(port)
     port.algorithms_changed.emit((AlgorithmOption(
-        id="ema_reverse",
+        id="ma_reverse_always",
         title="Реверс по средней",
         summary="Правило одной фразой.",
         details="Закрытие выше EMA(15) — лонг.",
@@ -1154,7 +1150,7 @@ def test_the_window_asks_the_port_for_the_catalogue_when_settings_open(
     """Каталог доезжает до окна настроек **без** «Применить» — потому что спросили.
 
     Пункт приёмки, пойманный на владельце счёта 09.09.2026: он запустил
-    программу, открыл настройки и увидел `ema_reverse` вместо названия,
+    программу, открыл настройки и увидел `ma_reverse_always` вместо названия,
     пустой список выбора и указание выбрать из пустоты. Причина — вызова
     `request_settings` не было ни в одной строке продуктового кода: каталог
     уезжал в окно только из `apply_settings`, то есть после первого
@@ -1180,7 +1176,7 @@ def test_the_window_asks_the_port_for_the_catalogue_when_settings_open(
             self.calls.append(("request_settings", None))
             self.settings_applied.emit(Settings())
             self.algorithms_changed.emit((AlgorithmOption(
-                id="ema_reverse",
+                id="ma_reverse_always",
                 title="Реверс по скользящей средней",
                 summary="Закрытие выше средней — лонг.",
                 details="Правило абзацами.",
@@ -1244,6 +1240,38 @@ def test_the_choose_button_is_off_while_there_is_nothing_to_choose(dialog) -> No
     )
 
 
+def test_the_choose_button_is_hidden_while_the_build_has_one_algorithm(dialog) -> None:
+    """Алгоритм в сборке один — кнопки «Выбрать алгоритм…» на вкладке нет.
+
+    Решение 0063: выбирать не из чего, и кнопка, ведущая в окно выбора из
+    одной строки, — лишнее нажатие. Название алгоритма остаётся видно.
+    Пустой каталог кнопку не прячет (там она выключена с объяснением),
+    два алгоритма — показывают.
+
+    Мутация, обязанная ронять проверку: `setVisible(True)` вместо
+    `setVisible(len(self._algorithms) != 1)` в `_show_algorithm`.
+
+    ⚠️ `isHidden`, а не `isVisibleTo`: окно не показано, и кнопка на
+    невыбранной вкладке «невидима» и без мутации.
+    """
+    assert not dialog.algorithm_button.isHidden(), (
+        "при пустом каталоге кнопка спрятана, а не выключена с объяснением"
+    )
+
+    dialog.set_algorithms((_option(),))
+    assert dialog.algorithm_button.isHidden(), (
+        "алгоритм в сборке один, а кнопка выбора на вкладке осталась"
+    )
+    assert not dialog.algorithm_name.isHidden(), (
+        "вместе с кнопкой спряталось и название алгоритма"
+    )
+
+    dialog.set_algorithms((_option(), _option("other", "Другой", chosen=False)))
+    assert not dialog.algorithm_button.isHidden(), (
+        "алгоритмов два, а кнопки выбора между ними нет"
+    )
+
+
 def test_the_window_does_not_talk_to_the_settings_it_closed(
     qapp, monkeypatch, make_window
 ) -> None:
@@ -1274,7 +1302,7 @@ def test_the_window_does_not_talk_to_the_settings_it_closed(
     window.open_settings()
     after_first = len(told)
     port.algorithms_changed.emit((AlgorithmOption(
-        id="ema_reverse", title="Реверс", summary="s", details="d", chosen=True,
+        id="ma_reverse_always", title="Реверс", summary="s", details="d", chosen=True,
     ),))
     assert len(told) == after_first, (
         "главное окно рассказало новый каталог уже закрытому окну настроек"
@@ -1306,8 +1334,6 @@ def test_tab_order_follows_the_screen(dialog, qapp) -> None:
         dialog.price_step, dialog.ruble_per_point,
         # «Сигнал»
         dialog.average_period, dialog.average_kind,
-        dialog.on_price_equals_average,
-        dialog.filter_enabled, dialog.threshold_percent, dialog.confirm_bars,
         # «Вход и выход»
         dialog.reversal_moment, dialog.after_take_profit,
         dialog.take_profit_enabled,
@@ -1374,15 +1400,15 @@ def test_all_four_forks_are_settings_not_constants() -> None:
     assert [after.name for after in AfterTakeProfit] == [
         "STOP_FOR_THE_DAY", "WAIT_FOR_SIGNAL", "RESTORE_AT_ONCE"
     ]
-    assert [case.name for case in OnPriceEqualsAverage] == [
-        "LIKE_PROTOTYPE", "TREAT_AS_LONG", "TREAT_AS_SHORT"
-    ]
 
     defaults = Settings()
     assert defaults.average_kind is AverageKind.EMA
-    assert defaults.reversal_moment is ReversalMoment.NEXT_BAR
+    # Переворот в одной свече и выход с предельной ценой — требования
+    # единственного алгоритма, ставшие умолчаниями (решение 0063).
+    assert defaults.strategy_id == "ma_reverse_always"
+    assert defaults.reversal_moment is ReversalMoment.SAME_BAR
+    assert defaults.time_exit_order is TimeExitKind.LIMIT
     assert defaults.after_take_profit is AfterTakeProfit.STOP_FOR_THE_DAY
-    assert defaults.on_price_equals_average is OnPriceEqualsAverage.LIKE_PROTOTYPE
 
 
 # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторожа потолка объёма.
@@ -1802,107 +1828,16 @@ def test_numbers_agree_with_their_words(kind: str, count: float, expected: str) 
     assert _agree(count, *words) == expected
 
 
-def test_the_saw_filter_survives_a_round_trip(dialog) -> None:
-    """Все три элемента фильтра читаются и пишутся окном (`D-029`)."""
-    dialog.set_values(Settings(
-        filter_enabled=True, threshold_percent=0.4, confirm_bars=3
-    ))
-    values = dialog.values()
-    assert values.filter_enabled is True
-    assert values.threshold_percent == pytest.approx(0.4)
-    assert values.confirm_bars == 3
-
-
-def test_the_saw_filter_is_off_by_default_and_off_means_all_three(dialog) -> None:
-    """Умолчание фильтра — выключено всеми тремя элементами сразу.
-
-    Стережёт сверку с прототипом: она сходится 127 из 127 на выключенном
-    фильтре, у прототипа фильтра нет вовсе, и включённый воспроизвести её
-    не может по построению.
-    """
-    values = dialog.values()
-    assert values.filter_enabled is False
-    assert values.threshold_percent == pytest.approx(0.0)
-    assert values.confirm_bars == 1
-
-
-def test_the_numbers_of_the_filter_are_dead_while_the_switch_is_off(dialog) -> None:
-    """Снятая галочка гасит оба числа — и молчит вместо тревоги."""
-    dialog.set_values(Settings(
-        filter_enabled=False, threshold_percent=0.4, confirm_bars=3
-    ))
-    assert not dialog.threshold_percent.isEnabled()
-    assert not dialog.confirm_bars.isEnabled()
-    assert dialog.filter_note.text() == "", (
-        "выключённый фильтр говорит о себе — тревога, которая горит всегда, "
-        "перестаёт читаться"
-    )
-
-
-def test_the_switch_does_not_erase_what_was_picked(dialog) -> None:
-    """Снятие галочки не стирает подобранные числа: включение вернёт их.
-
-    Обнуление полей выглядело бы аккуратнее и стоило бы владельцу счёта
-    подобранных цифр при первом же случайном щелчке.
-    """
-    dialog.set_values(Settings(
-        filter_enabled=True, threshold_percent=0.4, confirm_bars=3
-    ))
-    dialog.filter_enabled.setChecked(False)
-    assert dialog.values().threshold_percent == pytest.approx(0.4)
-    assert dialog.values().confirm_bars == 3
-    dialog.filter_enabled.setChecked(True)
-    assert dialog.threshold_percent.isEnabled()
-    assert dialog.values().threshold_percent == pytest.approx(0.4)
-
-
-def test_the_saw_filter_says_that_it_holds_the_position_longer(dialog) -> None:
-    """Включённый фильтр называет свои цифры и цену: выход тоже глушится."""
-    dialog.set_values(Settings(
-        filter_enabled=True, threshold_percent=0.4, confirm_bars=3
-    ))
-    note = dialog.filter_note.text()
-    assert "0,4" in note and "3 свечи" in note
-    assert "дольше" in note, "не сказано, что позиция живёт дольше"
-    assert "выход" in note, (
-        "не сказано, что фильтр глушит и выход тоже — а это и есть его цена"
-    )
-    assert "конце окна" in note, (
-        "не названо следствие при снятом закрытии по времени: верхней границы "
-        "времени жизни позиции не остаётся вовсе"
-    )
-
-
-def test_a_switched_on_filter_with_both_numbers_off_says_so(dialog) -> None:
-    """Галочка стоит, обе цифры в «выключено» — это названо, а не выглядит защитой."""
-    dialog.set_values(Settings(
-        filter_enabled=True, threshold_percent=0.0, confirm_bars=1
-    ))
-    note = dialog.filter_note.text()
-    assert "не делает" in note or "так же, как" in note, note
-
-
-def test_the_hints_of_the_filter_show_both_halves_of_the_measurement(dialog) -> None:
-    """Подсказки фильтра показывают и выигрыш, и шаткость цифры.
-
-    Замер есть, он на 79 днях, и половина его — оговорки. Подсказка
-    с одной первой половиной становится рекламой: владелец счёта прочтёт
-    «+10 340 ₽» и включит фильтр, не зная, что соседнее значение дало минус,
-    а лучшая на подборе цифра провалилась на проверке.
-    """
-    hints = " ".join(label.text() for label in dialog.findChildren(QLabel))
-    for gain in ("2 151", "8 327", "10 340", "−103"):
-        assert gain in hints, f"замер не показан: {gain}"
-    for caveat in ("−889", "−3 497", "не отличается", "шума"):
-        assert caveat in hints, f"оговорка выброшена: {caveat}"
-
-
 def test_closing_at_the_window_end_has_a_field_and_a_price(dialog) -> None:
     """Галочка «закрывать в конце окна» есть, включена и называет цену снятия."""
     assert dialog.values().close_on_time_end is True, "умолчание изменилось"
     assert dialog.window_close_note.text() == ""
 
-    dialog.set_values(Settings(close_on_time_end=False))
+    # Галочка действует только при выходе по рынку: «с предельной ценой»
+    # (умолчание с 05.10.2026) закрывает всегда.
+    dialog.set_values(Settings(
+        close_on_time_end=False, time_exit_order=TimeExitKind.MARKET,
+    ))
     assert dialog.values().close_on_time_end is False
     note = dialog.window_close_note.text()
     assert "ночь" in note and "выходные" in note, (
@@ -1982,42 +1917,41 @@ def test_a_cost_of_a_point_at_zero_does_not_leave_the_window(dialog) -> None:
     assert dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
 
 
-def test_slippage_without_a_price_step_does_not_leave_the_window(dialog) -> None:
-    """Негодное сочетание издержек не выпускается наружу: «ОК» и «Применить» гаснут.
+def test_slippage_without_a_price_step_from_the_exchange_is_said_not_blocked(dialog) -> None:
+    """Проскальзывание при шаге, которого биржа ещё не сообщила: строка вслух, кнопки горят.
 
-    Условие то же, что у модели исполнения (`backtest.Costs`). Молчаливая
-    подмена нулём означала бы поправку, которая выглядит заданной и ничего
-    не делает.
+    Шаг программа берёт у биржи сама (решение 05.10.2026) — гасить «ОК»
+    на том, что человеку не исправить, значило бы запереть окно настроек
+    до ответа биржи. Пока шага нет, проскальзывание не учитывается, и это
+    сказано: молчаливая подмена нулём выглядела бы заданной поправкой.
     """
     dialog.set_values(Settings(price_step=0.0, slippage_steps=1.0))
-    assert dialog.costs_error(), "негодное сочетание принято молча"
-    for standard in (
-        QDialogButtonBox.StandardButton.Ok,
-        QDialogButtonBox.StandardButton.Apply,
-    ):
-        assert not dialog.buttons.button(standard).isEnabled()
-
-    dialog.price_step.setValue(25.0)
     assert dialog.costs_error() == ""
+    assert dialog.costs_note.text().startswith(
+        "⚠️ Биржа ещё не сообщила шаг цены — пока проскальзывание"
+    ), dialog.costs_note.text()
     for standard in (
         QDialogButtonBox.StandardButton.Ok,
         QDialogButtonBox.StandardButton.Apply,
     ):
-        assert dialog.buttons.button(standard).isEnabled(), (
-            "кнопки не вернулись после починки сочетания — выйти из состояния нечем"
-        )
+        assert dialog.buttons.button(standard).isEnabled()
+
+    dialog.price_step.setValue(25.0)  # так его ставит эхо порта после ответа биржи
+    assert dialog.costs_note.text().startswith("В цену каждого исполнения"), (
+        dialog.costs_note.text()
+    )
 
 
 def test_the_two_checks_do_not_switch_the_buttons_on_for_each_other(dialog) -> None:
     """Проверок две, и последняя сработавшая не отменяет запрет первой."""
     dialog.set_values(Settings(
         trailing_enabled=True, trailing_start_pct=0.1, trailing_offset_pct=1.0,
-        price_step=0.0, slippage_steps=1.0,
+        ruble_per_point=0.0,
     ))
     assert dialog.take_error() and dialog.costs_error()
     assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
 
-    dialog.price_step.setValue(25.0)          # чинится только вторая
+    dialog.ruble_per_point.setValue(1.0)      # чинится только вторая
     assert dialog.take_error(), "проверка вакуумна: первая ошибка тоже ушла"
     assert not dialog.buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled(), (
         "починка одной проверки включила кнопки при живой второй"
@@ -2128,12 +2062,8 @@ SAMPLE = Settings(
     strategy_id="atr_channel",
     average_period=21,
     average_kind=AverageKind.SMA,
-    filter_enabled=True,
-    threshold_percent=0.35,
-    confirm_bars=3,
-    reversal_moment=ReversalMoment.SAME_BAR,
+    reversal_moment=ReversalMoment.NEXT_BAR,
     after_take_profit=AfterTakeProfit.WAIT_FOR_SIGNAL,
-    on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_LONG,
     # ⚠️ Фиксация прибыли включена, хотя умолчание тоже «включена», и это
     # вынужденно: пара «фиксация / способ» выражает ОДИН выбор из трёх,
     # и сочетания «не фиксируем + скользящий уровень» у настроек не бывает
@@ -2166,7 +2096,7 @@ SAMPLE = Settings(
     minute_bar_limit=MinuteBarLimit.FIFTEEN,
     # Выход по концу окна (Ф3 задачи З8). Предельная форма — не умолчание
     # и годится второму алгоритму, которого требует (`_ALWAYS_DEMANDS`).
-    time_exit_order=TimeExitKind.LIMIT,
+    time_exit_order=TimeExitKind.MARKET,
     time_exit_limit_steps=7,
     time_exit_wait_bars=3,
     log_directory="/tmp/терминал-логи",

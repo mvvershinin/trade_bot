@@ -61,6 +61,7 @@ ISS умеет отдавать и десятиминутные, и часовы
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -738,7 +739,7 @@ def parse_security(payload: bytes, *, secid: str, market: Market) -> InstrumentS
         )
     row = matching[0]
     step = _optional_float(row, "MINSTEP")
-    if step is None or step <= 0:
+    if step is None or not math.isfinite(step) or step <= 0:
         raise IssPayloadError(
             f"биржа не назвала шаг цены инструмента {secid!r} "
             f"(MINSTEP = {row.get('MINSTEP')!r}) — считать стоимость пункта не от чего"

@@ -21,11 +21,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetrics,
+    QHideEvent,
     QMouseEvent,
     QPainter,
     QPen,
@@ -71,6 +72,17 @@ GAP_CAPTION_WIDTH = 34
 # и без порога каждый щелчок правой кнопкой давал бы отрезок случайной ширины.
 CLICK_SLACK = 5.0
 
+# Протяжка правой кнопкой за край поля свечей двигает вид вслед за мышью
+# (просьба владельца счёта, Н4). Числа не торговые — это скорость прокрутки.
+# Пока мышь стоит за краем, событий движения нет, поэтому вид двигает таймер:
+# раз в EDGE_SCROLL_INTERVAL_MS на столько мест, сколько раз мышь ушла
+# за край на EDGE_SCROLL_PIXELS_PER_PLACE точек, но не больше
+# EDGE_SCROLL_MAX_PLACES за раз. Чуть за краем — медленно, далеко — быстро:
+# 20 точек за краем дают 25 свечей в секунду, предел — 75.
+EDGE_SCROLL_INTERVAL_MS = 40
+EDGE_SCROLL_PIXELS_PER_PLACE = 20.0
+EDGE_SCROLL_MAX_PLACES = 3.0
+
 # Штрих перекрестья: короткий и частый. Отличается от пунктира прогноза
 # (штрих вчетверо длиннее) и от границ пропуска — иначе три разных пунктира
 # на одном экране читаются как один.
@@ -94,6 +106,7 @@ class PainterChartSurface(QWidget, ChartSurface):
     | ведёт мышь, ничего не нажимая | перекрестье идёт за курсором; строка сведений показывает свечу под ним; над меткой всплывает подсказка |
     | зажал **левую** и ведёт | панорама графика — принято владельцем счёта, ломать нельзя |
     | **правая**: щелчок или протяжка | выделение отрезка, по нему разворачивается разбор сделок |
+    | **правая**, протяжка за край поля | вид едет следом за мышью, выделение растёт |
     | колесо | масштаб; свеча под курсором остаётся под курсором |
 
     Разведение именно такое, потому что панорама левой кнопкой уже в руках
@@ -128,9 +141,15 @@ class PainterChartSurface(QWidget, ChartSurface):
         #: Держится всегда: перекрестье следует за движением и не требует
         #: ни нажатия, ни включения (просьба владельца счёта 05.09.2026).
         self._cursor: QPointF | None = None
-        #: Протяжка правой кнопкой: где начали и где сейчас, в пикселях.
-        #: `None` — правая кнопка не нажата.
-        self._span_x: tuple[float, float] | None = None
+        #: Протяжка правой кнопкой: **место оси**, где начали, и где мышь
+        #: сейчас, в пикселях. Начало — номер места, а не пиксель: вид едет
+        #: под протяжкой за край (Н4), и начало, запомненное пикселем,
+        #: уехало бы вместе с ним. `None` — правая кнопка не нажата.
+        self._span: tuple[int, float] | None = None
+        #: Двигает вид, пока мышь с зажатой правой кнопкой стоит за краем поля.
+        self._edge_timer = QTimer(self)
+        self._edge_timer.setInterval(EDGE_SCROLL_INTERVAL_MS)
+        self._edge_timer.timeout.connect(self._edge_scroll_tick)
         self._hit: list[tuple[QPointF, Marker]] = []
         #: Кому рассказывать про свечу под курсором. Ставит панель графика.
         self._hover_handler: HoverHandler | None = None
@@ -179,6 +198,11 @@ class PainterChartSurface(QWidget, ChartSurface):
             == (self._data.instrument, self._data.timeframe)
         )
         anchor = self._stamp_at(self._view.right) if same_chart else None
+        # Протяжка правой кнопкой переживает замену ряда так же, как вид:
+        # начало держится по времени, номера мест после замены другие.
+        span_stamp = (
+            self._stamp_at(self._span[0]) if same_chart and self._span is not None else None
+        )
 
         self._data = data
         self._line = Timeline(data.candles)
@@ -203,6 +227,12 @@ class PainterChartSurface(QWidget, ChartSurface):
                 span=min(DEFAULT_VISIBLE, max(len(self._line), MIN_VISIBLE)),
                 follow=True,
             )
+        if self._span is not None:
+            if span_stamp is None:
+                self._span = None
+                self._edge_timer.stop()
+            else:
+                self._span = (round(self._index_of_stamp(span_stamp)), self._span[1])
         self.update()
 
     def _keep_view(self, anchor: float | None) -> None:
@@ -287,6 +317,26 @@ class PainterChartSurface(QWidget, ChartSurface):
 
     def is_following(self) -> bool:
         return self._view.follow
+
+    def show_moment(self, since: datetime, until: datetime) -> bool:
+        """Поставить отрезок посреди экрана; приближение — не ближе прежнего.
+
+        Слежение за последней свечой снимается: иначе первая же новая свеча
+        утащила бы экран от сделки, ради которой его сюда привели.
+        """
+        count = len(self._line)
+        if not count:
+            return False
+        first, last = self._index_of_time(since), self._index_of_time(until)
+        if last < 0 or first > count - 1:
+            return False
+        width = int(last - first) + 1
+        self._view.span = max(self._view.span, min(width + 2 * MIN_VISIBLE, count))
+        self._view.right = last + (self._view.span - width) / 2
+        self._view.follow = False
+        self._clamp_view()
+        self.update()
+        return True
 
     # ---------------------------------------------------------------- геометрия
 
@@ -426,16 +476,17 @@ class PainterChartSurface(QWidget, ChartSurface):
             # Выделение отрезка. Щелчок — его вырожденный случай: отбор сделок
             # один на оба действия, и человеку нечего запоминать.
             x = event.position().x()
-            self._span_x = (x, x)
+            self._span = (self._place_at_x(x, self._plot_rect()), x)
             self.update()
         elif event.button() == Qt.MouseButton.LeftButton:
             self._drag_x = event.position().x()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if event.button() == Qt.MouseButton.RightButton and self._span_x is not None:
-            started, ended = self._span_x
-            self._span_x = None
+        if event.button() == Qt.MouseButton.RightButton and self._span is not None:
+            started, ended = self._span
+            self._span = None
+            self._edge_timer.stop()
             self._report_span(started, ended)
             self.update()
         elif event.button() == Qt.MouseButton.LeftButton:
@@ -447,8 +498,14 @@ class PainterChartSurface(QWidget, ChartSurface):
         # Перекрестье идёт за курсором всегда — и при нажатой кнопке тоже:
         # это курсор, а не режим.
         self._cursor = QPointF(event.position())
-        if self._span_x is not None:
-            self._span_x = (self._span_x[0], event.position().x())
+        if self._span is not None:
+            self._span = (self._span[0], event.position().x())
+            held = bool(event.buttons() & Qt.MouseButton.RightButton)
+            if held and self._edge_overshoot(plot) != 0.0:
+                if not self._edge_timer.isActive():
+                    self._edge_timer.start()
+            else:
+                self._edge_timer.stop()
             self.update()
         elif self._drag_x is not None and not self._line.empty:
             step = plot.width() / max(self._view.span, 1)
@@ -478,9 +535,51 @@ class PainterChartSurface(QWidget, ChartSurface):
         self.update()
         super().leaveEvent(event)
 
+    def hideEvent(self, event: QHideEvent) -> None:
+        """Скрытый график сам по себе не едет: отпускания кнопки он не дождётся."""
+        self._edge_timer.stop()
+        super().hideEvent(event)
+
     # ------------------------------------------------------------- выделение
 
-    def _report_span(self, started: float, ended: float) -> None:
+    def _edge_overshoot(self, plot: QRectF) -> float:
+        """На сколько точек мышь протяжки ушла за край поля: «+» вправо, «−» влево."""
+        if self._span is None:
+            return 0.0
+        x = self._span[1]
+        if x > plot.right():
+            return x - plot.right()
+        if x < plot.left():
+            return x - plot.left()
+        return 0.0
+
+    def _edge_scroll_tick(self) -> None:
+        """Шаг прокрутки вида под протяжкой за край — вызывается таймером.
+
+        У края данных вид останавливается: в пустоту за последней свечой
+        и перед первой протяжка не везёт. Если человек сам отмотал вид
+        за край ряда раньше, назад его тоже не тянет — только не дальше.
+        """
+        overshoot = self._edge_overshoot(self._plot_rect())
+        if overshoot == 0.0 or self._line.empty:
+            self._edge_timer.stop()
+            return
+        shift = min(abs(overshoot) / EDGE_SCROLL_PIXELS_PER_PLACE, EDGE_SCROLL_MAX_PLACES)
+        was = self._view.right
+        if overshoot > 0:
+            limit = max(was, float(len(self._line) - 1))
+            self._view.right = min(was + shift, limit)
+        else:
+            limit = min(was, float(self._view.span - 1))
+            self._view.right = max(was - shift, limit)
+        if self._view.right == was:
+            self._edge_timer.stop()
+            return
+        self._view.follow = self._view.right >= len(self._line) - 1.5
+        self._report_hover(self._cursor)
+        self.update()
+
+    def _report_span(self, started: int, ended: float) -> None:
         """Рассказать панели про выделенный отрезок — по местам оси, не по свечам.
 
         Границы отрезка — время **мест**: у пропущенного часа места есть, свечей
@@ -508,15 +607,19 @@ class PainterChartSurface(QWidget, ChartSurface):
             ),
         ))
 
-    def _span_places(self, started: float, ended: float) -> tuple[int, int] | None:
-        """Номера первого и последнего места оси под протяжкой. `None` — мимо ряда."""
+    def _span_places(self, started: int, ended: float) -> tuple[int, int] | None:
+        """Номера первого и последнего места оси под протяжкой. `None` — мимо ряда.
+
+        `started` — место, где нажали; `ended` — где мышь сейчас, в точках.
+        Мышь за краем поля считается стоящей на краю: выделение — то, что
+        видно, а за край его доращивает прокрутка вида, а не пиксели за осью.
+        """
         if self._line.empty:
             return None
         plot = self._plot_rect()
-        left, right = sorted((started, ended))
-        first = self._place_at_x(left, plot)
-        last = self._place_at_x(right, plot)
-        first, last = min(first, last), max(first, last)
+        inside = min(max(ended, plot.left()), plot.right() - 1e-6)
+        place = self._place_at_x(inside, plot)
+        first, last = min(started, place), max(started, place)
         if last < 0 or first > len(self._line) - 1:
             return None
         return max(first, 0), min(last, len(self._line) - 1)
@@ -1051,9 +1154,9 @@ class PainterChartSurface(QWidget, ChartSurface):
         разбор сделок, и оставленная полоса спорила бы с ним за внимание.
         Без полосы протяжка выглядит как «ничего не происходит».
         """
-        if self._span_x is None:
+        if self._span is None:
             return
-        places = self._span_places(*self._span_x)
+        places = self._span_places(*self._span)
         if places is None:
             return
         first, last = places

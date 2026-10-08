@@ -74,7 +74,6 @@ from ui.formatting import (
     fmt_datetime,
     fmt_money,
     fmt_number,
-    fmt_percent,
     fmt_price,
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `fmt_volume` держал потолок
     # объёма и других потребителей в этом файле не имеет.
@@ -127,7 +126,8 @@ __all__ = [
     # Требования алгоритма к общим настройкам программы: отказ на границе
     # применения. Зовётся портом, а не из `engine_settings` — разбор в самой
     # функции.
-    "check_demands",
+    "settled",
+    "retired_line",
     "strategy_title",
     "run_costs",
     "minute_order_of",
@@ -325,6 +325,24 @@ _TIME_EXIT_ORDERS: dict[TimeExitKind, TimeExitOrder] = {
 }
 
 
+def _time_exit_in_force(values: Settings) -> TimeExitOrder:
+    """Форма выхода по концу окна, которую движок получает **сейчас**.
+
+    Шаг цены сообщает биржа (решение владельца счёта 05.10.2026); пока
+    он неизвестен, выход «с предельной ценой» движку не собрать, и движок
+    получает «по рынку» — то же говорит плашка порта (`step_wait`). Отказ
+    здесь гасил «Применить» до прихода карточки биржи: перечень изменений
+    (`all_changes`), снимок прогона и точки перебора идут сюда же мимо порта.
+
+    ⚠️ Подменяется только форма заявки, а не выбор: галочку закрытия по концу
+    окна строка `close_on_time_end` таблицы ниже берёт из выбора, и «по рынку»
+    без шага закрывает позицию так же, как предельная цена с шагом.
+    """
+    if values.time_exit_order is TimeExitKind.LIMIT and values.price_step <= 0:
+        return TimeExitOrder.MARKET
+    return _TIME_EXIT_ORDERS[values.time_exit_order]
+
+
 #: Откуда движок берёт каждое своё поле, если оно **приходит из окна**.
 #:
 #: Таблица, а не перечисление в конструкторе, и по той же причине, что
@@ -338,7 +356,16 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     "window": lambda values, _mode: TradingWindow(
         start=values.window_start, end=values.window_end
     ),
-    "close_on_time_end": lambda values, _mode: values.close_on_time_end,
+    # Выход с предельной ценой сам значит «закрывать по концу окна всегда»
+    # (`engine.TimeExitOrder`, требование алгоритма №1 в `strategies/registry.py`).
+    # Галочка берётся **вместе** с этим выбором, а не после подмены «по рынку»
+    # без шага (`engine_settings` ниже): иначе старый файл со снятой галочкой
+    # без карточки биржи не закрывал позицию вовсе, а с карточкой — закрывал
+    # (аудит /risk 06.10.2026, находка 1). Одно место на все пути: порт,
+    # снимок прогона, точки перебора.
+    "close_on_time_end": lambda values, _mode: (
+        values.close_on_time_end or values.time_exit_order is TimeExitKind.LIMIT
+    ),
     "volume": lambda values, _mode: float(values.volume),
     "reversal": lambda values, _mode: _REVERSALS[values.reversal_moment],
     "take_profit": lambda values, _mode: values.take_profit_enabled,
@@ -367,7 +394,7 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     "price_step": lambda values, _mode: values.price_step,
     # Выход по концу окна с предельной ценой (Э5, задача З8, Ф3): три поля
     # окна на вкладке «Торговое окно». Форма — таблицей `_TIME_EXIT_ORDERS`.
-    "time_exit_order": lambda values, _mode: _TIME_EXIT_ORDERS[values.time_exit_order],
+    "time_exit_order": lambda values, _mode: _time_exit_in_force(values),
     "time_exit_limit_steps": lambda values, _mode: values.time_exit_limit_steps,
     "time_exit_wait_bars": lambda values, _mode: values.time_exit_wait_bars,
     # Календарь владельца счёта: отметки окна → набор дат движка. Перевод,
@@ -500,43 +527,6 @@ def _unavailable_choice(values: Settings) -> str:
     return ""
 
 
-def limit_demanded_by(values: Settings) -> str:
-    """Название алгоритма, который требует выхода с предельной ценой. Пусто — не требует.
-
-    Незнакомый алгоритм считается требующим: обещать «можно по рынку»
-    про алгоритм, которого в сборке нет, нечем.
-    """
-    try:
-        entry = registry.find(values.strategy_id)
-    except registry.UnknownStrategy:
-        return values.strategy_id
-    demanded = any(demand.outer == "time_exit_order" for demand in entry.demands)
-    return entry.title if demanded else ""
-
-
-def limit_without_step(values: Settings) -> str:
-    """Отказ «предельная цена без шага цены» — одна фраза на все пути.
-
-    Окно, «Применить», запрос прогона, сборка порта при запуске. Совет
-    выбрать заявку «по рынку» даётся, **только если алгоритм её позволяет**:
-    у алгоритма, требующего предельной цены (`demands` реестра), такой
-    совет — совет сделать невозможное (находка 04.10.2026: «если алгоритм
-    позволяет» стояло в журнале у алгоритма, который не позволяет). Тем же
-    правилом говорит строка под полем в окне настроек
-    (`SettingsDialog.time_exit_error`).
-    """
-    other = (
-        "" if limit_demanded_by(values) else
-        " или выберите заявку «по рынку» на вкладке «Торговое окно»"
-    )
-    return (
-        "Выход по концу окна выбран заявкой с предельной ценой, а шаг цены "
-        "инструмента не задан — предельную цену не посчитать. Впишите шаг цены "
-        "на вкладке «Инструмент и данные» (он есть в карточке инструмента "
-        f"на сайте биржи){other}."
-    )
-
-
 def engine_settings(
     values: Settings, mode: Mode, base: EngineSettings | None = None
 ) -> EngineSettings:
@@ -576,13 +566,6 @@ def engine_settings(
     unavailable = _unavailable_choice(values)
     if unavailable:
         raise SettingsRefused(unavailable)
-    # ⚠️ То же условие, что у движка (`EngineSettings._check_time_exit`), —
-    # но здесь отказ называет поле и говорит человеку, что делать. Голый
-    # `ValueError` движка мимо `SettingsRefused` пролетал бы сборку порта
-    # (`app/port.py::_startup_settings`) и ронял программу при запуске
-    # с таким файлом настроек (правило 13).
-    if values.time_exit_order is TimeExitKind.LIMIT and values.price_step <= 0:
-        raise SettingsRefused(limit_without_step(values), field="price_step")
     previous = base if base is not None else EngineSettings()
     fields: dict[str, Any] = {
         name: take(values, mode) for name, take in _ENGINE_FROM_WINDOW.items()
@@ -590,40 +573,6 @@ def engine_settings(
     for name in _ENGINE_FROM_BASE:
         fields[name] = getattr(previous, name)
     return EngineSettings(**fields)
-
-
-#: Что уходит модулю, когда галочка «Фильтр против пилы» снята. Имена —
-#: **полей окна**, а не полей модуля: снятая галочка отменяет то, что стоит
-#: в полях окна, а как эти поля зовутся у модуля — дело модуля.
-#:
-#: Таблица, а не два `if` внутри сборщика, и причина та же, по которой
-#: таблицей стал сам сборщик: третье поле фильтра, заведённое завтра, здесь
-#: не окажется — и снятая галочка перестанет означать «выключено» ровно
-#: в том поле, о котором забыли. Полноту стережёт `_filter_off_gap`.
-#:
-#: ⚠️ Значения обязаны совпадать с умолчаниями модуля, и это проверяется
-#: тестом, а не обещанием: на выключенном фильтре стоит сверка с прототипом
-#: (127 сделок из 127), а у прототипа фильтра нет вовсе.
-_FILTER_OFF: dict[str, object] = {
-    "threshold_percent": 0.0,
-    "confirm_bars": 1,
-}
-
-
-def _filter_off_gap() -> tuple[str, ...]:
-    """Поля выключенного фильтра, которых у окна нет. Пусто — согласовано.
-
-    Опечатка в таблице выше не отняла бы настройку, а завела бы
-    несуществующее поле окна — и снятая галочка молча перестала бы
-    что-либо выключать.
-    """
-    known = {field.name for field in dataclasses.fields(Settings)}
-    return tuple(sorted(set(_FILTER_OFF) - known))
-
-
-#: Считается один раз, при импорте: набор полей окна за время работы
-#: не меняется, а платить за проверку на каждом прогоне незачем.
-_FILTER_OFF_GAP: tuple[str, ...] = _filter_off_gap()
 
 
 @functools.lru_cache(maxsize=None)
@@ -826,46 +775,59 @@ def expiry_days_of(values: Settings) -> int:
     return days
 
 
-def check_demands(values: Settings) -> None:
-    """Общие настройки отвечают требованиям выбранного алгоритма — или отказ.
+def retired_line(strategy_id: str) -> str:
+    """Строка журнала про убранный алгоритм. Пусто — имя не из убранных."""
+    gone = registry.retired_title(strategy_id)
+    if gone is None:
+        return ""
+    return (
+        f"Алгоритм «{gone}» убран, работает "
+        f"«{registry.default_entry().title}»."
+    )
 
-    ⚠️ **Проверяется пара, а не то поле, которое трогали.** Отказ смотрит
-    на выбранный алгоритм и на нынешнее значение названной им настройки —
-    поэтому ловятся оба порядка: «выбрали алгоритм при чужом моменте
-    переворота» и «поменяли момент переворота при выбранном алгоритме».
-    Проверка, повешенная на смену алгоритма, вторую правку пропустила бы
-    молча, и название в окне снова стало бы ложью — ровно ради чего отказ
-    и заводится.
 
-    ⛔ **Зовётся на границе применения, а не из `engine_settings`.** У той
-    есть вызовы помимо «Применить»: снимок настроек **прошлого** прогона
-    (`app/runs.py`), точки перебора (`app/leaders.py`) и конструктор порта
-    **без `try/except`**. Отказ внутри неё означал бы, что прогон, записанный
-    до правки, перестаёт открываться в журнале прогонов, а программа с таким
-    файлом настроек не запускается вовсе.
+def settled(values: Settings) -> tuple[Settings, tuple[str, ...]]:
+    """Настройки, приведённые к выбранному алгоритму, — и что подменено, строками.
 
-    ⚠️ Файл настроек сюда не приходит: при **чтении** файла прежних настроек
-    не существует — отказывать не в пользу чего. Там несовместимое значение
-    подменяется вслух (`app/settings_store.py`), и это разные ответы на один
-    вопрос намеренно.
+    Два шага, оба **вслух**, строкой для журнала решений:
 
-    :raises SettingsRefused: требование не выполнено; называет, что стоит,
-        что нужно и почему.
+    1. Убранный алгоритм (`registry.RETIRED`) → алгоритм по умолчанию.
+       Шаблон, старый файл или запрос прогона с `ema_reverse` не отказ,
+       а «Реверс с постоянной позицией» (решение 0063).
+    2. Требования алгоритма к общим настройкам (`StrategyEntry.demands`)
+       **выставляются**, а не дают отказ. Слова владельца счёта 05.10.2026
+       про отказ окна: «ну так надо было переставлять!». Окно эти поля
+       и так запирает (`ui/settings_dialog.py::_sync_demands`); сюда
+       несовместимое значение доходит из шаблона или командой порта.
+
+    ⛔ Зовётся на границе применения, а не из `engine_settings`: у той есть
+    вызовы помимо «Применить» (снимок прошлого прогона, точки перебора).
+
+    Незнакомое имя алгоритма здесь не разбирается: отказ про него
+    громко даёт `chosen_algorithm` следующим шагом.
     """
-    entry = chosen_algorithm(values)
+    said: list[str] = []
+    line = retired_line(values.strategy_id)
+    if line:
+        values = values.replace(strategy_id=registry.DEFAULT_ID)
+        said.append(line)
+    try:
+        entry = chosen_algorithm(values)
+    except SettingsRefused:
+        return values, tuple(said)
     for demand in entry.demands:
-        # `getattr` безопасен, а элемент заведомо существует: обе стороны
-        # уже сверены `_demand_gap` внутри `chosen_algorithm` выше.
+        # Элемент заведомо существует: обе стороны сверены `_demand_gap`
+        # внутри `chosen_algorithm` выше.
         current = getattr(values, demand.outer)
         if current.name == demand.value:
             continue
         wanted = type(current)[demand.value]
-        raise SettingsRefused(
-            f"Алгоритм «{entry.title}» {demand.reason}. Сейчас выбрано "
-            f"«{_choice(current)}», а нужно «{_choice(wanted)}». Прежние "
-            "настройки остались в силе.",
-            field=demand.outer,
+        values = values.replace(**{demand.outer: wanted})
+        said.append(
+            f"Алгоритм «{entry.title}» {demand.reason}. Стояло "
+            f"«{_choice(current)}» — выставлено «{_choice(wanted)}»."
         )
+    return values, tuple(said)
 
 
 def strategy_settings(values: Settings) -> StrategySettings:
@@ -884,30 +846,15 @@ def strategy_settings(values: Settings) -> StrategySettings:
     (`D-029`). Отказ роняет применение настроек, а не программу, — его ловит
     `HistoryPort.apply_settings` и показывает фразой.
 
-    ⚠️ **Снятая галочка фильтра сильнее полей.** При `filter_enabled=False`
-    порог и подтверждение берутся из `_FILTER_OFF`, а не из полей окна.
-    Это не молчаливая подмена, которая в этом модуле запрещена: подменяется
-    значение выключенной настройки, выключатель стоит рядом с полями
-    на экране, а строка про его переключение уходит в журнал (`_WINDOW_TOLD`).
-    Обратное — уважать поля при снятой галочке — означало бы выключатель,
-    который ничего не выключает.
     """
-    if _FILTER_OFF_GAP:
-        raise SettingsRefused(
-            "Программа собрана несогласованно: выключенный фильтр против пилы "
-            f"называет поля, которых у окна нет — {', '.join(_FILTER_OFF_GAP)}. "
-            "Работать так нельзя: снятая галочка перестала бы означать "
-            "«выключено». Обновите программу целиком."
-        )
     entry = chosen_algorithm(values)
     wanted = _module_types(entry)
     # `Any` здесь честнее любой хитрости: значения полей разного типа, и
     # соответствие имени типу проверяет сам алгоритм в своём `__post_init__` —
-    # громко и с фразой (`strategies/ema_reverse.py`).
+    # громко и с фразой (`strategies/ma_reverse_always.py`).
     fields: dict[str, Any] = {}
     for one in entry.fields:
-        off = not values.filter_enabled and one.outer in _FILTER_OFF
-        raw = _FILTER_OFF[one.outer] if off else getattr(values, one.outer)
+        raw = getattr(values, one.outer)
         fields[one.name] = _module_value(
             raw, wanted.get(one.name), said=one.title
         )
@@ -991,7 +938,7 @@ def _demands_of(entry: registry.StrategyEntry) -> tuple[AlgorithmDemand, ...]:
     """Требования алгоритма к общим настройкам — значениями окна.
 
     Имя элемента из реестра переводится в элемент перечисления окна тем же
-    способом, что и в `check_demands`: окно по нему только находит строку
+    способом, что и в `settled`: окно по нему только находит строку
     своего списка. Сверку «поле и элемент существуют» уже сделал
     `_demand_gap` при сборке каталога — несовместимая запись сюда
     не доходит, а дошла бы — упала бы громко, а не выключила требование.
@@ -1181,11 +1128,10 @@ def run_costs(values: Settings) -> Costs:
     """
     if values.slippage_steps > 0 and values.price_step <= 0:
         raise SettingsRefused(
-            f"Проскальзывание {values.slippage_steps} шагов задано, а шаг цены "
-            "инструмента не назван. Так поправка не сработает вовсе, а отчёт "
-            "выглядел бы посчитанным с ней. Впишите шаг цены в настройках — "
-            "он есть в карточке инструмента на сайте биржи (у фьючерса "
-            "на индекс МосБиржи это 25 ₽)."
+            f"Проскальзывание {values.slippage_steps} шагов задано, а биржа "
+            "ещё не сообщила шаг цены. Так поправка не сработает вовсе, а отчёт "
+            "выглядел бы посчитанным с ней. Шаг программа берёт у биржи сама, "
+            "как только есть связь."
         )
     try:
         return Costs(
@@ -1353,14 +1299,6 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # в прогоне двигается только на закрытии свечи (`B-058`).
     "minute_bar_limit": _Told("Наибольшая свеча для проверки по минуткам", _as_label),
     "log_directory": _Told("Каталог технического журнала", _as_text),
-    # ⚠️ Выключатель фильтра называет **себя**, а числа фильтра называет
-    # торговый модуль (`_TOLD_BY_STRATEGY`) — и называет **действующие**:
-    # при снятой галочке до модуля доходят его умолчания, а не то, что стоит
-    # в полях. Отсюда читаемая пара строк на включение: «Фильтр против пилы:
-    # выключен → включён; Порог пересечения: 0,00% → 0,04%». Правка числа
-    # при снятой галочке строки не даёт, и это верно: поведение робота
-    # от неё не меняется ничем.
-    "filter_enabled": _Told("Фильтр против пилы", _as_switch),
     # Три предохранителя: у каждого галочка и число, и в журнал идут оба.
     # Одна галочка без числа читалась бы как «включил и всё» — а включение
     # без числа не значит ничего; одно число без галочки читалось бы как
@@ -1427,11 +1365,8 @@ def _told_by_strategy() -> frozenset[str]:
 _TOLD_BY_STRATEGY: Final[frozenset[str]] = _told_by_strategy()
 
 #: Поля окна, принадлежащие алгоритму: всё, что читает хоть один алгоритм
-#: реестра, плюс выключатель фильтра — он не поле алгоритма, но существует
-#: только ради чисел фильтра (`_FILTER_OFF`).
-_ALGORITHM_OWNED: Final[frozenset[str]] = (
-    _TOLD_BY_STRATEGY | {"filter_enabled"} | frozenset(_FILTER_OFF)
-)
+#: реестра.
+_ALGORITHM_OWNED: Final[frozenset[str]] = _TOLD_BY_STRATEGY
 
 
 def unused_fields(strategy_id: str) -> frozenset[str]:
@@ -1439,9 +1374,8 @@ def unused_fields(strategy_id: str) -> frozenset[str]:
 
     Считается по таблице полей самого алгоритма (`StrategyEntry.fields`),
     а не списком руками: алгоритм объявляет, что читает, остальное
-    из `_ALGORITHM_OWNED` — нечитаемое. Выключатель фильтра нечитаем тогда,
-    когда алгоритм не читает ни одного числа фильтра: без них он ничего
-    не включает.
+    из `_ALGORITHM_OWNED` — нечитаемое. При одном алгоритме ответ пуст;
+    механизм оставлен для поддельного второго в проверках смены алгоритма.
 
     Окно гасит эти поля, журнал о их смене молчит — робот от них
     не меняется ничем. Незнакомое имя алгоритма — пусто: гасить по догадке
@@ -1452,33 +1386,7 @@ def unused_fields(strategy_id: str) -> frozenset[str]:
     except registry.UnknownStrategy:
         return frozenset()
     reads = {one.outer for one in entry.fields}
-    if reads & set(_FILTER_OFF):
-        reads.add("filter_enabled")
     return _ALGORITHM_OWNED - reads
-
-
-def _as_confirm(value: object) -> str:
-    """Подтверждение сигнала: свечей подряд, с оговоркой про единицу."""
-    return "1 свеча (подтверждения нет)" if value == 1 else f"{value} свечей подряд"
-
-
-#: Числа фильтра против пилы, **пока выключатель снят**.
-#:
-#: Про них рассказывает торговый модуль — но только когда фильтр включён:
-#: при снятой галочке до модуля доходят его умолчания (`_FILTER_OFF`),
-#: и модуль честно не видит никакой перемены. Строку в журнале это оставляло
-#: без строки вовсе, а ТЗ §4.4 А требует строку на **каждое** изменение поля
-#: окна — и сторож `test_a_change_of_any_settings_field_reaches_the_journal`
-#: ловит ровно это.
-#:
-#: Молчание тут не безобидно: владелец счёта подбирает порог при снятой
-#: галочке, потом включает её — и восстановить, что он крутил, нечем.
-#: Поэтому строка есть, и она **сразу говорит, что число ни на что
-#: не влияет**: иначе она читалась бы как включённый фильтр.
-_TOLD_WHILE_THE_FILTER_IS_OFF: dict[str, _Told] = {
-    "threshold_percent": _Told("Порог пересечения", fmt_percent),
-    "confirm_bars": _Told("Подтверждение сигнала", _as_confirm),
-}
 
 
 def _silent_fields() -> tuple[str, ...]:
@@ -1512,25 +1420,6 @@ def _changes(previous: Settings, now: Settings, *, guard: bool) -> list[str]:
     return [line for _, line in _changes_by_field(previous, now, guard=guard)]
 
 
-def _muted_filter_changes(
-    previous: Settings, now: Settings, *, unused: frozenset[str]
-) -> list[str]:
-    """Правка чисел фильтра при снятой галочке — строкой, и сразу с оговоркой.
-
-    Пусто, если галочка была или стала поднятой: тогда перемену увидел
-    и назвал сам торговый модуль, и вторая строка про то же была бы
-    двойным учётом.
-    """
-    if previous.filter_enabled or now.filter_enabled:
-        return []
-    return [
-        f"{told.label} (фильтр выключен, на робота не влияет): "
-        f"{told.show(getattr(previous, name))} → {told.show(getattr(now, name))}"
-        for name, told in _TOLD_WHILE_THE_FILTER_IS_OFF.items()
-        if name not in unused and getattr(previous, name) != getattr(now, name)
-    ]
-
-
 def window_changes(previous: Settings, now: Settings) -> list[str]:
     """Изменения полей, о которых не расскажут ни движок, ни торговый модуль.
 
@@ -1548,8 +1437,7 @@ def window_changes(previous: Settings, now: Settings) -> list[str]:
     означает изменение параметра по деньгам, которого нет в журнале.
     """
     # Поля, которые алгоритм, выбранный в `now`, не читает, строки не дают:
-    # робот от них не меняется, а строка «Фильтр против пилы: выключен →
-    # включён» читалась бы как включённая защита (`D-107`). Ключ — `now`:
+    # робот от них не меняется (`D-107`). Ключ — `now`:
     # если прежний алгоритм поле читал, а новый нет, влиять ему уже не на что.
     unused = unused_fields(now.strategy_id)
     lines = [
@@ -1557,7 +1445,6 @@ def window_changes(previous: Settings, now: Settings) -> list[str]:
         for name, line in _changes_by_field(previous, now, guard=False)
         if name not in unused
     ]
-    lines += _muted_filter_changes(previous, now, unused=unused)
     if _SILENT_FIELDS and any(
         getattr(previous, name) != getattr(now, name) for name in _SILENT_FIELDS
     ):
@@ -1643,13 +1530,18 @@ def all_changes(previous: Settings, now: Settings) -> tuple[list[str], str]:
     читается так», а в журнале была. Два описания одних и тех же изменений
     уже разошлись — просто тихо. Теперь источник один.
     """
+    # Перечень — про то, что будет **применено**: убранный алгоритм и
+    # требования алгоритма выставляются так же, как при «Применить»
+    # (`settled`), и строки про это идут первыми (решение 0063).
+    now, adjusted = settled(now)
     try:
         engine_was = engine_settings(previous, _DIFF_MODE)
         engine_now = engine_settings(now, _DIFF_MODE)
         rule = rule_changes(previous, now)
     except (SettingsRefused, ValueError, TypeError) as error:
         return [], str(error)
-    lines = window_changes(previous, now)
+    lines = list(adjusted)
+    lines += window_changes(previous, now)
     lines += engine_now.changes_from(engine_was)
     lines += rule
     lines += guard_changes(previous, now)
@@ -1811,6 +1703,7 @@ def trade_row(deal: Deal, *, origin: RunOrigin | None = None) -> TradeRow:
         commission_rub=deal.commission,
         trade_id=deal.entry_order_id,
         origin=origin,
+        profit_points=deal.points,
     )
 
 
@@ -1908,6 +1801,7 @@ def row_of_stored_trade(stored: StoredTrade) -> TradeRow:
         commission_rub=stored.commission,
         trade_id=stored.entry_order_id,
         origin=_ORIGINS_OF_STORED[stored.origin],
+        profit_points=stored.points,
     )
 
 

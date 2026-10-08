@@ -247,21 +247,28 @@ def test_off_names_the_limit_of_the_exit_order_left_with_the_broker() -> None:
 
 # ---------------------------------------------------- настройки и заявка
 
-def test_the_limit_form_without_a_price_step_is_refused_loudly() -> None:
-    """Стережёт отказ «шаг 0 при LIMIT» — в движке и на пути из окна.
+def test_without_a_price_step_the_border_gives_the_engine_a_market_exit() -> None:
+    """Стережёт: движок «шаг 0 при LIMIT» отвергает, а граница окна — нет.
 
-    С Ф3 форма и шаг оба приходят из окна; граница переводит отказ
-    в `SettingsRefused` с полем — его ловят все пути применения и сборка
-    порта при запуске (`tests/test_time_exit_window.py`).
+    Шаг цены сообщает биржа (05.10.2026); пока его нет, граница отдаёт
+    движку «по рынку» вместо отказа. Отказ здесь гасил «Применить» до
+    прихода карточки: перечень изменений перед подтверждением собирается
+    через эту же границу (`convert.all_changes`). Мутация: вернуть отказ
+    в `convert.engine_settings` — проверка падает.
     """
     with pytest.raises(ValueError, match="шаг цены"):
         EngineSettings(time_exit_order=TimeExitOrder.LIMIT)
-    with pytest.raises(convert.SettingsRefused, match="не посчитать") as refused:
-        convert.engine_settings(
-            Settings(price_step=0.0, time_exit_order=TimeExitKind.LIMIT),
-            WindowMode.REVERSE,
-        )
-    assert refused.value.field == "price_step"
+    engine = convert.engine_settings(
+        Settings(price_step=0.0, time_exit_order=TimeExitKind.LIMIT),
+        WindowMode.REVERSE,
+    )
+    assert engine.time_exit_order is TimeExitOrder.MARKET, engine
+    lines, trouble = convert.all_changes(
+        Settings(time_exit_order=TimeExitKind.LIMIT),
+        Settings(time_exit_order=TimeExitKind.LIMIT, average_period=21),
+    )
+    assert trouble == "", f"перечень перед «Применить» не собран без шага: {trouble}"
+    assert lines, "перечень перед «Применить» пуст"
 
 
 def test_the_price_step_reaches_the_engine_from_the_one_window_field() -> None:

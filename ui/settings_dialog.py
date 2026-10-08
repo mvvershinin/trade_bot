@@ -46,6 +46,7 @@ from typing import cast
 from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -74,19 +75,24 @@ from ui.confirm_changes import confirm_changes
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
     MAX_TIME_EXIT_WAIT_BARS,
+    STEP_WAIT,
     AfterTakeProfit,
     AlgorithmOption,
     AverageKind,
     ContractNotice,
     MinuteBarLimit,
     MinutePriceOrder,
-    OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
     TimeExitKind,
 )
 from ui.theme import current as current_theme
+from ui.theme import resize_within_screen
 from ui.wheel_guard import guard_wheel
+
+#: Что стоит в поле шага цены, пока биржа его не сообщила. Не «не задан»:
+#: задавать шаг человеку нечем и незачем — он придёт от биржи сам.
+STEP_UNKNOWN = "биржа ещё не сообщила"
 
 TIMEFRAMES = ("1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "День")
 
@@ -159,7 +165,7 @@ _TAB_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Это **строка и кнопка**, а не абзац: описание правила занимает 391–459
     # точек и вытесняло бы поля под прокрутку — замер 08.09.2026. Полное
     # описание живёт в отдельном окне (`ui/algorithm_dialog.py`).
-    ("Сигнал", ("_algorithm_group", "_signal_group", "_filter_group")),
+    ("Сигнал", ("_algorithm_group", "_signal_group")),
     ("Вход и выход", ("_entry_group", "_take_group")),
     ("Торговое окно", ("_time_group",)),
     ("Деньги", ("_volume_group", "_risk_group", "_commission_group")),
@@ -199,10 +205,6 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("strategy_id", "Сигнал", "algorithm_name"),
     ("average_period", "Сигнал", "average_period"),
     ("average_kind", "Сигнал", "average_kind"),
-    ("on_price_equals_average", "Сигнал", "on_price_equals_average"),
-    ("filter_enabled", "Сигнал", "filter_enabled"),
-    ("threshold_percent", "Сигнал", "threshold_percent"),
-    ("confirm_bars", "Сигнал", "confirm_bars"),
     ("reversal_moment", "Вход и выход", "reversal_moment"),
     ("after_take_profit", "Вход и выход", "after_take_profit"),
     ("take_profit_enabled", "Вход и выход", "take_profit_enabled"),
@@ -241,7 +243,7 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
 #: на показ (`_show_choices`) и на сбор (`values`).
 _CHOICES: tuple[str, ...] = (
     "average_kind", "reversal_moment", "after_take_profit",
-    "on_price_equals_average", "minute_order", "minute_bar_limit",
+    "minute_order", "minute_bar_limit",
     "time_exit_order",
 )
 
@@ -352,8 +354,8 @@ def _paint_hint(label: QLabel) -> None:
     теме случайно выходило 5,1:1, поэтому глазами дефект видели только те,
     у кого система светлая.
 
-    `Theme.text_dim` — цвет, заведённый ровно для этого: `#6b7280` в светлой
-    (4,9:1) и `#9aa4b2` в тёмной (8,2:1).
+    `Theme.text_dim` — цвет, заведённый ровно для этого. С 05.10.2026 —
+    `#4b5563` в светлой и `#c5ccd6` в тёмной (числа — `ui/theme.py`).
     """
     label.setProperty(HINT_ROLE, True)
     label.setStyleSheet(f"color: {current_theme().text_dim};")
@@ -423,13 +425,15 @@ def _steps(count: float) -> str:
 
 
 def _hint(text: str) -> QLabel:
-    """Подсказка под полем: серым, некрупно, с переносом строк."""
+    """Подсказка под полем: приглушённым цветом, с переносом строк.
+
+    ⚠️ Шрифт — основной, а не «на пункт мельче», как было до 05.10.2026:
+    владелец счёта назвал подсказки «очень плохо видно». Отличие от
+    подписи поля держится на цвете (`Theme.text_dim`), а не на размере.
+    """
     label = QLabel(text)
     label.setWordWrap(True)
     label.setTextFormat(Qt.TextFormat.PlainText)
-    font = label.font()
-    font.setPointSizeF(max(font.pointSizeF() - 1.0, 7.0))
-    label.setFont(font)
     _paint_hint(label)
     return label
 
@@ -444,7 +448,10 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Настройки робота")
         self.setModal(True)
-        self.resize(560, 720)
+        # Шире прежних 560: подсказки под полями переносились через слово,
+        # а с крупным шрифтом (`FONT_SCALE`) — тем более. Просьба владельца
+        # счёта 05.10.2026 (`ROADMAP.md`, Н1): «окно настроек сделать шире».
+        resize_within_screen(self, 820, 800)
 
         #: Строки у полей: требование алгоритма и отказ «Применить». Ключ —
         #: имя поля `Settings` и вид строки. Создаются по первому требованию
@@ -609,29 +616,7 @@ class SettingsDialog(QDialog):
         self.average_kind = _choice(AverageKind)
         self.reversal_moment = _choice(ReversalMoment)
         self.after_take_profit = _choice(AfterTakeProfit)
-        self.on_price_equals_average = _choice(OnPriceEqualsAverage)
 
-        # Фильтр против пилы. Выключен умолчанием — и выключен всеми тремя
-        # элементами сразу: галочка снята, порог ноль, подтверждение одна
-        # свеча. Это в точности поведение прототипа, и на нём стоит сверка
-        # 127 сделок из 127.
-        #
-        # ⚠️ Галочка отдельно от чисел не для красоты. «0 % и 1 свеча» —
-        # верное выражение выключенности, но с экрана оно не читается:
-        # состояние приходится выводить из двух чисел в разных строках.
-        # Числа при снятой галочке сохраняются, чтобы включение вернуло
-        # подобранное, а не умолчание; до движка они при этом не доходят
-        # (`app/convert.py::_FILTER_OFF`).
-        self.filter_enabled = QCheckBox("Включить фильтр против пилы")
-        self.filter_enabled.toggled.connect(self._sync_filter)
-
-        self.threshold_percent = _decimal(0.0, 5.0, 0.05, " %")
-        self.threshold_percent.setSpecialValueText("0,00 % — полосы нет")
-        self.threshold_percent.valueChanged.connect(self._sync_filter)
-
-        self.confirm_bars = _whole(1, 20)
-        self.confirm_bars.setSpecialValueText("1 — подтверждения нет")
-        self.confirm_bars.valueChanged.connect(self._sync_filter)
 
     def _build_take_fields(self) -> None:
         """Фиксация прибыли: включена ли она и **каким из двух способов**.
@@ -722,8 +707,15 @@ class SettingsDialog(QDialog):
         # Единица — пункты цены, а не рубли: шаг умножается на число шагов
         # и прибавляется к цене (`backtest.Costs.slippage`, предел заявки
         # движка). Рубли за пункт — соседнее поле.
-        self.price_step = _decimal(0.0, 1_000_000.0, 1.0, " пункт.", decimals=4)
-        self.price_step.setSpecialValueText("не задан")
+        # ⚠️ Только показ: шаг сообщает биржа, человек его не вписывает
+        # (решение владельца счёта 05.10.2026). Что пришло в поле с «ОК»,
+        # порт не берёт (`HistoryPort.apply_settings`).
+        self.price_step = _decimal(
+            0.0, 1_000_000.0, 1.0, " пункт., по данным биржи", decimals=4
+        )
+        self.price_step.setReadOnly(True)
+        self.price_step.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.price_step.setSpecialValueText(STEP_UNKNOWN)
         self.price_step.valueChanged.connect(self._sync_costs)
 
         # ⚠️ Нижняя граница — ноль, и ноль здесь рабочая конфигурация: ровно
@@ -801,9 +793,8 @@ class SettingsDialog(QDialog):
         # его правка обязана перерисовать строку и здесь.
         self.price_step.valueChanged.connect(self._sync_window_close)
         self.time_exit_note = _alert()
-        # Та же строка — под полем шага цены: чинить её там, а человек,
-        # открывший окно на первой вкладке, иначе видел бы погасшие кнопки
-        # без причины (снимок 04.10.2026).
+        # Та же строка — под полем шага цены: пока биржа шаг не сообщила,
+        # человек видит это и там, где шаг показан, и там, где он нужен.
         self.step_note = _alert()
 
         # Календарь нерабочих дней своего поля здесь не имеет: его правят
@@ -881,7 +872,6 @@ class SettingsDialog(QDialog):
         )
 
         self.depth_note = _hint("")
-        self.filter_note = _alert()
 
         # Обе строки говорят о состоянии предохранителя: включён он или нет
         # и что будет, когда сработает. Тревожное оформление — не всегда:
@@ -1079,14 +1069,14 @@ class SettingsDialog(QDialog):
         """
         box = self._group("Свойства инструмента", [
             ("Шаг цены инструмента", self.price_step,
-             "Наименьшее движение цены этого инструмента, в пунктах цены — "
-             "из карточки инструмента на сайте биржи; программа его сама "
-             "не подставляет. Нужен в двух местах: поправке на "
-             "проскальзывание на вкладке «Деньги» (она задаётся в шагах, "
-             "потому что «полшага» на фьючерсе и на акции — разные деньги) "
-             "и предельной цене заявки на выход по концу окна на вкладке "
-             "«Торговое окно» (отступ тоже в шагах). При заявке «с предельной "
-             "ценой» без шага настройки не применятся."),
+             "Наименьшее движение цены этого инструмента, в пунктах цены. "
+             "Программа берёт его у биржи сама — вписывать не нужно, и поле "
+             "только показывает, что сообщила биржа. Нужен в двух местах: "
+             "поправке на проскальзывание на вкладке «Деньги» (она задаётся "
+             "в шагах) и предельной цене заявки на выход по концу окна "
+             "на вкладке «Торговое окно» (отступ тоже в шагах). Пока биржа "
+             "шаг не сообщила, выход по концу окна идёт по рынку, "
+             "а проскальзывание не учитывается."),
             ("Рублей в пункте цены", self.ruble_per_point,
              "На сколько рублей меняется ваш результат, когда цена проходит "
              "один пункт. Программа спрашивает это число у биржи и подставляет "
@@ -1122,8 +1112,8 @@ class SettingsDialog(QDialog):
         body.addWidget(self.unused_note)
         body.addWidget(_hint(
             "Алгоритм решает только направление: лонг, шорт или ничего. "
-            "Поля ниже — его настройки; что он с ними делает, показывает "
-            "кнопка «Подробнее» в окне выбора."
+            "Поля ниже — его настройки. Правило одной фразой — во всплывающей "
+            "подсказке у названия алгоритма."
         ))
         return box
 
@@ -1137,48 +1127,7 @@ class SettingsDialog(QDialog):
              "Экспоненциальная сильнее реагирует на последние свечи, простая "
              "считает все свечи одинаково. Все известные результаты получены "
              "на экспоненциальной. Простая удваивает время проверки на истории."),
-            ("Цена закрылась ровно на средней", self.on_price_equals_average,
-             "Редкий случай: закрытие свечи совпало со средней до копейки. Ваш "
-             "нынешний робот в этот момент не делает ничего — и остаётся вне рынка. "
-             "На проверенном отрезке истории случай не встретился ни разу."),
         ])
-        return box
-
-    def _filter_group(self) -> QGroupBox:
-        box = self._group("Фильтр против пилы", [
-            ("Фильтр против пилы", self.filter_enabled,
-             "Против того случая, когда цена ходит вплотную к средней: робот "
-             "переворачивается на каждой свече и платит комиссию за каждый "
-             "переворот. Замер 05.09.2026 на ваших данных, 79 дней, окно "
-             "10:05–11:00: выключено — 111 сделок, чистая +2 151 ₽, просадка "
-             "8 718 ₽; порог 0,04 % — 93 сделки, +8 327 ₽, просадка 7 950 ₽; "
-             "подтверждение 3 свечами — 71 сделка, +10 340 ₽, просадка 6 362 ₽. "
-             "На дне 03.09, где вы поймали четыре переворота подряд, "
-             "подтверждение оставило одну сделку и −103 ₽ вместо шести "
-             "и −1 268 ₽. ⚠️ И вторая половина того же замера: ни один "
-             "из вариантов статистически от нуля не отличается — стандартная "
-             "ошибка итога 6–8,5 тыс. ₽ при самом итоге 2–10 тыс. ₽. Это "
-             "означает «79 дней мало», а не «фильтр работает»."),
-            ("Порог пересечения", self.threshold_percent,
-             "Полоса вокруг средней, внутри которой цена сигналом не считается: "
-             "чтобы перевернуться, цена обязана уйти за среднюю на эту величину. "
-             "Ноль означает «полосы нет» — так работает ваш нынешний робот, "
-             "и сверка с ним сделана на нуле. ⚠️ Лучшая на подборе цифра "
-             "провалилась на проверке: порог 0,20 % дал +7 048 ₽ на первой "
-             "половине отрезка и −3 497 ₽ на второй. Обе половины пережил "
-             "только порог 0,04 %."),
-            ("Подтверждение сигнала, свечей подряд", self.confirm_bars,
-             "Сколько свечей подряд цена должна закрываться по одну сторону "
-             "средней, прежде чем робот войдёт. Одна свеча означает «без "
-             "подтверждения», как сейчас. Больше — входов меньше и они позже. "
-             "⚠️ Соседние значения скачут: 3 свечи дали +10 340 ₽, 4 свечи "
-             "−889 ₽, 5 свечей +7 656 ₽. Соседи так вести себя не должны — это "
-             "мера шума на 79 днях, а не свойство рынка. Обе половины отрезка "
-             "пережили только 3 и 6."),
-        ])
-        layout = box.layout()
-        if isinstance(layout, QFormLayout):
-            layout.addRow(self.filter_note)
         return box
 
     def _entry_group(self) -> QGroupBox:
@@ -1538,6 +1487,10 @@ class SettingsDialog(QDialog):
         # выбирать не из чего, и это верно независимо от того, нашлось имя
         # в нём или нет.
         self.algorithm_button.setEnabled(bool(self._algorithms))
+        # Алгоритм один (решение 0063) — выбирать не из чего, кнопка и окно
+        # выбора спрятаны; название остаётся видно строкой. Пустой каталог
+        # кнопку не прячет: там она выключена с объяснением, почему.
+        self.algorithm_button.setVisible(len(self._algorithms) != 1)
         # Подсказка на выключенной кнопке Qt показывает — на неё и рассчитано:
         # человек ведёт мышью туда, куда собирался нажать.
         self.algorithm_button.setToolTip(
@@ -1561,11 +1514,18 @@ class SettingsDialog(QDialog):
         if not self._algorithms:
             self._say_about_the_algorithm(CATALOGUE_NOT_ARRIVED, alarming=False)
             return
+        # Кнопка выбора спрятана, когда алгоритм один (решение 0063): тогда
+        # советовать «выберите кнопкой справа» нельзя — кнопки нет.
+        way = (
+            "Выберите алгоритм из списка кнопкой справа либо обновите "
+            "программу целиком."
+            if self.algorithm_button.isVisibleTo(self) else
+            "Обновите программу целиком."
+        )
         self._say_about_the_algorithm(
             f"⚠️ Алгоритма «{self._strategy_id}» в этой сборке нет — робот "
             "работать им не сможет. Скорее всего настройки или шаблон сделаны "
-            "более новой сборкой программы. Выберите алгоритм из списка "
-            "кнопкой справа либо обновите программу целиком.",
+            f"более новой сборкой программы. {way}",
             alarming=True,
         )
 
@@ -1596,8 +1556,6 @@ class SettingsDialog(QDialog):
 
         Гасятся только поля, которые хоть один алгоритм каталога не читает:
         остальными — «Период средней» и прочими — ведают свои правила.
-        Числа фильтра дополнительно зависят от его галочки — это решает
-        `_sync_filter`, и он зовётся последним.
         """
         unused = self._unused_now()
         candidates = frozenset().union(*(item.unused for item in self._algorithms))
@@ -1621,7 +1579,6 @@ class SettingsDialog(QDialog):
         else:
             self.unused_note.setText("")
         self.unused_note.setVisible(bool(captions))
-        self._sync_filter()
 
     @staticmethod
     def _caption_of(widget: QWidget) -> str:
@@ -1892,8 +1849,6 @@ class SettingsDialog(QDialog):
             # «Сигнал»
             self.algorithm_button,
             self.average_period, self.average_kind,
-            self.on_price_equals_average,
-            self.filter_enabled, self.threshold_percent, self.confirm_bars,
             # «Вход и выход»
             self.reversal_moment, self.after_take_profit,
             # Порядок — как на экране: выключатель, выбор способа, числа
@@ -1941,8 +1896,6 @@ class SettingsDialog(QDialog):
         self.history_depth_days.setValue(max(settings.history_depth_days, 1))
         self.expiry_halt_days.setValue(settings.expiry_halt_days)
         self.average_period.setValue(settings.average_period)
-        self.threshold_percent.setValue(settings.threshold_percent)
-        self.confirm_bars.setValue(settings.confirm_bars)
         self._show_choices(settings)
         # Выключатели — одной таблицей, как и списки выше. Не ради длины:
         # выключатель, дописанный в поля и забытый здесь, возвращался бы
@@ -1950,7 +1903,6 @@ class SettingsDialog(QDialog):
         # «закрывать в конце окна» и фильтр против пилы. Строк стало меньше,
         # а мест, где можно забыть, — одно вместо четырёх.
         for switch, state in (
-            (self.filter_enabled, settings.filter_enabled),
             (self.take_profit_enabled, settings.take_profit_enabled),
             (self.close_on_time_end, settings.close_on_time_end),
             # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
@@ -2003,7 +1955,6 @@ class SettingsDialog(QDialog):
         self._sync_commission()
         self._sync_costs()
         self._sync_depth()
-        self._sync_filter()
         self._sync_window_close()
         self._take_algorithm(settings.strategy_id)
 
@@ -2094,14 +2045,6 @@ class SettingsDialog(QDialog):
             # и которой не будет в журнале решений.
             strategy_id=self._strategy_id,
             average_period=self.average_period.value(),
-            # ⚠️ Числа отдаются такими, какие стоят в полях, независимо
-            # от галочки. Выключенный фильтр — это не «нули в окне»,
-            # а подмена на границе с торговым модулем
-            # (`app/convert.py::_FILTER_OFF`). Обнулить их здесь значило бы
-            # потерять подобранное при первом же снятии галочки.
-            filter_enabled=self.filter_enabled.isChecked(),
-            threshold_percent=self.threshold_percent.value(),
-            confirm_bars=self.confirm_bars.value(),
             take_profit_enabled=self.take_profit_enabled.isChecked(),
             take_profit_pct=self.take_profit.value(),
             # ⚠️ Способ уходит наружу только вместе с включённой фиксацией,
@@ -2324,13 +2267,6 @@ class SettingsDialog(QDialog):
                 "перевести движение цены в рубли: все деньги отчёта вышли бы "
                 "нулевыми. Для фьючерса на индекс МосБиржи это 1 ₽ за пункт."
             )
-        if self.slippage_steps.value() > 0 and self.price_step.value() <= 0:
-            return (
-                f"Проскальзывание {_steps(self.slippage_steps.value())} "
-                "задано, а шаг цены инструмента не назван. Так поправка "
-                "не сработает вовсе, а отчёт выглядел бы посчитанным с ней. "
-                "Шаг цены есть в карточке инструмента на сайте биржи."
-            )
         return ""
 
     def _sync_buttons(self) -> None:
@@ -2350,7 +2286,7 @@ class SettingsDialog(QDialog):
         # Первая непройденная проверка — и запрет, и подсказка серой кнопки:
         # погасшая «ОК» без слова «почему» выглядит сломанной (находка
         # 04.10.2026 — причина стояла под полем, уехавшим под прокрутку).
-        reason = self.take_error() or self.costs_error() or self.time_exit_error()
+        reason = self.take_error() or self.costs_error()
         hint = f"Недоступно: {reason}" if reason else ""
         for standard in (
             QDialogButtonBox.StandardButton.Ok,
@@ -2408,6 +2344,12 @@ class SettingsDialog(QDialog):
             self.costs_note.setText("⚠️ " + error)
             return
         steps = self.slippage_steps.value()
+        if steps > 0 and self.price_step.value() <= 0:
+            self.costs_note.setText(
+                f"⚠️ {STEP_WAIT} — пока проскальзывание в отчёте не учитывается. "
+                "Шаг программа берёт у биржи сама, как только есть связь."
+            )
+            return
         if steps <= 0:
             self.costs_note.setText(
                 "Поправки нет: отчёт считает, что каждая заявка исполнилась "
@@ -2461,93 +2403,18 @@ class SettingsDialog(QDialog):
             "покажется то, что есть в базе."
         )
 
-    def _sync_filter(self, *_: object) -> None:
-        """Поля фильтра пилы и строка под ними. Молчит, пока фильтр выключен.
+    def step_wait(self) -> str:
+        """Что сейчас идёт иначе, потому что биржа не сообщила шаг цены. Пусто — ничего.
 
-        ⚠️ Молчит именно **выключенный**: тревога, которая горит всегда,
-        перестаёт читаться, а этой строкой сказано то, что владелец счёта
-        обязан знать до включения, — фильтр глушит и выход тоже.
-
-        Числа при снятой галочке гасятся, но не обнуляются: подобранное
-        сохраняется до следующего включения. До торгового модуля выключённые
-        числа не доходят — подмену делает `app.convert.strategy_settings`
-        таблицей `_FILTER_OFF`, и делает её одинаково для окна и для любого
-        другого вызывающего.
-        """
-        # Алгоритм, не читающий фильтр, выключает его целиком: галочка
-        # ничего не включает, и строка про включённый фильтр была бы ложью.
-        unused = self._unused_now()
-        on = self.filter_enabled.isChecked() and "filter_enabled" not in unused
-        for name, field in (
-            ("threshold_percent", self.threshold_percent),
-            ("confirm_bars", self.confirm_bars),
-        ):
-            field.setEnabled(on and name not in unused)
-        threshold = self.threshold_percent.value()
-        bars = self.confirm_bars.value()
-        if not on:
-            self.filter_note.setText("")
-            return
-        if threshold <= 0 and bars <= 1:
-            # Галочка стоит, а обе цифры выключены — фильтр не делает ничего.
-            # Это не ошибка ввода и не повод гасить кнопки: сочетание рабочее
-            # и в точности равно выключенному фильтру. Но выглядит оно как
-            # включённая защита, поэтому названо вслух.
-            self.filter_note.setText(
-                "⚠️ Фильтр включён, но обе его цифры стоят в «выключено»: "
-                "полоса 0 % и подтверждение одной свечой. Робот ведёт себя "
-                "ровно так же, как с снятой галочкой. Задайте порог, "
-                "подтверждение или оба."
-            )
-            return
-        parts = []
-        if threshold > 0:
-            parts.append(f"полоса ±{_pct(threshold)} вокруг средней")
-        if bars > 1:
-            parts.append(f"подтверждение {_bars(bars)}")
-        self.filter_note.setText(
-            "⚠️ Фильтр против пилы включён (" + ", ".join(parts) + "). Он "
-            "убирает часть переворотов и вместе с ними часть комиссии — "
-            "но глушит и выход тоже: слабый обратный сигнал перестаёт быть "
-            "поводом закрыться, и позиция живёт дольше обычного. При снятой "
-            "галочке «Закрывать позицию в конце окна» верхней границы времени "
-            "жизни позиции не остаётся вовсе. Сверка с вашим нынешним роботом "
-            "гоняется с выключенным фильтром: включённый её не воспроизводит "
-            "по построению — у вашего робота фильтра нет."
-        )
-
-    def time_exit_error(self) -> str:
-        """Почему выход по концу окна с такими числами не собрать. Пусто — можно.
-
-        Не торговое правило, а то же условие, что держит движок
-        (`EngineSettings._check_time_exit`) и граница применения
-        (`app/convert.py::engine_settings`): повторено здесь, чтобы человек
-        увидел отказ в момент ввода, а не после «ОК». Источник правды один.
+        Не запрет: человеку здесь делать нечего, шаг придёт сам, и кнопки
+        не гаснут. Та же правда, что на плашке главного окна
+        (`app/port.py::step_wait`): в поле стоит предельная цена, а прогон
+        идёт «по рынку», и одно без другого читалось бы ложью.
         """
         limit = self.time_exit_order.currentData() is TimeExitKind.LIMIT
-        if limit and self.price_step.value() <= 0:
-            # Поле, закрытое требованием алгоритма, «по рынку» не даст:
-            # совет выбрать его был бы советом сделать невозможное.
-            other = (
-                " или выберите заявку «по рынку»"
-                if self.time_exit_order.isEnabled() else ""
-            )
-            # Что действует сейчас — первым, той же правдой, что в журнале
-            # и на плашке главного окна: в поле стоит предельная цена,
-            # а прогон идёт «по рынку», и одно без другого читалось бы ложью.
-            applied = getattr(self, "_applied", None)
-            now = (
-                "Сейчас прогон идёт с выходом «по рынку»: "
-                if applied is not None
-                and applied.time_exit_order is not TimeExitKind.LIMIT else ""
-            )
-            return (
-                f"{now}выбрана заявка с предельной ценой, а шаг цены инструмента "
-                "не задан — предельную цену не посчитать. Впишите шаг цены "
-                "на вкладке «Инструмент и данные» (он есть в карточке "
-                f"инструмента на сайте биржи){other}."
-            )
-        return ""
+        if not limit or self.price_step.value() > 0:
+            return ""
+        return f"{STEP_WAIT} — пока выход по концу окна идёт по рынку."
 
     def _sync_window_close(self, *_: object) -> None:
         """Строки про выход по концу окна: форма заявки, её числа, галочка.
@@ -2561,13 +2428,13 @@ class SettingsDialog(QDialog):
         self.close_on_time_end.setEnabled(not limit)
         self.time_exit_limit_steps.setEnabled(limit)
         self.time_exit_wait_bars.setEnabled(limit)
-        error = self.time_exit_error()
+        waiting = self.step_wait()
         self._sync_buttons()
         # Пустая строка прячется, а не только стирается: иначе на месте
-        # отказа оставалась дыра в полвкладки (снимок 04.10.2026).
+        # строки оставалась дыра в полвкладки (снимок 04.10.2026).
         for note in (self.time_exit_note, self.step_note):
-            note.setText("⚠️ " + error if error else "")
-            note.setVisible(bool(error))
+            note.setText("⚠️ " + waiting if waiting else "")
+            note.setVisible(bool(waiting))
         if limit or self.close_on_time_end.isChecked():
             self.window_close_note.setText("")
             return

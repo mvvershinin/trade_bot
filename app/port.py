@@ -38,13 +38,14 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
-from PySide6.QtCore import QObject, QTimer, SignalInstance
+from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
 from app import contract_view, convert, stitched_view
 from app.minutes import minute_plan, minutes_under
@@ -88,6 +89,8 @@ from market import (
 from market.contracts import monthly_assets
 from ui.formatting import fmt_datetime
 from ui.models import (
+    FIELD_CAPTIONS,
+    STEP_WAIT,
     BacktestOptions,
     BacktestRequest,
     Candle,
@@ -824,6 +827,16 @@ class _Point:
     asked_at: dict[str, float] = dataclasses.field(default_factory=dict)
     task: asyncio.Task[None] | None = None
     trouble: str = ""
+    #: Шаг цены по каждому контракту, как его сообщила биржа (`MINSTEP`).
+    #: Источник шага один — карточка; файл настроек и окно его не задают
+    #: (решение владельца счёта 05.10.2026). Нет контракта — шаг неизвестен.
+    steps: dict[str, float] = dataclasses.field(default_factory=dict)
+    #: Контракты склейки, чей шаг ещё не спрошен, — спрашиваются той же
+    #: задачей после текущего инструмента (`_point_value`).
+    wanted: list[str] = dataclasses.field(default_factory=list)
+    #: Контракты склейки, про чей неизвестный шаг журнал уже сказал.
+    guessed: set[str] = dataclasses.field(default_factory=set)
+    filed: float = 0.0
 
 
 @dataclass(slots=True)
@@ -955,6 +968,18 @@ class HistoryPort(TerminalPort):
         первого железного правила.
     """
 
+    #: Что записать в файл настроек: настройки, имена полей, которые из них
+    #: взять (пустой кортеж — все), и пары «поле, чем оно обязано быть в файле
+    #: сейчас» (пустой — без условия).
+    #: Отдельный сигнал, а не эхо `settings_applied`: эхо уходит на каждое
+    #: изменение, в том числе сделанное программой самой (ответ биржи
+    #: о шаге и стоимости пункта, открытие окна настроек), а файл владельца
+    #: счёта пишется **только** по действию человека (`B-050`, находка
+    #: аудитов 05.10.2026). Исключение одно и названо — переход с истёкшего
+    #: контракта на действующий (`_switch_to_current`). Слушает сборка
+    #: (`app/main.py::_keep_settings`); окну этот сигнал не нужен.
+    settings_to_file = Signal(object, object, object)
+
     #: Прежние контракты и стыки для показа (решение 0061), прочитанные
     #: проходом прямо перед `_show`. Объявлено у класса, а не в `__init__`:
     #: сборка порта упирается в предел длины функции, а значение неизменяемое,
@@ -1066,6 +1091,10 @@ class HistoryPort(TerminalPort):
         в памяти и в журнале, а файл владельца счёта не трогает, пока человек
         сам не нажал «Применить» (`for_file`).
         """
+        #: Шаг цены, записанный в файле. Не действует (шаг сообщает биржа);
+        #: нужен ровно для одной строки журнала, если с биржевым он разошёлся
+        #: (`_step_taken`). Ноль — сказано или сравнивать не с чем.
+        self._point.filed = given.price_step if given is not None else 0.0
         self._file_holds: dict[str, Any] = {
             item.name: getattr(given, item.name)
             for item in dataclasses.fields(Settings)
@@ -1083,14 +1112,11 @@ class HistoryPort(TerminalPort):
     def _trouble_field(self) -> str:
         """Поле окна, правкой которого лечится подмена при запуске.
 
-        Предельная цена без шага (З8) лечится **шагом**, а не формой заявки:
-        форму у алгоритма №2 выбрать нельзя, она закрыта требованием. Иначе —
-        само подменённое поле.
+        Шаг цены здесь не называется никогда: его сообщает биржа, человеку
+        вписывать нечего (решение 05.10.2026), и подмена шага из файла
+        лечится ответом биржи, а не окном настроек.
         """
-        held = self._file_holds
-        if "time_exit_order" in held and self._values.price_step <= 0:
-            return "price_step"
-        return next(iter(held), "")
+        return next((name for name in self._file_holds if name != "price_step"), "")
 
     @property
     def startup_substituted(self) -> frozenset[str]:
@@ -1342,7 +1368,7 @@ class HistoryPort(TerminalPort):
         # настроек движка. Обновить только первое значит поменять подпись
         # в панели и оставить прогон прежним: окно говорит «Только закрытие»,
         # а робот на графике продолжает входить.
-        fresh = convert.engine_settings(self._values, mode, self._engine_settings)
+        fresh = _engine_of(self._values, mode, self._engine_settings)
         changes = fresh.changes_from(self._engine_settings)
         self._mode = mode
         self._engine_settings = fresh
@@ -1368,16 +1394,25 @@ class HistoryPort(TerminalPort):
 
         Поле, подменённое при сборке порта (`_startup_settings`, `B-050`),
         уходит в файл тем, что в нём и лежало, пока человек не применил
-        настройки сам. Иначе файл переписывала бы первая же запись, которую
-        человек не делал: ответ биржи о стоимости пункта (`_point_taken`)
-        или открытие окна настроек (`request_settings`). Отпускает подмену
-        только `apply_settings(by_person=True)`; программа, меняющая настройки
-        сама (`_point_taken`), зовёт его с `by_person=False`.
+        настройки сам. Отпускает подмену только `apply_settings(by_person=True)`;
+        программа, меняющая настройки сама (`_point_taken`), зовёт его
+        с `by_person=False`.
+
+        ⚠️ Сам файл пишется не по эху, а по `settings_to_file`: только
+        по действию человека и при переходе с истёкшего контракта. Ответ
+        биржи (шаг, стоимость пункта) действует в памяти и в файл не идёт.
         """
         return dataclasses.replace(values, **self._file_holds) if self._file_holds else values
 
-    def apply_settings(self, settings: Settings, *, by_person: bool = True) -> None:
+    def apply_settings(
+        self, settings: Settings, *, by_person: bool = True,
+        event: str = "Настройки изменены",
+    ) -> None:
         """Принять настройки окна и пересчитать прогон. `by_person` — см. `for_file`.
+
+        `event` — заголовок строки журнала. Программа, применяющая ответ
+        биржи (`_point_taken`), называет его своим: «Настройки изменены»
+        на каждом запуске читалось бы как правка, которой человек не делал.
 
         Разбор строк окна — громкий: незнакомый размер свечи и пустой
         инструмент отвергаются с объяснением, а не подменяются умолчанием.
@@ -1394,9 +1429,19 @@ class HistoryPort(TerminalPort):
         Три поля предохранителей выделены в отдельную строку уровня
         «предупреждение»: за ними сегодня не стоит ничего, и молчаливое
         «принято» читалось бы как «ограничение поставлено».
+
+        ⚠️ Шаг цены из пришедших настроек **не берётся**: его сообщает биржа
+        (`_point.steps`, решение 05.10.2026). Окно настроек, открытое до
+        ответа биржи, прислало бы на «ОК» ноль и стёрло бы биржевой шаг.
         """
+        # Шаг цены — от биржи. Убранный алгоритм и требования алгоритма —
+        # выставляются вслух, а не дают отказ (решение 0063): строка уходит
+        # в журнал ниже.
+        settings, adjusted = convert.settled(
+            settings.replace(price_step=self._step_of(settings.instrument))
+        )
         try:
-            fresh = convert.engine_settings(settings, self._mode, self._engine_settings)
+            fresh = _engine_of(settings, self._mode, self._engine_settings)
             convert.timeframe_of(settings.timeframe)
             convert.instrument_of(settings.instrument)
             # Настройки алгоритма собираются здесь ради **проверки**: отказ
@@ -1404,13 +1449,6 @@ class HistoryPort(TerminalPort):
             # Сами они пересобираются там, где нужны, — в живом ходе и в
             # прогоне (`_watcher`, `_replay`).
             convert.strategy_settings(settings)
-            # ⚠️ Требования алгоритма к общим настройкам программы — здесь,
-            # а не внутри `convert.engine_settings`: у той есть вызовы помимо
-            # «Применить» (снимок прошлого прогона, точки перебора, конструктор
-            # порта **без** `try/except`), и отказ в ней означал бы прогон,
-            # переставший открываться в журнале, и программу, не запускающуюся
-            # из-за поля в файле настроек.
-            convert.check_demands(settings)
             convert.expiry_days_of(settings)
             self._check_switch(settings)
         except convert.SettingsRefused as refusal:
@@ -1434,6 +1472,7 @@ class HistoryPort(TerminalPort):
         # а при смене самого алгоритма прежние принадлежат другому классу.
         # Порт этого различить не может — он не знает, какие бывают алгоритмы.
         changes += convert.rule_changes(self._values, settings)
+        changes += _unseen_changes(self._values, settings)
         guards = convert.guard_changes(self._values, settings)
         self._values = settings
         self._engine_settings = fresh
@@ -1442,10 +1481,13 @@ class HistoryPort(TerminalPort):
             self._trouble = ("", "")
         self._follow_instrument(settings.instrument)
         self._send(self.settings_applied, settings)
+        if by_person:
+            self._send(self.settings_to_file, settings, (), ())
         self._send(self.algorithms_changed, convert.algorithms(settings))
         # Инструмент мог смениться — плашка «действующий контракт» обязана
         # отозваться сразу, а не при следующем запуске.
         self.check_contract()
+        self._say_settled(adjusted)
         if guards:
             self.note(
                 "Предохранители изменены",
@@ -1458,7 +1500,23 @@ class HistoryPort(TerminalPort):
             reason = "Торговые значения не изменились"
         else:
             reason = "Значения совпали с прежними"
-        self._apply("Настройки изменены", reason)
+        self._apply(event, reason)
+
+    def _say_settled(self, adjusted: tuple[str, ...]) -> None:
+        """Что выставлено под алгоритм (`convert.settled`) — строкой в журнал.
+
+        Пусто — молчать: выставлять было нечего.
+        """
+        if adjusted:
+            self.note(
+                "Настройки выставлены под алгоритм",
+                " ".join(adjusted),
+                DecisionLevel.WARNING,
+            )
+
+    def _step_of(self, instrument: str) -> float:
+        """Шаг цены инструмента по данным биржи. Ноль — биржа ещё не сообщила."""
+        return self._point.steps.get(instrument.strip(), 0.0)
 
     def _follow_instrument(self, instrument: str) -> None:
         """Поток котировок — за инструментом только что принятых настроек."""
@@ -1657,22 +1715,22 @@ class HistoryPort(TerminalPort):
                 "Конец отрезка раньше его начала. Проверьте даты «от» и «до».",
             )
             return
+        # Убранный алгоритм и требования алгоритма выставляются, а не дают
+        # отказ (решение 0063); строка — в журнал, после проверок ниже.
+        fixed, adjusted = convert.settled(request.settings)
+        request = dataclasses.replace(request, settings=fixed)
         try:
-            convert.engine_settings(request.settings, self._mode, self._engine_settings)
+            _engine_of(request.settings, self._mode, self._engine_settings)
             convert.timeframe_of(request.settings.timeframe)
             convert.instrument_of(request.settings.instrument)
             convert.strategy_settings(request.settings)
-            # ⚠️ И здесь тоже: этот путь заканчивается вызовом `apply_settings`,
-            # но **после** того, как отрезок закреплён. Без проверки прямо
-            # здесь несовместимая пара оставила бы закреплённый отрезок
-            # и запрошенный прогон при непринятых настройках.
-            convert.check_demands(request.settings)
         except (convert.SettingsRefused, ValueError, TypeError) as error:
             self._refuse_backtest(
                 f"Настройки не годятся: {str(error).rstrip('.')}. Ни отрезок, "
                 "ни настройки не изменились.",
             )
             return
+        self._say_settled(adjusted)
         self._back.span = _Span(request.since, request.until, request.settings_source)
         self._back.pending = request
         self._back.trouble = ""
@@ -1995,8 +2053,8 @@ class HistoryPort(TerminalPort):
         Прогон ждёт уточнения (`hold`), подключение тоже (`stream`): на коде,
         который истёк, не рисуется и не подписывается ничего. Зовётся
         **после** проводки файла настроек — переход на действующий контракт
-        уходит в файл эхом `settings_applied`, и неподключённое эхо потеряло
-        бы его.
+        уходит в файл сигналом `settings_to_file`, и неподключённый сигнал
+        потерял бы его.
         """
         self.sync_contracts(why, hold=True)
         self.refresh(why)
@@ -2232,13 +2290,23 @@ class HistoryPort(TerminalPort):
                 self._file_holds["instrument"] = held
         if self._values.instrument.strip() != current:
             return ""  # отказ `apply_settings` уже сказан вслух
+        # Единственная запись в файл без «ОК» (решение координатора 29.09.2026,
+        # решение 0016): истёкший код в файле — каждый запуск начинался бы
+        # с него. Пишется одно поле и только поверх истёкшего кода: инструмент,
+        # названный ключом `--symbol`, в файл не попадает (`D-026`).
+        # Строка о переходе — **до** записи и без слов «записан в файл»: чем
+        # кончилась запись, порт не знает. Это говорит запись сама строкой
+        # ниже — «Настройки записаны в файл» или «Настройки не сохранены»
+        # (`app/main.py::_keep_settings`, аудит /risk 06.10.2026).
         self.note(
             "Переход на действующий контракт",
             f"{gone}; перешёл на действующий {current}"
             + (f" (ближний с {notice.current_since:%d.%m.%Y})" if notice.current_since else "")
-            + ". Инструмент в настройках сменён и записан в файл, история "
-            f"{current} загружается с биржи.",
+            + f". Инструмент в настройках сменён, история {current} загружается с биржи.",
             DecisionLevel.WARNING,
+        )
+        self._send(
+            self.settings_to_file, self._values, ("instrument",), (("instrument", symbol),),
         )
         return current
 
@@ -2980,7 +3048,7 @@ class HistoryPort(TerminalPort):
     async def _pass(self, why: str) -> None:
         # Снимок настроек на начало прохода. Дальше в этом проходе `self._values`
         # и `self._engine_settings` не читаются ни разу: см. докстринг `_Frame`.
-        frame = _Frame(self._values, self._engine_settings)
+        frame = _Frame(_in_force(self._values), self._engine_settings)
         self._send(self.busy_changed, True, "Читаю свечи из базы…")
         try:
             symbol = convert.instrument_of(frame.values.instrument)
@@ -3074,7 +3142,14 @@ class HistoryPort(TerminalPort):
         if load is not None and not load.done():
             # Поток сети один и занят загрузкой: запрос встал бы за ней
             # в очередь, и сторож назвал бы его «не отвечает» при исправной
-            # работе. Отметка не ставится — спросим на следующем проходе.
+            # работе. Отметка не ставится — спросим, как только загрузка
+            # кончится. ⚠️ Не «на следующем проходе»: следующего может
+            # не быть вовсе (история без живого потока), и шаг цены от биржи
+            # не пришёл бы никогда — плашка «биржа не сообщила шаг» стояла бы
+            # при исправной сети (путь владельца 05.10.2026).
+            load.add_done_callback(
+                lambda done: None if done.cancelled() else self._ask_point_value(symbol)
+            )
             return
         now = time.monotonic()
         if now - self._point.asked_at.get(symbol, float("-inf")) < POINT_VALUE_GAP:
@@ -3083,7 +3158,14 @@ class HistoryPort(TerminalPort):
         self._point.task = self._begin("point", self._point_value(symbol))
 
     async def _point_value(self, symbol: str) -> None:
-        """Ответ биржи о стоимости пункта: применить либо сказать, почему нет."""
+        """Ответ биржи о стоимости пункта и шаге цены: применить либо сказать, почему нет.
+
+        Шаг цены (`MINSTEP`) берётся **независимо** от стоимости пункта:
+        у акций стоимости шага нет, а шаг есть, и потерять его из-за
+        соседнего поля значило бы держать плашку «биржа не сообщила шаг»
+        при сообщённом шаге. Следом — шаги контрактов склейки, если о них
+        просил прогон (`_piece_steps`).
+        """
         ask = self._point.ask
         if ask is None:
             return
@@ -3093,26 +3175,111 @@ class HistoryPort(TerminalPort):
             raise
         except Exception as error:  # окно не должно падать вместе с запросом
             log.exception("карточка инструмента не прочитана (%s)", symbol)
+            # Прежний шаг, если биржа его уже сообщала, остаётся в силе:
+            # отказ сети не делает его неверным.
             self._point_trouble(
                 f"биржа не ответила про {symbol}: {error}. Стоимость пункта "
                 "осталась той, что стояла в настройках"
             )
-            return
-        if answer.rubles is None:
-            self._point_trouble(answer.told)
-            return
-        self._point_taken(symbol, answer.rubles, answer.told)
+        else:
+            self._learn_step(symbol, answer)
+            if answer.rubles is None:
+                self._point_trouble(answer.told)
+            self._point_taken(symbol, answer.rubles, answer.told)
+        await self._piece_steps(ask)
 
-    def _point_taken(self, symbol: str, rubles: float, told: str) -> None:
+    def _learn_step(self, symbol: str, answer: PointValue) -> bool:
+        """Запомнить шаг цены из карточки. Истина — шаг новый или сменился."""
+        spec = answer.spec
+        step = spec.price_step if spec is not None else 0.0
+        if not math.isfinite(step) or step <= 0 or self._point.steps.get(symbol) == step:
+            return False
+        self._point.steps[symbol] = step
+        return True
+
+    async def _piece_steps(self, ask: Callable[[str], Awaitable[PointValue]]) -> None:
+        """Шаги контрактов склейки, о которых просил прогон (`_piece_steps_for`).
+
+        Новый шаг пересчитывает прогон: кусок, посчитанный с шагом соседнего
+        контракта, иначе так и остался бы посчитанным с чужим.
+        """
+        learned = False
+        while self._point.wanted:
+            symbol = self._point.wanted.pop(0)
+            self._point.asked_at[symbol] = time.monotonic()
+            try:
+                answer = await ask(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # шаг этого куска остаётся взятым у соседа, вслух
+                log.exception("карточка контракта склейки не прочитана (%s)", symbol)
+                continue
+            learned = self._learn_step(symbol, answer) or learned
+        if learned:
+            self.refresh("шаг цены контракта склейки")
+
+    def _want_steps(self, symbols: Sequence[str]) -> None:
+        """Попросить шаги контрактов склейки. Возврат немедленный, ответ — потом."""
+        now = time.monotonic()
+        fresh = [
+            symbol for symbol in symbols
+            if symbol not in self._point.wanted
+            and now - self._point.asked_at.get(symbol, float("-inf")) >= POINT_VALUE_GAP
+        ]
+        if not fresh or self._point.ask is None:
+            return
+        self._point.wanted.extend(fresh)
+        if self._point.task is not None and not self._point.task.done():
+            return  # идущая задача возьмёт их следом за своим ответом
+        load = self._history.load
+        if load is not None and not load.done():
+            return  # сеть занята загрузкой — спросим на следующем проходе
+        self._point.task = self._begin("point", self._piece_steps(self._point.ask))
+
+    def _piece_steps_for(
+        self, frame: _Frame, symbol: str, stitch: stitched_view.Stitch
+    ) -> dict[str, float]:
+        """Шаг цены каждого контракта склейки — свой, из его карточки.
+
+        Неизвестный шаг куска берётся у текущего контракта (у контрактов
+        одной серии он одинаков), и это говорится вслух — один раз
+        на контракт, — а сама карточка спрашивается (`_want_steps`).
+        Говорить незачем, если шаг в прогоне ни на что не влияет.
+        """
+        known = {
+            piece.symbol: self._point.steps[piece.symbol]
+            for piece in stitch.pieces if piece.symbol in self._point.steps
+        }
+        missing = [piece.symbol for piece in stitch.pieces if piece.symbol not in known]
+        self._want_steps(missing)
+        step = frame.values.price_step
+        matters = bool(step_wait(frame.values.replace(price_step=0.0)))
+        for other in missing:
+            if other == symbol or other in self._point.guessed or step <= 0 or not matters:
+                continue
+            self._point.guessed.add(other)
+            self.note(
+                "Шаг цены контракта склейки не подтверждён",
+                f"Биржа не сообщила шаг цены {other}: этот кусок склейки "
+                f"посчитан с шагом {_step_text(step)} — шагом {symbol}. У контракта, "
+                "который больше не торгуется, карточки на бирже может не быть "
+                "вовсе; у контрактов одной серии шаг обычно одинаков.",
+                DecisionLevel.WARNING,
+            )
+        return known
+
+    def _point_taken(self, symbol: str, rubles: float | None, told: str) -> None:
         """Положить подтверждённую биржей величину в настройки — через окно.
 
         Через `apply_settings`, а не присваиванием в поле, и это не лишний
-        крюк. Тем же путём величина попадает в четыре места разом: в настройки
+        крюк. Тем же путём величина попадает в три места разом: в настройки
         движка (иначе деньги отчёта считались бы по-прежнему), в окно эхом
-        `settings_applied`, в файл настроек (его пишет тот, кто слушает эхо),
-        и строкой в журнал изменений — с прежним и новым значением, как
+        `settings_applied` и строкой в журнал изменений — с прежним и новым значением, как
         требует ТЗ §4.4 А. Присваивание дало бы тихую подмену числа, по
         которому считаются деньги, а это ровно то, против чего заведён `B-021`.
+
+        Величин две: стоимость пункта (`rubles`, `None` — биржа её не назвала,
+        остаётся прежняя) и шаг цены (`_point.steps`, решение 05.10.2026).
 
         Три условия молчания, и каждое по названной причине.
 
@@ -3121,7 +3288,7 @@ class HistoryPort(TerminalPort):
         та же беда, от которой `parse_security` выбирает строку по режиму
         торгов, только с другой стороны.
 
-        **Число и строка совпали с прежними.** Тогда применять нечего:
+        **Числа и строка совпали с прежними.** Тогда применять нечего:
         `apply_settings` погнал бы прогон по всей истории и написал бы строку
         «Значения совпали с прежними» — раз в десять минут, весь день.
 
@@ -3134,15 +3301,42 @@ class HistoryPort(TerminalPort):
             return
         if shown != symbol:
             return
-        self._point.trouble = ""
-        if (self._values.ruble_per_point, self._values.ruble_per_point_source) == (
-            rubles, told
-        ):
+        step = self._step_of(symbol)
+        if rubles is None:
+            rubles, told = self._values.ruble_per_point, self._values.ruble_per_point_source
+        else:
+            self._point.trouble = ""
+        if (
+            self._values.ruble_per_point, self._values.ruble_per_point_source,
+            self._values.price_step,
+        ) == (rubles, told, step):
             return
+        if step > 0:
+            self._step_taken(step)
         self.apply_settings(
             self._values.replace(ruble_per_point=rubles, ruble_per_point_source=told),
-            by_person=False,
+            by_person=False, event=FROM_EXCHANGE,
         )
+
+    def _step_taken(self, step: float) -> None:
+        """Биржа сообщила шаг: файлу он больше не перечит, а расхождение — вслух, один раз.
+
+        Шаг из файла настроек не действует (решение 05.10.2026), но человек,
+        вписавший его руками прежней сборкой, вправе узнать, что действует
+        другой. Строка одна: после неё сравнивать не с чем.
+        """
+        filed, self._point.filed = self._point.filed, 0.0
+        # Шаг из файла больше не придерживается. В файл биржевой шаг попадёт
+        # только с «ОК» человека (`settings_to_file`), сам по себе — нет.
+        self._file_holds.pop("price_step", None)
+        if filed > 0 and filed != step:
+            self.note(
+                "Шаг цены взят у биржи",
+                f"В файле настроек записан шаг цены {_step_text(filed)}, биржа "
+                f"сообщает {_step_text(step)}. Действует биржевой: шаг цены "
+                "программа берёт у биржи сама, вписывать его не нужно.",
+                DecisionLevel.WARNING,
+            )
 
     def _point_trouble(self, reason: str) -> None:
         """Сказать, что величина не подтверждена. Одну причину — один раз.
@@ -3968,7 +4162,10 @@ class HistoryPort(TerminalPort):
         plan = minute_plan(frame.values, convert.timeframe_of(frame.values.timeframe))
         async with self._runs.around(conditions.record(candles)) as entry:
             if stitch is not None:
-                self._stitched = await stitched_view.run(stitch, frame.values, frame.engine)
+                self._stitched = await stitched_view.run(
+                    stitch, frame.values, frame.engine,
+                    steps=self._piece_steps_for(frame, symbol, stitch),
+                )
                 run = plan.mark(stitched_view.as_history(
                     self._stitched, convert.run_costs(frame.values)
                 ))
@@ -4045,7 +4242,7 @@ class HistoryPort(TerminalPort):
         )
 
     async def _draw_live(self, symbol: str) -> None:
-        frame = _Frame(self._values, self._engine_settings)
+        frame = _Frame(_in_force(self._values), self._engine_settings)
         bars = await self._live_bars(frame, symbol)
         if not bars:
             return
@@ -4088,7 +4285,7 @@ class HistoryPort(TerminalPort):
         а закрытие бара прогоном, и их отказ порт говорит вслух.
         """
         try:
-            frame = _Frame(self._values, self._engine_settings)
+            frame = _Frame(_in_force(self._values), self._engine_settings)
             bar = await self._growing_bar(frame, symbol, minute)
             if bar is None or self._already_closed(bar):
                 return
@@ -4680,6 +4877,9 @@ class HistoryPort(TerminalPort):
             ),
             settings_trouble=self._trouble[0],
             settings_field=self._trouble[1],
+            # Считается из состояния, а не запоминается: шаг пришёл — плашка
+            # ушла сама, без того, чтобы её кто-то снимал.
+            step_wait=step_wait(self._values),
             day_profit_rub=day.net_profit if day is not None else None,
             day_commission_rub=day.commission if day is not None else None,
             day_trades=day.trades if day is not None else None,
@@ -4917,6 +5117,11 @@ def _day_summary(
     )
 
 
+def _step_text(value: float) -> str:
+    """Шаг цены подписью: без хвостовых нулей и с запятой."""
+    return f"{value:g}".replace(".", ",")
+
+
 def _rubles(value: float) -> str:
     """Стоимость пункта одной подписью: без хвостовых нулей и с запятой.
 
@@ -4925,6 +5130,87 @@ def _rubles(value: float) -> str:
     """
     text = f"{value:.5f}".rstrip("0").rstrip(".")
     return (text or "0").replace(".", ",")
+
+
+#: Что сказать человеку, пока биржа не сообщила шаг цены, — по полю, которое
+#: без шага не посчитать. Таблица, а не две ветки: у каждой строки одна форма
+#: «поле требует шага → чем оно заменено, пока шага нет». Текст простой,
+#: без жаргона: человек шаг не вписывает и сделать ничего не должен.
+_STEPLESS: tuple[tuple[str, Callable[[Settings], bool], Any, str], ...] = (
+    (
+        "time_exit_order",
+        lambda values: values.time_exit_order is TimeExitKind.LIMIT,
+        TimeExitKind.MARKET,
+        "выход по концу окна идёт по рынку",
+    ),
+    (
+        "slippage_steps",
+        lambda values: values.slippage_steps > 0,
+        0.0,
+        "проскальзывание в отчёте не учитывается",
+    ),
+)
+
+
+#: Заголовок строки журнала, когда настройки меняет ответ биржи, а не человек.
+FROM_EXCHANGE = "Данные биржи об инструменте применены"
+
+
+def _unseen_changes(before: Settings, after: Settings) -> list[str]:
+    """Выбор формы заявки, которого движок пока не получил, — строкой «было → стало».
+
+    Пока биржа не сообщила шаг цены, «С предельной ценой» до движка
+    не доходит (`convert._time_exit_in_force`), и его `changes_from` молчит. Без этой строки
+    выбор человека давал бы в журнал «Значения совпали с прежними».
+    Поле одно — остальные зависящие от шага поля движку не принадлежат,
+    и о них говорит `convert.window_changes`.
+    """
+    old, new = before.time_exit_order, after.time_exit_order
+    if old is new or _in_force(after).time_exit_order is new:
+        return []
+    return [
+        f"«{FIELD_CAPTIONS['time_exit_order']}»: {old.label} → {new.label}; "
+        f"{STEP_WAIT.lower()} — пока выход по концу окна идёт по рынку"
+    ]
+
+
+def _in_force(values: Settings) -> Settings:
+    """Настройки, которые действуют **сейчас**: без шага цены — без того, что от него зависит.
+
+    Шаг цены сообщает биржа (решение владельца счёта 05.10.2026), и до её
+    ответа он неизвестен. Выбор человека в `values` при этом не трогается:
+    заявка «с предельной ценой» остаётся выбранной и включается сама, как
+    только шаг пришёл. Здесь подмена — для издержек тестера (`_Frame`)
+    и плашки (`step_wait`); движок получает выбор человека, а форму заявки
+    подменяет сам `convert._time_exit_in_force` — галочка закрытия по концу
+    окна при этом не теряется (аудит /risk 06.10.2026).
+    """
+    if values.price_step > 0:
+        return values
+    fixed = {name: instead for name, needs, instead, _ in _STEPLESS if needs(values)}
+    return values.replace(**fixed) if fixed else values
+
+
+def step_wait(values: Settings) -> str:
+    """Плашка «биржа ещё не сообщила шаг цены» словами. Пусто — подменять нечего."""
+    if values.price_step > 0:
+        return ""
+    told = [said for _, needs, _, said in _STEPLESS if needs(values)]
+    return f"{STEP_WAIT} — пока {' и '.join(told)}." if told else ""
+
+
+def _engine_of(
+    values: Settings, mode: Mode, base: EngineSettings | None = None
+) -> EngineSettings:
+    """Настройки движка из выбора человека; подмену без шага делает `convert.engine_settings`.
+
+    ⚠️ Не `_in_force(values)`: подменённое «по рынку» стирает сам выбор
+    предельной цены, а он значит «закрывать по концу окна всегда».
+    Без шага движок не закрывал бы позицию по концу окна при снятой галочке
+    старого файла (аудит /risk 06.10.2026). Проскальзывание, вторая строка
+    `_STEPLESS`, движку не принадлежит — его подмена нужна только издержкам.
+    """
+    return convert.engine_settings(values, mode, base)
 
 
 def _startup_settings(
@@ -4942,18 +5228,19 @@ def _startup_settings(
     подменять не пришлось. Причина берётся из самого отказа движка: вторая
     формулировка одной причины разошлась бы с первой.
 
-    Второй случай той же формы — заявка на выход «с предельной ценой» при
-    неизвестном шаге цены (Э5, Ф3 задачи З8): форма ставится «по рынку»,
-    вслух. У алгоритма, который требует предельную цену, первое же
-    «Применить» без шага цены будет отвергнуто — это и есть напоминание.
+    Шаг цены из файла **не берётся** (решение владельца счёта 05.10.2026):
+    шаг сообщает биржа в карточке инструмента (`_point_taken`), до её ответа
+    он неизвестен — ноль. Заявка «с предельной ценой» при этом остаётся
+    в настройках выбранной; пока шага нет, движок получает «по рынку»
+    (`convert._time_exit_in_force`), и это видно плашкой (`step_wait`).
 
     ⚠️ Отказ, который подменой не лечится (программа собрана несогласованно,
     `convert._ENGINE_GAP`), не глотается: чинить его значениями настроек
     нечем, и работать с ним нельзя.
     """
-    values = given or Settings()
+    values = (given or Settings()).replace(price_step=0.0)
     try:
-        return values, convert.engine_settings(values, mode), ""
+        return values, _engine_of(values, mode), ""
     except (ValueError, TypeError):
         # Число из файла, которого движок не принимает (с Ф3 задачи З8 —
         # отступ и ожидание выхода с предельной ценой). Окно такое не даст:
@@ -4966,29 +5253,15 @@ def _startup_settings(
             for item in dataclasses.fields(values)
             if getattr(getattr(values, item.name), "unavailable", "")
         }
-        # Предельная цена без шага цены (Э5, Ф3 задачи З8): подменяется
-        # форма заявки, а не шаг. Шаг — свойство инструмента, и выдумать его
-        # программа не вправе (решение владельца счёта 04.10.2026: из карточки
-        # не подставлять). Узнаётся по полю отказа, а не по тексту.
-        stepless = (
-            refusal.field == "price_step"
-            and values.time_exit_order is TimeExitKind.LIMIT
-        )
-        if stepless:
-            fixed["time_exit_order"] = TimeExitKind.MARKET
         if not fixed:
             raise
         repaired = dataclasses.replace(values, **fixed)
         # Негодное число в том же файле всплывает только после этой подмены:
         # отказ выше случился раньше, чем движок дошёл до чисел.
         try:
-            engine, more = convert.engine_settings(repaired, mode), ""
+            engine, more = _engine_of(repaired, mode), ""
         except (ValueError, TypeError):
             repaired, engine, more = _numbers_repaired(repaired, mode)
-        if stepless:
-            return repaired, engine, " ".join(
-                part for part in (_stepless_note(refusal, repaired), more) if part
-            )
         chosen = ", ".join(
             f"«{getattr(value, 'label', value)}»" for value in fixed.values()
         )
@@ -5018,7 +5291,7 @@ def _numbers_repaired(values: Settings, mode: Mode) -> tuple[Settings, EngineSet
         if value == getattr(defaults, item.name):
             continue
         try:
-            convert.engine_settings(defaults.replace(**{item.name: value}), mode)
+            _engine_of(defaults.replace(**{item.name: value}), mode)
         except (ValueError, TypeError) as error:
             fixed[item.name] = getattr(defaults, item.name)
             reasons.append(str(error))
@@ -5027,44 +5300,11 @@ def _numbers_repaired(values: Settings, mode: Mode) -> tuple[Settings, EngineSet
     if not fixed:
         raise ValueError("настройки из файла не собрать, и подменить нечего")
     repaired = dataclasses.replace(values, **fixed)
-    return repaired, convert.engine_settings(repaired, mode), (
+    return repaired, _engine_of(repaired, mode), (
         "В файле настроек числа, которых робот не принимает: "
         + "; ".join(reasons)
         + ". Вместо них поставлены умолчания программы; остальные настройки "
         "из файла в силе, файл не изменён. Значения выбираются в окне настроек."
-    )
-
-
-def _stepless_note(refusal: convert.SettingsRefused, repaired: Settings) -> str:
-    """Строка журнала: предельная цена без шага при запуске, подменена на «по рынку».
-
-    Одна правда, и начинается она с того, что **действует сейчас**, а потом —
-    что сделать: колонка журнала обрезает хвост, и обрезанное «Впишите ша…»
-    без первой половины ничего не говорило (находка 04.10.2026). Строку
-    чтения файла про то же поле сборка при этом не печатает
-    (`app/main.py::_say_what_was_read`): она называла действующим значение,
-    которое порт тут же снял.
-
-    Совет «или выберите „по рынку“» — только если алгоритм его позволяет
-    (`convert.limit_without_step`): у алгоритма, требующего предельной
-    цены, это совет сделать невозможное.
-    """
-    del refusal  # причина та же, но сказана здесь своими словами — см. выше
-    title = convert.limit_demanded_by(repaired)
-    demand = (
-        f"хотя алгоритм «{title}» требует предельной цены" if title
-        else "хотя в файле настроек выбрана заявка с предельной ценой"
-    )
-    other = (
-        "" if title else
-        " — или выберите заявку «по рынку» на вкладке «Торговое окно»"
-    )
-    return (
-        f"Сейчас прогон идёт с выходом по концу окна «по рынку», {demand}: "
-        "шаг цены инструмента не задан, и предельную цену не посчитать. "
-        "Что сделать: впишите шаг цены в «Настройки» → «Инструмент и данные» "
-        f"(он есть в карточке инструмента на сайте биржи){other} и нажмите «ОК». "
-        "Остальные настройки из файла в силе, файл не изменён."
     )
 
 

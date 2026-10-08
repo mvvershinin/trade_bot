@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import threading
 import urllib.parse
@@ -33,7 +34,9 @@ from datetime import datetime, time, timedelta
 import pytest
 
 from app import port as port_module
+from app.main import _keep_settings
 from app.port import HistoryPort
+from app.settings_store import SettingsStore
 from market import MSK, HttpxTransport, MarketWorker
 from market.journal import redact
 from tests.test_ui_contract_load import (
@@ -45,7 +48,7 @@ from tests.test_ui_contract_load import (
     _noon,
     _seed_mxu6,
 )
-from ui.models import Mode, Position, RobotState, Settings, Side
+from ui.models import DecisionLevel, Mode, Position, RobotState, Settings, Side
 
 
 @pytest.fixture(autouse=True)
@@ -119,10 +122,12 @@ def _minutes_asked(chain: Chain, code: str) -> list[str]:
 def _start(loop, database: pathlib.Path, chain: Chain, *, state: RobotState | None = None,
            connect: bool = False, instrument: str = "MXU6",
            clock: Callable[[], datetime] | None = None,
-           during: Callable[[HistoryPort, Heard], Awaitable[None]] | None = None):
+           during: Callable[[HistoryPort, Heard], Awaitable[None]] | None = None,
+           store: SettingsStore | None = None):
     """Запуск как у `app/main.py`: проводка, `first_run`, «Подключиться» сразу.
 
     `during` — что делать сразу после запуска, до ожидания конца работ.
+    `store` — файл настроек, проводимый так же, как в `app/main.py`.
     """
 
     async def main():
@@ -133,6 +138,8 @@ def _start(loop, database: pathlib.Path, chain: Chain, *, state: RobotState | No
         heard = Heard(port)
         applied: list[Settings] = []
         port.settings_applied.connect(applied.append)
+        if store is not None:
+            _keep_settings(port, store, store.load().values, level=DecisionLevel.WARNING)
         link = Link(port)
         port.attach_stream(link.switch, retarget=link.retarget)
         if state is not None:
@@ -189,6 +196,89 @@ def test_an_expired_code_switches_to_the_current_one_at_startup(loop, base) -> N
     assert heard.charts and heard.charts[-1].instrument == "MXZ6", (
         "график после запуска не на MXZ6"
     )
+
+
+def test_an_expired_code_in_the_file_is_replaced_by_the_current_one(loop, base) -> None:
+    """Стережёт: переход с истёкшего кода — единственная запись в файл без «ОК».
+
+    Решение координатора 29.09.2026 (0016): истёкший код в файле начинал бы
+    с себя каждый запуск. В файле меняется **ровно один ключ** — инструмент:
+    ключей, которых в файле не было, переход не дописывает. Мутации: убрать
+    `settings_to_file` из `_switch_to_current` — в файле останется MXU6;
+    писать переход через `store.save` — в файле появятся пропавшие ключи.
+    """
+    store = SettingsStore(base.parent)
+    assert not store.save(Settings(instrument="MXU6", average_period=21))
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    for key in ("time_exit_order", "minute_order"):
+        del payload["settings"][key]
+    store.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    before = payload["settings"]
+
+    _port, heard, _applied, _ = _start(loop, base, ExpiredChain(TODAY), store=store)
+
+    after = json.loads(store.path.read_text(encoding="utf-8"))["settings"]
+    changed = {key for key in before.keys() | after.keys() if before.get(key) != after.get(key)}
+    assert changed == {"instrument"}, f"переход переписал в файле не только инструмент: {changed}"
+    assert after["instrument"] == "MXZ6", f"в файле остался {after['instrument']}"
+    said = [row.reason for row in heard.notes if row.event == "Настройки записаны в файл"]
+    assert said and "«Инструмент» — MXZ6" in said[-1], f"запись в файл не сказана: {said}"
+
+
+def test_a_file_unreadable_at_the_switch_is_said_not_claimed_written(
+    loop, base, monkeypatch
+) -> None:
+    """Стережёт правило 13: файл не читается в момент перехода — сказано, что не записано.
+
+    Файл прочитан при запуске, а к переходу с истёкшего контракта стал
+    нечитаемым (вход подставной: байты файла испорчены сразу после чтения).
+    Прежде `SettingsStore.patch` возвращал здесь «успех», и журнал говорил
+    «записан в файл», хотя не записано ничего.
+
+    ⚠️ Мутация молчания: `patch` снова отдаёт `""` на нечитаемом файле —
+    строки «Настройки не сохранены» нет, а «Настройки записаны в файл» есть.
+    """
+    store = SettingsStore(base.parent)
+    assert not store.save(Settings(instrument="MXU6"))
+    garbage = b"{ not json"
+    read = store.load
+
+    def read_then_break():
+        loaded = read()
+        store.path.write_bytes(garbage)
+        return loaded
+
+    monkeypatch.setattr(store, "load", read_then_break)
+
+    port, heard, _applied, _ = _start(loop, base, ExpiredChain(TODAY), store=store)
+
+    assert port.values.instrument == "MXZ6", "перехода не было — проверка вакуумна"
+    assert store.path.read_bytes() == garbage, "нечитаемый файл перезаписан без человека"
+    refused = [row.reason for row in heard.notes if row.event == "Настройки не сохранены"]
+    assert refused and "не читается" in refused[-1], f"отказ записи не сказан: {refused}"
+    claimed = [
+        row.reason for row in heard.notes
+        if row.event == "Настройки записаны в файл" or "записан в файл" in row.reason
+    ]
+    assert not claimed, f"журнал обещает запись, которой не было: {claimed}"
+
+
+def test_a_code_named_by_the_key_is_not_written_over_the_file(loop, base) -> None:
+    """Стережёт `D-026`: код из `--symbol` истёк — файл владельца не трогается, вслух.
+
+    В файле SiZ6, запуск на MXU6 (как с ключом `--symbol`). Переход на MXZ6
+    действует в памяти; поверх SiZ6 в файл он не пишется, и это сказано.
+    """
+    store = SettingsStore(base.parent)
+    assert not store.save(Settings(instrument="SiZ6"))
+    before = store.path.read_bytes()
+
+    port, heard, _applied, _ = _start(loop, base, ExpiredChain(TODAY), store=store)
+
+    assert port.values.instrument == "MXZ6", "перехода не было — проверка вакуумна"
+    assert store.path.read_bytes() == before, "код из ключа записан поверх файла владельца"
+    said = [row for row in heard.notes if row.event == "Настройки не сохранены"]
+    assert said and "SiZ6, а не MXU6" in said[-1].reason, [row.reason for row in said]
 
 
 @pytest.mark.parametrize(

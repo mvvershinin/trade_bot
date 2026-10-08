@@ -61,7 +61,7 @@ from backtest.history import Deal, deal_results, replay, summarise
 from backtest.overfitting import Shape
 from backtest.split import Period
 from engine import EngineSettings, Mode, Reversal, TradingWindow, in_moscow
-from strategies import EmaReverseSettings, registry
+from strategies import MaReverseAlwaysSettings, registry
 
 if TYPE_CHECKING:
     from backtest.history import Summary
@@ -87,7 +87,8 @@ __all__ = [
     "sweep",
 ]
 
-#: Под какой торговый алгоритм написана эта сетка. **Литерал, а не
+#: Под какой торговый алгоритм написана эта сетка. С 05.10.2026 —
+#: «Реверс с постоянной позицией», единственный (решение 0063). **Литерал, а не
 #: `registry.DEFAULT_ID`**: умолчание однажды сменят, и сетка тогда молча
 #: объявила бы себя написанной под алгоритм, полей которого она не знает.
 #:
@@ -95,7 +96,13 @@ __all__ = [
 #: момент переворота). Первое — имя поля **конкретного** алгоритма: у второго
 #: алгоритма период средней может называться иначе, значить иное или
 #: отсутствовать вовсе. Отсюда и объявление: сетка знает, чья она.
-GRID_STRATEGY_ID: Final[str] = "ema_reverse"
+GRID_STRATEGY_ID: Final[str] = "ma_reverse_always"
+
+
+#: Момент переворота на сетке — только в одной свече: алгоритм сетки
+#: требует его (`strategies/registry.py::_ALWAYS_DEMANDS`), и точка
+#: «через свечу» была бы прогоном правила, которым робот торговать не может.
+GRID_REVERSALS: Final[tuple[Reversal, ...]] = (Reversal.SAME_BAR,)
 
 
 class ForeignStrategy(ValueError):
@@ -109,7 +116,7 @@ class ForeignStrategy(ValueError):
 
 def refuse_foreign_strategy(
     strategy_id: str, settings: object
-) -> EmaReverseSettings:
+) -> MaReverseAlwaysSettings:
     """Сетка написана под этот алгоритм — или отказ вслух. Ловушка 14.
 
     ⚠️ **Молчание здесь стоит дороже всего в этом файле.** Перебор без этой
@@ -142,10 +149,10 @@ def refuse_foreign_strategy(
             f"в программе пока нет — выберите «{entry.title}» либо "
             "подбирайте вручную."
         )
-    if not isinstance(settings, EmaReverseSettings):
+    if not isinstance(settings, MaReverseAlwaysSettings):
         raise ForeignStrategy(
             f"сетка перебора написана под настройки алгоритма «{entry.title}» "
-            f"({EmaReverseSettings.__name__}), а поданы "
+            f"({MaReverseAlwaysSettings.__name__}), а поданы "
             f"{type(settings).__name__}. Перебор не запущен."
         )
     return settings
@@ -285,7 +292,7 @@ class Point:
 
     label: str
     engine: EngineSettings
-    strategy: EmaReverseSettings
+    strategy: MaReverseAlwaysSettings
     axes: tuple[tuple[str, float], ...] = ()
 
     @property
@@ -314,7 +321,7 @@ class Ground:
     """
 
     engine: EngineSettings
-    strategy: EmaReverseSettings = field(default_factory=EmaReverseSettings)
+    strategy: MaReverseAlwaysSettings = field(default_factory=MaReverseAlwaysSettings)
     costs: Costs = field(default_factory=Costs)
     #: Имя алгоритма, чьи настройки лежат в `strategy`. Отдельным полем,
     #: а не выведенное из класса настроек: два алгоритма вправе делить один
@@ -415,7 +422,7 @@ def _mode_points(ground: Ground) -> tuple[Point, ...]:
             engine=replace(ground.engine, reversal=reversal, stop_after_take_profit=stop),
             strategy=ground.strategy,
         )
-        for reversal in (Reversal.THROUGH_BAR, Reversal.SAME_BAR)
+        for reversal in GRID_REVERSALS
         for stop in (True, False)
     )
 
@@ -483,7 +490,7 @@ def full_cross(ground: Ground) -> tuple[Point, ...]:
         for name, window in windows
         for period in AVERAGE_PERIODS
         for take in TAKE_PERCENTS
-        for reversal in (Reversal.THROUGH_BAR, Reversal.SAME_BAR)
+        for reversal in GRID_REVERSALS
         for stop in (True, False)
     )
 

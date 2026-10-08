@@ -85,7 +85,7 @@ from market.aggregate import build_bars
 from market.candles import M5, Candle
 from market.chain import daily_volume, legs_of_chain
 from market.storage import CandleStore
-from strategies import EmaReverseSettings, StrategySettings
+from strategies import MaReverseAlwaysSettings, StrategySettings
 
 __all__ = [
     "CHAIN",
@@ -169,14 +169,14 @@ class Recipe:
     average_period: int
     take_percent: float
     take_on: bool = True
-    same_bar_reversal: bool = False
+    same_bar_reversal: bool = True
     stop_after_take: bool = True
     #: Положение на осях сетки. Пусто — точка вне сетки, соседей нет.
     axes: tuple[tuple[str, float], ...] = ()
 
 
 def point_of(
-    recipe: Recipe, engine: EngineSettings, strategy: EmaReverseSettings
+    recipe: Recipe, engine: EngineSettings, strategy: MaReverseAlwaysSettings
 ) -> Point:
     """Рецепт → сочетание для прогона. Всё остальное берётся у поданной основы."""
     return Point(
@@ -232,8 +232,9 @@ def windows() -> tuple[tuple[str, time, time, tuple[tuple[str, float], ...]], ..
 
 
 #: Момент переворота: подпись для имени шаблона, флаг и значение оси.
+#: Только в одной свече — этого требует алгоритм (решение 0063); «через»
+#: убрано вместе с «Реверсом по скользящей средней».
 REVERSALS: tuple[tuple[str, bool, float], ...] = (
-    ("через", False, 0.0),
     ("в одной", True, 1.0),
 )
 
@@ -304,7 +305,7 @@ def reference_recipes() -> tuple[tuple[Recipe, str], ...]:
     for label, start, end in REFERENCE_WINDOWS:
         made.append((
             Recipe(
-                label=f"{label} · EMA{DEFAULT_PERIOD} · 0,5 % · через · стоп",
+                label=f"{label} · EMA{DEFAULT_PERIOD} · 0,5 % · в одной · стоп",
                 window_start=start, window_end=end,
                 average_period=DEFAULT_PERIOD, take_percent=DEFAULT_TAKE,
             ),
@@ -521,7 +522,7 @@ class Ground:
     #: движка обязаны совпасть по построению, а перевод между ними живёт
     #: в одном месте (`app/convert.py`).
     engine: EngineSettings
-    strategy: EmaReverseSettings
+    strategy: MaReverseAlwaysSettings
     #: Имя алгоритма, чьи настройки лежат в `strategy`. Сетка написана
     #: под один алгоритм и объявляет это (`backtest/sweep.py`); чужой —
     #: отказ вслух, а не молчаливый подбор по чужим полям.
@@ -795,7 +796,7 @@ async def legs_of(  # noqa: PLR0913 — шесть доводов: рецепт,
     costs: Costs,
     *,
     engine: EngineSettings,
-    strategy: EmaReverseSettings,
+    strategy: MaReverseAlwaysSettings,
 ) -> tuple[Stretch, ...]:
     """Прогнать набор по каждому отрезку отдельно и вернуть отрезки с итогами.
 

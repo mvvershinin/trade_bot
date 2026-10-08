@@ -47,6 +47,7 @@ from broker.errors import (
     NotFound,
     ServerFailure,
     TokenFileError,
+    TokenRefused,
     WrongAddress,
 )
 from broker.margin import MarginPerContract, MarginSource
@@ -923,7 +924,7 @@ def test_the_link_hands_a_growing_minute_to_the_port_without_a_run(
     зелёной, а свечу — снова замершей.
     """
     monkeypatch.setattr(live_feed, "BrokerSession", lambda store: SimpleNamespace(
-        stored=lambda: SimpleNamespace(permissions_were_loose=False),
+        stored=lambda: SimpleNamespace(permissions_were_loose=False, scope_notice=None),
     ))
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
     port: Any = FakePort()
@@ -1066,6 +1067,35 @@ def test_a_refusal_that_a_retry_cannot_fix_takes_the_stream_down(monkeypatch) ->
     assert heard.warnings()[0] == "Инструмент не найден у брокера"
     assert "повтор здесь не поможет" in heard.warnings()[1]
     assert "«Подключиться»" in heard.warnings()[1]
+
+
+def test_a_token_the_broker_refused_takes_the_stream_down_without_a_retry_loop(
+    monkeypatch,
+) -> None:
+    """Стережёт `B-062`: на `invalid_grant` поток не переподключается по кругу.
+
+    Отказ снимает поток с первого раза, в журнал окна — «Брокер не принял
+    токен», а не «ошибка программы»; повтор — только кнопкой.
+    """
+    heard, worker = Heard(), FakeWorker()
+    refusal = TokenRefused("Token is not active", "авторизация: HTTP 400, код invalid_grant")
+    stream = FakeStream(refusal)
+    feed = feed_of(monkeypatch, stream, worker, heard)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(lambda: Connection.OFFLINE in heard.connections, "поток снят")
+            await asyncio.sleep(0.02)  # повтору дать шанс случиться
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+    assert len(stream.requests) == 1, "на отвергнутом токене поток переподключался"
+    assert heard.connections == [Connection.RECONNECTING, Connection.OFFLINE]
+    said = heard.warnings()[0]
+    assert said.startswith("Брокер не принял токен: токен не действует"), said
+    assert "ошибка программы" not in said
 
 
 @pytest.mark.parametrize(
@@ -1454,7 +1484,7 @@ def test_switching_on_again_reuses_the_session_and_restarts_the_stream(
             self.closed = 0
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             self.closed += 1
@@ -1533,6 +1563,9 @@ class ScheduleDesk:
     def __init__(self) -> None:
         self.asked: list[str] = []
         ScheduleDesk.made.append(self)
+
+    def allow_token_retry(self) -> None:
+        """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
     def answers(self, path: str) -> bool:
         return path in (TRADING_STATUS_PATH, DAILY_SCHEDULE_PATH)
@@ -1711,10 +1744,13 @@ def test_the_link_backfill_reaches_the_load_report_instead_of_the_log(
             return await answer.read(path, method=method, params=params, json=json)
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             pass
+
+        def allow_token_retry(self) -> None:
+            """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
     monkeypatch.setattr(live_feed, "BrokerSession", FakeSession)
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
@@ -1881,7 +1917,7 @@ def test_the_link_starts_the_backfill_on_every_connection(
             super().__init__()
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             closed.append("сессия")
@@ -1942,9 +1978,13 @@ def test_repeated_failed_presses_build_one_session(tmp_path: pathlib.Path, monke
         def __init__(self, store: object) -> None:
             sessions.append(self)
             self.closed = 0
+            self.retries = 0
 
         def stored(self) -> SimpleNamespace:
             raise no_token()
+
+        def allow_token_retry(self) -> None:
+            self.retries += 1
 
         async def close(self) -> None:
             self.closed += 1
@@ -1956,6 +1996,9 @@ def test_repeated_failed_presses_build_one_session(tmp_path: pathlib.Path, monke
     answers = [link.switch(True), link.switch(True), link.switch(True)]
     assert answers == ["Токен брокера ещё не введён."] * 3
     assert len(sessions) == 1, "на каждое нажатие построена новая сессия"
+    # `B-062`: нажатие — единственное, что снимает запомненный отказ токена.
+    # Первое нажатие сессию только строит; второе и третье снимают отказ.
+    assert sessions[0].retries == 2, "нажатие «Подключиться» не сняло отказ токена"
     asyncio.run(link.aclose())
     assert sessions[0].closed == 1
 
@@ -1968,7 +2011,10 @@ def test_loose_token_file_permissions_are_reported_to_the_journal(
             self.store = store
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=True)
+            return SimpleNamespace(permissions_were_loose=True, scope_notice=None)
+
+        def allow_token_retry(self) -> None:
+            """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
         async def close(self) -> None:
             return None
@@ -1986,6 +2032,65 @@ def test_loose_token_file_permissions_are_reported_to_the_journal(
     asyncio.run(scenario())
     warnings = [(event, level) for event, _, level in port.notes if "токеном" in event]
     assert warnings == [("Права файла с токеном", DecisionLevel.WARNING)]
+
+
+def test_token_type_mismatch_is_told_to_the_owner(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Стережёт правило 13: тип в файле расходится с токеном — строка в журнал решений.
+
+    `StoredToken` настоящий, прочитан `TokenStore` из файла: токен — JWT с
+    `azp=trade-api-read`, в поле файла «торговля». Подменена только сессия,
+    чтобы к брокеру ничего не ушло. Мутация «убрать `port.note` о типе» роняет тест.
+    """
+    import base64
+
+    def segment(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    token = ".".join(
+        (segment(b'{"alg":"HS512"}'), segment(b'{"azp":"trade-api-read"}'), "FAKEsig")
+    )
+    directory = tmp_path / "token" / "userdata"
+    directory.mkdir(parents=True)
+    path = directory / "broker-token.json"
+    path.write_text(
+        json.dumps(
+            {"version": 1, "token": token, "scope": "trade-api-write",
+             "issued": "2026-10-04T10:00:00+00:00", "account": None}
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    stored = live_feed.TokenStore(directory).load()
+
+    class MismatchSession:
+        def __init__(self, store: object) -> None:
+            self.store = store
+
+        def stored(self) -> object:
+            return stored
+
+        def allow_token_retry(self) -> None:
+            """Дублёру снимать нечего."""
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(live_feed, "BrokerSession", MismatchSession)
+    monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
+    monkeypatch.setattr(live_feed, "candle_stream", FakeStream())
+    port: Any = FakePort()
+    link = link_of(port, FakeWorker(), tmp_path / "userdata")
+
+    async def scenario() -> None:
+        assert link.switch(True) is None
+        await link.aclose()
+
+    asyncio.run(scenario())
+    told = [(text, level) for event, text, level in port.notes if event == "Тип токена"]
+    assert len(told) == 1, port.notes
+    text, level = told[0]
+    assert level is DecisionLevel.WARNING
+    assert "«только для чтения»" in text and "«для торговли и чтения данных»" in text
 
 
 # ====================================================== сборка: `_live_feed`
@@ -2123,7 +2228,7 @@ def test_a_closed_minute_asks_for_a_drawing_not_for_a_whole_run(
     проверку зелёной, а поток — без перерисовки вовсе.
     """
     monkeypatch.setattr(live_feed, "BrokerSession", lambda store: SimpleNamespace(
-        stored=lambda: SimpleNamespace(permissions_were_loose=False),
+        stored=lambda: SimpleNamespace(permissions_were_loose=False, scope_notice=None),
     ))
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
     port: Any = FakePort()
@@ -2222,10 +2327,13 @@ def quiet_session(monkeypatch) -> None:
             super().__init__()
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             pass
+
+        def allow_token_retry(self) -> None:
+            """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
     monkeypatch.setattr(live_feed, "BrokerSession", Session)
 
@@ -2902,7 +3010,7 @@ def test_the_link_hands_the_feed_the_real_trading_schedule(
             super().follow(hours)
 
     monkeypatch.setattr(live_feed, "BrokerSession", lambda store: SimpleNamespace(
-        stored=lambda: SimpleNamespace(permissions_were_loose=False),
+        stored=lambda: SimpleNamespace(permissions_were_loose=False, scope_notice=None),
     ))
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
     monkeypatch.setattr(live_feed, "LiveFeed", WatchedFeed)

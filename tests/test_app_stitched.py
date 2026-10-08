@@ -30,7 +30,7 @@ from engine import EngineSettings, Mode, TradingWindow
 from market.candles import M5, MSK, Timeframe
 from market.chain import Leg
 from market.storage import CandleStore, ContractRow, Source
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import MaReverseAlways, MaReverseAlwaysSettings
 from tests.market_helpers import minute
 from ui.models import MinutePriceOrder, Settings
 from ui.models import Mode as EngineMode
@@ -106,7 +106,7 @@ def test_days_without_a_contract_are_said_aloud(store: CandleStore) -> None:
     ]
     settings = EngineSettings(mode=Mode.REVERSE, window=TradingWindow(start=time(0), end=time(0)))
     run = asyncio.run(replay_pieces(
-        made, lambda: EmaReverse(EmaReverseSettings(period=15)), settings, Costs(), notes,
+        made, lambda: MaReverseAlways(MaReverseAlwaysSettings(period=15)), settings, Costs(), notes,
     ))
     assert notes[0][1] in run.problems
     assert any(entry.reason == notes[0][1] for entry in run.journal)
@@ -117,7 +117,7 @@ def test_missing_warmup_in_the_base_reaches_the_problems(store: CandleStore) -> 
     assert len(made[1].warmup) == BARS_A_DAY
     settings = EngineSettings(mode=Mode.REVERSE, window=TradingWindow(start=time(0), end=time(0)))
     run = asyncio.run(replay_pieces(
-        made, lambda: EmaReverse(EmaReverseSettings(period=30)), settings, Costs(),
+        made, lambda: MaReverseAlways(MaReverseAlwaysSettings(period=30)), settings, Costs(),
     ))
     said = "MXZ6: перед 17.09.2026 в базе 24 закрытых"
     assert any(text.startswith(said) for text in run.problems)

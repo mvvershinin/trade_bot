@@ -56,6 +56,7 @@ from ui import backend
 from ui.background import busy_cursor
 from ui.backtest_dialog import BacktestDialog
 from ui.backtest_report import BacktestReportDialog
+from ui.reports_dialog import ReportsDialog, ShownRun
 from ui.chart_panel import ChartPanel
 from ui.confirm_changes import confirm_changes
 from ui.contract_banner import ContractBar
@@ -97,8 +98,8 @@ from ui.settings_dialog import SettingsDialog
 from ui.status_panel import StatusPanel
 from ui.templates import Library, Template
 from ui.templates_dialog import TemplatesDialog
-from ui.settings_banner import SettingsTroubleBar
-from ui.theme import current as current_theme, text_on
+from ui.settings_banner import SettingsTroubleBar, StepWaitBar
+from ui.theme import current as current_theme, scaled, text_on
 from ui.version import version
 
 TITLE = "Терминал"
@@ -311,7 +312,8 @@ class _Banner(QLabel):
     #: контраста 3:1, а не 4,5:1. Прежние «системный + 2» давали 11–12 пунктов,
     #: то есть обоснование порога в проверке контраста не выдерживалось:
     #: формально требовалось 4,5:1. Число здесь и порог в тесте связаны.
-    LARGE_POINTS = 14.0
+    #: С 05.10.2026 — ×`FONT_SCALE`: шрифт окна вырос, плашка растёт с ним.
+    LARGE_POINTS = scaled(14.0)
 
     def __init__(
         self,
@@ -394,7 +396,7 @@ class _Banner(QLabel):
             # светло-серым — контраст 1,6:1, то есть кнопки на ней не видно.
             self.close_button.setStyleSheet(
                 f"QToolButton {{ color: {text_on(background)}; "
-                "background: transparent; border: none; font-size: 16px; "
+                f"background: transparent; border: none; font-size: {round(scaled(16))}px; "
                 "font-weight: bold; }"
             )
             self.close_button.adjustSize()
@@ -454,6 +456,7 @@ class MainWindow(QMainWindow):
         #: Окно «прогон не состоялся». Одно на программу: второй отказ
         #: подряд меняет текст, а не множит окна.
         self._backtest_refusal: QMessageBox | None = None
+        self._init_reports()
         #: Окно собрано целиком. Сторож для `changeEvent`: событие палитры
         #: приходит и в середине сборки, а `apply_theme()` трогает график
         #: и журналы — их в этот момент ещё нет.
@@ -487,6 +490,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.halt_banner)
         layout.addWidget(self.stuck_banner)
         layout.addWidget(self.settings_bar)
+        layout.addWidget(self.step_bar)
         layout.addWidget(self.token_banner)
         layout.addWidget(self.mode_banner)
         layout.addWidget(self.history_banner)
@@ -499,6 +503,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.chart.renderer_note)
 
         self.journals.export_requested.connect(self.export_journals)
+        self.journals.reports_requested.connect(self.open_reports)
 
         self._connect_port()
         self.apply_theme()
@@ -535,6 +540,8 @@ class MainWindow(QMainWindow):
         #: Настройки из файла приняты не так, как записаны (`settings_trouble`).
         self.settings_bar = SettingsTroubleBar()
         self.settings_bar.open_requested.connect(self.open_settings)
+        #: Биржа ещё не сообщила шаг цены (`step_wait`) — без кнопки.
+        self.step_bar = StepWaitBar()
 
     # --------------------------------------------------------------- сборка
 
@@ -942,6 +949,7 @@ class MainWindow(QMainWindow):
         # ничего не сломалось, просто показано прошлое. Но сказать это надо
         # крупно — на живом потоке застывший график читается как обрыв связи.
         self.settings_bar.show_trouble(state.settings_trouble)
+        self.step_bar.show_wait(state.step_wait)
         if state.history_span:
             self.history_banner.show_text(state.history_span, self.theme.warning)
         else:
@@ -950,9 +958,15 @@ class MainWindow(QMainWindow):
 
     def show_chart(self, data: ChartData) -> None:
         self.chart.show_chart(data)
+        self._chart_instrument = data.instrument
+        self._chart_bounds = (
+            (data.candles[0].opens_at, data.candles[-1].opens_at) if data.candles else None
+        )
 
     def append_candle(self, candle: Candle) -> None:
         self.chart.append_candle(candle)
+        if self._chart_bounds is not None:
+            self._chart_bounds = (self._chart_bounds[0], candle.opens_at)
 
     def update_last_candle(self, candle: Candle) -> None:
         self.chart.update_last_candle(candle)
@@ -975,11 +989,14 @@ class MainWindow(QMainWindow):
         """
         self.journals.set_trades(trades, summary)
         self.chart.set_trades(trades)
+        self._run_seen = True
+        self._refresh_reports()
 
     def append_trade(self, trade: TradeRow) -> None:
         """Робот закрыл позицию, пока окно открыто: строка идёт туда же, куда все."""
         self.journals.append_trade(trade)
         self.chart.append_trade(trade)
+        self._refresh_reports()
 
     def set_decisions(self, rows: Sequence[DecisionRow]) -> None:
         self.journals.set_decisions(rows)
@@ -1460,6 +1477,61 @@ class MainWindow(QMainWindow):
         self.report_dialog.finished.connect(self.report_dialog.deleteLater)
         self.report_dialog.show()
         self.report_dialog.raise_()
+
+    def _init_reports(self) -> None:
+        """Окно «Отчёты» (Н5, шаг 1) и что показано на графике.
+
+        Инструмент и первая с последней свечой — по ним заголовок отчёта
+        называет прогон. `_run_seen` — пришёл ли хоть один прогон: до него
+        «Отчёты» говорят «прогона нет», а не «сделок нет».
+        """
+        self.reports_dialog: ReportsDialog | None = None
+        self._chart_instrument = ""
+        self._chart_bounds: tuple[datetime, datetime] | None = None
+        self._run_seen = False
+
+    def shown_run(self) -> ShownRun | None:
+        """Прогон на экране для «Отчётов»: строки и итог журнала, свечи графика.
+
+        Сделки берутся из журнала, а не заново из порта: одна правда на три
+        места экрана — журнал, разбор по ПКМ и отчёт.
+        """
+        if not self._run_seen:
+            return None
+        first, last = self._chart_bounds or (None, None)
+        return ShownRun(
+            trades=tuple(self.journals.trades_model.rows()),
+            summary=self.journals.summary(),
+            instrument=self._chart_instrument,
+            first=first,
+            last=last,
+        )
+
+    def _refresh_reports(self) -> None:
+        """Открытое окно «Отчёты» не должно описывать прежний прогон."""
+        if self.reports_dialog is not None:
+            self.reports_dialog.set_run(self.shown_run())
+
+    def open_reports(self) -> None:
+        """Окно «Отчёты» по прогону на экране. Одно: второй щелчок поднимает его."""
+        if self.reports_dialog is None:
+            self.reports_dialog = ReportsDialog(
+                self.shown_run(), self, jump=self._show_trade_on_chart
+            )
+            self.reports_dialog.finished.connect(self._forget_reports)
+        self.reports_dialog.show()
+        self.reports_dialog.raise_()
+        self.reports_dialog.activateWindow()
+
+    def _forget_reports(self, *_: object) -> None:
+        if self.reports_dialog is not None:
+            self.reports_dialog.deleteLater()
+        self.reports_dialog = None
+
+    def _show_trade_on_chart(self, trade: TradeRow) -> bool:
+        """Двойной щелчок в «Отчётах»: график к сделке. `False` — её нет на графике."""
+        until = trade.exit_time if trade.exit_time is not None else trade.entry_time
+        return self.chart.show_moment(trade.entry_time, until)
 
     # ------------------------------------------------ загрузка истории
 

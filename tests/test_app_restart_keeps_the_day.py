@@ -35,7 +35,7 @@ from backtest import Costs
 from engine import EngineSettings, ExitReason, Mode
 from engine.window import in_moscow
 from market import Candle
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import MaReverseAlways, MaReverseAlwaysSettings
 from tests.test_app_observe import Said, bars, settings
 
 #: Ряд одного дня. На нём утром есть вход и выход, а после выхода средняя
@@ -52,7 +52,7 @@ STOP_AFTER_TAKE = replace(
 
 def _observer(engine: EngineSettings) -> LiveObserver:
     return LiveObserver(
-        strategy=EmaReverse(EmaReverseSettings()),
+        strategy=MaReverseAlways(MaReverseAlwaysSettings()),
         settings=engine,
         say=Said(),
         costs=Costs(commission_per_side=14.0),

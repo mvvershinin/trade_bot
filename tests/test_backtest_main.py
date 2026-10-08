@@ -402,7 +402,8 @@ def test_the_command_writes_a_table_with_both_columns(tmp_path) -> None:
     assert both_columns_filled(text)
     assert "ПОДБОР" in text and "ПРОВЕРКА" in text
     assert "весь торговый день" in text
-    assert "Прогонов: 107" in text
+    # 58 окон + 45 средняя×тейк + 2 режима: переворот только в одной свече.
+    assert "Прогонов: 105" in text
     assert "СКОЛЬЗЯЩАЯ ПРОВЕРКА ВПЕРЁД" in text
 
 @pytest.mark.slow

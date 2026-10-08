@@ -42,7 +42,7 @@ from app.observe import RECHECK_BARS, WARMUP_BARS, LiveObserver, LiveSource
 from backtest import Costs, replay
 from engine import EngineSettings, Mode, TimeExitOrder, TradingWindow
 from market import MSK, Candle, Timeframe
-from strategies import EmaReverse, EmaReverseSettings, Strategy
+from strategies import MaReverseAlways, MaReverseAlwaysSettings, Strategy
 from ui.models import DecisionLevel
 
 M5 = Timeframe(5)
@@ -109,7 +109,7 @@ class Said:
 def observer(said: Said | None = None) -> LiveObserver:
     """Наблюдатель на рабочих настройках. Издержки — как в прогоне по истории."""
     return LiveObserver(
-        strategy=EmaReverse(EmaReverseSettings()),
+        strategy=MaReverseAlways(MaReverseAlwaysSettings()),
         settings=settings(),
         say=said or Said(),
         costs=Costs(commission_per_side=14.0),
@@ -401,7 +401,7 @@ def test_the_live_run_equals_the_history_replay_on_the_same_bars(drive) -> None:
     costs = Costs(commission_per_side=14.0)
 
     async def go():
-        history = await replay(series, EmaReverse(EmaReverseSettings()), engine, costs=costs)
+        history = await replay(series, MaReverseAlways(MaReverseAlwaysSettings()), engine, costs=costs)
         watch = observer()
         await watch.start()
         # Прогрев половиной ряда, дальше — по бару, как в живом ходе.
@@ -448,9 +448,9 @@ def test_the_live_run_counts_limit_exits_like_the_history_replay(drive) -> None:
     costs = Costs(commission_per_side=14.0)
 
     async def go():
-        history = await replay(series, EmaReverse(EmaReverseSettings()), engine, costs=costs)
+        history = await replay(series, MaReverseAlways(MaReverseAlwaysSettings()), engine, costs=costs)
         watch = LiveObserver(
-            strategy=EmaReverse(EmaReverseSettings()), settings=engine,
+            strategy=MaReverseAlways(MaReverseAlwaysSettings()), settings=engine,
             say=Said(), costs=costs,
         )
         await watch.start()
@@ -472,7 +472,7 @@ def test_the_live_run_matches_even_when_bars_come_one_at_a_time(drive) -> None:
     engine = settings()
 
     async def go():
-        history = await replay(series, EmaReverse(EmaReverseSettings()), engine)
+        history = await replay(series, MaReverseAlways(MaReverseAlwaysSettings()), engine)
         watch = observer()
         await watch.start()
         for index in range(len(series)):

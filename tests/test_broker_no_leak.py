@@ -641,14 +641,18 @@ def test_no_token_when_server_echoes_it_back(store: TokenStore, journal: Any) ->
     assert not leaked(str(error))
     assert not leaked(buffer.getvalue())
     assert MASK in error.details, "тело отказа не прошло через чистку"
-    # Тело живёт **только** в `details`. Проверка не косметическая: `technical`
-    # читает владелец счёта, пока технического лога нет, — см. 05.09.2026
-    # в шапке `broker/errors.py`. Код отказа переносится, текст отказа — нет.
+    # Тело целиком живёт **только** в `details`: см. 05.09.2026 в шапке
+    # `broker/errors.py`. Из тела в `technical` переносятся код отказа и —
+    # с 05.10.2026 (`B-062`) — описание `error_description`, оно одно
+    # и только через `redaction.quotable`: здесь токен в нём заменён маской.
     assert "invalid_grant" in error.technical, "код отказа брокера потерян для разбора"
-    for piece in ("error_description", "is not valid", "token "):
-        assert piece not in error.technical, (
-            f"кусок тела ответа просочился в технический текст: {error.technical}"
-        )
+    assert "is not valid" in error.technical, (
+        f"описание брокера не дошло до технического лога: {error.technical}"
+    )
+    assert MASK in error.technical, f"токен в описании не замаскирован: {error.technical}"
+    assert "error_description" not in error.technical, (
+        f"в технический текст ушло тело, а не описание: {error.technical}"
+    )
 
 
 def frames_with_secret(error: BaseException) -> list[str]:
@@ -1992,7 +1996,10 @@ def test_the_owner_text_of_a_failure_by_status_does_not_depend_on_the_body() -> 
     в переписку. Ровно так 05.09.2026 к нему и приехала страница 404
     от nginx брокера.
     """
-    echo = f'{{"error": "invalid_grant", "refresh_token": "{PATTERN_ONLY}"}}'
+    # Код в эхе — не из `errors._BY_CODE`. Единственная намеренная зависимость
+    # фразы от тела — `invalid_grant` с описанием брокера (`B-062`) — стережётся
+    # отдельно в `tests/test_broker_token_refused.py`.
+    echo = f'{{"error": "BAD_REQUEST", "refresh_token": "{PATTERN_ONLY}"}}'
     for status in (400, 401, 404, 429, 500):
         with_body = from_status(status, where="портфель", body=echo)
         without_body = from_status(status, where="портфель", body="")

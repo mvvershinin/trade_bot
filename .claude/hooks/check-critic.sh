@@ -128,7 +128,7 @@ SCAN=$(jq -Rr '
     (fromjson? // empty) as $d
     | ($d.message.content?) as $c
     | if ($c | type) == "string" then
-        if ($d.type? == "user") and ($c | test("<command-name>/(review|validate|risk|parity)</command-name>"))
+        if ($d.type? == "user") and ($c | test("<command-name>/(review|validate|risk)</command-name>"))
         then "CRIT" else empty end
       elif ($c | type) == "array" then
         $c[]
@@ -141,11 +141,11 @@ SCAN=$(jq -Rr '
               elif ($n == "Bash") then
                 ((.input.command? // "")) as $b
                 | if ($b | is_src_write) then "CODE" else empty end
-              elif (((.input.subagent_type? // "") | test("^(code-critic|architecture-validator|risk-security-officer|parity-auditor)$"))) then
+              elif (((.input.subagent_type? // "") | test("^(code-critic|architecture-validator|risk-security-officer)$"))) then
                 "CRIT"
               else empty end
           elif ($d.type? == "user") and (.type? == "text")
-               and ((.text? // "") | test("<command-name>/(review|validate|risk|parity)</command-name>"))
+               and ((.text? // "") | test("<command-name>/(review|validate|risk)</command-name>"))
           then "CRIT"
           else empty end
       else empty end
@@ -156,7 +156,7 @@ printf '%s\n' "$SCAN" | grep -qx CODE || exit 0
 
 # Последнее событие CODE означает, что код меняли после последнего критика
 if [ "$(printf '%s\n' "$SCAN" | grep -x -e CODE -e CRIT | tail -1)" = CODE ]; then
-    printf '%s' '{"decision":"block","reason":"⚡ СТОП. Код изменён после последнего запуска критика. Запусти /review перед завершением. Если тронута торговая логика — ещё и /parity. Если деньги или токен — ещё и /risk."}'
+    printf '%s' '{"decision":"block","reason":"⚡ СТОП. Код изменён после последнего запуска критика. Запусти /review перед завершением. Если тронута торговая логика — ещё и полный pytest с проверкой-образцом. Если деньги или токен — ещё и /risk."}'
 fi
 
 exit 0

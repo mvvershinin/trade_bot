@@ -26,6 +26,8 @@ from PySide6.QtCore import Qt
 
 os.environ.setdefault("QT_API", "pyside6")  # до первого импорта qasync
 
+from app import convert
+from app.port import NO_GUARDS, HistoryPort, _Frame
 from backtest import BREATHE_EVERY, Deal, HistoryRun
 from engine import ExitReason, Side
 from market import (
@@ -42,19 +44,19 @@ from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     CalendarDay,
-    Candle as WindowCandle,
     ChartData,
     Connection,
     DecisionLevel,
     HistoryLoadRequest,
     Layer,
     Mode,
+    ReversalMoment,
     Settings,
     TimeExitKind,
 )
-
-from app import convert
-from app.port import NO_GUARDS, HistoryPort, _Frame
+from ui.models import (
+    Candle as WindowCandle,
+)
 
 #: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
 #: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
@@ -697,25 +699,46 @@ def _something_else(field: str, expected_value):
     об изменении вообще появилась, а не как она сформулирована.
     """
     if field == "strategy_id":
-        return _another_algorithm() or f"{expected_value}/иначе"
+        return _another_algorithm(expected_value) or f"{expected_value}/иначе"
     if field in _ANOTHER_VALUE:
         return _ANOTHER_VALUE[field]
     return _another_of_the_same_type(field, expected_value)
 
 
-def _another_algorithm() -> str | None:
-    """Второй торговый алгоритм сборки. `None` — он в ней один.
+def _another_algorithm(current: str) -> str | None:
+    """Другой торговый алгоритм реестра. `None` — он в нём один.
 
-    ⚠️ Спрашивается у реестра, а не записывается здесь именем. В сборке
-    сегодня один алгоритм, и любое другое имя для порта незнакомо: он обязан
-    такие настройки **отвергнуть**, а не записать «было → стало». Как только
-    второй алгоритм появится, проверка ниже сама перейдёт на сильное
-    утверждение — правки теста для этого не потребуется.
+    Спрашивается у реестра, а не записывается здесь именем: с 05.10.2026
+    алгоритм в сборке один (решение 0063), и второй ставит фикстура `twin`.
     """
-    others = [
-        name for name in registry.known_ids() if name != Settings().strategy_id
-    ]
+    others = [name for name in registry.known_ids() if name != current]
     return others[0] if others else None
+
+
+#: Подставной второй алгоритм: тот же расчёт, своё имя, **без требований**.
+#: Нужен проверкам смены алгоритма и полей, которых требует настоящий
+#: (момент переворота, форма выхода): при одном алгоритме с требованиями
+#: их изменение выставляется обратно, и журналу нечего записать.
+TWIN_ID = "twin_without_demands"
+
+
+@pytest.fixture
+def twin(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Реестр с подставным вторым алгоритмом; ответ — настройки на нём.
+
+    Настоящая таблица не трогается (`D-078`): подмена живёт одну проверку.
+    """
+    real = registry.default_entry()
+    double = dataclasses.replace(
+        real, id=TWIN_ID, title="Двойник без требований", demands=(),
+    )
+    monkeypatch.setattr(registry, "_ENTRIES", (real, double))
+    # Прежние умолчания программы: у подставного требований нет, и смена
+    # момента переворота и формы выхода на нём доходит до журнала.
+    return Settings(
+        strategy_id=TWIN_ID, reversal_moment=ReversalMoment.NEXT_BAR,
+        time_exit_order=TimeExitKind.MARKET,
+    )
 
 
 def _another_of_the_same_type(field: str, expected_value):
@@ -781,7 +804,9 @@ def _with_step(values: Settings) -> Settings:
     return values
 
 
-def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:
+def _apply(
+    loop, database: pathlib.Path, updated: Settings, start: Settings | None = None,
+) -> Recorded:
     """Применить настройки и вернуть записи. Прогон не гоняется.
 
     Строка журнала пишется до постановки прогона в очередь, поэтому ждать
@@ -790,7 +815,10 @@ def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:
 
     async def go():
         worker = MarketWorker(database)
-        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        port = HistoryPort(
+            worker, values=Settings() if start is None else start, days=0,
+            sanitize=redact,
+        )
         recorded = Recorded(port)
         port.apply_settings(updated)
         await port.aclose()
@@ -800,8 +828,18 @@ def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:
     return loop.run_until_complete(go())
 
 
-@pytest.mark.parametrize("field", [field.name for field in fields(Settings)])
-def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, field) -> None:
+#: Шаг цены человек не меняет: его сообщает биржа (решение 05.10.2026), и то,
+#: что пришло в нём с «Применить», порт не берёт —
+#: `tests/test_step_from_exchange.py`.
+_NOT_SET_BY_PERSON = frozenset({"price_step"})
+
+
+@pytest.mark.parametrize("field", [
+    field.name for field in fields(Settings) if field.name not in _NOT_SET_BY_PERSON
+])
+def test_a_change_of_any_settings_field_reaches_the_journal(
+    loop, database, field, twin,
+) -> None:
     """ТЗ §4.4 А: изменение настройки — строка с прежним и новым значением.
 
     Проверяются **все** поля окна, а не одно. Список изменений раньше
@@ -822,14 +860,16 @@ def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, fiel
     # первым. Алгоритмов теперь два; вернётся один — об этом будет сказано
     # вслух (`CLAUDE.md` №13).
     if field == "strategy_id":
-        assert _another_algorithm() is not None, (
+        assert _another_algorithm(TWIN_ID) is not None, (
             "в сборке один торговый алгоритм: строку «было → стало» для имени "
             "алгоритма нечем получить, и проверка этого поля вакуумна. Пока "
             "так, изменение правила принятия решений в журнал не стережётся"
         )
-    before = Settings()
+    # Начало — подставной алгоритм без требований (`twin`): иначе изменение
+    # момента переворота и формы выхода выставлялось бы обратно.
+    before = twin
     changed = before.replace(**{field: _something_else(field, getattr(before, field))})
-    recorded = _apply(loop, database, _with_demands(changed))
+    recorded = _apply(loop, database, _with_demands(changed), start=before)
     reasons = [entry.reason for entry in recorded.appended]
     assert "Значения совпали с прежними" not in reasons, (
         f"поле «{field}» изменено, а в журнале написано, что всё осталось "
@@ -865,7 +905,7 @@ def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, fiel
 
 
 @pytest.mark.parametrize("field", [field.name for field in fields(Settings)])
-def test_a_change_of_any_settings_field_reaches_the_confirmation(field) -> None:
+def test_a_change_of_any_settings_field_reaches_the_confirmation(field, twin) -> None:
     """Перечень перед «Применить» собирается для **любого** поля окна.
 
     ⚠️ Проверка заведена правкой `B-051` и стоит рядом с журнальной нарочно:
@@ -905,7 +945,7 @@ def test_a_change_of_any_settings_field_reaches_the_confirmation(field) -> None:
     настроек алгоритмов поле в поле; отдать пустой список; отдать список
     из одной постоянной строки; убрать любое поле из `_WINDOW_TOLD`.
     """
-    before = Settings()
+    before = twin
     changed = before.replace(**{field: _something_else(field, getattr(before, field))})
     lines, trouble = convert.all_changes(before, _with_demands(changed))
     assert trouble == "", (
@@ -921,7 +961,7 @@ def test_a_change_of_any_settings_field_reaches_the_confirmation(field) -> None:
     )
 
 
-def test_a_change_of_the_algorithm_names_both_rules_in_the_confirmation() -> None:
+def test_a_change_of_the_algorithm_names_both_rules_in_the_confirmation(twin) -> None:
     """Смена алгоритма названа в перечне дважды: имя и получившееся правило.
 
     Два утверждения, и они падают порознь — в этом их смысл:
@@ -936,7 +976,7 @@ def test_a_change_of_the_algorithm_names_both_rules_in_the_confirmation() -> Non
     Мутации, обязанные ронять проверку: убрать `strategy_id` из строк окна;
     убрать `rule_changes` из `all_changes`.
     """
-    before = Settings()
+    before = twin
     other = next(
         one for one in registry.known_ids() if one != before.strategy_id
     )
@@ -954,7 +994,7 @@ def test_a_change_of_the_algorithm_names_both_rules_in_the_confirmation() -> Non
     ), f"перечень не говорит, чем обернулась замена алгоритма: {lines}"
 
 
-def test_a_new_period_chosen_together_with_the_algorithm_is_not_lost() -> None:
+def test_a_new_period_chosen_together_with_the_algorithm_is_not_lost(twin) -> None:
     """Период, изменённый заодно со сменой алгоритма, из перечня не пропадает.
 
     ⚠️ Это сторож на **следствие принятого решения**, а не на его формулировку.
@@ -982,7 +1022,7 @@ def test_a_new_period_chosen_together_with_the_algorithm_is_not_lost() -> None:
     Мутация, обязанная ронять проверку: убрать строку «Правило теперь читается
     так» из `rule_changes`; собрать её по прежним настройкам.
     """
-    before = Settings()
+    before = twin
     other = next(one for one in registry.known_ids() if one != before.strategy_id)
     # Период — из фикстуры: 20 нет ни в одном умолчании окна, поэтому
     # совпадение с посторонней строкой перечня исключено.
@@ -1258,9 +1298,8 @@ def test_a_halted_run_is_visible_in_the_window(loop, database, monkeypatch) -> N
     """
     from dataclasses import replace as _replace
 
-    from ui.main_window import MainWindow
-
     from app import port as port_module
+    from ui.main_window import MainWindow
 
     HALT_REASON = "Сделка не сопоставилась ни с одной заявкой в полёте"
     the_real_replay = port_module.replay
@@ -3784,7 +3823,7 @@ def _watch_key_of(loop, database: pathlib.Path, values: Settings) -> tuple:
     return key
 
 
-def test_the_live_run_is_keyed_by_the_chosen_algorithm(loop, database) -> None:
+def test_the_live_run_is_keyed_by_the_chosen_algorithm(loop, database, twin) -> None:
     """Имя алгоритма входит в то, чем задан живой ход.
 
     Без него окно показывало бы новый алгоритм, а решения считал бы прежний:
@@ -3799,11 +3838,10 @@ def test_the_live_run_is_keyed_by_the_chosen_algorithm(loop, database) -> None:
     assert values.strategy_id in key, (
         f"имя алгоритма не входит в ключ живого хода: {key}"
     )
-    other = _another_algorithm()
+    # Второй алгоритм — подставной (`twin`): смена алгоритма обязана давать
+    # другой ключ, то есть новый прогрев с той же границы.
+    other = _another_algorithm(values.strategy_id)
     if other is not None:
-        # Как только в сборке появится второй алгоритм, проверка сама станет
-        # сильнее: смена алгоритма обязана давать другой ключ, то есть новый
-        # прогрев с той же границы.
         assert _watch_key_of(
             loop, database, values.replace(strategy_id=other)
         ) != key, "смена алгоритма не пересобирает живой ход"
@@ -3981,9 +4019,11 @@ def test_a_stitched_run_on_a_coarse_bar_also_says_minutes_were_not_given(
 
     async def stitched_series(self, frame, symbol, timeframe):
         candles, _ = await real_series(self, frame, symbol, timeframe)
-        return candles, SimpleNamespace(candles=candles, seams=(), symbols="подставная")
+        return candles, SimpleNamespace(
+            candles=candles, seams=(), symbols="подставная", pieces=(),
+        )
 
-    async def stitched_run(stitch, values, engine):
+    async def stitched_run(stitch, values, engine, **_kwargs):
         reached.append(stitch)
         return await the_real_replay(
             stitch.candles,

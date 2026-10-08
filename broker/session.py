@@ -49,6 +49,7 @@ from broker.errors import (
     ServerFailure,
     Timeout,
     TokenExpired,
+    TokenRefused,
     UnexpectedAnswer,
     WrongAddress,
     code_of,
@@ -387,6 +388,9 @@ class BrokerSession:
         #: получал бы одну и ту же строку на каждом переподключении,
         #: а их у него много.
         self._wrong_addresses: set[str] = set()
+        #: Отказ `invalid_grant` на обмене токена: описание и технический текст.
+        #: Пока он стоит, обмен к брокеру не идёт — до `allow_token_retry`.
+        self._refused: tuple[str, str] | None = None
 
     # --- жизненный цикл ---
 
@@ -424,15 +428,29 @@ class BrokerSession:
         Пункт приёмки Э1-4 (`/risk`): «тип токена определяется, боевой режим
         на токене „только чтение“ не включается».
 
-        ⚠️ Тип берётся из того, что владелец счёта указал при вводе токена,
-        и передаётся брокеру полем `client_id`. Способа **спросить** тип
-        у брокера отдельным запросом документация не описывает; ответ сервиса
-        авторизации содержит поле `scope`, но состав его значений
-        в документации не задан, поэтому решение на нём не строится.
+        Тип берётся **из самого токена** — поле `azp` полезной нагрузки JWT
+        (`tokens.issued_for`, правка 05.10.2026): брокер обменивает токен
+        только с этим `client_id`, так что токен для чтения с полем файла
+        «торговля» до заявок всё равно не дошёл бы, а предохранитель говорил
+        бы «можно». Поле файла решает, только если токен не JWT или клиент
+        в нём незнаком. Ответ сервиса авторизации содержит поле `scope`,
+        но состав его значений в документации не задан, поэтому решение
+        на нём не строится.
         """
-        scope = self.cabinet_token().scope
+        stored = self.stored()
+        scope = stored.token.scope
         if not scope.can_trade:
-            raise ReadOnlyToken(f"тип токена в файле настроек: {scope.value}")
+            source = "по самому токену" if stored.scope_from_token else "по файлу настроек"
+            raise ReadOnlyToken(f"тип токена {source}: {scope.value}")
+
+    def allow_token_retry(self) -> None:
+        """Человек нажал «Подключиться»: следующий обмен токена снова идёт к брокеру.
+
+        Единственный способ снять запомненный отказ `invalid_grant`. Зовёт его
+        только действие человека (`app/live_feed.LiveLink.switch`), а не цикл
+        переподключения: повтор того же токена без изменений даёт тот же отказ.
+        """
+        self._refused = None
 
     async def access_token(self) -> AccessToken:
         """Действующий рабочий токен. Обменивает и обновляет сам.
@@ -451,7 +469,21 @@ class BrokerSession:
             now = self._clock()
             if current is not None and not current.stale(now, ACCESS_REFRESH_MARGIN):
                 return current
-            return await self._exchange()
+            if self._refused is not None:
+                # Новый объект на каждый вызов: поднятое дважды исключение
+                # копит трассировки прежних подъёмов (`_wrong_address_error`).
+                description, technical = self._refused
+                raise TokenRefused(
+                    description, f"{technical}; повтор без запроса — обмен уже отклонён"
+                )
+            try:
+                return await self._exchange()
+            except TokenRefused as refused:
+                # Запоминается до действия человека: повтор того же токена
+                # получит тот же отказ, а опрос счёта и расписание спрашивали
+                # бы сервис авторизации на каждом круге (`B-062`).
+                self._refused = (refused.description, refused.technical)
+                raise
 
     async def _exchange(self) -> AccessToken:
         """Обменять токен личного кабинета на рабочий."""

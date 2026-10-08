@@ -56,7 +56,7 @@ from typing import Any
 
 import pytest
 
-from strategies import EmaReverse, EmaReverseSettings, StrategyEntry, registry
+from strategies import MaReverseAlways, MaReverseAlwaysSettings, StrategyEntry, registry
 
 LAYER = pathlib.Path(__file__).resolve().parent.parent / "strategies"
 REGISTRY_SOURCE = LAYER / "registry.py"
@@ -237,22 +237,17 @@ def test_the_loader_check_is_not_blind() -> None:
 # --------------------------------------------------------------------------
 
 def test_the_default_is_the_module_that_trades_today() -> None:
-    """Умолчание — реверс по скользящей средней, и это проверяется сборкой.
+    """Умолчание — «Реверс с постоянной позицией», и это проверяется сборкой.
 
-    ТЗ §4.8: «по умолчанию всегда выбрана скользящая средняя». Мутация
-    `DEFAULT_ID` роняет этот тест; она же уронила бы сверку с прототипом,
-    но сверка идёт на архиве, которого в свежем клоне нет, — здесь проверка
-    работает всегда.
+    Решение владельца счёта 05.10.2026 (решение 0063): алгоритм единственный.
+    Мутация `DEFAULT_ID` роняет этот тест.
     """
     assert registry.DEFAULT_ID in registry.known_ids()
     entry = registry.default_entry()
     assert entry is registry.find(registry.DEFAULT_ID)
-    assert entry.settings_type is EmaReverseSettings
-    # ⚠️ `type(...) is`, а не `isinstance`: с 14.09.2026 у первого алгоритма
-    # есть наследник («Реверс с постоянной позицией»), и `isinstance` принял
-    # бы его за умолчание — то есть подмена `DEFAULT_ID` прошла бы наполовину
-    # молча, а сверка с прототипом идёт на архиве, которого в свежем клоне нет.
-    assert type(entry.build(entry.defaults())) is EmaReverse, (
+    assert registry.DEFAULT_ID == "ma_reverse_always"
+    assert entry.settings_type is MaReverseAlwaysSettings
+    assert type(entry.build(entry.defaults())) is MaReverseAlways, (
         "умолчание реестра собирает не тот модуль, которым торгуют сегодня"
     )
 
@@ -264,10 +259,24 @@ def test_the_build_is_exactly_the_modules_it_declares() -> None:
     и первый в списке — не умолчание. Умолчание отдельным полем
     (`DEFAULT_ID`), и его стережёт проверка выше.
     """
-    assert registry.known_ids() == ("ema_reverse", "ma_reverse_always"), (
+    assert registry.known_ids() == ("ma_reverse_always",), (
         "состав реестра изменился. Это не запрет: впишите новый модуль сюда "
         "вместе с проверками, которые он обязан пройти"
     )
+
+
+def test_the_removed_algorithm_is_named_but_not_built() -> None:
+    """Убранный «Реверс по скользящей средней» назван, но не собирается.
+
+    Стережёт: `ema_reverse` есть в таблице убранных (по ней старый файл
+    и шаблон читаются как алгоритм по умолчанию), а `find()` по нему
+    по-прежнему отказывает — молча подставить другое правило реестр не вправе.
+    """
+    assert registry.retired_title("ema_reverse") == "Реверс по скользящей средней"
+    assert registry.retired_title(registry.DEFAULT_ID) is None
+    assert "ema_reverse" not in registry.known_ids()
+    with pytest.raises(registry.UnknownStrategy):
+        registry.find("ema_reverse")
 
 
 # --------------------------------------------------------------------------
@@ -560,7 +569,7 @@ def test_that_agreement_check_is_not_blind() -> None:
     swapped = dataclasses.replace(
         second,
         fields=(
-            registry.SettingsField("period", "confirm_bars", "Период средней"),
+            registry.SettingsField("period", "take_profit_pct", "Период средней"),
             *second.fields[1:],
         ),
     )

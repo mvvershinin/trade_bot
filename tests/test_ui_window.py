@@ -529,14 +529,14 @@ def test_the_live_badge_reads_at_least_as_well_as_the_simulation_one(window) -> 
 
     Спутать симуляцию с боем нельзя (ТЗ §4.4 З), а отметка боя рисовалась
     белым по `danger` безусловно: в тёмной теме это 3,49:1, тогда как
-    «СИМУЛЯЦИЯ» идёт по `text_dim` и даёт 7,06:1. Безопасное состояние
-    читалось лучше опасного.
+    «СИМУЛЯЦИЯ» идёт по `badge_quiet` (до 05.10.2026 — `text_dim`)
+    и даёт 7,06:1. Безопасное состояние читалось лучше опасного.
     """
     from ui.theme import DARK, LIGHT, contrast, text_on
 
     for theme in (LIGHT, DARK):
         live = contrast(text_on(theme.danger), theme.danger)
-        simulated = contrast(theme.background, theme.text_dim)
+        simulated = contrast(theme.background, theme.badge_quiet)
         assert live >= 4.5, f"отметка боевого режима нечитаема: {live:.2f}"
         assert live >= simulated * 0.75, (
             f"боевой режим читается заметно хуже симуляции: {live:.2f} против "

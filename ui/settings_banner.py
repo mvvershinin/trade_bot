@@ -18,10 +18,10 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from ui.theme import current as current_theme
-from ui.theme import text_on
+from ui.theme import scaled, text_on
 
 #: Кегль плашки — тот же, что у остальных плашек над графиком (`_Banner`).
-LARGE_POINTS = 14.0
+LARGE_POINTS = scaled(14.0)  # 14 пт — порог WCAG, ×1,2 — `FONT_SCALE`
 
 
 class SettingsTroubleBar(QWidget):
@@ -62,6 +62,40 @@ class SettingsTroubleBar(QWidget):
         fill = current_theme().danger
         self.label.setText(f"Настройки приняты не так, как записаны. {text}")
         self.label.setStyleSheet(
+            f"background: {fill}; color: {text_on(fill)}; border-radius: 4px;"
+        )
+        self.setVisible(True)
+
+
+class StepWaitBar(QLabel):
+    """Плашка «биржа ещё не сообщила шаг цены» — красная, без кнопки.
+
+    Кнопки нет намеренно: шаг цены программа берёт у биржи сама (решение
+    владельца счёта 05.10.2026), и окно настроек человеку здесь ничем
+    не поможет. Текст готовым приходит от порта (`RobotState.step_wait`);
+    шаг пришёл — строка пустая, и плашка прячется сама.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWordWrap(True)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setContentsMargins(12, 8, 12, 8)
+        font = self.font()
+        font.setPointSizeF(max(font.pointSizeF() + 2.0, LARGE_POINTS))
+        font.setBold(True)
+        self.setFont(font)
+        self.setVisible(False)
+
+    def show_wait(self, text: str) -> None:
+        """Показать текст порта; пустой — спрятать плашку."""
+        if not text:
+            self.clear()
+            self.setVisible(False)
+            return
+        fill = current_theme().danger
+        self.setText(text)
+        self.setStyleSheet(
             f"background: {fill}; color: {text_on(fill)}; border-radius: 4px;"
         )
         self.setVisible(True)

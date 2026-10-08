@@ -93,7 +93,7 @@ def test_a_saved_template_returns_every_field_unchanged(library) -> None:
     values = Settings(
         timeframe="15 минут", average_period=21,
         take_profit_pct=0.9, volume=4, window_start=time(10, 30),
-        commission_per_side_rub=None, threshold_percent=0.4, confirm_bars=3,
+        commission_per_side_rub=None,
     )
     assert library.write((Template(name="Проба", values=values),)) == ""
 
@@ -546,7 +546,9 @@ def test_the_money_half_and_the_rest_add_up_to_the_whole_list() -> None:
     assert not set(diff.money) & set(diff.other), "строка попала в оба списка"
 
 
-def test_the_list_of_changes_survives_a_change_of_the_algorithm() -> None:
+def test_the_list_of_changes_survives_a_change_of_the_algorithm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Смена алгоритма даёт перечень изменений, а не падение.
 
     ⚠️ Был строгий `xfail` — сторож-долг на `B-051`. Пометка снята 14.09.2026
@@ -581,6 +583,11 @@ def test_the_list_of_changes_survives_a_change_of_the_algorithm() -> None:
     теперь проходит `tests/test_app_port.py::
     test_a_change_of_any_settings_field_reaches_the_confirmation`.
     """
+    # Алгоритм в сборке один (решение 0063): второй — подставной, своё имя
+    # и название при том же расчёте. Настоящая таблица не трогается (`D-078`).
+    real = registry.default_entry()
+    double = dataclasses.replace(real, id="twin", title="Двойник")
+    monkeypatch.setattr(registry, "_ENTRIES", (real, double))
     first = Settings()
     other = next(
         one.id for one in registry.entries() if one.id != first.strategy_id

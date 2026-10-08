@@ -8,6 +8,12 @@
 * токен бывает «только для чтения» и «для торговли и чтения данных»;
 * тип задаётся при обмене полем `client_id`: `trade-api-read` либо
   `trade-api-write`;
+* ⚠️ **брокер принимает обмен только с `client_id`, для которого токен
+  выпущен** (показ заказчику 05.10.2026): иначе `400 invalid_grant`
+  «Token client and authorized client don't match». Этот клиент записан
+  в самом токене — refresh-токен БКС есть JWT с полем `azp` в полезной
+  нагрузке (проверено на двух настоящих токенах). Поэтому тип читается
+  из токена (`issued_for`), а поле файла — запасной путь для не-JWT;
 * токен показывается один раз и привязан к одному брокерскому счёту.
 
 Предупреждение за **10 дней** — требование ТЗ §4.1 и пункт приёмки
@@ -16,7 +22,10 @@
 
 from __future__ import annotations
 
+import base64
 import enum
+import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Final
@@ -64,11 +73,75 @@ class TokenScope(enum.Enum):
     def can_trade(self) -> bool:
         return self is TokenScope.TRADE
 
+    @classmethod
+    def of_client(cls, azp: str | None) -> "TokenScope | None":
+        """Тип по клиенту из токена (`issued_for`); незнакомый клиент — `None`."""
+        for scope in cls:
+            if scope.client_id == azp:
+                return scope
+        return None
+
     @property
     def human(self) -> str:
         if self is TokenScope.TRADE:
             return "для торговли и чтения данных"
         return "только для чтения"
+
+
+#: Каким видом `azp` вообще разрешено попадать в журнал. Значение `azp` —
+#: имя клиента сервиса авторизации, а не секрет, но пришло оно из чужого
+#: текста: в журнал идёт только короткое и из безопасных символов.
+_PRINTABLE_CLIENT: Final[re.Pattern[str]] = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+
+#: Частей в JWT: заголовок, полезная нагрузка, подпись (RFC 7519 §3).
+_JWT_PARTS: Final[int] = 3
+
+
+def issued_for(value: str) -> str | None:
+    """Поле `azp` из полезной нагрузки JWT — клиент, для которого выпущен токен.
+
+    Подпись **не проверяется**: её проверяет брокер, а здесь только читается
+    одно поле, чтобы обмен шёл с тем `client_id`, какой брокер примет.
+    Не JWT, нагрузка не разбирается, `azp` нет — `None`.
+
+    ⚠️ Наружу выходит **только** строка `azp`. Разобранная нагрузка (там `sub`,
+    `sid` и прочее о владельце счёта) не возвращается, не печатается и не
+    покидает функцию в исключении: все отказы разбора гасятся здесь же без
+    привязки к имени — у `JSONDecodeError` и `UnicodeDecodeError` в полях
+    лежит разбираемый текст, и поднятое исключение унесло бы его в трассировку.
+    Поле `typ` («Refresh», а у офлайн-токенов Keycloak — «Offline») на решение
+    не влияет: проверка его вернула бы ту самую ошибку типа, ради которой
+    функция написана.
+    """
+    claims: object = None
+    raw: bytes = b""
+    try:
+        parts = value.split(".")
+        if len(parts) != _JWT_PARTS:
+            return None
+        middle = parts[1]
+        raw = base64.urlsafe_b64decode(middle + "=" * (-len(middle) % 4))
+        claims = json.loads(raw)
+        if not isinstance(claims, dict):
+            return None
+        azp = claims.get("azp")
+        return azp if isinstance(azp, str) and azp else None
+    except (ValueError, RecursionError):
+        # `binascii.Error`, `UnicodeDecodeError` и `JSONDecodeError` — все
+        # потомки `ValueError`; `RecursionError` — нагрузка с глубокой
+        # вложенностью. Без `as`: привязка к имени держала бы текст нагрузки.
+        return None
+    finally:
+        claims = None
+        raw = b""
+        parts = []
+        middle = ""
+        del claims, raw, parts, middle
+
+
+def printable_client(azp: str) -> str:
+    """`azp` для журнала: как есть, если короткий и безопасный, иначе — пометка."""
+    return azp if _PRINTABLE_CLIENT.fullmatch(azp) else "<нечитаемое значение>"
 
 
 class NoticeLevel(enum.Enum):

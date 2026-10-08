@@ -43,9 +43,8 @@ from strategies import (
     Claim,
     Decision,
     Description,
-    EmaReverse,
     Intent,
-    OnPriceEqualsAverage,  # noqa: F401 — берётся через globals()[...] ниже
+    MaReverseAlways,
     Sample,
     SettingsField,
     Strategy,
@@ -106,7 +105,7 @@ def test_market_candle_cannot_pass_into_the_module_silently() -> None:
     with pytest.raises(TypeError, match="time"):
         check_bar(stranger)
     with pytest.raises(TypeError, match="time"):
-        EmaReverse().on_closed_bar(stranger)  # type: ignore[arg-type]
+        MaReverseAlways().on_closed_bar(stranger)  # type: ignore[arg-type]
 
 
 def test_any_object_with_a_time_field_is_refused() -> None:
@@ -139,7 +138,7 @@ def test_a_well_formed_stand_in_is_accepted() -> None:
         volume = 1.0
 
     check_bar(Stand())
-    assert EmaReverse().on_closed_bar(Stand()).close == 100.0  # type: ignore[arg-type]
+    assert MaReverseAlways().on_closed_bar(Stand()).close == 100.0  # type: ignore[arg-type]
 
 
 def test_an_object_that_is_not_a_bar_is_refused() -> None:
@@ -152,7 +151,7 @@ def test_an_object_that_is_not_a_bar_is_refused() -> None:
 # --------------------------------------------------------------------------
 
 def test_module_one_satisfies_the_strategy_port() -> None:
-    strategy = EmaReverse()
+    strategy = MaReverseAlways()
     assert isinstance(strategy, Strategy)
     assert strategy.title
     decision = strategy.on_closed_bar(
@@ -164,7 +163,7 @@ def test_module_one_satisfies_the_strategy_port() -> None:
 
 @pytest.mark.parametrize(
     "ours, theirs",
-    [("AverageKind", "AverageKind"), ("OnPriceEqualsAverage", "OnPriceEqualsAverage")],
+    [("AverageKind", "AverageKind")],
 )
 def test_enum_values_match_the_window(ours: str, theirs: str) -> None:
     """Значения совпадают с `ui.models`, иначе `app/` переложит выбор мимо.
@@ -350,12 +349,12 @@ def test_a_non_number_close_is_refused(close: float) -> None:
     with pytest.raises(ValueError, match="не число"):
         check_bar(bar)
     with pytest.raises(ValueError, match="не число"):
-        EmaReverse().on_closed_bar(bar)
+        MaReverseAlways().on_closed_bar(bar)
 
 
 def test_a_non_number_close_does_not_poison_the_average() -> None:
     """Отказ происходит до того, как свеча попала в расчёт."""
-    strategy = EmaReverse()
+    strategy = MaReverseAlways()
     first = Bar(closes_at=MOMENT, open=1.0, high=1.0, low=1.0, close=100.0)
     spoiled = Bar(
         closes_at=MOMENT + timedelta(minutes=5),

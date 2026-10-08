@@ -141,50 +141,46 @@ def drive(
 # --------------------------------------------------------------------------
 
 
-def test_choosing_the_algorithm_at_the_wrong_reversal_is_not_accepted(
-    loop, tmp_path
-) -> None:
-    """Выбор алгоритма при чужом моменте переворота не принимается.
+def test_a_wrong_reversal_is_set_right_out_loud(loop, tmp_path) -> None:
+    """Чужой момент переворота при «Применить» выставляется, а не даёт отказ.
 
-    Стережёт: **молчаливое принятие** несовместимой пары при смене алгоритма.
-    Мутация, обязанная ронять проверку: принять настройки и тихо переставить
-    момент переворота — сторож на тексте отказа этого не заметил бы, а сторож
-    на «настройки не применились» падает.
+    Слова владельца счёта 05.10.2026 про отказ окна: «ну так надо было
+    переставлять!» (решение 0063).
+
+    Стережёт два поведения: настройки **приняты** с переворотом в одной
+    свече, и подмена сказана строкой в журнале. Мутации, обязанные ронять
+    проверку: вернуть отказ (`applied` пуст) и подменять молча (нет строки).
     """
     recorded = drive(loop, tmp_path, Settings(), lambda port: port.apply_settings(BAD))
-    assert not recorded.applied, (
-        "несовместимая пара принята: настройки уехали в окно и в файл, "
-        f"а робот стоял бы вне рынка на каждом перевороте. Принято: "
-        f"{recorded.applied}"
+    assert recorded.applied == [GOOD.replace(price_step=0.0)], (
+        f"несовместимая пара не выставлена под алгоритм: принято "
+        f"{recorded.applied}, отказы {recorded.failures}"
     )
-    assert recorded.failures, "отказ прошёл молча — человеку не сказано ничего"
-    said = " ".join(recorded.failures)
+    rows = [
+        row for row in recorded.journal
+        if row.event == "Настройки выставлены под алгоритм"
+    ]
+    assert rows, f"подмена прошла молча. Журнал: {recorded.events()}"
+    said = rows[0].reason
     assert registry.find(ALWAYS).title in said, (
-        f"отказ не называет алгоритм, из-за которого он случился: «{said}»"
+        f"строка не называет алгоритм, из-за которого подмена: «{said}»"
     )
-    assert "В той же свече" in said, (
-        f"отказ не говорит, что поставить вместо нынешнего: «{said}»"
-    )
+    assert "В той же свече" in said, f"строка не говорит, что выставлено: «{said}»"
 
 
-def test_changing_the_reversal_under_the_chosen_algorithm_is_not_accepted(
+def test_changing_the_reversal_under_the_chosen_algorithm_is_set_back(
     loop, tmp_path
 ) -> None:
     """Обратный порядок: алгоритм уже выбран, меняют момент переворота.
 
-    Стережёт: **заднюю дверь**. Сторож, повешенный на смену алгоритма,
-    эту правку пропустил бы молча — человек сперва выбирает алгоритм при
-    «в одной свече» (принято), а потом отдельным «Применить» возвращает
-    «через свечу», и название в окне снова становится ложью.
-
-    Мутация, обязанная ронять проверку: проверять требования только тогда,
-    когда изменилось поле `strategy_id`.
+    Стережёт: **заднюю дверь** — требование, проверяемое только при смене
+    поля `strategy_id`. Мутация, обязанная ронять проверку: выставлять
+    требования только тогда, когда изменился алгоритм.
     """
     recorded = drive(loop, tmp_path, GOOD, lambda port: port.apply_settings(BAD))
-    assert not recorded.applied, (
-        f"момент переворота переставлен под выбранным алгоритмом: {recorded.applied}"
-    )
-    assert recorded.failures, "отказ прошёл молча"
+    assert [one.reversal_moment for one in recorded.applied] == [
+        ReversalMoment.SAME_BAR
+    ], f"момент переворота переставлен под выбранным алгоритмом: {recorded.applied}"
 
 
 def test_the_compatible_pair_is_accepted(loop, tmp_path) -> None:
@@ -195,63 +191,41 @@ def test_the_compatible_pair_is_accepted(loop, tmp_path) -> None:
     нельзя вовсе.
     """
     recorded = drive(loop, tmp_path, Settings(), lambda port: port.apply_settings(GOOD))
-    assert recorded.applied == [GOOD], (
+    # Шаг цены порт берёт у биржи, а не из пришедших настроек (05.10.2026):
+    # без её ответа он ноль, и принятое отличается от посланного только им.
+    assert recorded.applied == [GOOD.replace(price_step=0.0)], (
         f"сходящаяся пара не принята: {recorded.failures}"
     )
     assert not recorded.failures
 
 
-def test_the_first_algorithm_is_not_restricted(loop, tmp_path) -> None:
-    """Алгоритм без требований принимается при любом моменте переворота.
-
-    Стережёт: требование, приклеенное ко **всем** алгоритмам. Умолчание
-    программы — переворот через свечу, и именно на нём держится сверка
-    с прототипом 127 из 127; отказ, сработавший здесь, отнял бы у проекта
-    его единственный машинный пункт приёмки.
-    """
-    values = Settings(average_period=20, reversal_moment=ReversalMoment.NEXT_BAR)
-    assert registry.find(values.strategy_id).demands == ()
-    recorded = drive(
-        loop, tmp_path, Settings(), lambda port: port.apply_settings(values)
-    )
-    assert recorded.applied == [values], f"отказано без требования: {recorded.failures}"
-
-
-def test_a_backtest_with_an_incompatible_pair_does_not_start(loop, tmp_path) -> None:
+def test_a_backtest_with_an_incompatible_pair_starts_set_right(loop, tmp_path) -> None:
     """Второй путь применения: запрос прогона по истории.
 
-    Стережёт: проверку, поставленную **только** в «Применить». Этот путь
-    закрепляет отрезок и ставит прогон в очередь до того, как настройки
-    станут текущими, — без отказа прямо здесь остался бы запрошенный прогон
-    при непринятых настройках.
+    Стережёт: подмену, поставленную **только** в «Применить». Прогон
+    с чужим моментом переворота запрашивается, а не отвергается, и строка
+    о подмене стоит в журнале **до** строки о запросе: этот путь закрепляет
+    отрезок раньше, чем настройки станут текущими.
 
-    ⚠️ **Ловится заголовком события, а не тем, что настройки не применились,
-    и это замер, а не осторожность.** `run_backtest` кончается вызовом
-    `apply_settings`, и та откажет сама: `applied` пуст, а `failures` полон
-    **и без** проверки в `run_backtest`. Прежняя редакция стояла ровно
-    на этих двух утверждениях и мутацию «убрать вызов требований
-    из `run_backtest`» пережила зелёной (14.09.2026). Различает их журнал:
-    запрошенный прогон оставляет в нём «Прогон на истории запрошен»,
-    а за собой — закреплённый отрезок и занятую очередь.
-
-    Мутация, обязанная ронять проверку: убрать вызов требований из
-    `HistoryPort.run_backtest`.
+    Мутация, обязанная ронять проверку: убрать `convert.settled`
+    из `HistoryPort.run_backtest` (тогда строка о подмене появится только
+    после запроса, от `apply_settings`, либо не появится вовсе).
     """
     since, until = _span()
     request = BacktestRequest(settings=BAD, since=since, until=until)
     recorded = drive(
         loop, tmp_path, Settings(), lambda port: port.run_backtest(request)
     )
-    assert not recorded.applied, "прогон принял несовместимые настройки"
-    assert recorded.failures, "прогон не начат молча"
     events = recorded.events()
-    assert "Прогон на истории запрошен" not in events, (
-        "прогон запрошен при непринятых настройках: отрезок закреплён, "
-        f"очередь занята тем, чему отказано. Журнал: {events}"
+    assert "Прогон на истории запрошен" in events, (
+        f"прогон с выставляемой парой не запрошен: {recorded.failures}; {events}"
     )
-    assert "Прогон на истории не начат" in events, (
-        f"человеку не сказано, что не начат именно прогон: {events}"
+    assert "Настройки выставлены под алгоритм" in events, (
+        f"подмена в запросе прогона прошла молча: {events}"
     )
+    assert events.index("Настройки выставлены под алгоритм") < events.index(
+        "Прогон на истории запрошен"
+    ), f"подмену сделал не запрос прогона: {events}"
 
 
 def _span() -> tuple[datetime, datetime]:
@@ -308,10 +282,10 @@ def test_the_field_of_the_record_has_no_default() -> None:
     assert field.default_factory is dataclasses.MISSING
 
 
-def test_the_refusal_follows_the_declaration_and_not_the_name_of_the_algorithm(
+def test_the_substitution_follows_the_declaration_and_not_the_name_of_the_algorithm(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Отказ идёт по объявленному требованию, а не по имени `ma_reverse_always`.
+    """Подмена идёт по объявленному требованию, а не по имени `ma_reverse_always`.
 
     Стережёт: проверку, приколоченную к личности алгоритма. Требование
     объявляется **на местной** записи реестра — про другое поле и другое
@@ -331,9 +305,10 @@ def test_the_refusal_follows_the_declaration_and_not_the_name_of_the_algorithm(
     )
     monkeypatch.setattr(registry, "_ENTRIES", (demanding,))
     convert._algorithm_trouble.cache_clear()  # noqa: SLF001 — запись подменена
-    with pytest.raises(convert.SettingsRefused, match="простой средней"):
-        convert.check_demands(Settings(average_kind=AverageKind.EMA))
-    convert.check_demands(Settings(average_kind=AverageKind.SMA))
+    values, said = convert.settled(Settings(average_kind=AverageKind.EMA))
+    assert values.average_kind is AverageKind.SMA
+    assert "простой средней" in " ".join(said), said
+    assert convert.settled(Settings(average_kind=AverageKind.SMA))[1] == ()
 
 
 @pytest.mark.parametrize(
@@ -365,7 +340,7 @@ def test_a_typo_in_the_declaration_is_refused_out_loud(
     monkeypatch.setattr(registry, "_ENTRIES", (broken,))
     convert._algorithm_trouble.cache_clear()  # noqa: SLF001 — запись подменена
     with pytest.raises(convert.SettingsRefused, match=expected):
-        convert.check_demands(Settings())
+        convert.chosen_algorithm(Settings())
 
 
 @pytest.fixture(autouse=True)
@@ -517,19 +492,20 @@ def test_a_compatible_pair_in_the_file_is_left_alone(tmp_path: pathlib.Path) -> 
     assert read.troubles == ()
 
 
-def test_the_file_of_an_algorithm_without_demands_is_left_alone(
-    tmp_path: pathlib.Path,
-) -> None:
-    """Алгоритм без требований: момент переворота из файла берётся как есть.
+def test_a_template_with_the_removed_algorithm_is_confirmed_as_the_only_one() -> None:
+    """Шаблон с `ema_reverse`: перечень перед «Применить» говорит, что будет.
 
-    Стережёт: подмену, приклеенную к полю, а не к требованию. Умолчание
-    программы — переворот через свечу, и переписать его у первого алгоритма
-    значило бы менять правило, на котором стоит сверка с прототипом.
+    Стережёт: подтверждение шаблона, сделанного до 05.10.2026 (решение 0063).
+    Перечень называет убранный алгоритм и тот, что будет работать, а не
+    «алгоритма с таким именем в этой сборке нет», и собирается без отказа.
+    Мутация, обязанная ронять проверку: убрать `settled` из `all_changes`.
     """
-    values = Settings(reversal_moment=ReversalMoment.NEXT_BAR)
-    assert registry.find(values.strategy_id).demands == ()
-    store = SettingsStore(tmp_path)
-    assert store.save(values) == ""
-    read = SettingsStore(tmp_path).load()
-    assert read.values.reversal_moment is ReversalMoment.NEXT_BAR
-    assert read.troubles == ()
+    lines, trouble = convert.all_changes(
+        Settings(), Settings().replace(strategy_id="ema_reverse")
+    )
+    assert trouble == "", trouble
+    assert lines[:1] == [
+        "Алгоритм «Реверс по скользящей средней» убран, работает "
+        "«Реверс с постоянной позицией»."
+    ], lines
+    assert not any("в этой сборке нет" in line for line in lines), lines

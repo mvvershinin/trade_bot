@@ -19,28 +19,34 @@ from datetime import date, datetime, time, timedelta
 
 import pytest
 
-from engine import EngineSettings, ExitReason, Fill, JournalEntry, JournalLevel, OrderAction
+from app import convert
+from backtest import Deal, HistoryRun, Pair, Plan, Summary
+from engine import (
+    DayMarks,
+    EngineSettings,
+    ExitReason,
+    Fill,
+    JournalEntry,
+    JournalLevel,
+    OrderAction,
+    TradingWindow,
+)
 from engine import Mode as EngineMode
 from engine import Side as EngineSide
-from engine import DayMarks, TradingWindow
 from engine import window as engine_window
-from market import Candle, MSK, Timeframe
+from market import MSK, Candle, Timeframe
 from strategies import AverageKind as StrategyAverageKind
-from strategies import Intent, registry
+from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     AverageKind,
     DecisionLevel,
     Layer,
     Mode,
-    OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
     Side,
 )
-
-from app import convert
-from backtest import Deal, HistoryRun, Pair, Plan, Summary
 
 
 def candle(hour: int, minute: int, minutes: int = 5) -> Candle:
@@ -489,142 +495,17 @@ def test_the_window_values_reach_the_engine() -> None:
 def test_the_strategy_settings_are_assembled_field_by_field() -> None:
     values = Settings(
         average_period=9, average_kind=AverageKind.SMA,
-        on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_SHORT,
     )
-    from strategies import EmaReverseSettings
+    from strategies import MaReverseAlwaysSettings
 
     module = convert.strategy_settings(values)
     # ⚠️ Сужение — часть проверки, а не поклон системе типов. Сборщик
     # объявлен через порт настроек и класс алгоритма не называет; убедиться,
     # что он собрал настройки **выбранного** алгоритма, а не какие-нибудь, —
     # ровно то, ради чего проверка и стоит.
-    assert isinstance(module, EmaReverseSettings)
+    assert isinstance(module, MaReverseAlwaysSettings)
     assert module.period == 9
     assert module.kind is StrategyAverageKind.SMA
-    assert module.on_equal.value == "short"
-
-
-def test_a_switched_off_filter_gives_the_module_exactly_its_own_defaults() -> None:
-    """Снятая галочка фильтра = умолчания торгового модуля, поле в поле.
-
-    **Это сторож сверки с прототипом.** Она сходится 127 сделок из 127 на
-    выключенном фильтре, у прототипа фильтра нет вовсе, и любое ненулевое
-    значение, просочившееся сюда, сломает её молча: список сделок другой,
-    а ошибки нигде нет.
-
-    Сравнение целиком, а не по двум полям: третье поле фильтра, заведённое
-    завтра и забытое в `_FILTER_OFF`, обошло бы поимённую проверку.
-    """
-    from strategies import EmaReverseSettings
-
-    values = Settings(
-        filter_enabled=False, threshold_percent=0.4, confirm_bars=5
-    )
-    produced = convert.strategy_settings(values)
-    assert isinstance(produced, EmaReverseSettings)
-    default = EmaReverseSettings(
-        period=values.average_period,
-        kind=StrategyAverageKind.EMA,
-        on_equal=produced.on_equal,
-    )
-    assert produced == default, (
-        "выключённый фильтр отдал модулю не его умолчания — сверка "
-        "с прототипом поедет молча"
-    )
-
-
-def test_a_switched_on_filter_carries_both_numbers_to_the_module() -> None:
-    """Включённая галочка отдаёт модулю то, что стоит в полях."""
-    from strategies import EmaReverseSettings
-
-    produced = convert.strategy_settings(
-        Settings(filter_enabled=True, threshold_percent=0.04, confirm_bars=3)
-    )
-    assert isinstance(produced, EmaReverseSettings)
-    assert produced.threshold_percent == pytest.approx(0.04)
-    assert produced.confirm_bars == 3
-
-
-def test_the_off_values_of_the_filter_are_the_defaults_of_the_module() -> None:
-    """`_FILTER_OFF` совпадает с умолчаниями модуля — по таблице, а не на глаз.
-
-    Канарейка к тесту выше: тот сравнивает результат перевода, этот —
-    саму таблицу. Разъехавшись, они бы дали «выключено», которое выключает
-    не туда.
-    """
-    from app.convert import _FILTER_OFF
-    from strategies import EmaReverseSettings
-
-    default = EmaReverseSettings()
-    for name, value in _FILTER_OFF.items():
-        assert getattr(default, name) == value, (
-            f"«выключено» для поля {name} разошлось с умолчанием модуля"
-        )
-
-
-def test_a_field_of_the_filter_missing_from_the_assembler_is_refused(
-    monkeypatch,
-) -> None:
-    """Поле «выключенного фильтра», которого нет у сборщика, — отказ вслух.
-
-    Проверка полноты считается один раз при импорте, поэтому подменяется
-    её результат, а не таблица: иначе тест проверял бы не сторожа,
-    а собственную арифметику.
-    """
-    monkeypatch.setattr(convert, "_FILTER_OFF_GAP", ("выдуманное_поле",))
-    with pytest.raises(convert.SettingsRefused, match="выдуманное_поле"):
-        convert.strategy_settings(Settings())
-
-
-def test_switching_the_filter_is_a_line_in_the_journal() -> None:
-    """Переключение фильтра называется словом, а не `True`/`False`.
-
-    Строку пишет порт (`_WINDOW_TOLD`): сам выключатель в настройки
-    торгового модуля не переводится, и рассказать о нём больше некому.
-    """
-    lines = convert.window_changes(
-        Settings(filter_enabled=False), Settings(filter_enabled=True)
-    )
-    assert lines == ["Фильтр против пилы: выключен → включён"], lines
-
-
-def test_a_muted_filter_number_is_journalled_and_says_it_is_muted() -> None:
-    """Правка числа при снятой галочке — строка, и в ней сказано, что она инертна.
-
-    ТЗ §4.4 А требует строку на **каждое** изменение поля окна. Молчать
-    нельзя: владелец счёта подбирает порог при снятой галочке, а потом
-    восстановить, что он крутил, будет нечем. Врать «включено» тоже нельзя —
-    отсюда оговорка прямо в строке.
-    """
-    lines = convert.window_changes(
-        Settings(filter_enabled=False, threshold_percent=0.0),
-        Settings(filter_enabled=False, threshold_percent=0.5),
-    )
-    assert len(lines) == 1, lines
-    assert "фильтр выключен" in lines[0] and "0,50" in lines[0], lines
-
-
-def test_a_number_of_a_working_filter_is_not_journalled_twice() -> None:
-    """При включённом фильтре про число говорит только торговый модуль."""
-    assert convert.window_changes(
-        Settings(filter_enabled=True, threshold_percent=0.0),
-        Settings(filter_enabled=True, threshold_percent=0.5),
-    ) == []
-
-
-def test_the_numbers_of_the_filter_are_journalled_as_they_act() -> None:
-    """Журнал пишет **действующее** значение фильтра, а не то, что в поле.
-
-    Включение галочки при заранее набранных числах обязано дать строки
-    модуля «0,00% → 0,04%»: именно это изменение поведения и произошло.
-    """
-    off = Settings(filter_enabled=False, threshold_percent=0.04, confirm_bars=3)
-    on = off.replace(filter_enabled=True)
-    lines = convert.strategy_settings(on).changes_from(
-        convert.strategy_settings(off)
-    )
-    joined = " ".join(lines)
-    assert "0,04" in joined and "3" in joined, joined
 
 
 @pytest.mark.parametrize("mode", list(Mode))
@@ -991,33 +872,26 @@ def test_the_summary_of_the_chosen_algorithm_follows_the_applied_settings() -> N
     """Правило одной фразой считается по вашим настройкам, а не по умолчаниям.
 
     ⚠️ Чисел в этой отрисовке нет — и на этом держался дефект. Довод «`brief()`
-    цифр не содержит, значит от настроек не зависит» неверен: включённый порог
-    меняет **формулировку**. Владелец счёта, поставивший фильтр против пилы,
-    читал «закрытие выше средней», а на деле нужно несколько закрытий подряд
-    за полосой — и на вкладке, и в окне выбора (`B-039`).
+    цифр не содержит, значит от настроек не зависит» неверен: тип средней
+    меняет **формулировку** — «простой средней» против «экспоненциальной»
+    (`B-039`).
 
     Мутация, обязанная ронять проверку: собирать `summary` из умолчаний
     алгоритма вместо применённых настроек.
     """
-    values = Settings().replace(
-        filter_enabled=True, threshold_percent=0.04, confirm_bars=3
-    )
+    values = Settings().replace(average_kind=AverageKind.SMA)
     chosen = next(item for item in convert.algorithms(values) if item.chosen)
     entry = registry.find(chosen.id)
     assert chosen.summary == entry.summary(convert.strategy_settings(values)), (
         "краткое правило выбранного алгоритма собрано не из применённых настроек"
     )
-    assert "подряд" in chosen.summary, (
-        "подтверждение сигнала включено, а правило одной фразой говорит про "
-        f"одно закрытие: «{chosen.summary}»"
-    )
-    assert "полосы" in chosen.summary, (
-        "порог включён, а правило одной фразой говорит про саму среднюю: "
+    assert "простой средней" in chosen.summary, (
+        "выбрана простая средняя, а правило одной фразой говорит про другую: "
         f"«{chosen.summary}»"
     )
     assert chosen.summary != entry.summary(entry.defaults()), (
-        "правило с фильтром совпало с правилом без фильтра — значит считается "
-        "по умолчаниям"
+        "правило с простой средней совпало с правилом по умолчанию — значит "
+        "считается по умолчаниям"
     )
 
 
@@ -1074,66 +948,6 @@ def test_the_catalogue_does_not_fall_over_a_refusal() -> None:
     )
     assert "умолчаниями" in catalogue[0].details, (
         "не сказано, что числа в показанном правиле не принадлежат человеку"
-    )
-
-
-def test_choosing_another_algorithm_changes_what_decides() -> None:
-    """Выбрали второй алгоритм — решает второй, а не первый под его именем.
-
-    ⚠️ Проверяется **поведением**, а не именем класса и не классом настроек.
-    Сборка, показывающая второй алгоритм и считающая первым, и там и там
-    выглядела бы исправно: названия и подписи берутся из реестра, а не из
-    того, чем считали.
-
-    ⚠️ **Правило у двух алгоритмов сборки одно и то же**, и различить их
-    намерением можно ровно в одном месте — фильтр против пилы. У алгоритма
-    №1 полоса вокруг средней берётся из окна, у алгоритма №2 её нет вовсе:
-    ноль прибит в `MaReverseAlwaysSettings.widened()`, потому что документ
-    заказчика такой настройки не знает. Окно с включённым фильтром и полосой
-    1 % даёт им на одной и той же свече **разные** решения: закрытие 100,5
-    при средней 100,06 лежит внутри полосы, и первый молчит, а второй хочет
-    лонг. Это единственное расхождение в сделках, какое между ними бывает.
-
-    ⚠️ До 14.09.2026 контраст стоял на удалённом `ma_crossing` и после его
-    удаления исчез: в теле остался один `assert` про алгоритм №1, а название
-    и докстринг продолжали обещать сравнение двух. Названная здесь мутация
-    такой тест уронить не могла.
-
-    Мутация, обязанная ронять проверку: собрать модуль
-    по `registry.default_entry()` вместо выбранного.
-    """
-    # Полоса включена и широка: ровно она и разводит два алгоритма.
-    values = Settings().replace(filter_enabled=True, threshold_percent=1.0)
-    flat = [Candle(
-        time=datetime(2026, 6, 19, 10, 0, tzinfo=MSK) + timedelta(minutes=5 * step),
-        open=100.0, high=100.0, low=100.0, close=100.0, volume=1.0,
-        timeframe=Timeframe(5),
-    ) for step in range(15)]
-    # Закрытие выше средней, но внутри однопроцентной полосы вокруг неё.
-    above = Candle(
-        time=datetime(2026, 6, 19, 11, 15, tzinfo=MSK),
-        open=100.5, high=100.5, low=100.5, close=100.5, volume=1.0,
-        timeframe=Timeframe(5),
-    )
-
-    def decide(strategy_id: str):
-        chosen = values.replace(strategy_id=strategy_id)
-        module = convert.chosen_algorithm(chosen).build(
-            convert.strategy_settings(chosen)
-        )
-        for candle in [*flat, above]:
-            decision = module.on_closed_bar(_as_bar(candle))
-        return decision
-
-    first = decide("ema_reverse")
-    second = decide("ma_reverse_always")
-    assert first.intent is Intent.NONE, (
-        "алгоритм №1 с включённым фильтром обязан промолчать на пересечении "
-        f"слабее полосы, а он ответил «{first.reason}»"
-    )
-    assert second.intent is Intent.LONG, (
-        "решение принял первый алгоритм, хотя выбран второй: полосы вокруг "
-        f"средней у второго нет вовсе, а он ответил «{second.reason}»"
     )
 
 

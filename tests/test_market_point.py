@@ -329,3 +329,18 @@ def test_the_body_of_an_empty_answer_is_really_empty() -> None:
     случайно перестало быть пустым, — и зеленела бы, ничего не проверяя.
     """
     assert json.loads(NOTHING)["securities"]["data"] == []
+
+
+@pytest.mark.parametrize("step", [float("nan"), float("inf"), "nan", "inf"])
+def test_a_step_that_is_not_a_finite_number_is_refused(step: object) -> None:
+    """Стережёт: `NaN` и бесконечность шагом цены не становятся.
+
+    `NaN <= 0` — ложь, и проверка «шаг больше нуля» его пропускала: предел
+    заявки и стоимость пункта посчитались бы из `NaN` молча.
+    """
+    row = {**MXU6_ROW, "MINSTEP": step}
+    loader, _ = client(lambda _url: security_body(row))
+    answer = ask_point_value(loader, "MXU6")
+    assert answer.spec is None, answer.spec
+    assert answer.rubles is None
+    assert "шаг цены" in answer.told, answer.told

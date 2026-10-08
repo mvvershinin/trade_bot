@@ -12,7 +12,7 @@ allowed-tools: Agent, Read, Grep, Glob, Bash
 1. Прочитай `.docs/PROTOTYPE.md`, `.docs/DOMAIN.md` §3, `.docs/ARCHITECTURE.md`
 2. Запусти Agent: `subagent_type` general-purpose, `model` opus,
    правила из `.claude/agents/02-strategy-quant.md`
-3. После работы — **обязательно** `/parity`, затем `/validate` и `/review`
+3. После работы — **обязательно** полный `pytest` — проверка-образец `tests/test_golden_deals.py`, затем `/validate` и `/review`
 
 ## Что повторяется из прототипа буквально
 
@@ -25,7 +25,6 @@ allowed-tools: Agent, Read, Grep, Glob, Bash
 
 ## Помни
 
-Изменение торговой логики **без сверки с прототипом не принимается**.
+Изменение торговой логики **без зелёной проверки-образца (`tests/test_golden_deals.py`) не принимается**; образец меняется только `tools/golden_deals.py --rewrite --reason`.
 
-Пункт приёмки «те же сделки, что у прототипа» проверяется только в режиме
-«через свечу». В режиме «в одной свече» сделки заведомо другие — это не дефект.
+Сверки с прототипом больше нет (решение 0063): алгоритм, который он реализовал, удалён.

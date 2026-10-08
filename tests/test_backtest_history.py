@@ -30,7 +30,7 @@ from engine import (
     Side,
     TradingWindow,
 )
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import MaReverseAlways, MaReverseAlwaysSettings
 
 from backtest import (
     Costs,
@@ -451,7 +451,7 @@ def _bars(count: int = 200) -> list:
 
 def _run(settings: EngineSettings, *, costs: Costs | None = None):
     return asyncio.run(replay(
-        _bars(), EmaReverse(EmaReverseSettings(period=15)), settings, costs=costs
+        _bars(), MaReverseAlways(MaReverseAlwaysSettings(period=15)), settings, costs=costs
     ))
 
 

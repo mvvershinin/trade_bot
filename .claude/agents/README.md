@@ -30,13 +30,13 @@ httpx/websockets · pandas · Nuitka standalone (запасной путь сб�
 /review       баги и режимы отказа
 ```
 
-### 3. Тронул торговую логику — сверься с прототипом
+### 3. Тронул торговую логику — проверка-образец
 
 ```
-/parity       вход, выход, окно, тейк, переворот
+.venv/bin/pytest tests/test_golden_deals.py   вход, выход, окно, тейк, переворот
 ```
 
-Изменение торговой логики без сверки не принимается. Совпадение итоговой прибыли
+Изменение торговой логики без зелёной проверки-образца не принимается (решение 0063). Совпадение итоговой прибыли
 при разных сделках — это не совпадение, а совпадение двух ошибок.
 
 ### 4. Тронул деньги — аудит предохранителей
@@ -66,7 +66,6 @@ httpx/websockets · pandas · Nuitka standalone (запасной путь сб�
 | `/ui` | desktop-ui-expert | окно, график, журналы, настройки |
 | `/package` | packaging-expert | сборка, установщики, Windows + Linux |
 | `/risk` | risk-security-officer | предохранители, токен, потолок объёма |
-| `/parity` | parity-auditor | сверка с прототипом |
 | `/roadmap` | product-owner | этапы, приёмка, открытые вопросы |
 | `/validate` | architecture-validator | слои и зависимости |
 | `/review` | code-critic | состязательное ревью |
@@ -88,7 +87,6 @@ httpx/websockets · pandas · Nuitka standalone (запасной путь сб�
 | 6 | **desktop-ui-expert** | **opus** | техн. | `ui/`: Qt, график, журналы |
 | 7 | **packaging-expert** | sonnet | техн. | сборка, установщики, релиз |
 | 8 | **risk-security-officer** | **opus** | контроль | деньги, токен, предохранители — **read-only** |
-| 9 | **parity-auditor** | **opus** | контроль | сверка с прототипом — в продукт не пишет |
 | 10 | **product-owner** | sonnet | бизн. | этапы, приёмка, открытые вопросы |
 | 11 | **architecture-validator** | **opus** | контроль | слои и зависимости — **read-only** |
 | 12 | **code-critic** | **opus** | контроль | состязательное ревью — **read-only** |
@@ -181,7 +179,7 @@ app/            →  все
 ### Изменение в торговой логике
 
 ```
-parity-auditor (прогон ДО) → strategy-quant → parity-auditor (прогон ПОСЛЕ)
+проверка-образец (прогон ДО) → strategy-quant → проверка-образец (прогон ПОСЛЕ)
    → расхождения построчно → architecture-validator + code-critic
 ```
 

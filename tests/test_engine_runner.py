@@ -40,7 +40,7 @@ from engine import (
     intake,
     to_bar,
 )
-from strategies import Bar, EmaReverse, Intent
+from strategies import Bar, MaReverseAlways, Intent
 from tests.engine_helpers import (
     MSK,
     FakeCandle,
@@ -797,7 +797,7 @@ def test_a_candle_going_backwards_is_not_smoothed_over() -> None:
     Это не повтор: повтор штатен, а ряд, поехавший назад, дальше считать
     нельзя. Останавливает его торговый модуль — он ведёт свой ряд.
     """
-    engine = Engine(EmaReverse(), WORKING)
+    engine = Engine(MaReverseAlways(), WORKING)
     engine.on_candle(candle(10, 10))
     with pytest.raises(ValueError):
         engine.on_candle(candle(10, 5))

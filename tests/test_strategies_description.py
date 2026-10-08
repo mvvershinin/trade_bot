@@ -425,7 +425,7 @@ def test_every_claim_of_the_description_is_true_of_the_module(
     соврать может только таблица — а таблицу исполняет машина.
 
     Мутация, обязанная ронять эту проверку: `close > average + edge` →
-    `close < average + edge` в `strategies/ema_reverse.py::_side`.
+    `close < average` в `strategies/ma_reverse_always.py::_side`.
     """
     description = entry.description(settings)
     assert description.claims, (
@@ -490,7 +490,7 @@ def test_the_direction_word_of_every_claim_matches_its_probe(
     разойтись поодиночке.
 
     Мутации, обязанные ронять проверку: поменять местами подписи в
-    `strategies/ema_reverse.py::_SIDES`; поменять слова в `_relation`;
+    `strategies/ma_reverse_always.py::_SIDES`; поменять слова в `_relation`;
     заменить подпись равенства «ровно на» на «далеко от».
     """
     for claim in entry.description(settings).claims:

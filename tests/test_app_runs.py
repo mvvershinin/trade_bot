@@ -67,9 +67,8 @@ from market import (
 from market.journal import SECRET_MASK, redact
 from strategies import (
     AverageKind,
-    EmaReverse,
-    EmaReverseSettings,
-    OnPriceEqualsAverage,
+    MaReverseAlways,
+    MaReverseAlwaysSettings,
     registry,
 )
 from ui.models import Mode as WindowMode
@@ -117,7 +116,7 @@ def _conditions(*, days: int = 30, until: datetime | None = None) -> RunConditio
         symbol=SYMBOL,
         timeframe="5 минут",
         engine=EngineSettings(mode=Mode.REVERSE, commission_per_side=14.0),
-        strategy=EmaReverseSettings(),
+        strategy=MaReverseAlwaysSettings(),
         algorithm=registry.default_entry(),
         app_version="1.2.3",
         days=days,
@@ -181,7 +180,7 @@ def test_a_pass_of_the_engine_leaves_a_finished_row_with_conditions_and_result(
     assert session.finished_at is not None, "прогон закрылся, но остался незакрытым"
     assert session.symbol == SYMBOL
     assert session.timeframe == "5 минут"
-    assert session.strategy == EmaReverse.title
+    assert session.strategy == MaReverseAlways.title
     assert session.app_version, "версия программы не записана"
     assert "Настройки движка" in session.settings, "снимка настроек в записи нет"
     assert "свечей" in session.note, "на чём гнали — не записано"
@@ -241,7 +240,7 @@ def test_the_port_writes_no_decisions_and_no_trades_and_that_holds_the_limit(
         # и разошёлся бы с алгоритмом молча (`D-100`). Проверка от этого
         # не ослабла — она берёт таблицу оттуда, где та теперь лежит,
         # и точно так же падает на поле, заведённом завтра и не подписанном.
-        (registry.default_entry().titles(), EmaReverseSettings),
+        (registry.default_entry().titles(), MaReverseAlwaysSettings),
         (_COSTS_TITLES, Costs),
     ],
     ids=["движок", "торговый модуль", "издержки"],
@@ -280,7 +279,7 @@ def test_a_setting_added_tomorrow_lands_in_the_snapshot_by_itself() -> None:
     # здесь именно про это: снимок обязан сниматься с любого набора полей.
     tomorrow = cast(EngineSettings, SettingsOfTomorrow())
     text = settings_text(
-        tomorrow, EmaReverseSettings(), algorithm=registry.default_entry()
+        tomorrow, MaReverseAlwaysSettings(), algorithm=registry.default_entry()
     )
     assert "daily_loss_limit_rub: 25000" in text, (
         "поле, у которого нет подписи, выпало из снимка целиком — "
@@ -328,16 +327,13 @@ _ANOTHER_ENGINE: dict[str, object] = {
 _ANOTHER_STRATEGY: dict[str, object] = {
     "period": 20,
     "kind": AverageKind.SMA,
-    "on_equal": OnPriceEqualsAverage.TREAT_AS_LONG,
-    "threshold_percent": 0.2,
-    "confirm_bars": 2,
 }
 
 
 def test_the_table_of_other_values_covers_every_field() -> None:
     """Стережёт сам следующий тест: неполная таблица делала бы его слепым."""
     assert set(_ANOTHER_ENGINE) == {field.name for field in fields(EngineSettings)}
-    assert set(_ANOTHER_STRATEGY) == {field.name for field in fields(EmaReverseSettings)}
+    assert set(_ANOTHER_STRATEGY) == {field.name for field in fields(MaReverseAlwaysSettings)}
 
 
 @pytest.mark.parametrize("name", sorted(_ANOTHER_ENGINE))
@@ -357,16 +353,16 @@ def test_changing_any_engine_setting_changes_the_snapshot(name: str) -> None:
     base = EngineSettings(commission_per_side=14.0, price_step=5.0)
     other = base.replace(**{name: _ANOTHER_ENGINE[name]})
     assert settings_text(
-        base, EmaReverseSettings(), algorithm=registry.default_entry()
+        base, MaReverseAlwaysSettings(), algorithm=registry.default_entry()
     ) != settings_text(
-        other, EmaReverseSettings(), algorithm=registry.default_entry()
+        other, MaReverseAlwaysSettings(), algorithm=registry.default_entry()
     ), f"настройка `{name}` не видна в снимке: два разных прогона запишутся одинаково"
 
 
 @pytest.mark.parametrize("name", sorted(_ANOTHER_STRATEGY))
 def test_changing_any_strategy_setting_changes_the_snapshot(name: str) -> None:
     """Стережёт то же самое для настроек торгового модуля."""
-    base = EmaReverseSettings()
+    base = MaReverseAlwaysSettings()
     other = base.replace(**{name: _ANOTHER_STRATEGY[name]})
     engine = EngineSettings()
     assert settings_text(
@@ -387,7 +383,7 @@ def test_the_snapshot_says_what_the_robot_did_with_those_numbers() -> None:
     из `app/runs.py::settings_text`.
     """
     text = settings_text(
-        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry()
+        EngineSettings(), MaReverseAlwaysSettings(), algorithm=registry.default_entry()
     )
     assert "Правило робота словами:" in text, "снимок не называет правило вовсе"
     assert "Закрытие выше EMA(15) — робот хочет быть в лонге." in text, (
@@ -404,7 +400,7 @@ def test_the_rule_in_the_snapshot_follows_the_settings() -> None:
     """
     engine = EngineSettings()
     twenty = settings_text(
-        engine, EmaReverseSettings(period=20), algorithm=registry.default_entry()
+        engine, MaReverseAlwaysSettings(period=20), algorithm=registry.default_entry()
     )
     assert "Закрытие выше EMA(20) — робот хочет быть в лонге." in twenty
     assert "EMA(15)" not in twenty
@@ -419,14 +415,14 @@ def test_the_rule_does_not_leak_into_the_marks_of_the_snapshot() -> None:
     в чужих записях, то есть перестала бы узнавать свои прогоны.
     """
     text = settings_text(
-        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry()
+        EngineSettings(), MaReverseAlwaysSettings(), algorithm=registry.default_entry()
     )
     marks = snapshot_marks(text)
     assert set(marks) == (
         {title for title in marks if not title.startswith("•")}
     ), "строка описания попала в подписи полей снимка"
     assert len(marks) == len(fields(EngineSettings)) + len(
-        fields(EmaReverseSettings)
+        fields(MaReverseAlwaysSettings)
     ), (
         "число подписей снимка изменилось: описание правила перестало быть "
         f"текстом и стало полем. Подписи: {sorted(marks)}"
@@ -872,7 +868,7 @@ def test_the_window_snapshot_carries_the_program_numbers_of_the_set() -> None:
 def test_every_program_number_has_a_title_for_a_person() -> None:
     """Стережёт: у каждого поля `ProgramFields` есть подпись, а не имя латиницей."""
     text = settings_text(
-        EngineSettings(), EmaReverseSettings(), algorithm=registry.default_entry(),
+        EngineSettings(), MaReverseAlwaysSettings(), algorithm=registry.default_entry(),
         program=runs.ProgramFields(expiry_halt_days=1, history_depth_days=90),
     )
     for field in dataclasses.fields(runs.ProgramFields):

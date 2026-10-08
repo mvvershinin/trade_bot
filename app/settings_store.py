@@ -140,11 +140,18 @@ def _known_algorithm(values: Settings) -> tuple[Settings, tuple[str, ...]]:
     if values.strategy_id in registry.known_ids():
         return values, ()
     fallback = registry.default_entry()
+    gone = registry.retired_title(values.strategy_id)
+    if gone is not None:
+        # Алгоритм убран владельцем счёта (решение 0063): не беда, а факт.
+        # Строка уходит в журнал; файл переписывается только по «ОК».
+        return values.replace(strategy_id=fallback.id), (
+            f"Алгоритм «{gone}» убран, работает «{fallback.title}».",
+        )
     return values.replace(strategy_id=fallback.id), (
         f"Торгового алгоритма «{values.strategy_id}» в этой сборке нет — "
         f"взят «{fallback.title}». Робот работает НЕ ТЕМ правилом, которое "
-        "вы выбирали: откройте «Настройки» → «Сигнал» → «Выбрать алгоритм…», "
-        "выберите алгоритм из списка и нажмите «Применить». ⚠️ Остальные "
+        "вы выбирали: обновите программу целиком либо откройте «Настройки» "
+        "и нажмите «Применить», чтобы записать взятый. ⚠️ Остальные "
         "настройки остались прежними, а подбирались они под другой алгоритм — "
         "проверьте их тоже.",
     )
@@ -269,6 +276,13 @@ def _one_way_to_take_profit(values: Settings) -> tuple[Settings, tuple[str, ...]
 #:
 #: Таблицей, а не тремя ветками: четвёртый предохранитель, заведённый завтра,
 #: попадёт сюда строкой, а не новым `if` (`CLAUDE.md`, правило 9).
+#: Поля «Реверса по скользящей средней», убранного 05.10.2026 вместе с ним
+#: (решение 0063). Старый файл настроек их содержит; читать их некому.
+RETIRED_KEYS: Final[frozenset[str]] = frozenset({
+    "filter_enabled", "threshold_percent", "confirm_bars",
+    "on_price_equals_average",
+})
+
 _GUARDS_OFF: Final[tuple[tuple[str, str, str], ...]] = (
     ("volume_cap_enabled", "volume_cap", "потолок объёма"),
     ("daily_loss_limit_enabled", "daily_loss_limit_pct", "дневной лимит убытка"),
@@ -410,7 +424,12 @@ class SettingsStore:
             ))
         notes: list[str] = []
         table = field_codecs()
-        self._unknown = {key: item for key, item in raw.items() if key not in table}
+        # Поля убранного алгоритма (решение 0063) в «незнакомые» не идут
+        # и обратно в файл не пишутся: им больше некому принадлежать.
+        self._unknown = {
+            key: item for key, item in raw.items()
+            if key not in table and key not in RETIRED_KEYS
+        }
         # Выключенные на этапе предохранители объясняются **своими словами**,
         # а не общим «файл новее»: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113).
         # В файле они при этом остаются — `self._unknown` их держит.
@@ -506,6 +525,59 @@ class SettingsStore:
                 "прежние. Проверьте, что папка существует и в неё можно писать."
             )
         return ""
+
+    def patch(self, values: Settings, names: tuple[str, ...]) -> str:
+        """Переписать в файле только поля `names`, остальное — байт в байт как было.
+
+        Для единственной записи без «ОК» — перехода с истёкшего контракта
+        (`HistoryPort._switch_to_current`). `save` записал бы всё прочитанное:
+        с подменами при чтении и с ключами, которых в файле не было, — а это
+        и есть правка файла владельца без его ведома (`B-050`). Здесь
+        меняются только названные ключи, отсутствующие и незнакомые остаются
+        как есть.
+
+        Файла нет или он не читается — не пишется ничего, и это фраза:
+        первый «ОК» человека создаст файл сам, а до него смена живёт только
+        в памяти — молчать об этом при строке «записан в файл» нельзя.
+        """
+        if not self._path.exists():
+            return (
+                f"Файла настроек {self._path} ещё нет: смена действует до "
+                "закрытия программы, файл появится с первым «ОК» в настройках."
+            )
+        # Не читается — тоже фраза, а не «успех» (аудит /risk 06.10.2026):
+        # прежде здесь стояло `return ""`, и переход с истёкшего контракта
+        # сообщал «записан в файл», хотя не записано ничего. Файл при этом
+        # не перезаписывается умолчаниями: он чужой, его чинит человек.
+        kept = "смена действует до закрытия программы, файл оставлен как есть."
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            return f"Файл настроек {self._path} не читается ({_why(error)}): {kept}"
+        stored = payload.get(_KEY_VALUES) if isinstance(payload, dict) else None
+        if not isinstance(stored, dict):
+            return f"В файле настроек {self._path} нет раздела настроек: {kept}"
+        encoded = encode_fields(values)
+        stored.update({name: encoded[name] for name in names})
+        body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        try:
+            write_atomically(self._path, body)
+        except OSError as error:
+            return (
+                f"Настройки не сохранены в {self._path}: {error}. В этом сеансе "
+                "они действуют, но при следующем запуске программа возьмёт прежние."
+            )
+        return ""
+
+    @staticmethod
+    def patched(values: Settings, names: tuple[str, ...]) -> str:
+        """Что записала `patch`, словами для журнала: подписи окна и значения."""
+        return (
+            "В файле настроек изменено только: "
+            + ", ".join(f"«{caption_of(name)}» — {getattr(values, name)}" for name in names)
+            + ". Остальное в файле не тронуто."
+        )
+
 
 def _why(error: Exception) -> str:
     """Почему файл не прочёлся — по-русски и без кода библиотеки.

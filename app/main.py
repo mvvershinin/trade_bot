@@ -347,6 +347,27 @@ def wants_dark(args: argparse.Namespace) -> bool:
     return not args.light
 
 
+def _dress_application(application: "QApplication", args: argparse.Namespace) -> None:
+    """Палитра и шрифт приложения — до сборки первого окна, одним вызовом.
+
+    Шрифт крупнее системного в `ui.theme.FONT_SCALE` раз (просьба владельца
+    счёта 05.10.2026, `ROADMAP.md` Н2). Ставится **приложению**, а не окнам:
+    все виджеты, созданные после, наследуют его сами, и ни одно окно
+    не останется с прежним кеглем по забывчивости.
+
+    ⚠️ После палитры: `setStyle` внутри `_use_dark_palette` шрифт не трогает,
+    но порядок «стиль, затем шрифт» не оставляет места проверять это.
+    """
+    from ui.theme import scaled_font  # noqa: PLC0415 — `ui` тянет Qt, а Qt
+    # поднимается только после QT_API и QT_QPA_PLATFORM (шапка модуля)
+
+    if wants_dark(args):
+        _use_dark_palette(application)
+    else:
+        application.setPalette(_light_palette(application.palette()))
+    application.setFont(scaled_font(application.font()))
+
+
 def _use_dark_palette(application) -> None:
     """Тёмная палитра для машины со светлой системной темой.
 
@@ -359,6 +380,35 @@ def _use_dark_palette(application) -> None:
     """
     application.setStyle("Fusion")
     application.setPalette(_dark_palette())
+
+
+#: Текст выключенного поля и кнопки в тёмной палитре. Числа — у цикла
+#: по `ColorGroup.Disabled` в `_dark_palette`.
+_DISABLED_INK = "#aaa5b0"
+
+#: То же для светлой (системной) палитры. Системный `#bebebe` на сером фоне
+#: окна `#efefef` давал 1,6:1 — неактивные поля окна настроек («С предельной
+#: ценой», «Закрывать позицию в конце окна») почти не читались (снимок
+#: 05.10.2026). `#5f5f5f` — 5,6:1 против 18:1 у живого чёрного.
+_LIGHT_DISABLED_INK = "#5f5f5f"
+
+#: Роли текста, которые красятся отдельно в выключенном состоянии.
+_DISABLED_TEXT_ROLES = ("ButtonText", "WindowText", "Text")
+
+
+def _light_palette(system: "QPalette") -> "QPalette":
+    """Системная светлая палитра, у которой выключенный текст читается.
+
+    Меняется только выключенный текст: всё остальное — как у системы.
+    Возвращает копию — проверяется без подмены палитры общего приложения.
+    """
+    from PySide6.QtGui import QColor, QPalette  # noqa: PLC0415 — Qt после QT_API
+
+    palette = QPalette(system)
+    for name in _DISABLED_TEXT_ROLES:
+        role = getattr(QPalette.ColorRole, name)
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(_LIGHT_DISABLED_INK))
+    return palette
 
 
 def _dark_palette() -> "QPalette":
@@ -400,12 +450,21 @@ def _dark_palette() -> "QPalette":
     # запрещённое действие. Цвет взят не новый, а уже стоящий в палитре
     # (`Mid`): 4,8:1 на кнопке против 13,9:1 у живого текста — втрое тусклее
     # и по-прежнему читаемо.
+    #
+    # С 05.10.2026 цвет свой, светлее `Mid`: владелец счёта назвал
+    # неактивные поля «очень плохо видно». 7,2:1 против 13,9:1 у живого —
+    # вдвое тусклее, отличить по-прежнему можно. `Mid` остался прежним:
+    # им Fusion рисует рамки и фаски, а не текст.
     for role in (
         QPalette.ColorRole.ButtonText,
         QPalette.ColorRole.WindowText,
         QPalette.ColorRole.Text,
     ):
-        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#8a8590"))
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(_DISABLED_INK))
+    # Серый текст-подсказка в пустом поле («по умолчанию — папка userdata/logs»,
+    # «Выберите строку…» в «Отчётах»). Без этой строки Qt выводил его из
+    # `Text` с прозрачностью, и на снимке 05.10.2026 он почти не читался.
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(_DISABLED_INK))
     return palette
 
 
@@ -518,8 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     # См. шапку модуля, пункт 3: закрытие окна не останавливает цикл.
     application.setQuitOnLastWindowClosed(False)
 
-    if wants_dark(args):
-        _use_dark_palette(application)
+    _dress_application(application, args)
 
     collect_in_main_thread(application)  # сборка мусора — в потоке окна, `B-057`
 
@@ -941,42 +999,75 @@ def _wire_settings_and_log(  # noqa: PLR0913 — шестой довод это 
 def _keep_settings(
     port: HistoryPort, store: SettingsStore, read: Settings, *, level: DecisionLevel
 ) -> None:
-    """Записывать настройки в файл, как только порт их принял.
+    """Записывать в файл настроек то, что порт велел записать, — и только это.
 
-    Слушается `settings_applied` — эхо порта, а не сигнал окна: в файл обязано
-    попасть то, что **принято**, а не то, что нажато. Отвергнутые настройки
-    порт эхом не отдаёт.
+    Слушается `settings_to_file`, а не эхо `settings_applied`. Эхо уходит
+    на каждое изменение, в том числе сделанное программой самой: ответ биржи
+    о шаге цены и стоимости пункта, открытие окна настроек. Пока запись шла
+    по эху, карточка биржи без единого нажатия меняла в файле владельца
+    счёта `price_step`, `ruble_per_point_source` и дописывала ключи, которых
+    в нём не было (находка аудитов 05.10.2026, обещание `B-050`: файл
+    пишется только по действию человека). Порт шлёт сигнал на «ОК» и
+    «Применить» человека и при переходе с истёкшего контракта — больше ни
+    на что.
 
-    Здесь же порту сообщается новая глубина показа: она живёт в настройках
-    программы, а не в настройках движка (`D-026`), и без этой строки менялась
-    бы только до перезапуска. Прогон следом порт заводит сам.
+    На эхо здесь сообщается порту только новая глубина показа: она живёт
+    в настройках программы, а не в настройках движка (`D-026`). Прогон
+    следом порт заводит сам.
+
+    `only` — какие поля взять из присланных (пусто — все); `over` — пары
+    «поле, чем оно обязано быть в файле»: запись поверх другого значения
+    не делается и говорится вслух. Так переход с истёкшего кода не пишет
+    в файл инструмент, названный ключом `--symbol`, поверх файла владельца.
 
     ⚠️ Отказ записи не бросается, а становится строкой журнала. Слот Qt,
     из которого летит исключение, оставляет владельца счёта с трассировкой
     в консоли и молчащим окном.
 
     ⚠️ Пишется только **изменение**: `read` — то, что прочитано из файла,
-    дальше — то, что записано последним. Эхо приходит и без применения:
-    открытие окна настроек (`request_settings`) отдаёт действующие настройки
-    тем же сигналом. Пока запись шла на каждое эхо, одно открытие окна
-    переписывало файл владельца счёта — дописывало ключи, которых в нём
-    не было, ещё до «ОК» и даже при «Отмене» (находка 04.10.2026).
+    дальше — то, что записано последним.
     """
     kept = [read]
 
-    def remember(values: Settings) -> None:
+    def follow(values: Settings) -> None:
         port.set_depth(values.depth_days)
-        # Подмена при сборке порта в файл не идёт, пока человек не применил сам (`B-050`).
-        wanted = port.for_file(values)
+
+    def remember(
+        values: Settings, only: tuple[str, ...], over: tuple[tuple[str, object], ...]
+    ) -> None:
+        if any(getattr(kept[0], name) != value for name, value in over):
+            port.note(
+                "Настройки не сохранены",
+                "Программа сменила настройку сама, но в файле настроек стоит не то "
+                "значение, поверх которого она это сделала (так бывает, когда "
+                "инструмент назван ключом при запуске): в файле "
+                + ", ".join(f"{getattr(kept[0], name)}, а не {value}" for name, value in over)
+                + ". Файл оставлен как есть, смена действует до закрытия программы.",
+            )
+            return
+        if only:
+            wanted = dataclasses.replace(
+                kept[0], **{name: getattr(values, name) for name in only}
+            )
+        else:
+            wanted = port.for_file(values)
         if wanted == kept[0]:
             return
-        failure = store.save(wanted)
+        # Без человека — только названные поля и только они: подмены при
+        # чтении и ключи, которых в файле не было, остаются как есть.
+        failure = store.patch(wanted, only) if only else store.save(wanted)
         if failure:
             port.note("Настройки не сохранены", failure, level)
-        else:
-            kept[0] = wanted
+            return
+        kept[0] = wanted
+        if only:
+            # Запись без «ОК» человека — вслух и в обе стороны: об отказе
+            # строкой выше, об успехе здесь. Строка о переходе с истёкшего
+            # контракта результат записи не обещает (`HistoryPort._switch_to_current`).
+            port.note("Настройки записаны в файл", store.patched(wanted, only))
 
-    port.settings_applied.connect(remember)
+    port.settings_applied.connect(follow)
+    port.settings_to_file.connect(remember)
 
 
 def _say_what_was_read(

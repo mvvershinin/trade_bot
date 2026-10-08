@@ -28,7 +28,7 @@ from backtest import replay
 from backtest.execution import Costs
 from backtest.stitched import Piece, replay_pieces, stitched_lines
 from engine import EngineSettings, ExitReason, JournalLevel, Mode, Side, TradingWindow, close_time
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import MaReverseAlways, MaReverseAlwaysSettings
 from tests.engine_helpers import MSK, STEP, FakeCandle, candle
 
 PERIOD = 15
@@ -50,8 +50,8 @@ def _series(day: int, hour: int, closes: list[float]) -> tuple[FakeCandle, ...]:
     )
 
 
-def _build() -> EmaReverse:
-    return EmaReverse(EmaReverseSettings(period=PERIOD))
+def _build() -> MaReverseAlways:
+    return MaReverseAlways(MaReverseAlwaysSettings(period=PERIOD))
 
 
 def _run(pieces: list[Piece]):

@@ -4,7 +4,7 @@
 
 ```
 Сложная задача → /orchestrate → план → подтверждение → агенты → /validate → /review
-Торговая логика → /strategy → /parity → /validate → /review
+Торговая логика → /strategy → полный pytest (проверка-образец) → /validate → /review
 Деньги, заявки  → /broker или /strategy → /risk → /validate → /review
 Перед боем      → /go-live
 ```
@@ -53,7 +53,7 @@
 
 ⬜ `/validate` — PASS
 ⬜ `/review` — APPROVE
-⬜ `/parity` — сошлось (если тронута торговая логика)
+⬜ `tests/test_golden_deals.py` — зелёный (если тронута торговая логика)
 ⬜ `/risk` — APPROVE (если тронуты деньги или токен)
 ⬜ Тесты проходят
 ⬜ Нет хардкода цифр, за которыми стоят замеры

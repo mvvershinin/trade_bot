@@ -43,7 +43,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 
 from backtest.execution import Costs, Minutes
@@ -90,6 +90,9 @@ class Piece:
     #: контракт сюда класть нельзя: цены соседнего контракта на стыке
     #: другие, и уровень задевался бы ценой, которой у этого не было.
     minutes: Minutes | None = None
+    #: Шаг цены **этого** контракта по его карточке биржи. `None` — биржа
+    #: о нём не сообщила, кусок идёт с шагом прогона.
+    price_step: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +239,11 @@ async def replay_pieces(
     старого контракта в новый не переходит. `notes` — предупреждения
     вызывающего (например, дни периода без контракта): они ложатся
     в журнал и в `problems` наравне со своими.
+
+    Шаг цены куска (`Piece.price_step`) — свойство контракта, а не прогона:
+    кусок идёт со своим шагом и в движке (предел заявки на выход), и в
+    издержках (проскальзывание в шагах). Не назван — шаг из `settings`
+    и `costs`.
     """
     journal: list[JournalEntry] = [
         _warning(at, "Склейка неполная", text) for at, text in notes
@@ -265,14 +273,19 @@ async def replay_pieces(
         if short is not None:
             problems.append(short)
             journal.append(_warning(close_time(piece.body[0]), "Прогрев неполный", short))
+        own = piece.price_step
+        mine, priced = (
+            (settings, costs) if own is None or own <= 0
+            else (replace(settings, price_step=own), replace(costs, price_step=own))
+        )
         run = await replay(
-            (*piece.warmup, *piece.body), build(), settings,
-            costs=costs, minutes=piece.minutes,
+            (*piece.warmup, *piece.body), build(), mine,
+            costs=priced, minutes=piece.minutes,
         )
         following = "" if run.halted else after
         seam = None
         if following:
-            seam = _seam_deal(run, piece.body[-1], costs, settings)
+            seam = _seam_deal(run, piece.body[-1], priced, mine)
         journal.extend(run.journal)
         if seam is not None:
             journal.append(_seam_entry(seam, piece.symbol, following, piece.until))

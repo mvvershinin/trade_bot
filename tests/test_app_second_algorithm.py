@@ -46,8 +46,8 @@ from strategies import (
     Claim,
     Decision,
     Description,
-    EmaReverseSettings,
     Intent,
+    MaReverseAlwaysSettings,
     Sample,
     SettingsField,
     Strategy,
@@ -234,7 +234,7 @@ class TwinAlgorithm:
 
     title = "Подставной с общим классом настроек"
 
-    def __init__(self, settings: EmaReverseSettings) -> None:
+    def __init__(self, settings: MaReverseAlwaysSettings) -> None:
         self.settings = settings
         self.seen = 0
 
@@ -262,7 +262,7 @@ class TwinAlgorithm:
         )
 
 
-def describe_twin(settings: EmaReverseSettings) -> Description:
+def describe_twin(settings: MaReverseAlwaysSettings) -> Description:
     """Правило близнеца словами. Заголовок — его собственный."""
     return Description(
         title=TwinAlgorithm.title,
@@ -643,9 +643,9 @@ def test_the_sweep_accepts_the_algorithm_it_was_written_for() -> None:
     подряд, — то есть перебор не работал бы вовсе.
     """
     from backtest.sweep import GRID_STRATEGY_ID, refuse_foreign_strategy
-    from strategies import EmaReverseSettings
+    from strategies import MaReverseAlwaysSettings
 
-    given = EmaReverseSettings()
+    given = MaReverseAlwaysSettings()
     assert refuse_foreign_strategy(GRID_STRATEGY_ID, given) is given
 
 
@@ -714,7 +714,7 @@ def test_the_sweep_follows_its_own_declaration_not_the_registry_default(
     `registry.find(GRID_STRATEGY_ID)` в `backtest/sweep.py::grid_strategy`.
     """
     from backtest.sweep import GRID_STRATEGY_ID, grid_strategy
-    from strategies import EmaReverseSettings
+    from strategies import MaReverseAlwaysSettings
 
     first = registry.default_entry()
     monkeypatch.setattr(registry, "_ENTRIES", (second_entry(), first))
@@ -725,7 +725,7 @@ def test_the_sweep_follows_its_own_declaration_not_the_registry_default(
     assert made.id == GRID_STRATEGY_ID, (
         "сетка пошла за умолчанием реестра, а не за своим объявлением"
     )
-    assert made.settings_type is EmaReverseSettings
+    assert made.settings_type is MaReverseAlwaysSettings
 
 
 # ---------------------------------------------------------------------------

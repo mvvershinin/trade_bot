@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from datetime import datetime
 
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QPainter
@@ -203,5 +204,13 @@ class ChartSurface:
 
         Кнопка «к последней свече» по этому признаку гасится: если пользователь
         отмотал историю, график не должен прыгать назад на каждой новой свече.
+        """
+        raise NotImplementedError
+
+    def show_moment(self, since: datetime, until: datetime) -> bool:
+        """Показать отрезок времени — сделку, выбранную в окне «Отчёты».
+
+        `False` — отрезка среди нарисованных свечей нет (график показывает
+        другие данные); окно говорит это словами, а не молчит.
         """
         raise NotImplementedError

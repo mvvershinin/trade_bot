@@ -49,8 +49,6 @@ from collections.abc import Callable
 from typing import Any, Final
 
 from strategies.contracts import Description, Strategy, StrategySettings
-from strategies.ema_reverse import EmaReverse, EmaReverseSettings
-from strategies.ema_reverse import describe as describe_ema_reverse
 from strategies.ma_reverse_always import MaReverseAlways, MaReverseAlwaysSettings
 from strategies.ma_reverse_always import describe as describe_ma_reverse_always
 
@@ -60,6 +58,8 @@ __all__ = [
     "StrategyEntry",
     "UnknownStrategy",
     "DEFAULT_ID",
+    "RETIRED",
+    "retired_title",
     "entries",
     "known_ids",
     "find",
@@ -313,46 +313,7 @@ class StrategyEntry:
         return tuple(sorted({one.name for one in self.fields} - known))
 
 
-#: Поля настроек `EmaReverseSettings` — **одна таблица на оба алгоритма,
-#: которые этим классом настроек пользуются**.
-#:
-#: ⚠️ Общая, а не скопированная, и это не экономия строк. Таблица говорит,
-#: из какого поля окна берётся каждое поле настроек; две копии рядом
-#: означали бы, что одно и то же поле окна доезжает у двух алгоритмов
-#: в разные поля — молча и с исправным видом окна. Ровно этот класс дефекта
-#: и есть ловушка №2 миниплана `strategy-modules-switchable.md`. Что копии
-#: не завелись, стережёт `tests/test_strategies_registry.py`.
-#:
-#: ⚠️ Таблица полна по классу настроек, а не по тому, что алгоритм читает:
-#: проверка полноты `settings_gap()` сверяет таблицу с классом настроек,
-#: а не со списком полей, которые алгоритм на самом деле открывает. Что
-#: какое-то поле не читается, алгоритм говорит сам — в описании правила
-#: словами.
-_MOVING_AVERAGE_FIELDS: Final[tuple[SettingsField, ...]] = (
-    SettingsField("period", "average_period", "Период средней"),
-    SettingsField("kind", "average_kind", "Тип средней"),
-    SettingsField(
-        "on_equal", "on_price_equals_average",
-        "Закрытие ровно на средней",
-    ),
-    SettingsField(
-        "threshold_percent", "threshold_percent", "Порог пересечения, %",
-    ),
-    SettingsField(
-        "confirm_bars", "confirm_bars", "Подтверждение сигнала, свечей",
-    ),
-)
-
-#: Поля настроек `MaReverseAlwaysSettings` — **своя таблица, а не общая**.
-#:
-#: ⚠️ Не копия двух первых строк таблицы выше, и разница существенная:
-#: у алгоритма №2 трёх остальных полей нет вовсе. Общая таблица на два
-#: разных класса настроек означала бы `stray_fields` длиной в три имени —
-#: то есть сборка настроек уходила бы в никуда, а окно показывало бы
-#: исправный вид. Совпадение первых двух строк с первой таблицей —
-#: не дублирование, а следствие `D-096`: поле окна «Период средней» одно
-#: на оба алгоритма, и разные поля окна означали бы два разных периода
-#: при одном показанном.
+#: Поля настроек `MaReverseAlwaysSettings`: период и тип средней.
 _ALWAYS_FIELDS: Final[tuple[SettingsField, ...]] = (
     SettingsField("period", "average_period", "Период средней"),
     SettingsField("kind", "average_kind", "Тип средней"),
@@ -386,6 +347,10 @@ _ALWAYS_DEMANDS: Final[tuple[SettingsDemand, ...]] = (
     # заявка с предельной ценой. Она же значит «закрывать по концу окна
     # всегда» — галочка «Закрывать позицию в конце окна» её не выключает
     # (`engine.TimeExitOrder`), поэтому отдельного требования к галочке нет.
+    # ⚠️ Верно потому, что сборка берёт галочку **вместе** с выбором формы
+    # (`app/convert.py::_ENGINE_FROM_WINDOW`, строка `close_on_time_end`):
+    # пока биржа не сообщила шаг, движок идёт «по рынку», и закрытие по концу
+    # окна без этого пропадало при снятой галочке старого файла.
     SettingsDemand(
         outer="time_exit_order",
         value="LIMIT",
@@ -398,32 +363,11 @@ _ALWAYS_DEMANDS: Final[tuple[SettingsDemand, ...]] = (
 
 #: Таблица модулей. Явные импорты, ни одного `importlib` — см. шапку файла.
 #:
-#: ⚠️ Второй записи предшествовала третья, удалённая: проверочный алгоритм
-#: «Тестовый скользящий» (`ma_crossing`), заведённый 09.09.2026, снят
-#: 14.09.2026 по решению владельца счёта — он повторял правило первого
-#: и мешал разбору.
-#:
-#: ⚠️ «Реверс с постоянной позицией» правила первого **не повторяет**: это
-#: его наследник, считает тот же код, а отличается названием и узким набором
-#: настроек (`strategies/ma_reverse_always.py`). Заказанное отличие —
-#: переворот в одной свече — живёт в настройках движка, а не здесь.
-#:
-#: Механизм смены алгоритма стережёт сверх этого **поддельный** модуль
-#: в `tests/test_app_second_algorithm.py`: он сделан непохожим нарочно
-#: и настоящим алгоритмом не заменяется.
+#: ⚠️ Запись одна: «Реверс по скользящей средней» (`ema_reverse`) убран
+#: 05.10.2026 по решению владельца счёта (решение 0063), проверочный
+#: `ma_crossing` — 14.09.2026. Механизм смены алгоритма стережёт
+#: **поддельный** модуль в `tests/test_app_second_algorithm.py`.
 _ENTRIES: Final[tuple[StrategyEntry, ...]] = (
-    StrategyEntry(
-        id="ema_reverse",
-        title=EmaReverse.title,
-        settings_type=EmaReverseSettings,
-        factory=EmaReverse,
-        fields=_MOVING_AVERAGE_FIELDS,
-        # Требований к общим настройкам у первого алгоритма нет, и это сказано
-        # вслух, а не умолчано: он работает при любом моменте переворота,
-        # и сверка с прототипом 127 из 127 идёт именно через свечу.
-        demands=(),
-        describe=describe_ema_reverse,
-    ),
     StrategyEntry(
         id="ma_reverse_always",
         title=MaReverseAlways.title,
@@ -435,11 +379,28 @@ _ENTRIES: Final[tuple[StrategyEntry, ...]] = (
     ),
 )
 
-#: Модуль по умолчанию. ТЗ §4.8: «по умолчанию всегда выбрана скользящая
-#: средняя»; подтверждено владельцем счёта 08.09.2026. Уехавшее умолчание —
-#: это сборка, которая торгует не тем правилом, о котором договаривались,
-#: и заметить это по экрану нельзя.
-DEFAULT_ID: Final[str] = "ema_reverse"
+#: Модуль по умолчанию — он же единственный (решение 0063, 05.10.2026).
+#: Уехавшее умолчание — это сборка, которая торгует не тем правилом,
+#: о котором договаривались, и заметить это по экрану нельзя.
+DEFAULT_ID: Final[str] = "ma_reverse_always"
+
+#: Убранные алгоритмы: имя → название для человека. Файл настроек, шаблон
+#: или запрос прогона с таким именем читается как `DEFAULT_ID` — вслух,
+#: строкой в журнале (`app/convert.py::settled`), а не отказом: правило
+#: убрал владелец счёта, и программа с его старым файлом обязана запускаться.
+#:
+#: ⚠️ Отдельно от `_ENTRIES`, а не записью в ней: `find()` по убранному имени
+#: по-прежнему отказывает. Молча подставить другое правило вместо названного
+#: здесь нельзя (правило 13 `CLAUDE.md`) — подмену делает тот, кто умеет
+#: о ней сказать.
+RETIRED: Final[dict[str, str]] = {
+    "ema_reverse": "Реверс по скользящей средней",
+}
+
+
+def retired_title(strategy_id: str) -> str | None:
+    """Название убранного алгоритма или `None`, если имя не из убранных."""
+    return RETIRED.get(strategy_id)
 
 
 def entries() -> tuple[StrategyEntry, ...]:
@@ -467,8 +428,7 @@ def find(strategy_id: str) -> StrategyEntry:
         f"торгового модуля «{strategy_id}» в этой сборке нет. "
         f"Есть: {', '.join(known_ids())}. "
         "Скорее всего настройки или шаблон сделаны более новой сборкой "
-        "программы: обновите программу целиком либо выберите модуль "
-        "из списка в настройках"
+        "программы: обновите программу целиком"
     )
 
 

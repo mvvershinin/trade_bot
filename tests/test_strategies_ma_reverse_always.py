@@ -28,16 +28,8 @@ import pytest
 from strategies import registry
 from strategies.average import AverageKind, MovingAverage
 from strategies.contracts import Bar, Decision, Intent
-from strategies.ema_reverse import (
-    DEFAULT_PERIOD,
-    EmaReverse,
-    EmaReverseSettings,
-    OnPriceEqualsAverage,
-)
 from strategies.ma_reverse_always import (
-    PINNED_CONFIRM_BARS,
-    PINNED_ON_EQUAL,
-    PINNED_THRESHOLD_PERCENT,
+    DEFAULT_PERIOD,
     MaReverseAlways,
     MaReverseAlwaysSettings,
     describe,
@@ -64,7 +56,7 @@ def bar_at(number: int, close: float) -> Bar:
     )
 
 
-def feed(module: EmaReverse, closes: list[float]) -> list[Decision]:
+def feed(module: MaReverseAlways, closes: list[float]) -> list[Decision]:
     """Подать ряд закрытий и собрать решения по одному на свечу."""
     return [
         module.on_closed_bar(bar_at(number, close))
@@ -111,49 +103,6 @@ def series_with_equality(period: int = DEFAULT_PERIOD) -> tuple[list[float], lis
 # --------------------------------------------------------------------------
 # Главное: второй реализации правила нет
 # --------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("kind", list(AverageKind), ids=lambda item: item.name)
-def test_the_stream_of_intents_repeats_the_first_algorithm_bar_for_bar(
-    kind: AverageKind,
-) -> None:
-    """Поток решений второго алгоритма совпадает с первым на его умолчаниях.
-
-    Совпадает не только намерение: сверяется решение целиком — намерение,
-    причина для журнала, значение средней, число свечей, прогрев и признак
-    «свеча в обработку не идёт». Ронять эту проверку обязана любая попытка
-    написать правило второй раз: другая строгость сравнения, другая свеча
-    прогрева, другой засев средней.
-    """
-    closes, _equal_at = series_with_equality()
-    first = feed(EmaReverse(EmaReverseSettings(kind=kind)), closes)
-    second = feed(MaReverseAlways(MaReverseAlwaysSettings(kind=kind)), closes)
-    assert len(first) == len(second) == len(closes)
-    diverged = [
-        (number, one, other)
-        for number, (one, other) in enumerate(zip(first, second, strict=True))
-        if one != other
-    ]
-    assert not diverged, (
-        f"алгоритмы разошлись на {len(diverged)} свечах из {len(closes)}; "
-        f"первое расхождение — свеча {diverged[0][0] + 1}: "
-        f"{diverged[0][1]} против {diverged[0][2]}"
-    )
-
-
-def test_that_comparison_would_notice_a_second_rule() -> None:
-    """Канарейка: расхождение в правиле обязано быть пойманным сравнением.
-
-    Без неё сравнение потоков зеленело бы и на проверке, которая ничего
-    не сравнивает. Здесь первому алгоритму даётся настройка, которой
-    у второго нет вовсе, — порог пересечения, — и потоки обязаны разойтись.
-    """
-    closes, _equal_at = series_with_equality()
-    filtered = feed(EmaReverse(EmaReverseSettings(threshold_percent=1.0)), closes)
-    always = feed(MaReverseAlways(), closes)
-    assert filtered != always, (
-        "сравнение потоков не заметило другого правила — оно ничего не проверяет"
-    )
 
 
 def test_the_series_really_contains_what_the_checks_below_need() -> None:
@@ -296,30 +245,6 @@ def test_the_settings_are_only_the_period_and_the_kind() -> None:
     )
 
 
-def test_the_three_pinned_values_reach_the_calculation() -> None:
-    """Прибитые значения доезжают до расчёта, а не остаются объявлением.
-
-    Мутация, обязанная ронять проверку: подставить в `widened()` значение
-    из окна вместо прибитого — тогда владелец счёта, включивший фильтр
-    против пилы на первом алгоритме, получил бы его и на втором, не выбирая.
-    """
-    narrow = MaReverseAlwaysSettings(period=9, kind=AverageKind.SMA)
-    assert narrow.widened() == EmaReverseSettings(
-        period=9,
-        kind=AverageKind.SMA,
-        on_equal=PINNED_ON_EQUAL,
-        threshold_percent=PINNED_THRESHOLD_PERCENT,
-        confirm_bars=PINNED_CONFIRM_BARS,
-    )
-    assert PINNED_ON_EQUAL is OnPriceEqualsAverage.LIKE_PROTOTYPE
-    assert PINNED_THRESHOLD_PERCENT == 0.0
-    assert PINNED_CONFIRM_BARS == 1
-    module = MaReverseAlways(narrow)
-    assert module.settings == narrow.widened(), (
-        "собранный модуль считает не по тем настройкам, которые объявлены"
-    )
-
-
 def test_a_broken_period_is_refused_by_the_narrow_settings_too() -> None:
     """Узкие настройки проверяются так же строго, как расширенные.
 
@@ -332,16 +257,24 @@ def test_a_broken_period_is_refused_by_the_narrow_settings_too() -> None:
         MaReverseAlwaysSettings(period=15.5)  # type: ignore[arg-type]
 
 
-def test_settings_of_the_first_algorithm_are_refused_out_loud() -> None:
-    """Чужие настройки на ходу — отказ, а не тихое расширение.
+@dataclasses.dataclass(frozen=True)
+class ForeignSettings:
+    """Настройки чужого алгоритма: те же два поля, другой класс."""
 
-    Принятые молча, они включили бы фильтр против пилы, которого владелец
-    счёта на этом алгоритме не выбирал и в окне не видел.
+    period: int = 20
+    kind: AverageKind = AverageKind.EMA
+
+
+def test_foreign_settings_are_refused_out_loud() -> None:
+    """Чужие настройки на ходу — отказ, а не тихое согласие.
+
+    Стережёт: `apply` с настройками не своего класса бросает `TypeError`
+    и оставляет прежние настройки.
     """
     module = MaReverseAlways()
     before = module.settings
     with pytest.raises(TypeError, match="никто не выбирал"):
-        module.apply(EmaReverseSettings(threshold_percent=1.0))
+        module.apply(ForeignSettings())
     assert module.settings == before, "настройки поменялись вопреки отказу"
 
 
@@ -365,17 +298,6 @@ def test_a_new_period_is_applied_and_told_to_the_journal() -> None:
     )
 
 
-def test_the_defaults_agree_with_the_first_algorithm() -> None:
-    """Умолчания периода и типа средней у двух алгоритмов одни.
-
-    Поле окна «Период средней» одно на оба (`D-096`), и разные умолчания
-    означали бы, что смена алгоритма молча меняет период.
-    """
-    mine = MaReverseAlwaysSettings()
-    theirs = EmaReverseSettings()
-    assert (mine.period, mine.kind) == (theirs.period, theirs.kind)
-
-
 # --------------------------------------------------------------------------
 # А5. Описание правила словами
 # --------------------------------------------------------------------------
@@ -389,7 +311,6 @@ def test_the_description_is_titled_by_the_module_itself() -> None:
     """
     said = describe(MaReverseAlwaysSettings())
     assert said.title == MaReverseAlways.title == "Реверс с постоянной позицией"
-    assert said.title != EmaReverse.title
     # Название несут обе короткие отрисовки: подпись в списке выбора
     # и строка журнала решений. В отрисовку абзацами оно не входит вовсе —
     # там его печатает окно.

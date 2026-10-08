@@ -127,7 +127,10 @@ THRESHOLD_FILE: Final[str] = "tests/test_lint_ratchet.py"
 #: аргументов, как у соседнего `candles_url`; адрес дневных свечей ISS
 #: для таблицы контрактов (решение 0061). **545 в тот же вечер:** `ruff --fix`
 #: по порядку импортов в `ui/models.py` при Ф5 снял три старые находки.
-KNOWN_RUFF_FINDINGS: Final[int] = 545
+#: ⚠️ **532 с 05.10.2026:** убран «Реверс по скользящей средней» (решение
+#: 0063) — его модуль, фильтр против пилы в окне и проверки №1; заодно
+#: `ruff --fix` по порядку импортов в пяти тронутых тестах.
+KNOWN_RUFF_FINDINGS: Final[int] = 532
 
 #: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 57 files`.
 #: Было 191 (замер 08.09.2026): число подняли под находку «Cannot find
@@ -157,7 +160,10 @@ KNOWN_RUFF_FINDINGS: Final[int] = 545
 #: Порог возврата предохранителей сдвигается вместе с ней: 191, а не 190.
 #: **187 в тот же день** — ещё одна такая же: `market_helpers`
 #: в `tests/test_market_contracts.py`. Возврат предохранителей — к 192.
-KNOWN_MYPY_FINDINGS: Final[int] = 187
+#: ⚠️ **184 с 05.10.2026:** убран «Реверс по скользящей средней» (решение
+#: 0063) вместе с `tests/test_ui_unused_fields.py` и его `from helpers`.
+#: Возврат предохранителей — к 189.
+KNOWN_MYPY_FINDINGS: Final[int] = 184
 
 
 def _tool_is_installed(module: str) -> bool:

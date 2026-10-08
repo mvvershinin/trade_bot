@@ -46,7 +46,7 @@ from engine import (
 )
 from market.aggregate import build_bars
 from market.candles import M5, MINUTE, Candle
-from strategies import EmaReverse, EmaReverseSettings, Intent
+from strategies import MaReverseAlways, MaReverseAlwaysSettings, Intent
 from tests.engine_helpers import (
     MSK,
     FakeCandle,
@@ -435,7 +435,7 @@ def test_a_fixed_take_gives_the_same_deals_and_arms_with_minutes_and_without(
 
     def run(fed: Minutes | None) -> history_module.HistoryRun:
         return asyncio.run(replay(
-            bars, EmaReverse(EmaReverseSettings()), settings, minutes=fed,
+            bars, MaReverseAlways(MaReverseAlwaysSettings()), settings, minutes=fed,
         ))
 
     plain = run(None)
@@ -470,7 +470,7 @@ def test_the_minutes_of_a_piece_reach_the_replay_of_that_piece(
         candles: Sequence[object], *_: object, minutes: Minutes | None = None, **__: object
     ) -> history_module.HistoryRun:
         got.append((len(candles), minutes))
-        return await replay(candles, EmaReverse(EmaReverseSettings()), EngineSettings())
+        return await replay(candles, MaReverseAlways(MaReverseAlwaysSettings()), EngineSettings())
 
     monkeypatch.setattr(stitched, "replay", fake_replay)
     own = Minutes([one(10, 10, (100, 100, 100, 100))])
@@ -484,7 +484,7 @@ def test_the_minutes_of_a_piece_reach_the_replay_of_that_piece(
         ),
     ]
     asyncio.run(stitched.replay_pieces(
-        pieces, lambda: EmaReverse(EmaReverseSettings()), EngineSettings(),
+        pieces, lambda: MaReverseAlways(MaReverseAlwaysSettings()), EngineSettings(),
         costs=stitched.Costs(commission_per_side=1.0),
     ))
     assert [minutes for _, minutes in got] == [None, own]
@@ -527,7 +527,7 @@ def test_the_run_names_its_minute_order_and_the_bars_it_walked_by_range() -> Non
 
     def run(fed: Minutes | None) -> history_module.HistoryRun:
         return asyncio.run(replay(
-            bars, EmaReverse(EmaReverseSettings()), EngineSettings(), minutes=fed,
+            bars, MaReverseAlways(MaReverseAlwaysSettings()), EngineSettings(), minutes=fed,
         ))
 
     walked = run(minutes)

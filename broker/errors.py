@@ -29,6 +29,16 @@
 **тело физически не попадает в `technical`**: туда идут код отказа (если тело
 вообще от брокера) и описание тела — вид и длина, без единого символа из него.
 
+⚠️ **Исключение одно, и оно намеренное — `B-062`, 05.10.2026.** Поле
+`error_description` из ответа сервиса авторизации (Keycloak) идёт
+в `technical` дословно, а у отказа `TokenRefused` — и в `human`. Причина:
+у `invalid_grant` смысл живёт только в этом тексте («Token is not active»,
+«Session not active»…), и без него отказ на Windows при работающем на Linux
+том же токене разобрать было нечем. Описание проходит `redaction.quotable`:
+чистка секретов, маска длинных кусков, снятие целиком при куске нашего
+токена, без переносов строк, не длиннее `MAX_DESCRIPTION`. Остальное тело
+по-прежнему в `technical` не попадает.
+
 `str(исключение)` возвращает **человеческий** текст. Это сделано нарочно:
 где-нибудь обязательно напишут `f"{ошибка}"` и покажут результат в окне.
 Все три поля проходят через `scrub`, поэтому даже отказ, в тело которого
@@ -44,9 +54,12 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Final, Mapping
+from typing import Any, Callable, Final, Mapping
 
-from broker.redaction import scrub
+from broker.redaction import quotable, scrub
+
+#: Сколько символов описания отказа (`error_description`) цитируется дословно.
+MAX_DESCRIPTION: Final[int] = 300
 
 #: Сколько символов тела ответа оставляем для технического лога. Тело
 #: приходит из сети и по длине ничем не ограничено: страница ошибки шлюза
@@ -265,6 +278,64 @@ class TokenFileError(BrokerError):
         super().__init__(human, technical)
 
 
+#: Описания отказа `invalid_grant` от сервиса авторизации (Keycloak) → что
+#: это значит для владельца счёта. Ключ — описание в нижнем регистре без
+#: точки в конце. Неузнанное показывается дословно: перевод наугад хуже
+#: оригинала. Тексты — стандартные сообщения Keycloak на обмене по
+#: `refresh_token`; документация БКС их не перечисляет (поле описано
+#: как `error_description: string`, `.docs/broker-api/02-authorization.md`).
+KEYCLOAK_WORDS: Final[Mapping[str, str]] = {
+    "invalid refresh token": "токен недействителен",
+    "token is not active": "токен не действует — срок истёк или токен отозван",
+    "session not active": "сессия токена у брокера закрыта — токен удалён или отозван",
+    "offline session not active": (
+        "сессия токена у брокера закрыта — токен удалён или отозван"
+    ),
+    "stale token": "токен устарел — брокер считает его заменённым",
+    "token expired": "срок токена истёк",
+    "refresh token expired": "срок токена истёк",
+    "invalid refresh token. token client and authorized client don't match": (
+        "тип токена в файле не совпадает с тем, для которого он выпущен"
+    ),
+    "session doesn't have required client": (
+        "тип токена в программе (чтение или торговля) не совпадает с тем, "
+        "с каким он выпущен в кабинете"
+    ),
+    "maximum allowed refresh token reuse exceeded": (
+        "брокер не разрешает больше обменивать этот токен"
+    ),
+}
+
+
+def refusal_words(description: str) -> str:
+    """Описание брокера → по-русски, если узнано; иначе — как прислано."""
+    known = KEYCLOAK_WORDS.get(description.strip().rstrip(".").casefold())
+    return known if known is not None else description
+
+
+class TokenRefused(AuthFailed):
+    """400 `invalid_grant` на обмене токена: сервис авторизации токен не принял.
+
+    Потомок `AuthFailed`, а не `BadRequest`: это отказ **токена**, а не
+    ошибка программы (`B-062`, показ 05.10.2026 — окно говорило «неверные
+    параметры, ошибка программы»). Повтором не лечится: сессия запоминает
+    отказ и до действия человека к сервису авторизации больше не ходит
+    (`BrokerSession.allow_token_retry`).
+    """
+
+    def __init__(self, description: str = "", technical: str = "") -> None:
+        self.description = description
+        words = refusal_words(description).rstrip(".")
+        reason = f": {words}" if words else ""
+        # Мимо `AuthFailed.__init__`: у того текст постоянный.
+        BrokerError.__init__(
+            self,
+            f"Брокер не принял токен{reason}. Проверьте токен в кабинете БКС; "
+            "если он действующий — сообщите нам строку из технического лога.",
+            technical,
+        )
+
+
 # --- ответ пришёл, но не тот ---
 
 
@@ -461,6 +532,17 @@ def code_of(body: str) -> str | None:
     return _code_in(first) if isinstance(first, Mapping) else None
 
 
+def description_of(body: str) -> str:
+    """`error_description` из тела — в виде, пригодном для лога и окна. Иначе "".
+
+    Единственный кусок тела, который цитируется дословно (исключение в шапке
+    модуля). Всё, что пришло из сети, проходит `redaction.quotable`.
+    """
+    payload = _json_object(body)
+    value = payload.get("error_description") if payload is not None else None
+    return quotable(value, MAX_DESCRIPTION) if isinstance(value, str) else ""
+
+
 def describe_body(body: str) -> str:
     """Чем является тело ответа — **без единого символа из него самого**.
 
@@ -486,12 +568,27 @@ def from_status(status: int, *, where: str, body: str = "") -> BrokerError:
     code = code_of(body)
     if code:
         technical = f"{technical}, код {code}"
+    description = description_of(body)
+    if description:
+        technical = f"{technical}; описание брокера: «{description}»"
     if body:
         technical = f"{technical}; тело: {describe_body(body)}"
 
-    error = _classify(status, technical)
+    refined = _BY_CODE.get((status, code or ""))
+    error = (
+        refined(description, technical)
+        if refined is not None
+        else _classify(status, technical)
+    )
     error.details = body_details(body)
     return error
+
+
+#: Отказы, которые по HTTP-коду не различить: тот же 400, но смысл задаёт код
+#: брокера. Таблица, а не ветка в `_classify`: следующий такой код — строка.
+_BY_CODE: Final[Mapping[tuple[int, str], Callable[[str, str], BrokerError]]] = {
+    (400, "invalid_grant"): TokenRefused,
+}
 
 
 def _classify(status: int, technical: str) -> BrokerError:

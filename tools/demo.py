@@ -124,12 +124,6 @@ def main(argv: list[str] | None = None) -> int:
         help="открыть всплывающее описание правила — то же, что «Подробнее»",
     )
     parser.add_argument(
-        "--saw-filter",
-        dest="saw_filter",
-        action="store_true",
-        help="включить фильтр против пилы: описание правила длиннее всего",
-    )
-    parser.add_argument(
         "--dark",
         dest="dark",
         action="store_true",
@@ -164,14 +158,14 @@ def main(argv: list[str] | None = None) -> int:
         return _finish(application, _demo_calendar(), args)
 
     if args.settings:
-        return _finish(application, _demo_settings(filtered=args.saw_filter), args)
+        return _finish(application, _demo_settings(), args)
 
     if args.algorithms:
-        return _finish(application, _demo_algorithms(filtered=args.saw_filter), args)
+        return _finish(application, _demo_algorithms(), args)
 
     if args.algorithm_details:
         return _finish(
-            application, _demo_algorithm_details(filtered=args.saw_filter), args
+            application, _demo_algorithm_details(), args
         )
 
     # Та же чистка, что в бою (`app/main.py`): показ не должен отличаться
@@ -186,21 +180,18 @@ def main(argv: list[str] | None = None) -> int:
     return _finish(application, window, args)
 
 
-def _demo_settings(*, filtered: bool = False) -> "SettingsDialog":
+def _demo_settings() -> "SettingsDialog":
     """Окно настроек на вкладке «Сигнал» — для снимка и для глаз.
 
     Каталог алгоритмов приходит в окно **готовыми строками** от торговой
     части через порт; здесь порта нет, поэтому каталог берётся тем же
     вызовом, которым его собирает `app/` (`convert.algorithms`). Второго
     текста при этом не появляется: считает его по-прежнему сам алгоритм.
-
-    :param filtered: включить фильтр против пилы. Описание при нём длиннее
-        всего (459 точек против 391), и мерить помещаемость надо на нём.
     """
     from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
     from ui.settings_dialog import SettingsDialog  # noqa: PLC0415 — тянет PySide6
 
-    values = _demo_values(filtered=filtered)
+    values = _demo_values()
     dialog = SettingsDialog(values)
     dialog.set_algorithms(convert.algorithms(values))
     # Вкладка «Сигнал» — вторая: снимок обязан открываться на ней, иначе
@@ -211,19 +202,14 @@ def _demo_settings(*, filtered: bool = False) -> "SettingsDialog":
     return dialog
 
 
-def _demo_values(*, filtered: bool):  # noqa: ANN202 — Settings тянет PySide6
-    """Настройки для показа: умолчания либо включённый фильтр против пилы."""
+def _demo_values():  # noqa: ANN202 — Settings тянет PySide6
+    """Настройки для показа: умолчания программы."""
     from ui.models import Settings  # noqa: PLC0415 — тянет PySide6
 
-    values = Settings()
-    if not filtered:
-        return values
-    return values.replace(
-        filter_enabled=True, threshold_percent=0.04, confirm_bars=3
-    )
+    return Settings()
 
 
-def _demo_algorithms(*, filtered: bool = False) -> "AlgorithmDialog":
+def _demo_algorithms() -> "AlgorithmDialog":
     """Окно выбора алгоритма — для снимка и для глаз.
 
     ⚠️ Отдельный ключ нужен потому, что `--shot` снимает **одно** окно,
@@ -234,18 +220,18 @@ def _demo_algorithms(*, filtered: bool = False) -> "AlgorithmDialog":
     from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
     from ui.algorithm_dialog import AlgorithmDialog  # noqa: PLC0415 — тянет PySide6
 
-    values = _demo_values(filtered=filtered)
+    values = _demo_values()
     dialog = AlgorithmDialog(convert.algorithms(values))
     dialog.set_chosen(values.strategy_id)
     return dialog
 
 
-def _demo_algorithm_details(*, filtered: bool = False) -> "AlgorithmDetails":
+def _demo_algorithm_details() -> "AlgorithmDetails":
     """Всплывающее описание правила — то, что показывает «Подробнее»."""
     from app import convert  # noqa: PLC0415 — рядом с местом сборки окна
     from ui.algorithm_dialog import AlgorithmDetails  # noqa: PLC0415 — тянет PySide6
 
-    values = _demo_values(filtered=filtered)
+    values = _demo_values()
     return AlgorithmDetails(convert.algorithms(values)[0])
 
 

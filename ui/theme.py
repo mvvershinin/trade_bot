@@ -13,8 +13,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from PySide6.QtGui import QColor, QPalette
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QColor, QFont, QPalette
+from PySide6.QtWidgets import QApplication, QWidget
 
 from ui.models import Layer, LevelKind, MarkerKind, ShadeKind
 
@@ -28,6 +28,7 @@ class Theme:
     grid: str
     text: str
     text_dim: str
+    badge_quiet: str     # заливка отметки «СИМУЛЯЦИЯ» — см. `QUIET_BADGE`
     axis: str
     bull: str            # свеча вверх
     bear: str            # свеча вниз
@@ -97,12 +98,83 @@ class Theme:
 #: Порог стережёт `tests/test_ui_panel.py`.
 LIGHT_GREEN = "#0f7a64"
 
+#: Во сколько раз шрифт окна крупнее системного. Просьба владельца счёта
+#: 05.10.2026 (`ROADMAP.md`, Н2): «шрифт увеличить в 1.2 раза — очень плохо
+#: видно». Не торговое число, поэтому константа, а не поле настроек.
+#:
+#: Применяется **один раз**, ко шрифту приложения (`app/main.py::
+#: _dress_application`): все виджеты наследуют его сами. Здесь же через него
+#: пересчитаны немногие кегли, заданные в окне абсолютным числом, — иначе
+#: они остались бы прежними и на фоне выросшего текста стали бы мельче.
+FONT_SCALE = 1.2
+
+
+def scaled(size: float) -> float:
+    """Абсолютный кегль окна, пересчитанный на `FONT_SCALE`."""
+    return size * FONT_SCALE
+
+
+def scaled_font(font: QFont) -> QFont:
+    """Копия шрифта, крупнее в `FONT_SCALE` раз. Исходный не меняется.
+
+    ⚠️ Системный шрифт бывает задан в точках экрана, а не в пунктах: тогда
+    `pointSizeF()` возвращает −1, и умножение дало бы отрицательный кегль.
+    Такой шрифт растёт по `pixelSize()`.
+    """
+    bigger = QFont(font)
+    if font.pointSizeF() > 0:
+        bigger.setPointSizeF(font.pointSizeF() * FONT_SCALE)
+    else:
+        bigger.setPixelSize(round(font.pixelSize() * FONT_SCALE))
+    return bigger
+
+
+#: Сколько оставить от края экрана окну, которое просит размер больше
+#: экрана: рамка, заголовок и панель задач. Не точный расчёт — запас.
+SCREEN_MARGIN = 80
+
+
+def resize_within_screen(window: QWidget, width: int, height: int) -> None:
+    """Задать окну размер, но не больше доступной части его экрана.
+
+    ⚠️ Зачем: с крупным шрифтом окна просят больше места, а у владельца
+    счёта бывает экран 1280×800 с панелью задач. Окно, вылезшее за экран,
+    прячет нижние кнопки «ОК» и «Применить» — и не скажет об этом.
+    """
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        room = screen.availableGeometry()
+        width = min(width, room.width() - SCREEN_MARGIN)
+        height = min(height, room.height() - SCREEN_MARGIN)
+    window.resize(width, height)
+
+
+#: Приглушённый текст — пояснения под полями, подписи, описания легенды.
+#:
+#: ⚠️ Подобран по жалобе владельца счёта 05.10.2026: «очень плохо видно».
+#: Прежние `#9aa4b2` (тёмная) и `#6b7280` (светлая) давали 7,1:1 и 4,8:1
+#: (на сером фоне окна `#efefef` — 4,2:1, ниже порога 4,5). Новые:
+#: тёмная `#c5ccd6` — 11,0:1 на фоне графика и 10,7:1 на панели; светлая
+#: `#4b5563` — 7,6:1 на белом и 6,6:1 на `#efefef`. Текст остаётся
+#: приглушённым: живой текст тёмной темы — 14:1. Порог стережёт
+#: `tests/test_ui_theme_font.py`.
+DARK_TEXT_DIM = "#c5ccd6"
+LIGHT_TEXT_DIM = "#4b5563"
+
+#: Заливка отметки «СИМУЛЯЦИЯ» — прежние значения `text_dim`, отдельным
+#: полем намеренно. Отметка безопасного режима не должна читаться лучше
+#: отметки боевого (`tests/test_ui_window.py`, ТЗ §4.4 З): посветлевший
+#: `text_dim` дал бы ей 11:1 против 5,3:1 у «БОЕВОЙ РЕЖИМ».
+QUIET_BADGE_LIGHT = "#6b7280"
+QUIET_BADGE_DARK = "#9aa4b2"
+
 LIGHT = Theme(
     dark=False,
     background="#ffffff",
     grid="#e6e8ec",
     text="#1b1f24",
-    text_dim="#6b7280",
+    text_dim=LIGHT_TEXT_DIM,
+    badge_quiet=QUIET_BADGE_LIGHT,
     axis="#c2c8d0",
     bull=LIGHT_GREEN,
     bear="#c62828",
@@ -128,7 +200,8 @@ DARK = Theme(
     background="#15181d",
     grid="#242a33",
     text="#e6e9ef",
-    text_dim="#9aa4b2",
+    text_dim=DARK_TEXT_DIM,
+    badge_quiet=QUIET_BADGE_DARK,
     axis="#39424f",
     bull="#26a69a",
     bear="#ef5350",

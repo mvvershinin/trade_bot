@@ -22,12 +22,12 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 from ui.models import ContractNotice, RobotState
 from ui.models import switch_blocked_reason as blocked_reason
 from ui.theme import current as current_theme
-from ui.theme import text_on
+from ui.theme import scaled, text_on
 
 __all__ = ["ContractBar", "blocked_reason", "notice_text"]
 
 #: Кегль, как у остальных плашек над графиком (`_Banner.LARGE_POINTS`).
-LARGE_POINTS = 14.0
+LARGE_POINTS = scaled(14.0)  # 14 пт — порог WCAG, ×1,2 — `FONT_SCALE`
 
 
 def notice_text(notice: ContractNotice) -> str:

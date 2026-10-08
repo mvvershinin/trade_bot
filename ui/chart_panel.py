@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
 from ui.chart import create_surface
 from ui.chart.glyphs import GlyphStyle, draw_area_sample, draw_line_sample
 from ui.chart.protocol import ChartSurface
+from ui.fit_scroll import FitScrollArea
 from ui.formatting import (
     EMPTY,
     PRICE_FIELDS,
@@ -971,6 +972,12 @@ class ChartPanel(QWidget):
 
         self.info_bar = CandleInfoBar(theme=self._theme)
         self.legend = LegendPanel(self._surface, self._theme)
+        # ⚠️ В прокрутке — по снимку 05.10.2026: с шрифтом ×1,2 описания
+        # легенды на экране 1280×800 переносятся в две строки, легенда
+        # требовала около двухсот точек как **наименьшую** высоту, главное
+        # окно вылезало за нижний край экрана, у графика пропадала ось
+        # времени, а строки легенды резались посередине.
+        self.legend_area = FitScrollArea(self.legend, min_lines=3)
         self.digest = TradeDigest(self, self._theme)
         self._build_controls()
         self._listen_to_surface()
@@ -1054,7 +1061,7 @@ class ChartPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.strip)
-        layout.addWidget(self.legend)
+        layout.addWidget(self.legend_area)
         layout.addWidget(self.info_bar)
         layout.addWidget(self._surface.widget(), 1)
 
@@ -1109,6 +1116,10 @@ class ChartPanel(QWidget):
     def scroll_to_last(self) -> None:
         self._surface.scroll_to_last()
 
+    def show_moment(self, since: datetime, until: datetime) -> bool:
+        """Перевести график к отрезку времени. `False` — его нет на графике."""
+        return self._surface.show_moment(since, until)
+
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
         self._surface.set_theme(theme)
@@ -1141,7 +1152,7 @@ class ChartPanel(QWidget):
 
     def _toggle_legend(self, on: bool) -> None:
         """Свернуть или развернуть легенду. Стрелка на кнопке показывает, куда."""
-        self.legend.setVisible(on)
+        self.legend_area.setVisible(on)
         self.legend_button.setText("Что на графике ▴" if on else "Что на графике ▾")
 
     # ------------------------------------------------------------------ сведения о свече
