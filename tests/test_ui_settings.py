@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from helpers import RecordingPort, settle_qt
-from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QWidget
 
 import ui.main_window
 import ui.settings_dialog
@@ -2231,3 +2231,211 @@ def test_the_minute_bar_limit_chosen_in_the_window_reaches_the_run(
     assert box.currentText() == chosen.label
     expected = convert.TIMEFRAMES[box.currentText()].minutes
     assert convert.minute_bar_limit_of(dialog.values()) == expected
+
+
+#: Системный кегль машины владельца счёта: XFCE, «Ubuntu 10» (замер
+#: 09.10.2026, `xfconf-query -c xsettings -p /Gtk/FontName`). Программа берёт
+#: системный шрифт ×1,2 (`ui.theme.FONT_SCALE`), то есть у него окно — 12 пт.
+#: Без этой строки проверка шла бы кеглем машины прогона (здесь 9 пт ×1,2),
+#: а дефект виден не при всяком кегле: см. докстринг теста ниже.
+OWNER_SYSTEM_POINTS = 10.0
+
+#: Шаг перебора ширины окна, точек. Обрезание зависит от того, насколько
+#: желаемая ширина формы шире настоящей, — то есть от шрифта машины: у владельца
+#: счёта оно было на 820, кеглем прогона — на 650–800 и не было на 820.
+#: Перебор от наименьшей ширины до 820 ловит его при любом из замеренных кеглей.
+_WIDTH_STEP = 30
+
+
+@pytest.fixture()
+def owner_font(qapp):
+    """Шрифт приложения как у владельца счёта: системные 10 пт ×1,2.
+
+    Шрифт общий на весь прогон — возвращается в `finally`, иначе сосед
+    по процессу получил бы чужой кегль и чужие переносы строк.
+    """
+    from ui.theme import scaled_font
+
+    before = qapp.font()
+    system = qapp.font()
+    system.setPointSizeF(OWNER_SYSTEM_POINTS)
+    qapp.setFont(scaled_font(system))
+    try:
+        yield
+    finally:
+        qapp.setFont(before)
+
+
+def _settle_layout(qapp) -> None:
+    """Дать раскладке дойти до конца цепочки, а не до её середины.
+
+    Смена текста подсказки доходит до области прокрутки по цепочке
+    отложенных запросов: подпись → группа → страница → область. Два прохода
+    очереди (`settle_qt`) застают страницу на полпути — на один кадр она ещё
+    прежней высоты, — и проверка ловила бы этот кадр, а не дефект.
+    """
+    for _ in range(10):
+        qapp.processEvents()
+    settle_qt(qapp)
+
+
+def _layout_trouble(dialog: SettingsDialog, where: str) -> list[str]:
+    """Что на видимой странице окна наложено или обрезано — словами.
+
+    Четыре проверки, все в координатах страницы:
+
+    * соседи в одном контейнере с раскладкой — группы на странице, строки
+      формы (подпись, поле, подсказка) в группе, поля в строке — не залезают
+      друг на друга;
+    * виджет лежит внутри своего контейнера: строка, вылезшая за край группы,
+      ни с кем не перекрыта, но срезана рамкой группы;
+    * текст с переносом получил не меньше высоты, чем ему нужно при его
+      ширине (`heightForWidth`). Меньше — и `QLabel`, центрирующий текст по
+      вертикали, срезает верхнюю и нижнюю строки: ровно снимок владельца
+      счёта 09.10.2026;
+    * проверять было что: на странице есть подсказка с переносом и пара
+      соседей. Без этого перестроенная страница зеленела бы пустым списком.
+
+    Первые две вместе и дают «ни один виджет не перекрывает другой»: соседи
+    не пересекаются, а дети не выходят за родителя — значит, и виджеты разных
+    групп не встретятся. Проверка только соседей внутри группы пропускала
+    группы, наехавшие одна на другую (мутация 09.10.2026).
+    """
+    from PySide6.QtWidgets import QScrollArea
+
+    area = dialog.tabs.currentWidget()
+    assert isinstance(area, QScrollArea), "страница вкладки — не область прокрутки"
+    page = area.widget()
+    assert page is not None, "у области прокрутки нет страницы"
+    tab = dialog.tabs.tabText(dialog.tabs.currentIndex())
+    found: list[str] = []
+    labels = [
+        label for label in page.findChildren(QLabel)
+        if label.isVisible() and label.wordWrap()
+    ]
+    for label in labels:
+        need = label.heightForWidth(label.width())
+        if label.height() < need:
+            found.append(
+                f"{_widget_name(label)} — высота {label.height()} "
+                f"при нужных {need}, текст срезан"
+            )
+    containers = [page] + [
+        widget for widget in page.findChildren(QWidget)
+        if widget.isVisible() and widget.layout() is not None
+    ]
+    pairs = 0
+    for container in containers:
+        pairs += _neighbour_trouble(container, page, found)
+    if not labels or not pairs:
+        found.append(
+            f"проверять нечего — подсказок с переносом {len(labels)}, "
+            f"пар соседей {pairs}"
+        )
+    return [f"{where}, «{tab}»: {line}" for line in found]
+
+
+def _widget_name(widget) -> str:
+    """Тип виджета и начало его текста — чтобы человек нашёл его в окне."""
+    text = getattr(widget, "text", getattr(widget, "title", lambda: ""))()
+    return f"{type(widget).__name__} «{str(text)[:40]}»"
+
+
+def _widget_span(widget, page) -> str:
+    """Верх и низ виджета в координатах страницы."""
+    from PySide6.QtCore import QPoint
+
+    top = widget.mapTo(page, QPoint(0, 0)).y()
+    return f"{top}–{top + widget.height()}"
+
+
+def _neighbour_trouble(container, page, found: list[str]) -> int:
+    """Дети контейнера: внутри него и не друг на друге. Возвращает число пар.
+
+    Беды дописываются в `found`; число пар нужно, чтобы отличить «наложений
+    нет» от «сравнивать было нечего».
+    """
+    kids = [
+        child for child in container.children()
+        if isinstance(child, QWidget) and child.isVisible() and not child.isWindow()
+    ]
+    for child in kids:
+        if not container.rect().contains(child.geometry()):
+            found.append(
+                f"{_widget_name(child)} {_widget_span(child, page)} выходит "
+                f"за край {_widget_name(container)} "
+                f"{_widget_span(container, page)}, срезан"
+            )
+    pairs = 0
+    for index, first in enumerate(kids):
+        for second in kids[index + 1:]:
+            pairs += 1
+            if first.geometry().intersects(second.geometry()):
+                found.append(
+                    f"{_widget_name(first)} {_widget_span(first, page)} "
+                    f"наложено на {_widget_name(second)} {_widget_span(second, page)}"
+                )
+    return pairs
+
+
+def test_no_hint_is_cut_and_no_row_overlaps_another_on_any_tab(
+    owner_font, make_dialog, qapp
+) -> None:
+    """Стережёт: подсказки окна настроек видны целиком и строки не наезжают.
+
+    Дефект владельца счёта 09.10.2026 (снимок 17:13): на вкладке «Вход и
+    выход» подсказки под «Скользящим уровнем», «Порогом включения»
+    и «Отступом» срезаны сверху и снизу. Причина — в `QFormLayout` Qt
+    (6.11.1 и ветка dev): высоты строк хранятся одной таблицей на две
+    запомненные ширины — последнюю запрошенную и желаемую. Запрос высоты
+    при желаемой ширине (его делает подсказка размера страницы прокрутки)
+    переписывает таблицу, а отметка «посчитано для настоящей ширины»
+    остаётся, и следующая раскладка ставит строки по чужой ширине. Желаемая
+    ширина формы шире настоящей — строк в таблице меньше, чем у текста.
+
+    Проходит то, что делает человек: окно показано, ширина — от наименьшей
+    допустимой до 820 с шагом; на каждой ширине — все вкладки, затем на
+    «Вход и выход» переключение способа туда и обратно, галочка «Уровень
+    выхода» снята и поставлена, красное сообщение об ошибке в `take_note`
+    и его уход. ⚠️ Сообщение об ошибке короче обычного пояснения (замер
+    09.10.2026: 4 строки против 6 на ширине 631), так что рост текста
+    проверяют шаги «скользящий уровень», «галочка поставлена» и «ошибка
+    исправлена», а не сам шаг «ошибка».
+    """
+    dialog = make_dialog(Settings(trailing_enabled=True))
+    dialog.resize(820, 800)
+    dialog.show()
+    _settle_layout(qapp)
+    narrowest = dialog.minimumSizeHint().width()
+    take_page = dialog.page_of("Вход и выход")
+    steps = (
+        ("неподвижная цель", lambda: dialog.take_fixed.setChecked(True)),
+        ("скользящий уровень", lambda: dialog.trailing_enabled.setChecked(True)),
+        ("галочка снята", lambda: dialog.take_profit_enabled.setChecked(False)),
+        ("галочка поставлена", lambda: dialog.take_profit_enabled.setChecked(True)),
+        ("ошибка", lambda: (dialog.trailing_start.setValue(0.05),
+                            dialog.trailing_offset.setValue(0.05))),
+        ("ошибка исправлена", lambda: (dialog.trailing_start.setValue(0.5),
+                                       dialog.trailing_offset.setValue(0.2))),
+    )
+    trouble: list[str] = []
+    for width in sorted({*range(narrowest, 820, _WIDTH_STEP), 820}):
+        dialog.resize(width, 800)
+        _settle_layout(qapp)
+        for index in range(dialog.tabs.count()):
+            dialog.tabs.setCurrentIndex(index)
+            _settle_layout(qapp)
+            trouble += _layout_trouble(dialog, f"ширина {dialog.width()}")
+        dialog.tabs.setCurrentWidget(take_page)
+        for step, act in steps:
+            act()
+            _settle_layout(qapp)
+            if step == "ошибка":
+                assert dialog.take_error(), (
+                    "состояние ошибки не наступило — красный текст не проверен"
+                )
+            trouble += _layout_trouble(dialog, f"ширина {dialog.width()}, {step}")
+    assert not trouble, (
+        f"в окне настроек {len(trouble)} наложений и обрезаний, первые:\n"
+        + "\n".join(trouble[:8])
+    )

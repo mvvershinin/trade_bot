@@ -43,7 +43,7 @@ from collections.abc import Sequence
 from dataclasses import fields
 from typing import cast
 
-from PySide6.QtCore import QEvent, QSignalBlocker, Qt, QTime, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -436,6 +436,40 @@ def _hint(text: str) -> QLabel:
     label.setTextFormat(Qt.TextFormat.PlainText)
     _paint_hint(label)
     return label
+
+
+#: Ширины для сброса отметки Qt «высоты строк посчитаны» — см. `_Form`.
+#: Две, а не одна: одна из них может совпасть с желаемой шириной формы,
+#: а запрос на желаемой ширине отметку не сбрасывает.
+_STALE_WIDTHS = (1, 2)
+
+
+class _Form(QFormLayout):
+    """Форма группы, строки которой стоят по высотам **своей** ширины.
+
+    ⚠️ Обход дефекта Qt (6.11.1; в ветке dev код тот же). `QFormLayout`
+    держит высоты строк одной таблицей на две запомненные ширины: последнюю
+    запрошенную и желаемую (`sizeHint`). Запрос высоты на желаемой ширине —
+    его делает расчёт подсказки размера страницы (`QLayout::totalSizeHint`) —
+    переписывает таблицу, а отметка «посчитано для настоящей ширины»
+    остаётся. Следующая раскладка ставит строки по чужой ширине. Желаемая
+    ширина шире настоящей — у подсказки в таблице меньше строк, чем у текста,
+    и `QLabel`, центрирующий текст, срезает верхнюю и нижнюю. Снимок
+    владельца счёта 09.10.2026: шрифт 12 пт, желаемая ширина формы 798 точек
+    при настоящих 730, подсказка «Скользящий уровень» — 74 точки вместо 92.
+
+    Запрос на соседних ширинах перед раскладкой снимает отметку, и Qt
+    пересчитывает таблицу для той ширины, на которую раскладывает. Остаток:
+    настоящая ширина ровно равна желаемой — Qt берёт таблицу на две точки
+    уже, то есть строк не меньше нужного. Сторож —
+    `tests/test_ui_settings.py::test_no_hint_is_cut_and_no_row_overlaps_another_on_any_tab`.
+    """
+
+    def setGeometry(self, rect: QRect) -> None:  # имя задано Qt
+        """Раскладка — после сброса отметки «таблица посчитана для этой ширины»."""
+        for narrower in _STALE_WIDTHS:
+            super().heightForWidth(rect.width() - narrower)
+        super().setGeometry(rect)
 
 
 class SettingsDialog(QDialog):
@@ -949,7 +983,7 @@ class SettingsDialog(QDialog):
 
     def _group(self, title: str, rows: list[tuple[str, QWidget, str]]) -> QGroupBox:
         box = QGroupBox(title)
-        form = QFormLayout(box)
+        form = _Form(box)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for caption, widget, hint in rows:
