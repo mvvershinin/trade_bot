@@ -182,7 +182,7 @@ def test_each_stitched_contract_gets_its_own_step(loop, database, monkeypatch) -
     async def stitched_series(self, frame, symbol, timeframe):
         candles, _ = await real_series(self, frame, symbol, timeframe)
         return candles, SimpleNamespace(
-            candles=candles, seams=(), symbols="подставная", pieces=pieces,
+            candles=candles, seams=(), symbols="подставная", pieces=pieces, basis="",
         )
 
     async def stitched_run(stitch, values, engine, *, steps=None):

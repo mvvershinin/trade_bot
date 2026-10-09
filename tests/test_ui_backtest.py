@@ -631,6 +631,26 @@ def test_the_report_window_says_the_span_and_the_trading_days(qapp) -> None:
     )
 
 
+def test_the_report_head_shows_what_the_stitched_run_counted_on(qapp) -> None:
+    """Шапка «Прогон» несёт строку «Считается на:» склейки (B-069); без неё — нет строки."""
+    from dataclasses import replace
+
+    from PySide6.QtWidgets import QLabel
+
+    from ui.backtest_report import BacktestReportDialog, period_lines
+
+    basis = "Считается на: MXU6 18.06–16.09 (57 дн. со свечами; нет 07.09–16.09)"
+    assert not any(line.startswith("Считается на") for line in period_lines(_report()))
+    report = replace(_report(), basis=basis)
+    window = BacktestReportDialog(report)
+    try:
+        assert basis in [label.text() for label in window.findChildren(QLabel)], (
+            "строки «Считается на:» нет в окне отчёта"
+        )
+    finally:
+        window.deleteLater()
+
+
 def test_the_report_window_shows_every_assumption_in_full(qapp) -> None:
     """Допущения показаны абзацами целиком, а не одним заголовком."""
     from PySide6.QtWidgets import QLabel

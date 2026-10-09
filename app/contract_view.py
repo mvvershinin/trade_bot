@@ -22,15 +22,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 
+from app.stitched import span_text, uncovered
 from market import (
     MSK,
     CandleStore,
     ContractError,
     ContractLoad,
     ContractRow,
+    Leg,
+    LegDays,
+    LoadReport,
     MarketWorker,
     Timeframe,
     asset_of,
@@ -46,9 +51,12 @@ from ui.models import ChartData, ContractNotice, ContractSeam, HistoryLoadOutcom
 
 __all__ = [
     "ChartContext",
+    "asked_text",
     "chart_context",
-    "load_lead",
-    "load_outcome",
+    "legs_done",
+    "legs_lead",
+    "legs_outcome",
+    "no_contract",
     "notice_of",
     "not_started",
     "split_shown",
@@ -126,40 +134,120 @@ def not_started(symbol: str, rows: list[ContractRow]) -> str:
     )
 
 
-def load_lead(row: ContractRow, warmup_bars: int, today: date) -> str:
-    """Что именно начали грузить — строкой в журнал, до обращения к бирже."""
-    assert row.active_from is not None  # проверено `not_started`
+def _legs_text(legs: Sequence[Leg]) -> str:
+    """Куски словами: «MXM6 17.06, MXU6 18.06–16.09»."""
+    return ", ".join(f"{leg.symbol} {span_text(leg.since, leg.until)}" for leg in legs)
+
+
+def no_contract(legs: Sequence[Leg], since: date, today: date) -> list[str]:
+    """Дни отрезка без контракта в таблице — строками для человека."""
+    return [
+        f"{first:%d.%m.%Y} … {last:%d.%m.%Y}: в таблице контрактов нет ближнего "
+        "на эти дни — они не загружены."
+        for first, last in uncovered(legs, since, today)
+    ]
+
+
+def legs_lead(legs: Sequence[Leg], warmup_bars: int, since: date, today: date) -> str:
+    """Что именно начали грузить — строкой в журнал, до обращения к бирже (B-069)."""
+    holes = no_contract(legs, since, today)
     return (
-        f"{row.symbol}: с рубежа {row.active_from:%d.%m.%Y} по {today:%d.%m.%Y} МСК "
-        f"и {warmup_bars} баров прогрева средней перед рубежом. Минуты "
-        "до рубежа, кроме прогрева, не качаются: тогда ближним был другой "
-        "контракт. Свечи берутся у биржи; токен брокера не нужен."
+        f"С {since:%d.%m.%Y} по {today:%d.%m.%Y} МСК: "
+        f"{_legs_text(legs) or 'ни одного контракта'} — каждый своими днями, "
+        f"плюс {warmup_bars} баров прогрева средней перед каждым. Свечи берутся "
+        "у биржи; токен брокера не нужен."
+        + "".join(f" {text}" for text in holes)
     )
 
 
-def load_outcome(load: ContractLoad, seconds: float) -> HistoryLoadOutcome:
-    """Итог загрузки контракта → фразы для окна. Беду называет слой данных."""
-    trouble = load.problem
-    fetched = sum(report.fetched for report in load.reports)
-    inserted = sum(report.inserted for report in load.reports)
-    updated = sum(report.updated for report in load.reports)
-    kept = sum(report.kept for report in load.reports)
+def legs_done(legs: Sequence[Leg], loads: Sequence[ContractLoad]) -> str:
+    """Что успело загрузиться до обрыва, а что нет — одной фразой."""
+    done, left = legs[: len(loads)], legs[len(loads):]
+    if not legs:
+        return "До загрузки минут дело не дошло."
+    parts = [
+        f"Загружено: {_legs_text(done)}." if done
+        else "Минуты не загружены ни по одному контракту."
+    ]
+    if left:
+        parts.append(f"Не загружено: {_legs_text(left)}.")
+    return " ".join(parts)
+
+
+def asked_text(reports: Sequence[LoadReport]) -> str:
+    """Сколько дней загрузка **на самом деле** спросила у биржи — фразой итога.
+
+    Слова владельца счёта 09.10.2026: «почему каждый раз 20 тысяч свечей?».
+    «Пришло с биржи 18 610 свечей» не отличает перекачку всего отрезка
+    («Загрузить заново») от догрузки недостающего — а это и был вопрос.
+    Счёт — по отрезкам, которые `sync_minutes` отправил бирже
+    (`LoadReport.ranges`), против отрезков, о которых его просили:
+    отмеченные загруженными дни в первые не попадают.
+    """
+    asked = sum((stop - start).days + 1 for report in reports for start, stop in report.ranges)
+    span = sum(
+        (report.requested_to - report.requested_from).days + 1
+        for report in reports
+        if report.requested_from is not None and report.requested_to is not None
+    )
+    rest = ", остальные уже были в базе" if asked < span else ""
+    return f"Календарных дней запрошено у биржи: {asked} из {span}{rest}."
+
+
+def legs_outcome(
+    symbol: str,
+    loads: Sequence[ContractLoad],
+    checked: Sequence[LegDays],
+    *,
+    seconds: float,
+    said: Sequence[str] = (),
+) -> HistoryLoadOutcome:
+    """Итог загрузки по кускам → фразы для окна (B-069).
+
+    `detail` — одна строка «Загружено: MXU6 18.06–16.09 (65 из 65 торговых
+    дней биржи) · …». Всё, чего не хватает, — в `trouble`, и тогда `ok=False`:
+    в журнал это уходит предупреждением (`HistoryPort._done_loading`).
+    `said` — беды, названные зовущим: дни без контракта, отказ сверки.
+    """
+    by_symbol = {one.leg.symbol: one for one in checked}
+    legs = [Leg(load.symbol, load.start, load.until or load.start) for load in loads]
+    shown = []
+    for number, leg in enumerate(legs):
+        found = by_symbol.get(leg.symbol)
+        days = (
+            "сверки нет" if found is None else
+            f"{found.present} из {len(found.exchange)}"
+            + (" торговых дней биржи" if number == 0 else "")
+        )
+        shown.append(f"{leg.symbol} {span_text(leg.since, leg.until)} ({days})")
+    reports = [report for load in loads for report in load.reports]
+    fetched = sum(report.fetched for report in reports)
+    inserted = sum(report.inserted for report in reports)
     detail = (
-        f"Пришло с биржи {fetched} свечей: {inserted} новых, {updated} обновлено"
-        + (f", {kept} отвергнуто" if kept else "")
-        + f". Период контракта — с {load.active_from:%d.%m.%Y}; для прогрева "
-        f"средней нужно {load.warmup_bars} закрытых баров, перед рубежом их "
-        f"{load.warm_bars} (с {load.since:%d.%m.%Y}). Заняло {seconds:.0f} с."
+        f"Загружено: {' · '.join(shown) or 'ничего'}. {asked_text(reports)} "
+        f"Пришло с биржи {fetched} свечей, из них {inserted} новых. "
+        f"Заняло {seconds:.0f} с."
     )
+    trouble = list(said)
+    gaps = [
+        f"{one.leg.symbol}: нет свечей за {span_text(first, last)} — сделки "
+        "за эти дни не посчитаны."
+        for one in checked for first, last in one.missing
+    ]
+    if gaps:
+        gaps.append(
+            "Отметки «уже спрашивали» с этих дней сняты: «Догрузить недостающее» "
+            "запросит их у биржи снова."
+        )
+    trouble += gaps
+    trouble += [load.problem for load in loads if load.problem]
+    named = " → ".join(load.symbol for load in loads)
     return HistoryLoadOutcome(
-        symbol=load.symbol,
-        ok=trouble is None,
-        headline=(
-            f"История {load.symbol} загружена с рубежа"
-            if trouble is None else f"История {load.symbol} загружена не вся"
-        ),
+        symbol=symbol,
+        ok=not trouble,
+        headline=f"История загружена: {named}" if not trouble else "История загружена не вся",
         detail=detail,
-        trouble=trouble or "",
+        trouble="\n".join(trouble),
     )
 
 

@@ -12,6 +12,9 @@
 ⚠️ Дни периода, не покрытые ни одним контрактом, `pieces` выкидывает
 по построению. Молча это не остаётся: каждая такая дыра — строка
 предупреждения в журнале прогона и в `StitchedRun.problems` (правило 13).
+То же — будние дни **внутри** куска без единого бара (B-069: MXU6
+05.09–16.09 прошёл без сделок и без слова), кроме отмеченных загруженными:
+отметка без свечей — биржа в тот день не торговала.
 """
 
 from __future__ import annotations
@@ -27,11 +30,11 @@ from backtest.stitched import Piece, StitchedRun, replay_pieces
 from engine import EngineSettings
 from market.candles import MSK, Candle, Timeframe
 from market.chain import Leg
-from market.contracts import WARMUP_LOOK_BACK_DAYS, ContractError, asset_of, pieces
+from market.contracts import WARMUP_LOOK_BACK_DAYS, ContractError, asset_of, pieces, runs_of
 from market.storage import CandleStore
 from ui.models import Settings
 
-__all__ = ["StitchRequest", "load_pieces", "run_stitched", "uncovered"]
+__all__ = ["StitchRequest", "basis_line", "load_pieces", "run_stitched", "span_text", "uncovered"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +56,9 @@ class StitchRequest:
     #: **своего** контракта (`Piece.minutes`), и уровни внутри бара
     #: проверяются по ним; `None` — по размаху бара, как до минуток.
     minute_order: MinuteOrder | None = None
+    #: Сегодня по Москве: день, который ещё идёт, пропуском не считается.
+    #: `None` — по часам машины.
+    today: date | None = None
 
 
 def _moment(day: date) -> datetime:
@@ -74,10 +80,68 @@ def uncovered(legs: Sequence[Leg], since: date, until: date) -> list[tuple[date,
     return holes
 
 
+#: Номер субботы в `date.weekday()`: суббота и воскресенье пропуском
+#: не считаются. Календарь, а не настройка.
+_SATURDAY = 5
+
+
+def span_text(first: date, last: date) -> str:
+    """Отрезок дат коротко: «07.09–16.09», один день — «07.09»."""
+    return f"{first:%d.%m}" if first == last else f"{first:%d.%m}–{last:%d.%m}"
+
+
+def _missing(
+    leg: Leg, body: Sequence[Candle], settled: set[date], today: date
+) -> list[tuple[date, date]]:
+    """Будние дни куска до сегодня без единого бара и без отметки — отрезками.
+
+    Отметка `data_day` без свечей — биржа в этот день не торговала (праздник):
+    тревоги нет. Выходные не смотрятся: торги выходного дня без свечей
+    здесь не ловятся.
+    """
+    have = {bar.time.astimezone(MSK).date() for bar in body}
+    weekdays: list[date] = []
+    day = leg.since
+    while day <= leg.until and day < today:
+        if day.weekday() < _SATURDAY:
+            weekdays.append(day)
+        day += timedelta(days=1)
+    return runs_of(
+        weekdays, (one for one in weekdays if one not in have and one not in settled)
+    )
+
+
+def basis_line(made: Sequence[Piece]) -> str:
+    """«Считается на: MXU6 18.06–16.09 (57 дн. со свечами; нет 07.09–16.09) · …».
+
+    На каких контрактах и днях посчитан прогон по склейке — одной строкой.
+    «Из N торговых дней биржи» здесь нет: прогон к бирже не ходит, и N ему
+    взять неоткуда. Пусто — кусков нет.
+
+    Дни считаются будние (пн–пт), как торговые дни биржи: свечи торгов
+    выходного дня биржа относит к понедельнику, и сверка загрузки с её
+    дневными свечами считает так же. Путь человека 09.10.2026: MXU6
+    18.06–16.09 — 83 календарных дня со свечами против 65 торговых дней
+    биржи; два разных числа на один кусок читались бы как пропажа.
+    """
+    parts = []
+    for piece in made:
+        days = len({
+            day for bar in piece.body
+            if (day := bar.time.astimezone(MSK).date()).weekday() < _SATURDAY
+        })
+        gaps = ", ".join(span_text(first, last) for first, last in piece.missing)
+        parts.append(
+            f"{piece.symbol} {span_text(piece.since, piece.until)} ({days} дн. со свечами"
+            + (f"; нет {gaps}" if gaps else "") + ")"
+        )
+    return f"Считается на: {' · '.join(parts)}" if parts else ""
+
+
 def load_pieces(
     store: CandleStore, request: StitchRequest
 ) -> tuple[list[Piece], list[tuple[datetime, str]]]:
-    """Куски с барами и прогревом — плюс предупреждения о днях без контракта.
+    """Куски с барами и прогревом — плюс предупреждения о днях без свечей.
 
     :raises ContractError: актив не назван, его цепочки в таблице нет либо
         таблица противоречит сама себе.
@@ -88,7 +152,9 @@ def load_pieces(
             "неизвестно"
         )
     legs = pieces(store, request.since, request.until, asset=request.asset)
+    today = request.today or datetime.now(MSK).date()
     made: list[Piece] = []
+    holes: list[tuple[datetime, str]] = []
     for number, leg in enumerate(legs):
         warmup: tuple[Candle, ...] = ()
         wanted = 0 if number == 0 else request.warmup_bars
@@ -119,11 +185,23 @@ def load_pieces(
                 _moment(leg.until + timedelta(days=1)),
                 request.minute_order,
             )
+        missing = _missing(leg, body, store.settled_days(leg.symbol), today)
         made.append(Piece(
             symbol=leg.symbol, since=leg.since, until=leg.until,
             warmup=warmup, body=tuple(body), warmup_wanted=wanted,
-            minutes=minutes,
+            minutes=minutes, missing=tuple(missing),
         ))
+        if not body:
+            continue  # пустой кусок называет прогон (`replay_pieces`)
+        holes.extend(
+            (
+                _moment(first),
+                f"{leg.symbol}: нет свечей за {span_text(first, last)} — сделки "
+                "за эти дни не посчитаны. Загрузите историю с "
+                f"{first:%d.%m.%Y}: «Загрузить историю…» в меню «Программа»",
+            )
+            for first, last in missing
+        )
     notes = [
         (
             _moment(start),
@@ -132,7 +210,7 @@ def load_pieces(
         )
         for start, end in uncovered(legs, request.since, request.until)
     ]
-    return made, notes
+    return made, sorted([*notes, *holes], key=lambda note: note[0])
 
 
 async def run_stitched(

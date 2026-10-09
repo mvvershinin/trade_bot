@@ -82,10 +82,13 @@ from types import TracebackType
 from typing import Any, TypeVar, cast
 
 from market.candles import Candle, Timeframe
+from market.chain import Leg
 from market.contracts import (
     ContractLoad,
     ContractRequest,
+    LegDays,
     RefreshedRows,
+    check_days,
     load_contract_minutes,
     refresh_contracts,
 )
@@ -836,6 +839,26 @@ class MarketWorker:
         loader = self._loader(client)
         return await self._submit_net(
             lambda: load_contract_minutes(relay, loader, request),
+            loader=loader,
+        )
+
+    async def check_days(
+        self,
+        legs: Sequence[Leg],
+        *,
+        market: Market,
+        client: IssClient | None = None,
+    ) -> list[LegDays]:
+        """Сверить куски загрузки с дневными свечами биржи (B-069).
+
+        Ходит в сеть — в потоке сети, — и останавливается той же кнопкой,
+        что и загрузка. Разбор и снятие отметок с пропусков —
+        `market.contracts.check_days`.
+        """
+        relay = self._relay(await self._ready_store())
+        loader = self._loader(client)
+        return await self._submit_net(
+            lambda: check_days(relay, loader, legs, market=market),
             loader=loader,
         )
 

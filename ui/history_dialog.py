@@ -42,6 +42,12 @@
 дыра. Сторож на это отдельный: в тексте безопасного варианта обязана стоять
 фраза про изменение сделок.
 
+Дата «С какого дня» общая для обоих вариантов (B-069, слова владельца счёта
+09.10.2026: «выбрали период с 17 июня — … и ВСЕ дни без пропусков»). Поле
+поэтому не бывает выключенным, и щелчок по нему вариант не меняет: прежний
+`PickOnClick` (`B-030`) выбирал по щелчку «заново» — теперь это была бы
+подмена безопасного варианта рискованным.
+
 ⚠️ Чего этот текст **не** обещает. Написать «существующие свечи не трогаются»
 было бы неправдой даже для догрузки: дни, за которые биржу ещё не спрашивали,
 запрашиваются целиком, и внутри них минутка от брокера будет заменена
@@ -55,7 +61,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from PySide6.QtCore import QDate, QEvent, QLocale, QObject, Qt
+from PySide6.QtCore import QDate, QLocale, Qt
 from PySide6.QtWidgets import (
     QDateEdit,
     QDialog,
@@ -70,9 +76,10 @@ from PySide6.QtWidgets import (
 
 from ui.models import HistoryFacts, HistoryLoadRequest, Settings
 from ui.theme import current as current_theme
+from ui.theme import resize_within_screen
 from ui.wheel_guard import guard_wheel
 
-__all__ = ["HistoryDialog", "PickOnClick", "SHARED_WARNING", "TRADES_CHANGE", "fill_note"]
+__all__ = ["HistoryDialog", "SHARED_WARNING", "TRADES_CHANGE", "fill_note"]
 
 #: Главное последствие, общее для обоих вариантов. Одна строка на два места
 #: намеренно: два разных текста об одном последствии читались бы как два
@@ -95,40 +102,6 @@ SHARED_WARNING = (
 #: Сколько запросов в секунду отдаёт биржа. Не расчёт, а справка для человека:
 #: она объясняет, почему кнопка «Загрузить» не срабатывает мгновенно.
 REQUESTS_PER_SECOND = 5
-
-
-class PickOnClick(QObject):
-    """Щелчок по полю выбирает переключатель, к которому поле привязано.
-
-    Слова владельца счёта 06.09.2026: «неактивное поле не меняется»
-    (`B-030`). Поле «Загрузить заново с даты…» стоит справа от своего
-    переключателя, читается как часть одной строки — и человек щёлкает
-    по полю. Пока щелчок не делал ничего, это выглядело как поломка.
-
-    ⚠️ **Почему фильтр событий, а не сигнал поля.** Выключенное поле сигналов
-    не испускает вовсе: `QWidget.setEnabled(False)` отключает и нажатия,
-    и фокус. А фильтр событий вызывается **до** проверки на выключенность
-    (`QApplicationPrivate::notify_helper`), то есть щелчок по мёртвому полю
-    здесь виден. Проверено на живом Qt, а не по документации.
-
-    Событие пропускается дальше (`False`): поле, ставшее включённым,
-    обязано получить и сам щелчок — иначе первое нажатие пропадает,
-    и человек жмёт дважды.
-    """
-
-    def __init__(self, choice: QRadioButton, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._choice = choice
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # имя задано Qt
-        """Нажатие мыши на поле — выбрать переключатель и пропустить дальше."""
-        if event.type() is QEvent.Type.MouseButtonPress and not self._choice.isChecked():
-            self._choice.setChecked(True)
-            if isinstance(watched, QWidget):
-                # Поле только что ожило — отдать ему и фокус, чтобы щелчок
-                # кончился там, куда человек целился, а не в пустоте.
-                watched.setFocus(Qt.FocusReason.MouseFocusReason)
-        return False
 
 
 def fill_note(facts: HistoryFacts) -> str:
@@ -210,7 +183,9 @@ class HistoryDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Загрузка истории с биржи")
         self.setModal(True)
-        self.resize(640, 560)
+        # Выше прежних 560: строка «С какого дня» (B-069) добавила высоту, и при
+        # шрифте ×1,2 предупреждения под вариантами обрезались (снимок 09.10.2026).
+        resize_within_screen(self, 700, 680)
 
         self._facts = facts
         self._settings = settings
@@ -238,7 +213,7 @@ class HistoryDialog(QDialog):
             "Обычный путь. Дни, за которые биржу уже спрашивали, "
             "не перезапрашиваются вовсе."
         )
-        self.reload = QRadioButton("Загрузить заново с даты…")
+        self.reload = QRadioButton("Загрузить заново")
         self.reload.setToolTip(
             "Снять отметки «за этот день уже спрашивали» и запросить отрезок "
             "у биржи целиком. Нужно, когда данные в базе вызывают сомнение."
@@ -260,15 +235,12 @@ class HistoryDialog(QDialog):
         )
         self.since.setDate(_qdate(self._default_since()))
         self.since.setToolTip(
-            "С какого дня перезапросить историю у биржи. День берётся целиком. "
-            "Щелчок по полю сам выбирает вариант «Загрузить заново с даты…»."
+            "С какого дня грузить историю — по сегодня. День берётся целиком. "
+            "Дата одна для обоих вариантов."
         )
         self.since.dateChanged.connect(self._sync)
-        # ⚠️ `B-030`: щелчок по полю обязан выбирать его переключатель.
-        # Ссылка хранится полем окна намеренно: фильтр, созданный и забытый,
-        # соберётся сборщиком мусора, и защита исчезнет молча.
-        self.pick_on_click = PickOnClick(self.reload, self)
-        self.since.installEventFilter(self.pick_on_click)
+        self.since_caption = QLabel("С какого дня:")
+        self.since_caption.setBuddy(self.since)
 
         self.missing_note = self._note(SHARED_WARNING)
         self.reload_note = self._note("")
@@ -293,11 +265,10 @@ class HistoryDialog(QDialog):
         return label
 
     def _default_since(self) -> date:
-        """Какую дату подставить в поле «заново с…».
+        """Какую дату подставить в поле «С какого дня».
 
-        Ровно та же, что у обычной догрузки: глубина из настроек, считая
-        сегодняшний день. Другое умолчание означало бы, что переключение
-        варианта молча меняет отрезок.
+        Глубина из настроек, считая сегодняшний день, — как и до того,
+        как дата стала общей для обоих вариантов (B-069).
         """
         return self._today - timedelta(days=max(self._depth(), 1) - 1)
 
@@ -316,13 +287,19 @@ class HistoryDialog(QDialog):
         rows = QVBoxLayout(first)
         rows.addWidget(self.add_missing)
         rows.addWidget(self.missing_note)
-        picked = QHBoxLayout()
-        picked.addWidget(self.reload)
-        picked.addWidget(self.since)
-        picked.addStretch(1)
-        rows.addLayout(picked)
+        rows.addWidget(self.reload)
         rows.addWidget(self.reload_note)
         layout.addWidget(first)
+
+        # Дата — под вариантами и общая для обоих. Ниже, а не выше них:
+        # первым фокус получает переключатель, и колесо мыши над полем
+        # даты её не крутит (`guard_wheel`).
+        picked = QHBoxLayout()
+        picked.addWidget(self.since_caption)
+        picked.addWidget(self.since)
+        picked.addWidget(QLabel("по сегодня"))
+        picked.addStretch(1)
+        layout.addLayout(picked)
 
         layout.addWidget(self.summary)
         layout.addStretch(1)
@@ -361,14 +338,10 @@ class HistoryDialog(QDialog):
 
     def _sync(self, *_: object) -> None:
         """Свести окно к согласованному виду и сказать, что получится."""
-        # Для контракта дата тоже выбирается: раньше рубежа с прогревом
-        # она прижимается к нему в порту (`HistoryPort._load_contract`).
-        self.since.setEnabled(self.reload.isChecked())
         if self._facts.by_contract:
             self.since.setToolTip(
-                "С какого дня перезапросить минуты контракта. Дата раньше "
-                "рубежа контракта прижимается к нему: минуты до рубежа "
-                "этому контракту не нужны."
+                "С какого дня грузить — по сегодня. Каждый день отрезка "
+                "грузится тем контрактом, который тогда был ближним."
             )
         self.reload_note.setText(self._reload_warning())
         self.summary.setText(self._summary_text())
@@ -404,34 +377,21 @@ class HistoryDialog(QDialog):
         )
         facts = self._facts
         if facts.by_contract:
-            # Решение 0061: для контракта отрезок задаёт рубеж, а не число
-            # дней из настроек. Обещать здесь «90 дней» значило бы описать
-            # не ту загрузку, что пойдёт.
-            start = (
-                f"с рубежа контракта {facts.contract_from:%d.%m.%Y}"
-                if facts.contract_from is not None else
-                "с рубежа контракта (его день программа уточнит у биржи "
-                "по дневным объёмам перед загрузкой)"
-            )
-            if (
-                self.reload.isChecked()
-                and facts.contract_from is not None
-                and since > facts.contract_from
-            ):
-                # Дни от рубежа до выбранной даты отмечены и запрошены
-                # не будут — обещать «с рубежа» значило бы соврать.
-                start = f"с {since:%d.%m.%Y} (рубеж контракта {facts.contract_from:%d.%m.%Y})"
+            # B-069: отрезок — с даты из окна по сегодня, и на каждом его дне
+            # грузится тот контракт, что тогда был ближним, а не только код
+            # из настроек. Число дней не обещается: какие из них торговые,
+            # скажет сверка с биржей после загрузки.
             if self.reload.isChecked():
                 how = (
-                    f"Отметки «уже спрашивали» будут сняты с {since:%d.%m.%Y} "
-                    "(но не раньше рубежа с прогревом), и эти дни запрошены "
-                    "у биржи заново."
+                    f"Отметки «уже спрашивали» будут сняты с {since:%d.%m.%Y}, "
+                    "и эти дни запрошены у биржи заново."
                 )
             return (
-                f"Будет запрошено: {facts.symbol} {start} по {until:%d.%m.%Y} "
-                f"и {facts.warmup_bars} баров прогрева средней перед рубежом. "
-                "Минуты до рубежа не качаются: тогда ближним был другой "
-                f"контракт. {how}"
+                f"Будет запрошено: с {since:%d.%m.%Y} по сегодня ({until:%d.%m.%Y}) — "
+                "каждый ближний контракт за свои дни по таблице контрактов "
+                "(её уточнят у биржи), плюс "
+                f"{facts.warmup_bars} баров прогрева средней перед каждым; после "
+                f"загрузки — сверка дней с биржей. {how}"
                 + (
                     f" Если у этого актива есть месячные контракты (как у нефти BR), "
                     f"биржа это покажет перед загрузкой, и она пойдёт по дням: "
@@ -445,10 +405,8 @@ class HistoryDialog(QDialog):
         )
 
     def _span(self) -> tuple[date, date]:
-        """Отрезок, который уйдёт в просьбу. Правая граница — сегодня всегда."""
-        if self.reload.isChecked():
-            return min(_pydate(self.since.date()), self._today), self._today
-        return self._today - timedelta(days=self._depth() - 1), self._today
+        """Отрезок, который уйдёт в просьбу: с даты из поля по сегодня."""
+        return min(_pydate(self.since.date()), self._today), self._today
 
     def request(self) -> HistoryLoadRequest | None:
         """Просьба, собранная из полей. `None` — просить нечего.
@@ -459,10 +417,9 @@ class HistoryDialog(QDialog):
         """
         if not self._facts.symbol.strip():
             return None
-        reloading = self.reload.isChecked()
         return HistoryLoadRequest(
             symbol=self._facts.symbol.strip(),
             days=self._depth(),
-            since=_pydate(self.since.date()) if reloading else None,
-            replace=reloading,
+            since=self._span()[0],
+            replace=self.reload.isChecked(),
         )

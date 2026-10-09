@@ -58,6 +58,7 @@ from market import (
     WARMUP_LOOK_BACK_DAYS,
     ChainNotQuarterly,
     ContractError,
+    ContractLoad,
     ContractRequest,
     ContractRow,
     Expiry,
@@ -69,6 +70,8 @@ from market import (
     HistoryRequest,
     Inventory,
     IssStopped,
+    Leg,
+    LegDays,
     MarketWorker,
     PointValue,
     StoredHalt,
@@ -78,8 +81,10 @@ from market import (
     bar_start,
     build_bars,
     chain_around,
+    chain_covering,
     expiry_verdict,
     is_synthetic,
+    pieces,
     rows_of_asset,
     warmup_bars,
 )
@@ -988,6 +993,9 @@ class HistoryPort(TerminalPort):
     #: Последний прогон по склейке (решение 0061) — ради подписи сделки
     #: на стыке и разбивки итога по контрактам. `None` — прогон одним рядом.
     _stitched: stitched_view.StitchedRun | None = None
+    #: «Считается на: …» последнего прогона по склейке (B-069) — в шапку
+    #: отчёта и в «Отчёты». Пусто — прогон одним рядом.
+    _basis: str = ""
 
     def __init__(
         self,
@@ -1867,6 +1875,11 @@ class HistoryPort(TerminalPort):
         self._history.pages = 0
         request = dataclasses.replace(request, symbol=code)
         chain = _chain_of(code)
+        if chain and request.since is not None:
+            # B-069: цепочка назад до начала отрезка из окна — иначе первый
+            # его контракт остался бы без начала периода и выпал бы из кусков.
+            today = in_moscow(self._clock()).date()
+            chain = chain_covering(code, min(request.since, today), today)
         # Код квартального фьючерса — загрузка по контракту: с рубежа плюс
         # прогрев, без хвоста (решение 0061). Прочие коды — по дням, как
         # прежде: у них нет цепочки контрактов, и хвоста нет тоже.
@@ -1943,12 +1956,14 @@ class HistoryPort(TerminalPort):
     async def _load_contract(
         self, request: HistoryLoadRequest, chain: list[str]
     ) -> None:
-        """Загрузка по контракту: уточнить рубежи у биржи, затем минуты с рубежа.
+        """Загрузка по контракту: уточнить рубежи у биржи, затем минуты по кускам.
 
-        Два шага, и порядок не вкусовой: откуда начинать, знает только
-        таблица контрактов, а её уточняет первый шаг. Строка «начата» пишется
-        дважды — до биржи (что уточняем) и после (с какого дня качаем):
-        человек видит, что происходит, на каждом шаге.
+        Порядок не вкусовой: откуда начинать, знает только таблица
+        контрактов, а её уточняет первый шаг. Отрезок — с даты из окна
+        по сегодня, и на каждом его куске грузится свой ближний контракт
+        (B-069: прежде грузился только код из настроек, и хвост архивного
+        MXU6 не грузил никто). Даты нет (переход при запуске) — с рубежа
+        кода, как прежде. После загрузки — сверка дней с биржей.
         """
         symbol = request.symbol
         now = self._clock()
@@ -1960,31 +1975,25 @@ class HistoryPort(TerminalPort):
             f"{symbol}: у биржи уточняются сроки и рубежи контрактов "
             f"{', '.join(chain)} по дневным объёмам. Токен брокера не нужен.",
         )
+        legs: list[Leg] = []
+        loads: list[ContractLoad] = []
         try:
             rows = await self._refresh_chain(chain, symbol, now)
-            refusal = contract_view.not_started(symbol, rows)
-            if refusal:
-                self.check_contract()
-                self._done_loading(HistoryLoadOutcome(
-                    symbol=symbol, headline="Загрузка не начата", trouble=refusal,
-                ))
+            if self._not_started(symbol, rows):
                 return
             row = next(one for one in rows if one.symbol == symbol)
             assert row.active_from is not None  # проверено `not_started`
-            since = row.active_from
+            since = row.active_from if request.since is None else min(request.since, today)
+            legs = await self._worker.call(
+                lambda store: pieces(store, since, today, asset=asset_of(symbol))
+            )
             if request.replace:
-                # Заново — с даты из окна. Раньше рубежа с глубиной поиска
-                # прогрева не начинается: минуты до него этому контракту
-                # не нужны (0061). Даты нет — весь период контракта.
-                earliest = since - timedelta(days=WARMUP_LOOK_BACK_DAYS)
-                start = max(request.since or earliest, earliest)
-                await self._worker.forget_day_marks(symbol, start, today)
-            self.note("Загрузка минут контракта", contract_view.load_lead(row, warmup, today))
-            load = await self._filling(self._worker.load_contract(ContractRequest(
-                symbol=symbol, market=FUTURES, until=today, warmup_bars=warmup,
-                timeframe=convert.timeframe_of(self._values.timeframe), now=now,
-                progress=lambda result: self._load_tick(since, today, result),
-            )))
+                await self._forget_legs(legs, since)
+            self.note("Загрузка минут контракта",
+                      contract_view.legs_lead(legs, warmup, since, today))
+            # Все куски — одним `_filling`: прогон, попросившийся между
+            # кусками, пошёл бы по недогруженной базе.
+            await self._filling(self._load_legs(legs, loads, warmup, (since, today), now))
         except asyncio.CancelledError:
             raise
         except ChainNotQuarterly as error:
@@ -1998,7 +2007,7 @@ class HistoryPort(TerminalPort):
             self.check_contract()
             self._done_loading(HistoryLoadOutcome(
                 symbol=symbol, cancelled=True, headline="Загрузка остановлена",
-                detail=str(stopped),
+                detail=f"{stopped}. {contract_view.legs_done(legs, loads)}",
             ))
             return
         except Exception as error:  # окно не должно падать вместе с биржей
@@ -2007,17 +2016,82 @@ class HistoryPort(TerminalPort):
             self._done_loading(HistoryLoadOutcome(
                 symbol=symbol,
                 headline="Загрузка не удалась",
-                trouble=f"{_plain(error)}. Скачанное до обрыва записано и отмечено: "
-                        "повторная загрузка продолжит с этого места.",
+                trouble=f"{_plain(error)}. {contract_view.legs_done(legs, loads)} "
+                        "Скачанное до обрыва записано и отмечено: повторная "
+                        "загрузка продолжит с этого места.",
             ))
             return
+        checked, said = await self._check_days(legs, since, today)
         # ⚠️ Не в `finally`: при отмене (`aclose` при выходе) новая задача
         # чтения таблицы завелась бы уже после того, как закрытие собрало
         # свои задачи, и писала бы в окно, которого нет.
         self.check_contract()
-        self._done_loading(
-            contract_view.load_outcome(load, time.monotonic() - started)
-        )
+        self._done_loading(contract_view.legs_outcome(
+            symbol, loads, checked, seconds=time.monotonic() - started, said=said,
+        ))
+
+    async def _load_legs(
+        self,
+        legs: Sequence[Leg],
+        loads: list[ContractLoad],
+        warmup: int,
+        span: tuple[date, date],
+        now: datetime,
+    ) -> None:
+        """Минуты каждого куска своим контрактом — с прогревом перед куском.
+
+        Загруженное дописывается в `loads` по ходу, а не возвращается в конце:
+        при обрыве посередине зовущий называет, какие куски загружены.
+        """
+        for leg in legs:
+            loads.append(await self._worker.load_contract(ContractRequest(
+                symbol=leg.symbol, market=FUTURES, until=leg.until, since=leg.since,
+                warmup_bars=warmup, now=now,
+                timeframe=convert.timeframe_of(self._values.timeframe),
+                progress=lambda result: self._load_tick(*span, result),
+            )))
+
+    def _not_started(self, symbol: str, rows: list[ContractRow]) -> bool:
+        """У кода нет рубежа — сказать окну и журналу; `True` — загрузка не идёт."""
+        refusal = contract_view.not_started(symbol, rows)
+        if refusal:
+            self.check_contract()
+            self._done_loading(HistoryLoadOutcome(
+                symbol=symbol, headline="Загрузка не начата", trouble=refusal,
+            ))
+        return bool(refusal)
+
+    async def _forget_legs(self, legs: Sequence[Leg], since: date) -> None:
+        """«Заново»: снять отметки по каждому куску, с глубиной поиска прогрева.
+
+        Не раньше даты из окна: дни до неё человек перезапрашивать не просил.
+        """
+        for leg in legs:
+            start = max(since, leg.since - timedelta(days=WARMUP_LOOK_BACK_DAYS))
+            await self._worker.forget_day_marks(leg.symbol, start, leg.until)
+
+    async def _check_days(
+        self, legs: Sequence[Leg], since: date, today: date
+    ) -> tuple[list[LegDays], list[str]]:
+        """Сверка дней с биржей после загрузки — и что сказать сверх неё.
+
+        Сверх неё — дни отрезка без контракта в таблице и отказ самой сверки.
+        Минуты уже в базе, и отказ сверки загрузку не отменяет: он говорится
+        строкой беды, а не «Загрузка не удалась».
+        """
+        said = contract_view.no_contract(legs, since, today)
+        if not legs:
+            return [], said
+        try:
+            return await self._worker.check_days(legs, market=FUTURES), said
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # минуты в базе; сверка — отдельная беда
+            log.exception("сверка дней с биржей не сделана")
+            return [], [*said, (
+                f"Сверка дней с биржей не сделана: {_plain(error)}. Пропуски "
+                "в базе не проверены — повторите загрузку."
+            )]
 
     async def _refresh_chain(
         self, chain: list[str], symbol: str, now: datetime
@@ -3069,6 +3143,7 @@ class HistoryPort(TerminalPort):
                 "Движок идёт по живому ряду…" if self._watch.observing
                 else "Прогон робота по истории…",
             )
+            self._basis = stitch.basis if stitch is not None else ""
             if stitch is not None:
                 # Склейка — только прогон по истории: живой ход идёт одним
                 # контрактом, и его развилка (`_advance`) сюда не заходит.
@@ -4109,9 +4184,10 @@ class HistoryPort(TerminalPort):
         """
         since, until = stitched_view.period(*span)
         try:
-            request = stitched_view.request_of(
+            # Сегодня — по часам порта: идущий день пропуском не считается.
+            request = dataclasses.replace(stitched_view.request_of(
                 frame.values, timeframe, since, until, asset=asset_of(codes[0])
-            )
+            ), today=in_moscow(self._clock()).date())
             made = await stitched_view.plan(
                 self._worker, request, symbol=codes[1], own=own,
             )
@@ -4697,6 +4773,7 @@ class HistoryPort(TerminalPort):
             levels=_levels(run),
             shades=convert.shades_of(candles, frame.engine),
             seams=seams,
+            basis=self._basis,
         )))
         self._keep_forming(
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
@@ -4777,6 +4854,7 @@ class HistoryPort(TerminalPort):
                 instrument=" → ".join(one.piece.symbol for one in self._stitched.pieces),
                 trades=self._seam_rows(report.trades),
                 contracts=stitched_view.lines(self._stitched),
+                basis=self._basis,
             )
         self._send(self.backtest_finished, report)
 
@@ -5422,6 +5500,7 @@ def _load_result(outcome: HistoryOutcome) -> HistoryLoadOutcome:
     lines = [
         f"Пришло с биржи {got} свечей."
         if report is None else
+        f"{contract_view.asked_text([report])} "
         f"Пришло с биржи {got} свечей: {report.inserted} новых, "
         f"{report.updated} обновлено"
         + (f", {report.kept} отвергнуто" if report.kept else "")

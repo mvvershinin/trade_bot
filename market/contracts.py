@@ -65,9 +65,12 @@ __all__ = [
     "ContractRequest",
     "Expiry",
     "ExpiryVerdict",
+    "LegDays",
     "adopt_chain",
     "asset_of",
     "chain_around",
+    "chain_covering",
+    "check_days",
     "confirm_quarterly",
     "current_contract",
     "expiry_verdict",
@@ -77,6 +80,7 @@ __all__ = [
     "pieces",
     "refresh_contracts",
     "rows_of_asset",
+    "runs_of",
 ]
 
 #: Сколько календарных дней дневных свечей берётся по каждому контракту.
@@ -244,6 +248,39 @@ def chain_around(symbol: str, *, before: int = 2, after: int = 1) -> list[str]:
             f"{step // len(QUARTER_MONTHS)}"
         )
     return codes
+
+
+#: Дальше этого цепочка назад не удлиняется, в кварталах. Год в коде биржи —
+#: одна цифра: восемь лет назад от MXZ6 — MXZ8 2018-го, а MXZ8 2028-го биржа
+#: может уже знать. Не настройка — следствие формата кода.
+_FARTHEST_QUARTERS_BACK = 4 * 8
+
+
+def chain_covering(symbol: str, since: date, today: date) -> list[str]:
+    """Цепочка вокруг `symbol`, удлинённая назад так, чтобы покрыть день `since`.
+
+    `chain_around` берёт два предыдущих контракта — этого хватает, чтобы
+    датировать уходящий. Отрезок с 17.06 при коде MXZ6 упирается в MXM6,
+    а начало его периода датирует только MXH6: без него `pieces` выкинул бы
+    MXM6, и 17.06 остался бы днём без контракта. Число кварталов — вывод
+    из дат, а не настройка: от квартала `since` до квартала `symbol` плюс
+    один контракт, датирующий первый.
+
+    :raises ContractError: код не квартальный (`chain_around`).
+    """
+    found = _QUARTERLY.match(symbol)
+    if found is None:
+        return chain_around(symbol)  # отказ — словами `chain_around`
+    month, digit = found.group(2), int(found.group(3))
+    # Год кода — по сегодняшнему: биржа выставляет контракты на год-два
+    # вперёд, значит MXZ9 в 2026-м — это 2019-й, а MXH7 — 2027-й.
+    year = today.year - today.year % 10 + digit
+    if year > today.year + 1:
+        year -= 10
+    expiry = year * 4 + QUARTER_MONTHS.index(month)
+    first = since.year * 4 + (since.month - 1) // 3
+    back = min(max(2, expiry - first + 1), _FARTHEST_QUARTERS_BACK)
+    return chain_around(symbol, before=back)
 
 
 # ---------------------------------------------------------------------------
@@ -660,13 +697,16 @@ class ContractLoad:
     """Что вышло из загрузки минут одного контракта."""
 
     symbol: str
-    active_from: date
+    #: Первый день тела: рубеж контракта либо начало куска, если оно позже.
+    start: date
     #: Первый день, за которым ходили на биржу. Раньше него хвост не качался.
     since: date
-    #: Сколько закрытых баров набралось перед рубежом и сколько просили.
+    #: Сколько закрытых баров набралось перед `start` и сколько просили.
     warm_bars: int
     warmup_bars: int
     reports: list[LoadReport] = field(default_factory=list)
+    #: Последний день тела — `ContractRequest.until`.
+    until: date | None = None
 
     @property
     def problem(self) -> str | None:
@@ -674,7 +714,7 @@ class ContractLoad:
         if self.warm_bars >= self.warmup_bars:
             return None
         return (
-            f"{self.symbol}: перед рубежом {self.active_from:%d.%m.%Y} набралось "
+            f"{self.symbol}: перед {self.start:%d.%m.%Y} набралось "
             f"{self.warm_bars} закрытых баров из {self.warmup_bars} — средняя "
             "начнёт с недогретого значения"
         )
@@ -717,6 +757,9 @@ class ContractRequest:
     progress: Callable[[FetchResult], None] | None = field(
         default=None, compare=False
     )
+    #: С какого дня тело: кусок периода, начатый позже рубежа (B-069).
+    #: Раньше рубежа не бывает — прижимается к нему. `None` — с рубежа.
+    since: date | None = None
 
 
 def load_contract_minutes(
@@ -727,6 +770,9 @@ def load_contract_minutes(
     Хвост до рубежа **не скачивается** (решение 0061), кроме прогрева:
     `request.warmup_bars` закрытых баров `request.timeframe` перед `active_from`. Число
     называет вызывающий — это период средней из настроек (правило 16).
+
+    `request.since` позже рубежа — тело с него, и прогрев перед ним: кусок
+    отрезка, начатого посреди периода контракта (B-069).
 
     ⚠️ **Прогрев качается целыми днями.** Биржа отдаёт минуты по датам,
     и учёт загруженного (`data_day`, от которого зависит закрытость бара)
@@ -748,8 +794,8 @@ def load_contract_minutes(
             f"у «{symbol}» нет начала периода в таблице контрактов: откуда "
             "начинать загрузку, неизвестно, а хвост до рубежа не качается"
         )
-    start = row.active_from
-    load = ContractLoad(symbol, start, start, 0, warmup_bars)
+    start = max(row.active_from, request.since or row.active_from)
+    load = ContractLoad(symbol, start, start, 0, warmup_bars, until=request.until)
     if request.until >= start:
         load.reports.append(
             sync_minutes(store, client, symbol, market=request.market,
@@ -770,6 +816,83 @@ def load_contract_minutes(
         day -= timedelta(days=1)
     load.warm_bars = _bars_before(store, symbol, request.timeframe, load.since, start)
     return load
+
+
+# ---------------------------------------------------------------------------
+# Сверка дней с биржей после загрузки (B-069)
+# ---------------------------------------------------------------------------
+
+def runs_of(days: Sequence[date], missing: Iterable[date]) -> list[tuple[date, date]]:
+    """Подряд идущие в `days` дни из `missing` — отрезками, обе границы включительно.
+
+    «Подряд» — по последовательности `days`, а не по календарю: 07.09–16.09
+    по торговым дням биржи — один отрезок, выходные внутри его не рвут.
+    """
+    wanted = set(missing)
+    found: list[tuple[date, date]] = []
+    first: date | None = None
+    last: date | None = None
+    for day in sorted(days):
+        if day in wanted:
+            first = first or day
+            last = day
+            continue
+        if first is not None and last is not None:
+            found.append((first, last))
+        first = last = None
+    if first is not None and last is not None:
+        found.append((first, last))
+    return found
+
+
+@dataclass(frozen=True, slots=True)
+class LegDays:
+    """Сверка одного куска: дни, когда биржа торговала, и каких из них нет в базе."""
+
+    leg: Leg
+    #: Дни куска с объёмом по дневным свечам биржи.
+    exchange: tuple[date, ...]
+    #: Дни биржи, за которые в базе нет ни одной минуты, — отрезками.
+    missing: tuple[tuple[date, date], ...] = ()
+    #: Сколько дней биржи в базе есть.
+    present: int = 0
+
+
+def check_days(
+    store: CandleStore, client: IssClient, legs: Sequence[Leg], *, market: Market
+) -> list[LegDays]:
+    """Сверить каждый кусок с дневными свечами биржи; с пропусков снять отметки.
+
+    Загрузка спрашивает биржу по дням и отмечает спрошенное (`data_day`).
+    Отмеченный день без минут — это либо праздник, либо сбой, и различить
+    их может только биржа: дневная свеча с объёмом значит «торговали».
+    Такой день без минут в базе — пропуск, и отметка с него снимается, чтобы
+    следующая «Догрузить недостающее» спросила его снова (B-069: MXU6
+    05.09–16.09 прошёл в прогон молча).
+
+    Ходит в сеть; сравнение — по дням, не по минутам: неполный день
+    пропуском не считается.
+    """
+    checked: list[LegDays] = []
+    for leg in legs:
+        volumes = client.daily_volumes(
+            leg.symbol, market=market, date_from=leg.since, date_to=leg.until
+        )
+        traded = sorted(
+            day for day, volume in volumes.items()
+            if volume > 0 and leg.since <= day <= leg.until
+        )
+        have = set(store.trading_days(leg.symbol))
+        missing = runs_of(traded, (day for day in traded if day not in have))
+        for first, last in missing:
+            store.forget_day_marks(leg.symbol, first, last)
+        checked.append(LegDays(
+            leg=leg,
+            exchange=tuple(traded),
+            missing=tuple(missing),
+            present=sum(1 for day in traded if day in have),
+        ))
+    return checked
 
 
 # ---------------------------------------------------------------------------

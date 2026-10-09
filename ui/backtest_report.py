@@ -75,13 +75,15 @@ def period_lines(report: BacktestReport) -> list[str]:
         if report.first_bar is not None and report.last_bar is not None
         else "свечей на этот отрезок в базе не нашлось"
     )
-    return [
+    lines = [
         f"Просили: {asked} МСК",
         f"Посчитано: {found} МСК",
         f"Свечей в прогоне: {fmt_number(report.bars, 0)}. "
         f"Торговых дней: {report.trading_days} "
         "(дней, в которые были торги, — не календарных)",
     ]
+    # Склейка: на каких контрактах и днях посчитано — готовой строкой (B-069).
+    return [*lines, report.basis] if report.basis else lines
 
 
 class BacktestReportDialog(QDialog):

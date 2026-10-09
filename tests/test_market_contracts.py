@@ -33,6 +33,8 @@ from market.contracts import (
     adopt_chain,
     asset_of,
     chain_around,
+    chain_covering,
+    check_days,
     current_contract,
     expiry_verdict,
     load_contract_minutes,
@@ -940,3 +942,59 @@ def test_the_banner_of_a_monthly_asset_does_not_promise_a_load(store: CandleStor
     assert "месячные" in notice.trouble, notice
     assert "узнает у биржи" not in notice.trouble, notice
     assert not notice.urgent and notice.current == "", notice
+
+
+# -- B-069: цепочка до начала отрезка, кусок с середины, сверка дней --------
+
+def test_the_chain_reaches_back_to_the_start_of_the_period() -> None:
+    """С 17.06 при MXZ6 нужен MXM6 и датирующий его MXH6; близкий отрезок — как прежде."""
+    today = date(2026, 10, 9)
+    assert chain_covering("MXZ6", date(2026, 6, 17), today) == [
+        "MXH6", "MXM6", "MXU6", "MXZ6", "MXH7",
+    ]
+    assert chain_covering("MXZ6", date(2026, 9, 1), today) == chain_around("MXZ6")
+    far = chain_covering("MXZ6", date(2010, 1, 1), today)
+    assert len(far) == len(set(far)), f"цепочка пошла по второму кругу десятилетия: {far}"
+
+
+def test_a_piece_from_the_middle_of_the_period_loads_from_its_own_start(
+    store: CandleStore,
+) -> None:
+    """`ContractRequest.since` позже рубежа — тело с него, прогрев перед ним."""
+    days = {date(2026, 9, d): 120 for d in (14, 15, 16, 17, 18, 21, 22)}
+    exchange = Exchange(days)
+    _dated_mxz6(store, date(2026, 9, 17))
+
+    load = load_contract_minutes(
+        store, exchange.client,
+        ContractRequest("MXZ6", FUTURES, until=date(2026, 9, 22), warmup_bars=15, now=NOW,
+                        since=date(2026, 9, 21)),
+    )
+
+    assert load.start == date(2026, 9, 21)
+    assert min(since for since, _ in exchange.minute_requests()) == date(2026, 9, 18)
+    assert date(2026, 9, 17) not in store.trading_days("MXZ6")
+
+
+def test_the_check_names_the_days_the_exchange_traded_and_the_base_lacks(
+    store: CandleStore,
+) -> None:
+    """Сверка: дни с объёмом у биржи без минут в базе — отрезком, отметки с них сняты.
+
+    Выходные 12–13.09 отрезок не рвут: «подряд» — по торговым дням биржи.
+    """
+    have = (date(2026, 9, 8), date(2026, 9, 9), date(2026, 9, 10))
+    exchange = Exchange({day: 60 for day in have})
+    for day in have:
+        store.put_minutes("MXU6", session(day, 60), Source.ISS)
+    marked = [date(2026, 9, 8) + timedelta(days=n) for n in range(9)]
+    store.mark_days_requested("MXU6", marked, now=NOW)
+
+    [found] = check_days(
+        store, exchange.client, [Leg("MXU6", date(2026, 9, 8), date(2026, 9, 16))],
+        market=FUTURES,
+    )
+
+    assert found.missing == ((date(2026, 9, 11), date(2026, 9, 16)),), found.missing
+    assert (found.present, len(found.exchange)) == (3, 7)
+    assert store.settled_days("MXU6") == set(have), "отметки с пропуска не сняты"

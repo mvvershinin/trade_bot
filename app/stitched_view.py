@@ -33,7 +33,7 @@ from typing import cast
 
 from app import convert
 from app.minutes import minute_plan
-from app.stitched import StitchRequest, load_pieces
+from app.stitched import StitchRequest, basis_line, load_pieces
 from backtest import HistoryRun
 from backtest.execution import Costs, LimitExits
 from backtest.stitched import Piece, StitchedRun, replay_pieces, stitched_lines
@@ -97,6 +97,11 @@ class Stitch:
     def symbols(self) -> str:
         """Контракты периода словами: «MXU6 → MXZ6»."""
         return " → ".join(piece.symbol for piece in self.pieces if piece.body)
+
+    @property
+    def basis(self) -> str:
+        """«Считается на: …» — контракты, дни со свечами и пропуски (B-069)."""
+        return basis_line(self.pieces)
 
 
 def _midnight(day: date) -> datetime:

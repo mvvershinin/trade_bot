@@ -16,8 +16,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import pathlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, time, timedelta
+from typing import TypeVar, cast
 
 import pytest
 
@@ -30,6 +31,7 @@ from engine import EngineSettings, Mode, TradingWindow
 from market.candles import M5, MSK, Timeframe
 from market.chain import Leg
 from market.storage import CandleStore, ContractRow, Source
+from market.worker import MarketWorker
 from strategies import MaReverseAlways, MaReverseAlwaysSettings
 from tests.market_helpers import minute
 from ui.models import MinutePriceOrder, Settings
@@ -100,9 +102,12 @@ def test_warmup_is_exactly_the_last_n_bars_of_the_same_contract(store: CandleSto
 
 def test_days_without_a_contract_are_said_aloud(store: CandleStore) -> None:
     made, notes = load_pieces(store, _request(date(2026, 6, 1)))
+    # Вторая заметка — дыра внутри куска MXU6 (B-069): свечи у него только 16.09.
     assert [text for _, text in notes] == [
         "01.06.2026 … 07.06.2026: в таблице контрактов нет ближнего на эти дни — "
-        "они в прогон не вошли"
+        "они в прогон не вошли",
+        "MXU6: нет свечей за 08.06–15.09 — сделки за эти дни не посчитаны. "
+        "Загрузите историю с 08.06.2026: «Загрузить историю…» в меню «Программа»",
     ]
     settings = EngineSettings(mode=Mode.REVERSE, window=TradingWindow(start=time(0), end=time(0)))
     run = asyncio.run(replay_pieces(
@@ -344,3 +349,141 @@ def test_the_stitched_run_keeps_the_limit_exits_of_every_piece(
              if one.name == "Выход по времени с предельной ценой"]
     assert named, "неисполненный выход с предельной ценой пропал из допущений склейки"
     assert "не исполнилось 1" in named[0].short, named[0].short
+
+
+# ---------------------------------------------------------------------------
+# B-069: дыра внутри куска не проходит молча
+# ---------------------------------------------------------------------------
+
+#: «Сегодня» для дыр: день, который ещё идёт, пропуском не считается.
+HOLE_TODAY = date(2026, 10, 9)
+
+
+@pytest.fixture
+def holed(tmp_path: pathlib.Path) -> Iterator[CandleStore]:
+    """MXU6 01.09–04.09 со свечами, 07.09–16.09 без свечей и без отметок.
+
+    03.09 (четверг) — отметка «спрашивали» без свечей: биржа не торговала
+    (праздник). 05–06.09 и 12–13.09 — выходные. MXZ6 17.09–18.09 со свечами.
+    """
+    with CandleStore(tmp_path / "holed.sqlite3") as opened:
+        opened.put_contracts(
+            [ContractRow("MXU6", active_from=date(2026, 6, 18), active_to=date(2026, 9, 16)),
+             ContractRow("MXZ6", active_from=SEAM)],
+            now=NOW,
+        )
+        for symbol, days in (
+            ("MXU6", (date(2026, 9, 1), date(2026, 9, 2), date(2026, 9, 4))),
+            ("MXZ6", (SEAM, date(2026, 9, 18))),
+        ):
+            for day in days:
+                start = datetime.combine(day, time(10, 0), MSK)
+                opened.put_minutes(
+                    symbol,
+                    [minute(start + timedelta(minutes=i), volume=1.0)
+                     for i in range(BARS_A_DAY * 5)],
+                    Source.ISS,
+                )
+            opened.mark_days_requested(symbol, days, now=NOW)
+        opened.mark_days_requested("MXU6", [date(2026, 9, 3)], counts={date(2026, 9, 3): 0},
+                                   now=NOW)
+        yield opened
+
+
+def _holed_request() -> StitchRequest:
+    return StitchRequest(
+        since=date(2026, 9, 1), until=date(2026, 9, 18), timeframe=M5, warmup_bars=15,
+        asset="MX", today=HOLE_TODAY,
+    )
+
+
+HOLE_NOTE = (
+    "MXU6: нет свечей за 07.09–16.09 — сделки за эти дни не посчитаны. "
+    "Загрузите историю с 07.09.2026: «Загрузить историю…» в меню «Программа»"
+)
+
+
+def test_a_hole_inside_a_piece_is_named_with_its_dates(holed: CandleStore) -> None:
+    """Стережёт B-069 (B2): будние дни куска без свечей и без отметки — заметкой с диапазоном.
+
+    Владелец счёта 09.10.2026: прогон 18.06–09.10 прошёл 05.09–16.09 MXU6
+    без сделок и без слова. Мутация: не собирать дыры кусков — заметки нет.
+    """
+    made, notes = load_pieces(holed, _holed_request())
+    assert [piece.symbol for piece in made] == ["MXU6", "MXZ6"]
+    assert [text for _, text in notes] == [HOLE_NOTE]
+    assert notes[0][0] == datetime(2026, 9, 7, tzinfo=MSK)
+    assert made[0].missing == ((date(2026, 9, 7), date(2026, 9, 16)),)
+
+
+def test_weekends_and_a_marked_day_without_candles_raise_no_alarm(holed: CandleStore) -> None:
+    """Стережёт B-069 (B4): выходные и отмеченный день без свечей тревоги не дают.
+
+    03.09 отмечен «спрашивали», свечей нет — биржа не торговала. 05–06.09 —
+    выходные. Ни то, ни другое в заметку не попадает; дыра 07.09–16.09 одна,
+    выходные 12–13.09 её не рвут. Мутации: смотреть все дни календаря —
+    появится 05.09; не смотреть отметки — появится 03.09.
+    """
+    made, notes = load_pieces(holed, _holed_request())
+    said = " ".join(text for _, text in notes)
+    assert "03.09" not in said, said
+    assert "05.09" not in said and "06.09" not in said, said
+    assert made[0].missing == ((date(2026, 9, 7), date(2026, 9, 16)),), made[0].missing
+    assert made[1].missing == (), "у MXZ6 пропусков нет"
+
+
+def test_today_is_not_a_hole(holed: CandleStore) -> None:
+    """Идущий день пропуском не считается: его свечи ещё набираются."""
+    request = dataclasses.replace(_holed_request(), until=date(2026, 9, 21),
+                                  today=date(2026, 9, 21))
+    made, notes = load_pieces(holed, request)
+    assert made[1].missing == (), made[1].missing
+    assert not any("21.09" in text for _, text in notes)
+
+
+def test_the_hole_reaches_the_run_journal_and_problems(holed: CandleStore) -> None:
+    """Стережёт B-069 (B3): заметка о дыре доходит до журнала прогона и до ⚠ «По контрактам».
+
+    Мутация «посчитали, но не отдали»: дыры собраны в куски
+    (`Piece.missing`), но не отданы заметкой — журнал и `problems` молчат.
+    """
+    request = dataclasses.replace(
+        stitched_view.request_of(Settings(), M5, date(2026, 9, 1), date(2026, 9, 18),
+                                 asset="MX"),
+        today=HOLE_TODAY,
+    )
+    # Поток данных подставной: нарезка идёт прямо по базе этого теста.
+    stitch = asyncio.run(stitched_view.plan(cast(MarketWorker, _Direct(holed)), request))
+    assert stitch is not None
+    values = Settings()
+    engine = convert.engine_settings(values, EngineMode.REVERSE)
+    run = asyncio.run(stitched_view.run(stitch, values, engine))
+    assert HOLE_NOTE in run.problems, run.problems
+    assert any(
+        entry.event == "Склейка неполная" and entry.reason == HOLE_NOTE
+        for entry in run.journal
+    ), "журнал прогона о дыре молчит"
+    assert f"⚠ {HOLE_NOTE}" in stitched_view.lines(run), "«По контрактам» о дыре молчит"
+
+
+def test_the_basis_line_names_contracts_days_and_holes(holed: CandleStore) -> None:
+    """Строка «Считается на:» — контракты, дни со свечами и пропуски, без «из N»."""
+    made, notes = load_pieces(holed, _holed_request())
+    stitch = stitched_view.Stitch(pieces=tuple(made), notes=tuple(notes))
+    assert stitch.basis == (
+        "Считается на: MXU6 01.09–16.09 (3 дн. со свечами; нет 07.09–16.09) · "
+        "MXZ6 17.09–18.09 (2 дн. со свечами)"
+    )
+
+
+T = TypeVar("T")
+
+
+class _Direct:
+    """Подставной поток данных: работа идёт прямо по базе, в этом же потоке."""
+
+    def __init__(self, store: CandleStore) -> None:
+        self._store = store
+
+    async def call(self, work: Callable[[CandleStore], T]) -> T:
+        return work(self._store)

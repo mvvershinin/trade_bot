@@ -959,6 +959,7 @@ class MainWindow(QMainWindow):
     def show_chart(self, data: ChartData) -> None:
         self.chart.show_chart(data)
         self._chart_instrument = data.instrument
+        self._chart_basis = data.basis
         self._chart_bounds = (
             (data.candles[0].opens_at, data.candles[-1].opens_at) if data.candles else None
         )
@@ -1487,6 +1488,7 @@ class MainWindow(QMainWindow):
         """
         self.reports_dialog: ReportsDialog | None = None
         self._chart_instrument = ""
+        self._chart_basis = ""
         self._chart_bounds: tuple[datetime, datetime] | None = None
         self._run_seen = False
 
@@ -1505,6 +1507,7 @@ class MainWindow(QMainWindow):
             instrument=self._chart_instrument,
             first=first,
             last=last,
+            basis=self._chart_basis,
         )
 
     def _refresh_reports(self) -> None:

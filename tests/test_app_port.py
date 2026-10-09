@@ -4020,7 +4020,7 @@ def test_a_stitched_run_on_a_coarse_bar_also_says_minutes_were_not_given(
     async def stitched_series(self, frame, symbol, timeframe):
         candles, _ = await real_series(self, frame, symbol, timeframe)
         return candles, SimpleNamespace(
-            candles=candles, seams=(), symbols="подставная", pieces=(),
+            candles=candles, seams=(), symbols="подставная", pieces=(), basis="",
         )
 
     async def stitched_run(stitch, values, engine, **_kwargs):

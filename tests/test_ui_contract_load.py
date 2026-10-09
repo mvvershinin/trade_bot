@@ -57,6 +57,7 @@ from ui.models import (
     BacktestRequest,
     ChartData,
     ContractNotice,
+    DecisionLevel,
     DecisionRow,
     HistoryLoadOutcome,
     HistoryLoadRequest,
@@ -874,3 +875,423 @@ def test_a_monthly_asset_falls_back_to_the_day_load_aloud(loop, tmp_path) -> Non
         rows = store.contracts()
     assert [row.symbol for row in rows] == ["BRK6"], rows
     assert all(row.active_from is None and row.active_to is None for row in rows), rows
+
+
+# ---------------------------------------------------------------------------
+# B-069: загрузка периода — каждым контрактом своими днями, затем сверка
+# ---------------------------------------------------------------------------
+
+#: «Сегодня» владельца счёта 09.10.2026 и рубежи 2026 года, как в его таблице.
+OWNER_TODAY = date(2026, 10, 9)
+ROLLS = {"MXM6": date(2026, 3, 19), "MXU6": date(2026, 6, 18), "MXZ6": date(2026, 9, 17)}
+
+
+class Quarters(Chain):
+    """Подставная биржа с настоящими кварталами: MXH6 → MXM6 → MXU6 → MXZ6 → MXH7.
+
+    Ближний по дневным объёмам — по рубежам `ROLLS`; до своего рубежа
+    контракт торгуется слабо, после следующего — не торгуется вовсе (истёк).
+    Минуты — каждый день, кроме `holes`: дней, за которые биржа торговала
+    (объём есть), а минут по коду не отдаёт.
+    """
+
+    def __init__(self, today: date, *, holes: dict[str, set[date]] | None = None) -> None:
+        super().__init__(today)
+        self.holes = holes or {}
+        codes = ("MXH6", "MXM6", "MXU6", "MXZ6", "MXH7")
+        self.volumes = {code: {} for code in codes}
+        day = date(2025, 9, 1)
+        while day <= today:
+            front = max(
+                (code for code, roll in ROLLS.items() if roll <= day), default="MXH6",
+                key=lambda code: ROLLS[code],
+            )
+            for code in codes[codes.index(front):]:
+                self.volumes[code][day] = 1000.0 if code == front else 10.0
+            day += timedelta(days=1)
+
+    def answer(self, url: str) -> bytes:
+        body = super().answer(url)
+        parsed = urllib.parse.urlparse(url)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        code = parsed.path.rsplit("/", 2)[-2]
+        if query.get("interval") != "1" or not self.holes.get(code):
+            return body
+        page = json.loads(body)
+        page["candles"]["data"] = [
+            row for row in page["candles"]["data"]
+            if date.fromisoformat(row[6][:10]) not in self.holes[code]
+        ]
+        return json.dumps(page).encode()
+
+    def spans_of(self, code: str) -> list[tuple[date, date]]:
+        """Отрезки минут, которые просили по коду."""
+        spans = []
+        for url in self.transport.urls:
+            parsed = urllib.parse.urlparse(url)
+            query = dict(urllib.parse.parse_qsl(parsed.query))
+            if query.get("interval") == "1" and parsed.path.rsplit("/", 2)[-2] == code:
+                spans.append((date.fromisoformat(query["from"]),
+                              date.fromisoformat(query["till"])))
+        return spans
+
+
+def _load_since(symbol: str, since: date):
+    async def work(port: HistoryPort, heard: Heard) -> None:
+        port.load_history(HistoryLoadRequest(symbol=symbol, days=90, since=since))
+        await _settle(heard)
+
+    return work
+
+
+def test_a_period_load_takes_every_contract_in_its_own_days(loop, tmp_path) -> None:
+    """Стережёт B-069 (A): период 17.06–сегодня — MXM6, MXU6, MXZ6 каждый своими днями.
+
+    Слова владельца счёта 09.10.2026: «выбрали период с 17 июня — и там
+    актуальный фьючерс до конца его действия… Далее грузим следующий».
+    По рубежам 0049 17.06 — ещё MXM6, MXU6 — 18.06–16.09, MXZ6 — с 17.09.
+    Мутация: грузить только код из настроек (MXZ6) — минут MXU6 и MXM6
+    не просили.
+    """
+    database = tmp_path / "base.sqlite3"
+    chain = Quarters(OWNER_TODAY)
+
+    _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+
+    outcome = heard.finished[-1]
+    assert outcome.ok, outcome.trouble
+    for code, first, last in (
+        ("MXM6", date(2026, 6, 17), date(2026, 6, 17)),
+        ("MXU6", date(2026, 6, 18), date(2026, 9, 16)),
+        ("MXZ6", date(2026, 9, 17), OWNER_TODAY),
+    ):
+        spans = chain.spans_of(code)
+        assert spans, f"минуты {code} не просили вовсе"
+        asked = {since + timedelta(days=n) for since, till in spans
+                 for n in range((till - since).days + 1)}
+        left = [day for day in (first + timedelta(days=n) for n in range((last - first).days + 1))
+                if day not in asked]
+        assert not left, f"{code}: дни своего куска не просили: {left[:3]}…"
+        assert max(till for _, till in spans) == last, f"{code} грузился за чужие дни: {spans}"
+        assert min(since for since, _ in spans) >= first - timedelta(days=WARMUP_LOOK_BACK_DAYS), (
+            f"{code} грузил хвост до своего куска: {spans}"
+        )
+    assert chain.spans_of("MXH6") == [], "MXH6 на отрезке не ближний — грузить его нечего"
+    assert outcome.detail.startswith(
+        "Загружено: MXM6 17.06 (1 из 1 торговых дней биржи) · MXU6 18.06–16.09 (91 из 91) · "
+        "MXZ6 17.09–09.10 (23 из 23)."
+    ), outcome.detail
+
+
+def _asked_days(chain: Quarters, code: str) -> list[date]:
+    """Дни, за которые минуты кода спросили у биржи. Страницы одного отрезка — один раз."""
+    return sorted({since + timedelta(days=n) for since, till in chain.spans_of(code)
+                   for n in range((till - since).days + 1)})
+
+
+def test_a_repeated_load_does_not_ask_the_exchange_for_days_it_already_has(
+    loop, tmp_path,
+) -> None:
+    """Стережёт B-069 (D): «Догрузить недостающее» второй раз не качает лежащие дни.
+
+    Слова владельца счёта 09.10.2026: «почему каждый раз 20 тысяч свечей?».
+    Тот же период с 17.06 грузится дважды, без «заново». Во второй раз биржу
+    не спрашивают ни об одном дне, отмеченном после первого (`settled`
+    в `data_day`); по MXZ6 спрашивают ровно сегодняшний, ещё не закрытый день.
+    Итог называет число запрошенных дней — и оно совпадает с тем, что
+    подставная биржа реально получила.
+
+    Мутации: снимать отметки без «заново»; не смотреть на отметки при выборе
+    дней; считать в итоге просимый отрезок вместо запрошенного; не сказать.
+    ⚠️ По прошлым кускам второй раз спрашивается их последний день (MXM6 17.06,
+    MXU6 16.09): после него минут этого кода в базе нет, и `_settle_tails`
+    его не закрывает. Отмеченным он не был — проверке это не противоречит;
+    перезапрос — долг `D-149`.
+    """
+    database = tmp_path / "base.sqlite3"
+    first_chain = Quarters(OWNER_TODAY)
+    _, first = _run(loop, database, first_chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+    assert first.finished[-1].ok, first.finished[-1].trouble
+    assert "Календарных дней запрошено у биржи: 118 из 118." in first.finished[-1].detail, (
+        first.finished[-1].detail
+    )
+    codes = ("MXM6", "MXU6", "MXZ6")
+    with CandleStore(database) as store:
+        settled = {code: store.settled_days(code) for code in codes}
+    assert all(settled.values()), f"первая загрузка ничего не отметила: {settled}"
+
+    chain = Quarters(OWNER_TODAY)
+    _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+
+    outcome = heard.finished[-1]
+    assert outcome.ok, outcome.trouble
+    asked = {code: _asked_days(chain, code) for code in codes}
+    for code in codes:
+        again = sorted(set(asked[code]) & settled[code])
+        assert not again, f"{code}: второй раз спросили уже отмеченные дни: {again[:5]}…"
+    assert asked["MXZ6"] == [OWNER_TODAY], f"MXZ6 спросили не только сегодня: {asked['MXZ6']}"
+    total = sum(len(days) for days in asked.values())
+    said = f"Календарных дней запрошено у биржи: {total} из 118, остальные уже были в базе."
+    assert said in outcome.detail, outcome.detail
+
+
+def test_after_the_load_the_days_the_exchange_traded_are_checked(loop, tmp_path) -> None:
+    """Стережёт B-069 (B1): биржа торговала 07.09–16.09, минут MXU6 в базе нет — громко.
+
+    Итог `ok=False`, строка с диапазоном в беде итога и в журнале
+    предупреждением, отметки «спрашивали» с этих дней сняты — следующая
+    «Догрузить недостающее» спросит их снова. Мутации: не сверять, сверить
+    и не сказать, не снять отметки.
+    """
+    database = tmp_path / "base.sqlite3"
+    hole = {date(2026, 9, 7) + timedelta(days=n) for n in range(10)}
+    chain = Quarters(OWNER_TODAY, holes={"MXU6": hole})
+
+    _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+
+    outcome = heard.finished[-1]
+    assert not outcome.ok, "пропуск 07.09–16.09 прошёл как успех"
+    line = "MXU6: нет свечей за 07.09–16.09 — сделки за эти дни не посчитаны."
+    assert line in outcome.trouble, outcome.trouble
+    assert "MXU6 18.06–16.09 (81 из 91)" in outcome.detail, outcome.detail
+    warned = [row for row in heard.notes
+              if row.event == "Загрузка истории" and line in row.reason]
+    assert warned and warned[-1].level is DecisionLevel.WARNING, "журнал о пропуске молчит"
+    with CandleStore(database) as store:
+        settled = store.settled_days("MXU6")
+    assert not settled & hole, f"отметки с пропуска не сняты: {sorted(settled & hole)}"
+    assert date(2026, 9, 4) in settled, "сняты отметки и с дней, где свечи есть"
+
+
+def test_the_tester_says_the_hole_and_the_basis_in_its_report(loop, tmp_path) -> None:
+    """Стережёт B-069 (B3 и «Считается на:»): дыра — ⚠ в отчёте, строка — в шапке и графике.
+
+    MXU6 со свечами 14.09 и 16.09, 15.09 без свечей и без отметки. Отчёт
+    о прогоне называет дыру в разбивке «По контрактам», строку «Считается на:»
+    несёт и отчёт, и снимок графика (оттуда — «Отчёты»). Мутация «посчитали,
+    но не отдали»: строка собрана, но в отчёт не положена.
+    """
+    database = tmp_path / "base.sqlite3"
+    _seed_mxu6(database, (9, 7))
+    chain = Chain(TODAY)
+    since = datetime.combine(TODAY - timedelta(days=9), time(0), MSK)
+    until = datetime.combine(TODAY, time(23, 59), MSK)
+
+    async def work(port: HistoryPort, heard: Heard) -> None:
+        port.load_history(HistoryLoadRequest(symbol="MXZ6"))
+        await _settle(heard)
+        await port.wait()
+        port.run_backtest(BacktestRequest(
+            settings=Settings(instrument="MXZ6"), since=since, until=until,
+        ))
+        await port.wait()
+
+    _, heard = _run(loop, database, chain, work, instrument="MXZ6")
+
+    report = heard.reports[-1]
+    hole = f"MXU6: нет свечей за {TODAY - timedelta(days=8):%d.%m}"
+    assert any(line.startswith(f"⚠ {hole}") for line in report.contracts), report.contracts
+    basis = (
+        f"Считается на: MXU6 {TODAY - timedelta(days=9):%d.%m}–"
+        f"{TODAY - timedelta(days=7):%d.%m} (2 дн. со свечами; нет "
+        f"{TODAY - timedelta(days=8):%d.%m}) · MXZ6 {TODAY - timedelta(days=6):%d.%m}–"
+        f"{TODAY:%d.%m} (5 дн. со свечами)"
+    )
+    # 5, а не 7: подставная биржа отдаёт минуты и в субботу с воскресеньем,
+    # а дни считаются торговые (пн–пт), как в сверке загрузки с биржей.
+    assert report.basis == basis, report.basis
+    full = [chart for chart in heard.charts if chart.candles]
+    assert full[-1].basis == basis, "строка не дошла до снимка графика — «Отчёты» её не покажут"
+
+
+class _BrokenOnMXZ6(Quarters):
+    """Биржа, рвущая связь на минутах MXZ6."""
+
+    def answer(self, url: str) -> bytes:
+        if "/MXZ6/" in url and "interval=1&" in url:
+            raise OSError("связь оборвалась")
+        return super().answer(url)
+
+
+def test_a_break_in_the_middle_names_the_pieces_loaded_and_not(loop, tmp_path) -> None:
+    """Обрыв посреди периода: скачанное остаётся, итог называет, что загружено, что нет.
+
+    Биржа рвёт связь на минутах MXZ6 — третьем куске. MXM6 и MXU6 уже
+    в базе, и итог говорит это словами, а не «Загрузка не удалась» без
+    подробностей.
+    """
+    database = tmp_path / "base.sqlite3"
+    chain = _BrokenOnMXZ6(OWNER_TODAY)
+
+    _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+
+    outcome = heard.finished[-1]
+    assert not outcome.ok
+    assert "Загружено: MXM6 17.06, MXU6 18.06–16.09." in outcome.trouble, outcome.trouble
+    assert "Не загружено: MXZ6 17.09–09.10." in outcome.trouble, outcome.trouble
+    with CandleStore(database) as store:
+        assert date(2026, 9, 16) in store.trading_days("MXU6"), "скачанное до обрыва пропало"
+
+
+#: Куски периода с 17.06 по рубежам 0049 — каждый своими днями.
+PERIOD_PIECES = (
+    ("MXM6", date(2026, 6, 17), date(2026, 6, 17)),
+    ("MXU6", date(2026, 6, 18), date(2026, 9, 16)),
+    ("MXZ6", date(2026, 9, 17), OWNER_TODAY),
+)
+
+
+def _days_of(first: date, last: date) -> list[date]:
+    return [first + timedelta(days=n) for n in range((last - first).days + 1)]
+
+
+def test_loading_anew_over_a_period_asks_every_contract_its_days_again(loop, tmp_path) -> None:
+    """Стережёт B-069 (D, обратная сторона): «Загрузить заново» перекачивает каждый кусок.
+
+    Период с 17.06 уже загружен и отмечен. «Заново» с той же даты обязано
+    снова спросить у биржи все дни MXM6, MXU6 и MXZ6 — полная перекачка
+    бывает только так. Мутация: снять отметки одного куска (кода из
+    настроек) — дни MXU6 второй раз не спрошены, и «заново» молча
+    оказывается догрузкой.
+    """
+    database = tmp_path / "base.sqlite3"
+    _, first = _run(loop, database, Quarters(OWNER_TODAY),
+                    _load_since("MXZ6", date(2026, 6, 17)), instrument="MXZ6")
+    assert first.finished[-1].ok, first.finished[-1].trouble
+    with CandleStore(database) as store:
+        # Без отметок второй раз спросили бы всё и без «заново» — проверка пуста.
+        assert store.settled_days("MXU6"), "первая загрузка ничего не отметила"
+
+    chain = Quarters(OWNER_TODAY)
+
+    async def anew(port: HistoryPort, heard: Heard) -> None:
+        port.load_history(HistoryLoadRequest(
+            symbol="MXZ6", days=90, since=date(2026, 6, 17), replace=True,
+        ))
+        await _settle(heard)
+
+    _, heard = _run(loop, database, chain, anew, instrument="MXZ6")
+
+    assert heard.finished[-1].ok, heard.finished[-1].trouble
+    for code, first_day, last_day in PERIOD_PIECES:
+        asked = set(_asked_days(chain, code))
+        left = [day for day in _days_of(first_day, last_day) if day not in asked]
+        assert not left, f"«заново» не перезапросило {code}: {left[:3]}…"
+
+
+def test_every_piece_of_the_period_gets_the_warmup_of_the_average_period(
+    loop, tmp_path,
+) -> None:
+    """Стережёт B-069 (A, «плюс прогрев»): перед каждым куском — прогрев на период средней.
+
+    Подставная биржа отдаёт 120 минут в день — 24 пятиминутки. Период 30
+    из настроек в один день не помещается: перед началом каждого куска
+    нужны два дня **его же** контракта. Мутация: порт передаёт загрузке
+    прогрев не из настроек (один бар) — берётся один день, средняя на стыке
+    начинает недогретой, а итог молчит: недогрев меряется тем же неверным
+    числом.
+    """
+    database = tmp_path / "base.sqlite3"
+    chain = Quarters(OWNER_TODAY)
+
+    async def work(port: HistoryPort, heard: Heard) -> None:
+        port.apply_settings(Settings(instrument="MXZ6", average_period=30))
+        await port.wait()
+        port.load_history(HistoryLoadRequest(symbol="MXZ6", days=90, since=date(2026, 6, 17)))
+        await _settle(heard)
+
+    _, heard = _run(loop, database, chain, work, instrument="MXZ6")
+
+    assert heard.finished[-1].ok, heard.finished[-1].trouble
+    for code, start, _ in PERIOD_PIECES:
+        asked = set(_asked_days(chain, code))
+        warm = {start - timedelta(days=1), start - timedelta(days=2)}
+        assert warm <= asked, (
+            f"{code}: прогрев перед {start:%d.%m} неполный — не спрошены "
+            f"{sorted(warm - asked)}"
+        )
+
+
+class _WithoutMXH6(Quarters):
+    """Биржа, не знающая MXH6: начало периода MXM6 датировать нечем, 17.06 без контракта."""
+
+    def __init__(self, today: date) -> None:
+        super().__init__(today)
+        del self.volumes["MXH6"]
+
+    def answer(self, url: str) -> bytes:
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        if "/MXH6/" in url and query.get("interval") == "24":
+            return _daily_body({})
+        return super().answer(url)
+
+
+def test_days_of_the_period_without_a_contract_are_said_after_the_load(
+    loop, tmp_path,
+) -> None:
+    """Стережёт B-069 (B, правило 13): день периода без контракта в таблице — громко.
+
+    MXH6 биржа не знает, начало MXM6 неизвестно, и 17.06 не грузится ничем.
+    Итог обязан это сказать (`ok=False`, строка в беде, журнал —
+    предупреждением), а не отчитаться «История загружена» по 18.06–09.10.
+    Мутация молчания: дни без контракта не отданы в итог.
+    """
+    database = tmp_path / "base.sqlite3"
+    chain = _WithoutMXH6(OWNER_TODAY)
+
+    _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+
+    outcome = heard.finished[-1]
+    line = ("17.06.2026 … 17.06.2026: в таблице контрактов нет ближнего на эти дни — "
+            "они не загружены.")
+    assert not outcome.ok, f"17.06 без контракта прошло как успех: {outcome.detail}"
+    assert line in outcome.trouble, outcome.trouble
+    warned = [row for row in heard.notes
+              if row.event == "Загрузка истории" and line in row.reason]
+    assert warned and warned[-1].level is DecisionLevel.WARNING, "журнал о дне без контракта молчит"
+
+
+class _CheckRefused(Quarters):
+    """Биржа, у которой дневные свечи перестают отвечать, когда пошли минуты."""
+
+    def __init__(self, today: date) -> None:
+        super().__init__(today)
+        self.minutes_asked = False
+
+    def answer(self, url: str) -> bytes:
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(url).query))
+        if query.get("interval") == "1":
+            self.minutes_asked = True
+        elif query.get("interval") == "24" and self.minutes_asked:
+            raise OSError("связь оборвалась")
+        return super().answer(url)
+
+
+def test_a_check_the_exchange_refused_is_said_and_the_load_is_not_clean(
+    loop, tmp_path,
+) -> None:
+    """Стережёт B-069 (B1, правило 13): сверка не сделана — так и сказано, `ok=False`.
+
+    Минуты всех кусков в базе, а дневные свечи для сверки биржа не отдала.
+    Пропуски не проверены, и «История загружена» без оговорки была бы
+    неправдой. Мутация молчания: отказ сверки проглочен.
+    """
+    database = tmp_path / "base.sqlite3"
+    chain = _CheckRefused(OWNER_TODAY)
+
+    _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                    instrument="MXZ6")
+
+    outcome = heard.finished[-1]
+    assert chain.minutes_asked, "до минут дело не дошло — сверку проверить нечем"
+    assert not outcome.ok, f"несделанная сверка прошла как успех: {outcome.detail}"
+    assert "Сверка дней с биржей не сделана" in outcome.trouble, outcome.trouble
+    assert "Пропуски в базе не проверены" in outcome.trouble, outcome.trouble
+    with CandleStore(database) as store:
+        assert date(2026, 9, 16) in store.trading_days("MXU6"), "минуты пропали вместе со сверкой"

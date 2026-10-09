@@ -206,13 +206,19 @@ def test_the_seam_is_drawn_at_the_first_candle_of_the_new_contract(qapp) -> None
 
 
 def test_the_load_dialog_does_not_promise_days_for_a_contract(qapp) -> None:
-    """Стережёт 6: для контракта окно называет рубеж, а не «90 дн.»."""
+    """Стережёт 6 и B-069: отрезок с даты по сегодня, каждым ближним контрактом.
+
+    Без обещания «90 дн.». До B-069 окно называло рубеж одного контракта из настроек — и грузило
+    только его. Теперь отрезок задаёт дата из окна (умолчание — глубина
+    из настроек), а контракты по дням — таблица.
+    """
     facts = HistoryFacts(symbol="MXZ6", by_contract=True,
                          contract_from=date(2026, 9, 17), warmup_bars=15)
     dialog = HistoryDialog(facts, Settings(history_depth_days=90), today=date(2026, 9, 27))
     try:
         text = dialog.summary.text()
-        assert "17.09.2026" in text and "15 баров" in text, text
+        assert "с 30.06.2026 по сегодня" in text and "15 баров" in text, text
+        assert "каждый ближний контракт" in text and "сверка дней с биржей" in text, text
         assert "дн.)" not in text, text
     finally:
         dialog.deleteLater()

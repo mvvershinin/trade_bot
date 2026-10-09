@@ -254,8 +254,10 @@ def test_the_default_is_to_add_what_is_missing_not_to_reload(qapp) -> None:
         assert request.replace is False, (
             "просьба по умолчанию перезапрашивает уже загруженные дни"
         )
-        assert request.since is None, (
-            "просьба по умолчанию несёт дату начала — значит это «заново»"
+        # B-069: дата общая для обоих вариантов — и по умолчанию она та же
+        # глубина из настроек, что была у догрузки.
+        assert request.since == TODAY - timedelta(days=Settings().history_depth_days - 1), (
+            f"дата по умолчанию не по глубине из настроек: {request.since}"
         )
     finally:
         dialog.deleteLater()
@@ -378,30 +380,39 @@ def test_the_chosen_date_reaches_the_request(qapp) -> None:
         dialog.deleteLater()
 
 
-def test_the_date_field_is_dead_while_the_plain_load_is_chosen(qapp) -> None:
-    """Поле даты живёт только у «заново»: иначе оно обещает то, чего не будет."""
+def test_the_date_field_is_live_for_both_choices(qapp) -> None:
+    """Стережёт B-069 (вместо прежнего «поле живёт только у заново», `B-030`).
+
+    Слова владельца счёта 09.10.2026: «выбрали период с 17 июня — … и ВСЕ
+    дни без пропусков». Дата «С какого дня» действует и для «Догрузить
+    недостающее»: поле живое при любом варианте, и выбранная дата уходит
+    в просьбу без `replace`.
+    """
     dialog = _dialog()
     try:
-        assert not dialog.since.isEnabled()
+        assert dialog.add_missing.isChecked(), "начальное состояние не то"
+        assert dialog.since.isEnabled(), "у догрузки поле даты мёртвое"
+        dialog.since.setDate(QDate(2026, 6, 17))
+        request = dialog.request()
+        assert request is not None
+        assert request.since == date(2026, 6, 17), "дата догрузки не дошла до просьбы"
+        assert request.replace is False, "дата сама включила «заново»"
+        assert "17.06.2026" in dialog.summary.text(), dialog.summary.text()
         dialog.reload.setChecked(True)
         assert dialog.since.isEnabled()
     finally:
         dialog.deleteLater()
 
 
-def test_a_click_on_the_dead_date_field_picks_its_choice(qapp) -> None:
-    """Стережёт `B-030`: щелчок по полю выбирает его переключатель.
+def test_a_click_on_the_date_field_does_not_pick_the_reload(qapp) -> None:
+    """Стережёт B-069 (прежний сторож `B-030` вывернут): щелчок по дате вариант не меняет.
 
-    Слова владельца счёта 06.09.2026: «неактивное поле не меняется». Поле
-    стоит справа от переключателя и читается как часть одной строки; человек
-    целится в него, а не в кружок диаметром в семь точек. Пока щелчок
-    не делал ничего, окно выглядело сломанным.
+    До B-069 поле принадлежало «заново», и щелчок по нему выбирал этот
+    вариант (`PickOnClick`). Теперь дата общая; оставленный фильтр по щелчку
+    молча менял бы безопасную догрузку на «заново», снимающее отметки.
 
-    ⚠️ Щелчок идёт **настоящим** нажатием мыши через `QTest`, а не вызовом
-    `setChecked`: проверка вызова стерегла бы наш же вызов. Проверка
-    «после щелчка поле включено» тоже не годится — она зеленеет, если
-    поле просто оставить включённым всегда, а это другое поведение
-    и другое обещание человеку.
+    ⚠️ Щелчок — настоящим нажатием мыши через `QTest`, а не вызовом:
+    фильтр событий видит только настоящие события.
     """
     from PySide6.QtTest import QTest
 
@@ -409,15 +420,14 @@ def test_a_click_on_the_dead_date_field_picks_its_choice(qapp) -> None:
     try:
         dialog.show()  # без показа геометрии нет, и щёлкать некуда
         assert dialog.add_missing.isChecked(), "начальное состояние не то"
-        assert not dialog.since.isEnabled(), "поле и так живое — проверка вакуумна"
 
         QTest.mouseClick(dialog.since, Qt.MouseButton.LeftButton)
 
-        assert dialog.reload.isChecked(), (
-            "щелчок по полю не выбрал «Загрузить заново с даты…»: человек "
-            "жмёт на поле и не получает ничего"
+        assert dialog.add_missing.isChecked() and not dialog.reload.isChecked(), (
+            "щелчок по дате выбрал «Загрузить заново»: безопасная догрузка "
+            "подменена той, что снимает отметки"
         )
-        assert dialog.since.isEnabled(), "поле осталось мёртвым после выбора"
+        assert dialog.since.isEnabled()
     finally:
         dialog.deleteLater()
         settle_qt(qapp)  # показанный диалог не должен пережить свой тест
