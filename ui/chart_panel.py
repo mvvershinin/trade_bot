@@ -44,7 +44,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
-from PySide6.QtCore import QPoint, QRectF, Qt
+from PySide6.QtCore import QEvent, QPoint, QRectF, Qt
 from PySide6.QtGui import QColor, QCursor, QGuiApplication, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -137,6 +138,11 @@ LEGEND_COLUMNS = 3
 #: не закрыть.
 DIGEST_WIDTH = 560
 DIGEST_HEIGHT = 420
+
+#: Больше стольких пропусков данных или затенённых отрезков в участке —
+#: раздел разбора сворачивается в одну строку со счётом. На весь период
+#: их сотни, и до сделок пришлось бы листать несколько экранов.
+DIGEST_FOLD_OVER = 3
 
 
 def tail_info(candles: Sequence[Candle]) -> CandleInfo | None:
@@ -679,11 +685,22 @@ def _hole_lines(facts: SpanFacts) -> list[str]:
 
     «Данных нет» и «сделок не было» — разные утверждения, и второе, сказанное
     вместо первого, есть ровно то, за что заведён `B-005`.
+
+    Больше `DIGEST_FOLD_OVER` пропусков — одна строка со счётом: на весь
+    период их сотни (клиринг и вечерний перерыв каждый день), и список
+    заслонял сделки, ради которых разбор открывали.
     """
+    holes = facts.span.holes
+    if len(holes) > DIGEST_FOLD_OVER:
+        minutes = sum(_minutes(since, until) for since, until in holes)
+        return [
+            f"⚠ Пропусков данных внутри участка: {len(holes)}, всего {fmt_minutes(minutes)}. "
+            "Свечей за это время нет — это не «сделок не было»."
+        ]
     return [
         f"⚠ В участок попал пропуск данных: {fmt_time(since)}–{fmt_time(until)} МСК. "
         "Свечей за это время нет — это не «сделок не было»."
-        for since, until in facts.span.holes
+        for since, until in holes
     ]
 
 
@@ -692,15 +709,28 @@ def _quiet_lines(facts: SpanFacts) -> list[str]:
 
     Ответ на первый вопрос, который возникает у пустого участка: «почему
     здесь ничего не происходило». Причина уже нарисована затенением, здесь
-    она названа словами.
+    она названа словами. Больше `DIGEST_FOLD_OVER` отрезков — одна строка
+    со счётом, по той же причине, что у пропусков.
     """
     since, until = to_msk(facts.span.start), to_msk(facts.span.end)
+    inside = [
+        shade for shade in facts.shades
+        if to_msk(shade.start) < until and to_msk(shade.end) > since
+    ]
+    if len(inside) > DIGEST_FOLD_OVER:
+        minutes = sum(
+            _minutes(max(to_msk(shade.start), since), min(to_msk(shade.end), until))
+            for shade in inside
+        )
+        return [
+            f"Затенённых отрезков внутри участка: {len(inside)}, всего "
+            f"{fmt_minutes(minutes)} — там робот сделок не совершает"
+        ]
     return [
         f"Затенено: {shade.note or shade.kind.label} "
         f"({fmt_time(shade.start)}–{fmt_time(shade.end)} МСК) — там робот "
         "сделок не совершает"
-        for shade in facts.shades
-        if to_msk(shade.start) < until and to_msk(shade.end) > since
+        for shade in inside
     ]
 
 
@@ -836,7 +866,16 @@ def fmt_span(since: datetime, until: datetime) -> str:
     стороны, ни комиссии, ни одного торгового правила. Прибыль, процент
     и комиссию считает `engine/` и приносит готовыми.
     """
-    minutes = int((to_msk(until) - to_msk(since)).total_seconds() // 60)
+    return fmt_minutes(_minutes(since, until))
+
+
+def _minutes(since: datetime, until: datetime) -> int:
+    """Целых минут между двумя отметками — то же вычитание часов, что в `fmt_span`."""
+    return int((to_msk(until) - to_msk(since)).total_seconds() // 60)
+
+
+def fmt_minutes(minutes: int) -> str:
+    """«1 ч 15 мин» из числа минут. Отрицательное — прочерк, а не «−5 мин»."""
     if minutes < 0:
         return EMPTY
     hours, rest = divmod(minutes, 60)
@@ -1022,7 +1061,43 @@ class ChartPanel(QWidget):
             "Вернуть график к правому краю и дальше следовать за новыми свечами."
         )
         self.last_button.clicked.connect(self._surface.scroll_to_last)
+        self._build_view_buttons()
         self._layers_caption = QLabel("Слои меток:")
+
+    def _build_view_buttons(self) -> None:
+        """«Весь период», «Разбор всех сделок», «Развернуть график».
+
+        Просьба владельца счёта 09.10.2026: «нельзя увеличить график и выделить
+        ВЕСЬ период». Все три — одно нажатие, без настроек: колесом до всего
+        ряда в 15 тысяч мест было больше тридцати щелчков, правой протяжкой
+        через весь ряд — минуты.
+        """
+        self.all_button = QPushButton("Весь период")
+        self.all_button.setToolTip(
+            "Показать весь загруженный ряд свечей в ширину графика.\n"
+            "Колесо мыши после этого приближает как обычно.\n"
+            "Неактивна, пока на графике нет свечей."
+        )
+        self.all_button.clicked.connect(self._surface.show_all)
+        self.digest_button = QPushButton("Разбор всех сделок")
+        self.digest_button.setToolTip(
+            "Тот же разбор, что открывает протяжка правой кнопкой по графику, —\n"
+            "сразу на весь ряд: итог, пропуски данных, каждая сделка и метки.\n"
+            "Неактивна, пока на графике нет свечей."
+        )
+        self.digest_button.clicked.connect(self._surface.select_all)
+        for button in (self.all_button, self.digest_button):
+            button.setEnabled(False)  # свечей ещё нет; включает `_set_tail`
+        self.wide_button = QPushButton("Развернуть график")
+        self.wide_button.setCheckable(True)
+        self.wide_button.setToolTip(
+            "Отдать графику всю высоту: журналы под ним прячутся.\n"
+            "Повторное нажатие возвращает их на прежнее место.\n"
+            "То же делает двойной щелчок левой кнопкой по графику."
+        )
+        self.wide_button.toggled.connect(self._toggle_wide)
+        #: Размеры частей разделителя до разворота — чтобы вернуть их же.
+        self._sizes_before_wide: list[int] = []
 
     def _listen_to_surface(self) -> None:
         """Подписаться на то, что отрисовщик знает, а панель — нет.
@@ -1033,6 +1108,7 @@ class ChartPanel(QWidget):
         """
         self._surface.set_hover_handler(self.show_candle_info)
         self._surface.set_span_handler(self.show_span)
+        self._surface.set_expand_handler(self._expand_by_click)
         # Состояние галочек раздаётся сразу, а не только при переключении:
         # у отрисовщика все слои видимы по умолчанию, у легенды — наоборот,
         # и обе стороны обязаны узнать, как оно на самом деле. Иначе легенда
@@ -1056,6 +1132,13 @@ class ChartPanel(QWidget):
         top.addStretch(1)
         top.addWidget(self.legend_button)
         top.addWidget(self.last_button)
+        top.addWidget(self.all_button)
+        top.addWidget(self.digest_button)
+        top.addWidget(self.wide_button)
+        # Разворачивать есть что, только когда панель лежит в разделителе
+        # вместе с журналами. Иначе кнопка, которая ничего не делает, —
+        # молчаливый отказ, и её не показываем вовсе.
+        self.wide_button.setVisible(self._splitter() is not None)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1150,6 +1233,45 @@ class ChartPanel(QWidget):
         self._surface.set_layer_visible(Layer.PLAN, on)
         self.legend.set_plan_visible(on)
 
+    def event(self, event: QEvent) -> bool:
+        """Панель переложили в другого родителя — кнопка разворота идёт следом.
+
+        В разделитель главного окна панель попадает **после** сборки
+        (`QSplitter.addWidget` перекладывает её к себе), поэтому видимость
+        кнопки решается здесь, а не только в конструкторе.
+        """
+        if event.type() == QEvent.Type.ParentChange and hasattr(self, "wide_button"):
+            self.wide_button.setVisible(self._splitter() is not None)
+        return super().event(event)
+
+    def _splitter(self) -> QSplitter | None:
+        """Разделитель, в котором лежит панель, или `None`."""
+        parent = self.parentWidget()
+        return parent if isinstance(parent, QSplitter) else None
+
+    def _toggle_wide(self, on: bool) -> None:
+        """Развернуть график на всю высоту разделителя — или вернуть как было.
+
+        Соседи по разделителю (журналы) схлопываются до нуля, а не прячутся:
+        так их можно вытянуть обратно и мышью за ручку разделителя. Прежние
+        размеры запоминаются и возвращаются повторным нажатием.
+        """
+        splitter = self._splitter()
+        if splitter is not None:
+            if on:
+                self._sizes_before_wide = splitter.sizes()
+                sizes = [0] * splitter.count()
+                sizes[splitter.indexOf(self)] = sum(self._sizes_before_wide)
+                splitter.setSizes(sizes)
+            elif self._sizes_before_wide:
+                splitter.setSizes(self._sizes_before_wide)
+        self.wide_button.setText("Вернуть журналы" if on else "Развернуть график")
+
+    def _expand_by_click(self) -> None:
+        """Двойной щелчок левой по графику — то же, что кнопка «Развернуть график»."""
+        if self._splitter() is not None:
+            self.wide_button.toggle()
+
     def _toggle_legend(self, on: bool) -> None:
         """Свернуть или развернуть легенду. Стрелка на кнопке показывает, куда."""
         self.legend_area.setVisible(on)
@@ -1202,6 +1324,10 @@ class ChartPanel(QWidget):
 
     def _set_tail(self, info: CandleInfo | None) -> None:
         self._tail = info
+        # Свечей нет — показывать и разбирать нечего, кнопки гаснут, а не
+        # молчат после нажатия.
+        for button in (self.all_button, self.digest_button):
+            button.setEnabled(info is not None)
         self._show_tail()
 
     def _show_tail(self) -> None:

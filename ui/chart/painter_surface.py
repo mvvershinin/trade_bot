@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QEvent, QLineF, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -36,7 +36,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QToolTip, QWidget
 
 from ui.chart.glyphs import GlyphStyle, draw_marker
-from ui.chart.protocol import ChartSurface, HoverHandler, SpanHandler
+from ui.chart.protocol import ChartSurface, ExpandHandler, HoverHandler, SpanHandler
 from ui.chart.timeline import Timeline
 from ui.formatting import fmt_number, to_msk
 from ui.models import (
@@ -73,15 +73,34 @@ GAP_CAPTION_WIDTH = 34
 CLICK_SLACK = 5.0
 
 # Протяжка правой кнопкой за край поля свечей двигает вид вслед за мышью
-# (просьба владельца счёта, Н4). Числа не торговые — это скорость прокрутки.
-# Пока мышь стоит за краем, событий движения нет, поэтому вид двигает таймер:
-# раз в EDGE_SCROLL_INTERVAL_MS на столько мест, сколько раз мышь ушла
-# за край на EDGE_SCROLL_PIXELS_PER_PLACE точек, но не больше
-# EDGE_SCROLL_MAX_PLACES за раз. Чуть за краем — медленно, далеко — быстро:
-# 20 точек за краем дают 25 свечей в секунду, предел — 75.
+# (просьба владельца счёта, Н4). Числа не торговые — это скорость прокрутки,
+# и правило 16 их не касается. Пока мышь стоит за краем, событий движения нет,
+# поэтому вид двигает таймер: раз в EDGE_SCROLL_INTERVAL_MS.
+#
+# Сдвиг за шаг — **доля видимого размаха**, а не число свечей: прежние «не больше
+# трёх мест за шаг» на виде в несколько тысяч мест проезжали экран минутами
+# («листается со скоростью черепахи», владелец счёта 09.10.2026). Доля растёт
+# линейно с выходом мыши за край и упирается в EDGE_SCROLL_MAX_SHARE начиная
+# с EDGE_SCROLL_FULL_PIXELS точек. Что это даёт:
+#   * 20 точек за краем на 90 видимых — 1,5 места за шаг, 37 свечей в секунду
+#     (столько же, сколько было);
+#   * 100 точек за краем — экран за 0,48 с при любом приближении,
+#     от 120 точек — за 0,4 с.
 EDGE_SCROLL_INTERVAL_MS = 40
-EDGE_SCROLL_PIXELS_PER_PLACE = 20.0
-EDGE_SCROLL_MAX_PLACES = 3.0
+EDGE_SCROLL_FULL_PIXELS = 120.0
+EDGE_SCROLL_MAX_SHARE = 0.1
+
+# Колесо: во сколько раз меняется видимый размах за щелчок (120 единиц).
+# От 90 видимых свечей до всего ряда в 16 тысяч мест — 13 щелчков; при прежних
+# 0,85 за щелчок выходило 33. Мелкие шаги тачпада дают дробную степень,
+# и меньше одного места за событие размах не меняется никогда — иначе
+# на малом приближении округление съедало бы шаг целиком.
+WHEEL_ZOOM_FACTOR = 1.5
+
+# Уже этого (в точках на место оси) свечи рисуются по столбцам экрана:
+# на столбец одна черта от наименьшей цены до наибольшей. Отдельные свечи там
+# всё равно сливаются, а рисовать каждую — 15 тысяч прямоугольников на кадр.
+DENSE_STEP = 2.0
 
 # Штрих перекрестья: короткий и частый. Отличается от пунктира прогноза
 # (штрих вчетверо длиннее) и от границ пропуска — иначе три разных пунктира
@@ -91,11 +110,17 @@ CROSSHAIR_DASH = (2.0, 3.0)
 
 @dataclass(slots=True)
 class _Viewport:
-    """Что именно видно: индекс правой свечи и сколько свечей влезает."""
+    """Что именно видно: индекс правой свечи и сколько свечей влезает.
+
+    `whole` — человек нажал «Весь период» и с тех пор вид руками не двигал.
+    Пока он стоит, новые свечи и новый прогон показываются тоже целиком:
+    иначе первая же живая свеча молча отрезала бы начало ряда.
+    """
 
     right: float = 0.0
     span: int = DEFAULT_VISIBLE
     follow: bool = True
+    whole: bool = False
 
 
 class PainterChartSurface(QWidget, ChartSurface):
@@ -128,6 +153,13 @@ class PainterChartSurface(QWidget, ChartSurface):
         #: на экране столько же, сколько занял бы час свечей.
         self._line = Timeline()
         self._average: list[LinePoint] = []
+        #: Отметки точек средней и их места на оси — посчитаны один раз,
+        #: а не на каждом кадре. Кадр рисуется на каждое движение мыши
+        #: (перекрестье), и перевод 15 тысяч точек в места съедал 20 мс
+        #: из каждого. Места зависят от оси и сбрасываются вместе с ней
+        #: (`_line_changed`), отметки — только с новой средней.
+        self._average_stamps: list[float] = []
+        self._average_places: list[float] | None = None
         self._average_label = ""
         self._markers: dict[Layer, list[Marker]] = {Layer.PLAN: [], Layer.FACT: []}
         self._paths: dict[Layer, list[TradePath]] = {Layer.PLAN: [], Layer.FACT: []}
@@ -155,6 +187,8 @@ class PainterChartSurface(QWidget, ChartSurface):
         self._hover_handler: HoverHandler | None = None
         #: Кому рассказывать про выделенный отрезок. Ставит панель графика.
         self._span_handler: SpanHandler | None = None
+        #: Кому сказать про двойной щелчок левой по полю. Ставит панель графика.
+        self._expand_handler: ExpandHandler | None = None
         #: Что было рассказано в прошлый раз. Держится, чтобы не переписывать
         #: строку сведений на каждом движении мыши внутри одной свечи:
         #: событий движения приходит порядка сотни в секунду, а перерисовка
@@ -206,7 +240,8 @@ class PainterChartSurface(QWidget, ChartSurface):
 
         self._data = data
         self._line = Timeline(data.candles)
-        self._average = list(data.average)
+        self._line_changed()
+        self._take_average(data.average)
         self._average_label = data.average_label
         self._markers = {
             Layer.PLAN: [m for m in data.markers if m.layer is Layer.PLAN],
@@ -245,6 +280,9 @@ class PainterChartSurface(QWidget, ChartSurface):
         """
         fits = max(len(self._line), MIN_VISIBLE)
         self._view.span = max(MIN_VISIBLE, min(self._view.span, fits))
+        if self._view.whole:
+            # «Весь период» — режим, как и слежение: новый ряд тоже целиком.
+            self._view.span = fits
         if self._view.follow or anchor is None:
             self._view.right = float(max(len(self._line) - 1, 0))
         else:
@@ -259,6 +297,9 @@ class PainterChartSurface(QWidget, ChartSurface):
         иначе картинка ползёт дальше как ни в чём не бывало (`B-005`).
         """
         self._line.append(candle)
+        self._line_changed()
+        if self._view.whole:
+            self._view.span = max(len(self._line), MIN_VISIBLE)
         if self._view.follow:
             self._view.right = float(len(self._line) - 1)
         self.update()
@@ -267,14 +308,30 @@ class PainterChartSurface(QWidget, ChartSurface):
         if self._line.empty:
             self.append_candle(candle)
             return
+        stamp = self._line.stamps[-1]
         self._line.replace_last(candle)
+        if self._line.stamps[-1] != stamp:
+            # Растущая свеча приходит много раз за свою жизнь, а ось меняется,
+            # только если сменилось её время, — иначе кэш мест сбрасывался бы
+            # на каждом тике цены.
+            self._line_changed()
         self.update()
 
     def set_average(self, points: Sequence[LinePoint], label: str = "") -> None:
-        self._average = list(points)
+        self._take_average(points)
         if label:
             self._average_label = label
         self.update()
+
+    def _take_average(self, points: Sequence[LinePoint]) -> None:
+        """Запомнить среднюю вместе с отметками её точек — один раз на приход."""
+        self._average = list(points)
+        self._average_stamps = [to_msk(point.time).timestamp() for point in self._average]
+        self._average_places = None
+
+    def _line_changed(self) -> None:
+        """Ось сменилась: места точек средней надо пересчитать заново."""
+        self._average_places = None
 
     def set_markers(self, layer: Layer, markers: Sequence[Marker]) -> None:
         self._markers[layer] = list(markers)
@@ -310,6 +367,31 @@ class PainterChartSurface(QWidget, ChartSurface):
         """Кому сообщать про отрезок под правой кнопкой. Разбор — в `ChartSurface`."""
         self._span_handler = handler
 
+    def set_expand_handler(self, handler: ExpandHandler | None) -> None:
+        """Кому сообщать про двойной щелчок левой. Разбор — в `ChartSurface`."""
+        self._expand_handler = handler
+
+    def show_all(self) -> None:
+        """Весь ряд в ширину графика. Слежение за последней свечой остаётся."""
+        if self._line.empty:
+            return
+        count = len(self._line)
+        self._view = _Viewport(
+            right=float(count - 1), span=max(count, MIN_VISIBLE), follow=True, whole=True
+        )
+        self._clamp_view()
+        self._report_hover(self._cursor)
+        self.update()
+
+    def select_all(self) -> None:
+        """Выделить весь ряд — тем же путём, что протяжка правой кнопкой."""
+        if self._span_handler is None:
+            return
+        if self._line.empty:
+            self._span_handler(None)
+            return
+        self._report_places(0, len(self._line) - 1)
+
     def scroll_to_last(self) -> None:
         self._view.right = float(max(len(self._line) - 1, 0))
         self._view.follow = True
@@ -334,6 +416,7 @@ class PainterChartSurface(QWidget, ChartSurface):
         self._view.span = max(self._view.span, min(width + 2 * MIN_VISIBLE, count))
         self._view.right = last + (self._view.span - width) / 2
         self._view.follow = False
+        self._view.whole = False
         self._clamp_view()
         self.update()
         return True
@@ -457,9 +540,13 @@ class PainterChartSurface(QWidget, ChartSurface):
         steps = event.angleDelta().y() / 120.0
         if steps == 0:
             return
-        factor = 0.85 ** steps
-        span = int(round(self._view.span * factor))
+        span = int(round(self._view.span * WHEEL_ZOOM_FACTOR ** -steps))
+        if span == self._view.span:
+            # Шаг тачпада меньше одного места: двигаемся хотя бы на одно,
+            # иначе на малом приближении колесо не делает ничего.
+            span += -1 if steps > 0 else 1
         span = max(MIN_VISIBLE, min(span, max(len(self._line), MIN_VISIBLE)))
+        self._view.whole = False
         # Свеча под курсором остаётся под курсором — иначе масштабирование
         # «уводит» график и приходится каждый раз искать нужное место заново.
         share = (event.position().x() - plot.left()) / max(plot.width(), 1.0)
@@ -493,6 +580,21 @@ class PainterChartSurface(QWidget, ChartSurface):
             self._drag_x = None
             self.setCursor(Qt.CursorShape.CrossCursor)
 
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        """Двойной щелчок левой по полю — развернуть график; правой — как раньше.
+
+        Второе нажатие двойного щелчка Qt присылает этим событием, а не
+        `mousePressEvent`. Правой кнопке оно отдаётся обычному нажатию:
+        двойной щелчок правой остаётся выделением, как и был. Левой —
+        панорама не начинается: щелчок без протяжки ничего не двигал и так.
+        """
+        if event.button() != Qt.MouseButton.LeftButton:
+            self.mousePressEvent(event)
+            return
+        if self._expand_handler is not None and self._plot_rect().contains(event.position()):
+            self._expand_handler()
+        event.accept()
+
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         plot = self._plot_rect()
         # Перекрестье идёт за курсором всегда — и при нажатой кнопке тоже:
@@ -511,7 +613,9 @@ class PainterChartSurface(QWidget, ChartSurface):
             step = plot.width() / max(self._view.span, 1)
             shift = (self._drag_x - event.position().x()) / max(step, 0.01)
             self._drag_x = event.position().x()
-            self._view.right += shift
+            if shift:
+                self._view.right += shift
+                self._view.whole = False
             self._view.follow = self._view.right >= len(self._line) - 1.5
             self._clamp_view()
         else:
@@ -556,6 +660,9 @@ class PainterChartSurface(QWidget, ChartSurface):
     def _edge_scroll_tick(self) -> None:
         """Шаг прокрутки вида под протяжкой за край — вызывается таймером.
 
+        Сдвиг — доля видимого размаха (см. `EDGE_SCROLL_MAX_SHARE`): экран
+        проезжается за одно и то же время и на 90 свечах, и на всём ряде.
+
         У края данных вид останавливается: в пустоту за последней свечой
         и перед первой протяжка не везёт. Если человек сам отмотал вид
         за край ряда раньше, назад его тоже не тянет — только не дальше.
@@ -564,7 +671,8 @@ class PainterChartSurface(QWidget, ChartSurface):
         if overshoot == 0.0 or self._line.empty:
             self._edge_timer.stop()
             return
-        shift = min(abs(overshoot) / EDGE_SCROLL_PIXELS_PER_PLACE, EDGE_SCROLL_MAX_PLACES)
+        share = min(abs(overshoot) / EDGE_SCROLL_FULL_PIXELS, 1.0) * EDGE_SCROLL_MAX_SHARE
+        shift = self._view.span * share
         was = self._view.right
         if overshoot > 0:
             limit = max(was, float(len(self._line) - 1))
@@ -575,6 +683,7 @@ class PainterChartSurface(QWidget, ChartSurface):
         if self._view.right == was:
             self._edge_timer.stop()
             return
+        self._view.whole = False
         self._view.follow = self._view.right >= len(self._line) - 1.5
         self._report_hover(self._cursor)
         self.update()
@@ -595,7 +704,16 @@ class PainterChartSurface(QWidget, ChartSurface):
         if places is None:
             self._span_handler(None)
             return
-        first, last = places
+        self._report_places(*places)
+
+    def _report_places(self, first: int, last: int) -> None:
+        """Отдать панели отрезок мест `first…last` — общий хвост протяжки и «выделить всё».
+
+        Один путь на оба действия: разбор всех сделок обязан быть тем же
+        разбором, что протяжка через весь ряд, с теми же пропусками.
+        """
+        if self._span_handler is None:
+            return
         step = self._grid_step()
         self._span_handler(ChartSpan(
             start=self._line.moments[first],
@@ -759,6 +877,9 @@ class PainterChartSurface(QWidget, ChartSurface):
 
     def _draw_candles(self, painter: QPainter, plot: QRectF, low: float, high: float) -> None:
         step = plot.width() / max(self._view.span, 1)
+        if step < DENSE_STEP:
+            self._draw_candle_columns(painter, plot, low, high)
+            return
         body = max(step * 0.66, 1.0)
         first = max(int(self._first_index()) - 1, 0)
         last = min(int(self._view.right) + 2, len(self._line))
@@ -782,6 +903,56 @@ class PainterChartSurface(QWidget, ChartSurface):
             bottom = self._y_of_price(min(candle.open, candle.close), plot, low, high)
             rect = QRectF(x - body / 2, top, body, max(bottom - top, 1.0))
             painter.fillRect(rect, color)
+
+    def _draw_candle_columns(
+        self, painter: QPainter, plot: QRectF, low: float, high: float
+    ) -> None:
+        """Свечи гуще двух точек на место — по столбцам экрана, одной чертой на столбец.
+
+        Черта — от наименьшей цены свечей столбца до наибольшей; цвет —
+        закрытие последней свечи столбца против открытия первой, то есть
+        как у одной большой свечи из них. Пустые места не рисуются: столбец
+        из одного пропуска остаётся пустым, как и на обычном приближении.
+        Это не расчёт по торговому правилу, а то же сжатие, которое глаз
+        делает сам, глядя на сотню свечей в сантиметре экрана.
+        """
+        rising: list[QLineF] = []
+        falling: list[QLineF] = []
+
+        def close_column(column: int, top: float, bottom: float, rises: bool) -> None:
+            x = column + 0.5
+            stroke = QLineF(
+                x, self._y_of_price(top, plot, low, high),
+                x, self._y_of_price(bottom, plot, low, high) + 0.5,
+            )
+            (rising if rises else falling).append(stroke)
+
+        step = plot.width() / max(self._view.span, 1)
+        origin = plot.left() + (0.5 - self._first_index()) * step
+        first = max(int(self._first_index()), 0)
+        last = min(int(self._view.right) + 1, len(self._line))
+        column = None
+        top = bottom = opened = closed = 0.0
+        for index, candle in enumerate(self._line.slots[first:last], start=first):
+            if candle is None:
+                continue
+            here = int(origin + index * step)
+            if here != column:
+                if column is not None:
+                    close_column(column, top, bottom, closed >= opened)
+                column, top, bottom = here, candle.high, candle.low
+                opened = candle.open
+            else:
+                top, bottom = max(top, candle.high), min(bottom, candle.low)
+            closed = candle.close
+        if column is not None:
+            close_column(column, top, bottom, closed >= opened)
+
+        for strokes, colour in ((rising, self._theme.bull), (falling, self._theme.bear)):
+            pen = QPen(QColor(colour))
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.drawLines(strokes)
 
     def _draw_gaps(self, painter: QPainter, plot: QRectF) -> None:
         """Назвать словами полосы, где свечей нет ни одной.
@@ -816,6 +987,13 @@ class PainterChartSurface(QWidget, ChartSurface):
             left = self._x_of_index(start - 0.5, plot)
             right = self._x_of_index(stop - 0.5, plot)
             if right < plot.left() or left > plot.right():
+                continue
+            if right - left < 1.0:
+                # Пропуск уже точки: два пунктира на одном столбце — это
+                # серая черта поверх свечей, а не граница. На весь период
+                # таких ежедневно два (клиринг, вечерний перерыв), и сотни
+                # черт закрывали график сплошной штриховкой. Пропуск при
+                # этом виден в разборе участка.
                 continue
             painter.setPen(edge)
             for x in (left, right):
@@ -896,24 +1074,40 @@ class PainterChartSurface(QWidget, ChartSurface):
         # ⚠️ Линия рвётся на стыке контрактов: у каждого своя средняя
         # (решение 0061), и отрезок между ними рисовал бы переход, которого
         # не считал никто, — скачок стыка выглядел бы сглаженным.
-        seams = sorted(seam.time for seam in self._seams)
+        #
+        # Обходятся только точки на экране, найденные по запомненным местам,
+        # а гуще точки на место — через одну-две: на весь период их 15 тысяч
+        # на тысячу с небольшим столбцов экрана, и линия по каждой не видна
+        # глазу, а стоит кадра.
+        places = self._average_places_now()
+        stamps = self._average_stamps
+        seams = sorted(to_msk(seam.time).timestamp() for seam in self._seams)
+        begin = bisect.bisect_left(places, self._first_index() - 2)
+        end = bisect.bisect_right(places, self._view.right + 2)
+        stride = max(int(self._view.span / max(plot.width(), 1.0)), 1)
+        picked = list(range(begin, end, stride))
+        if picked and picked[-1] != end - 1:
+            picked.append(end - 1)
         polygon = QPolygonF()
-        passed = 0
-        for point in self._average:
-            while passed < len(seams) and point.time >= seams[passed]:
+        passed = bisect.bisect_right(seams, stamps[begin]) if begin < end else 0
+        for number in picked:
+            while passed < len(seams) and stamps[number] >= seams[passed]:
                 passed += 1
                 if polygon.count() > 1:
                     painter.drawPolyline(polygon)
                 polygon = QPolygonF()
-            index = self._index_of_time(point.time)
-            if index < self._first_index() - 2 or index > self._view.right + 2:
-                continue
             polygon.append(QPointF(
-                self._x_of_index(index, plot),
-                self._y_of_price(point.value, plot, low, high),
+                self._x_of_index(places[number], plot),
+                self._y_of_price(self._average[number].value, plot, low, high),
             ))
         if polygon.count() > 1:
             painter.drawPolyline(polygon)
+
+    def _average_places_now(self) -> list[float]:
+        """Места точек средней на оси — из запомненного, пересчёт только по смене оси."""
+        if self._average_places is None:
+            self._average_places = [self._index_of_stamp(stamp) for stamp in self._average_stamps]
+        return self._average_places
 
     def _draw_paths(self, painter: QPainter, plot: QRectF, low: float, high: float) -> None:
         for layer, paths in self._paths.items():
@@ -998,12 +1192,17 @@ class PainterChartSurface(QWidget, ChartSurface):
         draw_marker(painter, point, marker.kind, layer, GlyphStyle(self._theme, self.font()))
 
     def _time_ticks(self, plot: QRectF) -> list[int]:
-        """Индексы свечей, у которых подписано время. Реже, чем каждая свеча."""
+        """Индексы свечей, у которых подписано время. Реже, чем каждая свеча.
+
+        Шаг — от настоящей ширины места, в том числе уже точки: прежний
+        потолок «не реже раза в 72 места» на весь период ставил двести с лишним
+        линий сетки — по одной на шесть точек экрана.
+        """
         step = plot.width() / max(self._view.span, 1)
-        every = max(int(72 / max(step, 1)), 1)
+        every = max(int(72 / step), 1) if step > 0 else 1
         first = max(int(self._first_index()), 0)
         last = min(int(self._view.right) + 1, len(self._line))
-        return [i for i in range(first, last) if i % every == 0]
+        return list(range(-(-first // every) * every, last, every))
 
     def _draw_axes(self, painter: QPainter, plot: QRectF, low: float, high: float) -> None:
         theme = self._theme
