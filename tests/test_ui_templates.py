@@ -1318,6 +1318,40 @@ def test_every_shipped_example_says_where_it_came_from() -> None:
         )
 
 
+def test_every_shipped_example_carries_the_program_default_tariff() -> None:
+    """Стережёт: каждый пример из поставки несёт комиссию, равную умолчанию.
+
+    Применение примера переписывает комиссию целиком. Пример с прежними
+    14 ₽ вернул бы их поверх ответа заказчика (17 ₽, решение 0060) — молча,
+    одной кнопкой. Ключ обязан стоять в файле: комиссия, взятая умолчанием
+    за отсутствием ключа, совпала бы и здесь, а в окне читалась бы оговоркой.
+    """
+    from ui.templates import example_files, examples_dir, read_for_import
+
+    default = Settings().commission_per_side_rub
+    files = example_files(examples_dir())
+    assert files, "в поставке нет ни одного файла примеров"
+    for path in files:
+        loaded = read_for_import(path)
+        assert loaded.templates, f"файл примеров {path.name} не прочитался"
+        # Пропавший ключ назван словами: значение у такого примера — то самое
+        # умолчание, и одно число в тексте отказа читалось бы как «равно».
+        wrong = {
+            one.name: (
+                "ключа нет в файле"
+                if "commission_per_side_rub" in one.missing
+                else one.values.commission_per_side_rub
+            )
+            for one in loaded.templates
+            if "commission_per_side_rub" in one.missing
+            or one.values.commission_per_side_rub != default
+        }
+        assert not wrong, (
+            f"в {path.name} комиссия примеров не равна умолчанию программы "
+            f"({default} ₽): {wrong}"
+        )
+
+
 def test_every_shipped_example_applies_without_a_caveat() -> None:
     """Стережёт: каждый пример из поставки применяется целиком, без оговорки.
 

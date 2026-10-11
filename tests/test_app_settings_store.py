@@ -66,8 +66,10 @@ DIFFERENT = Settings(
     trailing_start_pct=1.5,
     trailing_offset_pct=0.75,
     trailing_step_pct=0.11,
-    window_start=time(9, 30),
-    window_end=time(11, 30),
+    # Не 09:30–11:30: с 11.10.2026 это умолчание (решение 0060), и совпавшее
+    # поле проверка сохранения не видит.
+    window_start=time(9, 45),
+    window_end=time(12, 15),
     close_on_time_end=False,
     volume=4,
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
@@ -649,6 +651,53 @@ def test_a_real_settings_file_survives_a_read_and_a_write(tmp_path) -> None:
     assert path.read_text(encoding="utf-8") == OWNER_FILE_NOW, (
         "перезапись изменила файл настроек владельца счёта"
     )
+
+
+#: Окно и тариф, записанные в файл владельцем счёта. Первый — как у него
+#: в файле 11.10.2026. Второй — прежние умолчания 10:05–11:00 и 14 ₽,
+#: записанные в файл явно: именно их соблазнительно «перевести» на умолчания
+#: решения 0060 при чтении, и владелец, не трогавший окна, молча получил бы
+#: другое окно торговли и другие издержки.
+_OWNER_NUMBERS = (
+    pytest.param("10:15:00", "11:00:00", 14.0, id="owner-11.10"),
+    pytest.param("10:05:00", "11:00:00", 14.0, id="old-defaults-written"),
+)
+
+
+@pytest.mark.parametrize(("start", "end", "tariff"), _OWNER_NUMBERS)
+def test_the_owner_window_and_tariff_survive_the_new_defaults(
+    tmp_path, start, end, tariff
+) -> None:
+    """Стережёт: окно и тариф из файла читаются как записаны, а не умолчанием.
+
+    Решение 0060 §6 сменило умолчания на 09:30–11:30 и 17 ₽ — это касается
+    программы **без** файла настроек. Числа в файле — выбор владельца счёта,
+    и подмена их при чтении молча меняет время торговли и расчёт издержек.
+    Мутацией 11.10.2026 «перевод» окна 10:05–11:00 на новое умолчание при
+    чтении не ронял ни одного теста. Проверяется и повторное чтение после
+    «ОК»: подмена при записи — та же ложь, только отложенная на перезапуск.
+    """
+    body = json.loads(OWNER_FILE_NOW)
+    body["settings"].update(
+        window_start=start, window_end=end, commission_per_side_rub=tariff
+    )
+    path = tmp_path / SETTINGS_FILE_NAME
+    path.write_text(json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+    written = (time.fromisoformat(start), time.fromisoformat(end), tariff)
+    default = Settings()
+    assert written[0] != default.window_start and tariff != default.commission_per_side_rub, (
+        "числа в файле совпали с умолчанием — подмену проверка не увидит"
+    )
+
+    store = SettingsStore(tmp_path)
+    values = store.load().values
+    read = (values.window_start, values.window_end, values.commission_per_side_rub)
+    assert read == written, f"числа владельца подменены при чтении: {read}"
+
+    assert store.save(values) == ""
+    again = SettingsStore(tmp_path).load().values
+    reread = (again.window_start, again.window_end, again.commission_per_side_rub)
+    assert reread == written, f"числа владельца подменены после записи: {reread}"
 
 
 # ------------------------------- выключенные на этапе предохранители (D-113)

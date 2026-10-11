@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 from helpers import RecordingPort, settle_qt
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QWidget
 
 import ui.main_window
@@ -159,17 +160,107 @@ def test_the_dialogs_do_not_outlive_their_test(
 
 
 def test_defaults_match_the_agreed_numbers(dialog) -> None:
-    """Умолчания в полях — те, за которыми стоят замеры (DOMAIN.md §4)."""
+    """Умолчания в полях — договорённые числа.
+
+    Средняя и тейк — те, за которыми стоят замеры (DOMAIN.md §4). Окно
+    09:30–11:30 — ответ заказчика 15.09.2026 (решение 0060 §6), замеров
+    на нём нет: все сделаны при 10:05–11:00.
+    """
     values = dialog.values()
     assert values.average_period == 15
     assert values.average_kind is AverageKind.EMA
     assert values.take_profit_pct == pytest.approx(0.5)
-    assert values.window_start == time(10, 5)
-    assert values.window_end == time(11, 0)
+    assert values.window_start == time(9, 30)
+    assert values.window_end == time(11, 30)
     assert values.volume == 1
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
     # assert values.daily_loss_limit_pct == pytest.approx(2.0)
     # assert values.free_funds_reserve_pct == pytest.approx(30.0)
+
+
+def test_the_defaults_are_the_customer_answers_of_decision_0060() -> None:
+    """Стережёт: умолчания окна и тарифа — ответ заказчика 15.09.2026.
+
+    Решение 0060 §6: окно 09:30–11:30 МСК, комиссия 17 ₽ за контракт
+    на сторону. Числа здесь литералами из решения, а не ссылкой на поле
+    `Settings`: сверка поля с самим собой зеленела бы на любом умолчании.
+    До 11.10.2026 код стоял на 10:05–11:00 и 14 ₽ почти месяц после ответа.
+    """
+    default = Settings()
+    assert (default.window_start, default.window_end) == (time(9, 30), time(11, 30)), (
+        "умолчание торгового окна разошлось с решением 0060: "
+        f"{default.window_start}–{default.window_end}"
+    )
+    assert default.commission_per_side_rub == 17.0, (
+        "умолчание комиссии разошлось с решением 0060: "
+        f"{default.commission_per_side_rub}"
+    )
+
+
+#: Два набора для шапки: умолчания программы и числа, как у владельца счёта
+#: 11.10.2026. Шапка, собранная из полей, на втором показала бы чужое окно
+#: не хуже, чем зашитая литералом.
+_HEADER_CASES = (
+    Settings(),
+    Settings(window_start=time(10, 15), window_end=time(11, 0), commission_per_side_rub=14.0),
+)
+
+
+#: Чем виджет показывает человеку свой текст. Надпись над вкладками не обязана
+#: быть `QLabel`: заголовок рамки (`title`), кнопка и поле (`text`), поле
+#: многострочного текста (`toPlainText`) — и всплывающая подсказка любого
+#: из них (`toolTip`). Мутацией 11.10.2026 число в заголовке рамки над
+#: вкладками и в подсказке шапки проходило проверку, смотревшую только
+#: на `QLabel.text()`.
+_SHOWN_TEXT = ("text", "title", "toPlainText", "toolTip")
+
+
+def _shown_texts(widget: QWidget) -> list[str]:
+    """Весь текст, который виджет показывает человеку, — по таблице `_SHOWN_TEXT`."""
+    texts = []
+    for name in _SHOWN_TEXT:
+        getter = getattr(widget, name, None)
+        if callable(getter):
+            value = getter()
+            if isinstance(value, str) and value.strip():
+                texts.append(value)
+    return texts
+
+
+@pytest.mark.parametrize("settings", _HEADER_CASES, ids=("defaults", "owner-like"))
+def test_the_header_above_the_tabs_names_no_number(make_dialog, qapp, settings) -> None:
+    """Стережёт: шапка окна настроек над вкладками не содержит ни одной цифры.
+
+    `B-059`, `B-066`: шапка говорила «Тейк 0,5% и окно 10:05–11:00 подобраны…»,
+    а у владельца в поле стояло другое окно. Значения в полях у него свои,
+    и число в шапке разойдётся с полем при первой же правке. Проверяется то,
+    что видит человек: текст видимых виджетов собранного и показанного окна,
+    лежащих выше вкладок, их подсказки и заголовок самого окна, — а не строка
+    в исходнике.
+    """
+    window = make_dialog(settings)
+    window.show()
+    qapp.processEvents()
+    tabs_top = window.tabs.mapTo(window, QPoint(0, 0)).y()
+    above = [
+        widget
+        for widget in window.findChildren(QWidget)
+        if widget.isVisible()
+        and widget is not window.tabs
+        and not window.tabs.isAncestorOf(widget)
+        and widget.mapTo(window, QPoint(0, widget.height())).y() <= tabs_top
+    ]
+    header = [text for widget in above for text in _shown_texts(widget)]
+    assert any(text.strip() for text in header), (
+        "над вкладками не видно ни одной надписи — оговорку про числа в полях "
+        "убрали, и проверка ниже вакуумна"
+    )
+    numbered = [
+        text
+        for text in (window.windowTitle(), *header)
+        if any(char.isdigit() for char in text)
+    ]
+    assert not numbered, f"в шапке над вкладками есть цифры: {numbered}"
 
 
 def test_settings_survive_a_round_trip(dialog) -> None:
@@ -763,11 +854,11 @@ def test_the_number_of_the_unused_method_is_not_shown_alive(dialog) -> None:
         assert field.isEnabled(), "число выбранного способа недоступно"
 
 
-#: Тариф из `DOMAIN.md` §5: биржевой сбор из карточки инструмента плюс 1 ₽
-#: брокеру. На нём сделаны все замеры проекта. Число живёт здесь, чтобы
-#: подстановка «какого-нибудь» тарифа не прошла молча: поменять умолчание,
-#: не тронув документ и этот тест, нельзя.
-TARIFF_FROM_THE_DOCUMENT = 14.0
+#: Тариф из `DOMAIN.md` §5: ответ заказчика 15.09.2026, решение 0060 §6.
+#: До 11.10.2026 здесь стояло 14 ₽ — на них сделаны все замеры проекта.
+#: Число живёт здесь, чтобы подстановка «какого-нибудь» тарифа не прошла
+#: молча: поменять умолчание, не тронув документ и этот тест, нельзя.
+TARIFF_FROM_THE_DOCUMENT = 17.0
 
 
 def test_commission_tariff_reaches_the_engine(dialog) -> None:
@@ -825,6 +916,33 @@ def test_zero_commission_means_not_specified_not_free(dialog) -> None:
     note = dialog.commission_note.text()
     assert "не задан" in note
     assert "не выполняется" in note
+
+
+def test_the_empty_tariff_hint_names_the_program_default(dialog, monkeypatch) -> None:
+    """Стережёт: подсказка у пустого тарифа называет умолчание из `Settings`.
+
+    До 11.10.2026 там стояло литералом «использовалось 14 ₽», и смена
+    умолчания на 17 ₽ (решение 0060) подсказку не задела. Две половины:
+    на настоящем умолчании названы 17 ₽ и нет 14; на подставленном
+    умолчании названо подставленное — то есть число берётся из `Settings`,
+    а не написано в тексте второй раз.
+    """
+    dialog.commission.setValue(0.0)
+    note = dialog.commission_note.text()
+    assert "17 ₽" in note, f"подсказка не называет умолчание 17 ₽: {note!r}"
+    assert "14" not in note, f"подсказка называет старые 14 ₽: {note!r}"
+
+    def elsewhere(*args, **kwargs):
+        kwargs.setdefault("commission_per_side_rub", 23.5)
+        return Settings(*args, **kwargs)
+
+    monkeypatch.setattr(ui.settings_dialog, "Settings", elsewhere)
+    dialog.commission.setValue(5.0)
+    dialog.commission.setValue(0.0)
+    note = dialog.commission_note.text()
+    assert "23,5 ₽" in note, (
+        f"подсказка не взяла умолчание из Settings, а написала своё: {note!r}"
+    )
 
 
 def test_take_profit_range_upper_bound_matches_the_spec(dialog) -> None:
@@ -2075,8 +2193,10 @@ SAMPLE = Settings(
     trailing_start_pct=1.5,
     trailing_offset_pct=0.75,
     trailing_step_pct=0.11,
-    window_start=time(9, 30),
-    window_end=time(11, 30),
+    # Не 09:30–11:30: с 11.10.2026 это умолчание (решение 0060), и совпавшее
+    # поле проверка обмена не видит.
+    window_start=time(9, 45),
+    window_end=time(12, 15),
     close_on_time_end=False,
     volume=4,
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)

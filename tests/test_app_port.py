@@ -1162,9 +1162,12 @@ def test_a_frame_never_mixes_a_run_with_fresher_settings(loop, long_database) ->
     async def go():
         worker = MarketWorker(long_database)
         await worker.open()
-        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        # Окно явно, а не умолчанием: отметка FIRST_WINDOW_SHADE_END считана
+        # с 10:05, а умолчание с 11.10.2026 другое (решение 0060).
+        before = Settings().replace(window_start=time(10, 5), window_end=time(11, 0))
+        port = HistoryPort(worker, values=before, days=0, sanitize=redact)
         recorded = Recorded(port)
-        updated = Settings().replace(
+        updated = before.replace(
             average_period=20, window_start=time(12, 0), window_end=time(13, 0)
         )
         interfered: list[int] = []
