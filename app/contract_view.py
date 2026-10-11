@@ -182,16 +182,35 @@ def asked_text(reports: Sequence[LoadReport]) -> str:
     («Загрузить заново») от догрузки недостающего — а это и был вопрос.
     Счёт — по отрезкам, которые `sync_minutes` отправил бирже
     (`LoadReport.ranges`), против отрезков, о которых его просили:
-    отмеченные загруженными дни в первые не попадают.
+    отмеченные загруженными дни в первые не попадают. День, спрошенный
+    дважды (кусок передал свой край следующему), считается один раз — иначе
+    «запрошено» вышло бы больше «просили». Дни-доказательства (`D-149`,
+    `LoadReport.proofs`) — отдельной фразой: они спрошены на самом деле,
+    но не за тем, чтобы их загрузить.
     """
-    asked = sum((stop - start).days + 1 for report in reports for start, stop in report.ranges)
+    asked = sum(len(_asked_days(report)) for report in reports)
     span = sum(
         (report.requested_to - report.requested_from).days + 1
         for report in reports
         if report.requested_from is not None and report.requested_to is not None
     )
+    proofs = sum((stop - start).days + 1 for report in reports for start, stop in report.proofs)
     rest = ", остальные уже были в базе" if asked < span else ""
-    return f"Календарных дней запрошено у биржи: {asked} из {span}{rest}."
+    extra = (
+        f" Ещё {proofs} дн. спрошено только для проверки, что день перед ними "
+        "получен целиком: их свечи этой загрузкой не записывались."
+        if proofs else ""
+    )
+    return f"Календарных дней запрошено у биржи: {asked} из {span}{rest}.{extra}"
+
+
+def _asked_days(report: LoadReport) -> set[date]:
+    """Загружаемые дни, которые отчёт спросил у биржи, — без повторов."""
+    return {
+        start + timedelta(days=offset)
+        for start, stop in report.ranges
+        for offset in range((stop - start).days + 1)
+    }
 
 
 def legs_outcome(

@@ -130,7 +130,7 @@ THRESHOLD_FILE: Final[str] = "tests/test_lint_ratchet.py"
 #: ⚠️ **532 с 05.10.2026:** убран «Реверс по скользящей средней» (решение
 #: 0063) — его модуль, фильтр против пилы в окне и проверки №1; заодно
 #: `ruff --fix` по порядку импортов в пяти тронутых тестах.
-KNOWN_RUFF_FINDINGS: Final[int] = 532
+KNOWN_RUFF_FINDINGS: Final[int] = 531
 
 #: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 57 files`.
 #: Было 191 (замер 08.09.2026): число подняли под находку «Cannot find

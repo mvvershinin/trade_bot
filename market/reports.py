@@ -26,9 +26,18 @@ class LoadReport:
     source: str
     requested_from: date | None = None
     requested_to: date | None = None
+    #: Загружаемые дни, отрезками, как их спросили у биржи. Отрезки могут
+    #: налезать: кусок, данные которого кончились раньше конца, передаёт свой
+    #: последний день следующему (`market.sync`).
     ranges: list[tuple[date, date]] = field(default_factory=list)
+    #: Дни-доказательства (`D-149`): спрошены только затем, чтобы поток минут
+    #: прошёл дальше последнего загружаемого дня. Их свечи в базу не пишутся.
+    proofs: list[tuple[date, date]] = field(default_factory=list)
 
     fetched: int = 0        # свечей пришло с сервера (после снятия дублей страниц)
+    #: Сколько из `fetched` — свечи дней-доказательств: пришли и не записаны.
+    #: Без этого числа «пришло» больше «записано» без объяснения.
+    proof_candles: int = 0
     inserted: int = 0       # записано новых
     updated: int = 0        # перезаписано поверх данных источника не выше рангом
     kept: int = 0           # отвергнуто: в базе данные источника выше рангом
@@ -84,6 +93,11 @@ class LoadReport:
             f"пришло {self.fetched}",
             f"записано {self.inserted} новых, {self.updated} обновлено",
         ]
+        if self.proof_candles:
+            parts.append(
+                f"{self.proof_candles} свечей пришло только для проверки, что "
+                "предыдущий день получен целиком, и не записано"
+            )
         if self.kept:
             parts.append(f"{self.kept} отвергнуто — в базе данные надёжнее")
         if self.duplicates:

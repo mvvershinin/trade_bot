@@ -60,11 +60,11 @@ LAYERS = ("engine", "market", "backtest", "broker", "strategies", "ui", "app")
 #: вызовов на каждое поле.
 KNOWN: dict[str, int] = {
     "engine/pipeline.py::process_closed_candle": 265,
-    "market/sync.py::sync_minutes": 137,
     "broker/token_store.py::TokenStore.load": 136,
     "broker/token_store.py::TokenStore.save": 134,
     "ui/notices.py::guard_note": 109,
     "broker/session.py::BrokerSession._exchange": 95,
+    "market/sync.py::sync_minutes": 93,
     "ui/status_panel.py::StatusPanel.apply_state": 83,
 }
 

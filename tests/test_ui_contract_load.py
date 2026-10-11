@@ -165,6 +165,13 @@ class Chain:
     Минуты MXZ6 есть **каждый день** последних двух месяцев, включая хвост
     до рубежа: если загрузка о нём попросит, биржа отдаст — и проверка это
     увидит в `minute_spans`, а не в пустом ответе.
+
+    Последний день торгов — «сегодня + 80» у всех кодов, кроме названных
+    в `last_days`: на этом стоит проверка «архивный, но ещё торгуется»
+    (`test_app_contract_sync`). Стенд с настоящими сроками — `Quarters`:
+    при общем дальнем сроке закрытый MXU6 доказывал бы свой последний день
+    минутами по сегодня, через весь период MXZ6 (`D-149`), и сторож «не дальше
+    последнего дня торгов» был бы пуст.
     """
 
     def __init__(self, today: date, *, delay: float = 0.0, wave: float = 0.0) -> None:
@@ -172,6 +179,7 @@ class Chain:
         self.delay = delay
         self.wave = wave
         self.volumes = _volumes(today)
+        self.last_days: dict[str, date] = {}
         self.transport = _Transport(self.answer)
         self.client = IssClient(self.transport, sleep=_no_sleep, pause=0.0)
 
@@ -181,9 +189,8 @@ class Chain:
         if query.get("iss.only") == "description":
             code = parsed.path.rsplit("/", 1)[-1].removesuffix(".json")
             # Месячного MXX6 биржа не знает — цепочка MX квартальная.
-            return _description_body(
-                self.today + timedelta(days=80) if code in self.volumes else None
-            )
+            last = self.last_days.get(code, self.today + timedelta(days=80))
+            return _description_body(last if code in self.volumes else None)
         if "interval" not in query:
             return b"{}"
         code = parsed.path.rsplit("/", 2)[-2]
@@ -884,6 +891,12 @@ def test_a_monthly_asset_falls_back_to_the_day_load_aloud(loop, tmp_path) -> Non
 #: «Сегодня» владельца счёта 09.10.2026 и рубежи 2026 года, как в его таблице.
 OWNER_TODAY = date(2026, 10, 9)
 ROLLS = {"MXM6": date(2026, 3, 19), "MXU6": date(2026, 6, 18), "MXZ6": date(2026, 9, 17)}
+#: Последние дни торгов, как у биржи: третий четверг месяца экспирации.
+#: Рубеж следующего контракта — в этот же день, конец периода — накануне.
+LAST_DAYS = {
+    "MXH6": date(2026, 3, 19), "MXM6": date(2026, 6, 18), "MXU6": date(2026, 9, 17),
+    "MXZ6": date(2026, 12, 17), "MXH7": date(2027, 3, 18),
+}
 
 
 class Quarters(Chain):
@@ -898,6 +911,7 @@ class Quarters(Chain):
     def __init__(self, today: date, *, holes: dict[str, set[date]] | None = None) -> None:
         super().__init__(today)
         self.holes = holes or {}
+        self.last_days = dict(LAST_DAYS)
         codes = ("MXH6", "MXM6", "MXU6", "MXZ6", "MXH7")
         self.volumes = {code: {} for code in codes}
         day = date(2025, 9, 1)
@@ -952,6 +966,13 @@ def test_a_period_load_takes_every_contract_in_its_own_days(loop, tmp_path) -> N
     По рубежам 0049 17.06 — ещё MXM6, MXU6 — 18.06–16.09, MXZ6 — с 17.09.
     Мутация: грузить только код из настроек (MXZ6) — минут MXU6 и MXM6
     не просили.
+
+    Решение 0061 после `D-149`: за последним днём своего куска закрытый
+    контракт спрашивается только ради доказательства — не дальше своего
+    последнего дня торгов, и **ничего из этого не остаётся в базе**: ни минут,
+    ни отметок позже конца куска. Мутации: писать минуты дней-доказательств
+    в базу; отмечать дни-доказательства; дотягивать доказательство дальше
+    последнего дня торгов.
     """
     database = tmp_path / "base.sqlite3"
     chain = Quarters(OWNER_TODAY)
@@ -961,6 +982,9 @@ def test_a_period_load_takes_every_contract_in_its_own_days(loop, tmp_path) -> N
 
     outcome = heard.finished[-1]
     assert outcome.ok, outcome.trouble
+    with CandleStore(database) as store:
+        stored = {code: (store.trading_days(code), store.settled_days(code))
+                  for code in ("MXM6", "MXU6", "MXZ6")}
     for code, first, last in (
         ("MXM6", date(2026, 6, 17), date(2026, 6, 17)),
         ("MXU6", date(2026, 6, 18), date(2026, 9, 16)),
@@ -973,7 +997,13 @@ def test_a_period_load_takes_every_contract_in_its_own_days(loop, tmp_path) -> N
         left = [day for day in (first + timedelta(days=n) for n in range((last - first).days + 1))
                 if day not in asked]
         assert not left, f"{code}: дни своего куска не просили: {left[:3]}…"
-        assert max(till for _, till in spans) == last, f"{code} грузился за чужие дни: {spans}"
+        traded, settled = stored[code]
+        assert max(traded) == last, f"{code}: в базе минуты за чужие дни: {traded[-3:]}"
+        assert max(settled) <= last, f"{code}: отмечены дни за концом куска: {sorted(settled)[-3:]}"
+        assert max(till for _, till in spans) <= LAST_DAYS[code], (
+            f"{code} спрашивался дальше своего последнего дня торгов "
+            f"{LAST_DAYS[code]}: {spans}"
+        )
         assert min(since for since, _ in spans) >= first - timedelta(days=WARMUP_LOOK_BACK_DAYS), (
             f"{code} грузил хвост до своего куска: {spans}"
         )
@@ -993,31 +1023,39 @@ def _asked_days(chain: Quarters, code: str) -> list[date]:
 def test_a_repeated_load_does_not_ask_the_exchange_for_days_it_already_has(
     loop, tmp_path,
 ) -> None:
-    """Стережёт B-069 (D): «Догрузить недостающее» второй раз не качает лежащие дни.
+    """Стережёт B-069 (D) и `D-149` (А): вторая загрузка спрашивает только сегодня.
 
     Слова владельца счёта 09.10.2026: «почему каждый раз 20 тысяч свечей?».
     Тот же период с 17.06 грузится дважды, без «заново». Во второй раз биржу
-    не спрашивают ни об одном дне, отмеченном после первого (`settled`
-    в `data_day`); по MXZ6 спрашивают ровно сегодняшний, ещё не закрытый день.
+    не спрашивают **ни об одном прошлом дне** ни по одному коду: по MXM6
+    и MXU6 — ни одного запроса минут, по MXZ6 — ровно сегодняшний, ещё
+    не закрытый день. До `D-149` второй раз спрашивались последние дни
+    закрытых кусков (MXM6 17.06, MXU6 16.09): минут кода после них в базе
+    нет, и подтвердить их было нечем. Теперь первая загрузка доказывает их
+    днём за концом куска — по последний день торгов, без записи в базу.
+
     Итог называет число запрошенных дней — и оно совпадает с тем, что
-    подставная биржа реально получила.
+    подставная биржа реально получила: загружаемые дни «X из Y» без
+    повторов, дни-доказательства отдельной фразой, в сумме — всё спрошенное.
 
     Мутации: снимать отметки без «заново»; не смотреть на отметки при выборе
-    дней; считать в итоге просимый отрезок вместо запрошенного; не сказать.
-    ⚠️ По прошлым кускам второй раз спрашивается их последний день (MXM6 17.06,
-    MXU6 16.09): после него минут этого кода в базе нет, и `_settle_tails`
-    его не закрывает. Отмеченным он не был — проверке это не противоречит;
-    перезапрос — долг `D-149`.
+    дней; не доказывать последний день закрытого куска; считать в итоге
+    просимый отрезок вместо запрошенного; сложить дни-доказательства в «X»;
+    не сказать.
     """
     database = tmp_path / "base.sqlite3"
+    codes = ("MXM6", "MXU6", "MXZ6")
     first_chain = Quarters(OWNER_TODAY)
     _, first = _run(loop, database, first_chain, _load_since("MXZ6", date(2026, 6, 17)),
                     instrument="MXZ6")
     assert first.finished[-1].ok, first.finished[-1].trouble
-    assert "Календарных дней запрошено у биржи: 118 из 118." in first.finished[-1].detail, (
-        first.finished[-1].detail
+    received = sum(len(_asked_days(first_chain, code)) for code in codes)
+    assert received > 118, "первая загрузка ничего не доказывала — проверка второй пуста"
+    said_first = (
+        "Календарных дней запрошено у биржи: 118 из 118. "
+        f"Ещё {received - 118} дн. спрошено только для проверки"
     )
-    codes = ("MXM6", "MXU6", "MXZ6")
+    assert said_first in first.finished[-1].detail, first.finished[-1].detail
     with CandleStore(database) as store:
         settled = {code: store.settled_days(code) for code in codes}
     assert all(settled.values()), f"первая загрузка ничего не отметила: {settled}"
@@ -1029,13 +1067,12 @@ def test_a_repeated_load_does_not_ask_the_exchange_for_days_it_already_has(
     outcome = heard.finished[-1]
     assert outcome.ok, outcome.trouble
     asked = {code: _asked_days(chain, code) for code in codes}
-    for code in codes:
-        again = sorted(set(asked[code]) & settled[code])
-        assert not again, f"{code}: второй раз спросили уже отмеченные дни: {again[:5]}…"
-    assert asked["MXZ6"] == [OWNER_TODAY], f"MXZ6 спросили не только сегодня: {asked['MXZ6']}"
-    total = sum(len(days) for days in asked.values())
-    said = f"Календарных дней запрошено у биржи: {total} из 118, остальные уже были в базе."
+    assert asked == {"MXM6": [], "MXU6": [], "MXZ6": [OWNER_TODAY]}, (
+        f"вторая загрузка спросила не только сегодня: {asked}"
+    )
+    said = "Календарных дней запрошено у биржи: 1 из 118, остальные уже были в базе."
     assert said in outcome.detail, outcome.detail
+    assert "Ещё" not in outcome.detail, f"доказывать во второй раз было нечего: {outcome.detail}"
 
 
 def test_after_the_load_the_days_the_exchange_traded_are_checked(loop, tmp_path) -> None:
@@ -1065,6 +1102,57 @@ def test_after_the_load_the_days_the_exchange_traded_are_checked(loop, tmp_path)
         settled = store.settled_days("MXU6")
     assert not settled & hole, f"отметки с пропуска не сняты: {sorted(settled & hole)}"
     assert date(2026, 9, 4) in settled, "сняты отметки и с дней, где свечи есть"
+
+
+def test_a_real_hole_stays_unmarked_and_said_on_every_press(loop, tmp_path) -> None:
+    """Стережёт `D-149` (В): будний день с объёмом и без минут — строка сверки, без отметки.
+
+    Дыра MXU6 07.09–16.09: биржа торговала, минут не отдаёт. Поток минут
+    проходит через неё в день-доказательство 17.09, и загрузка дыру отмечает —
+    снимает отметку сверка с дневными свечами биржи (B-069). Так на каждом
+    нажатии: вторая «Догрузить» спрашивает дыру снова, вместе с 17.09 и
+    не дальше, и снова называет её, а не молча считает загруженной.
+    Мутации: отметить дыру после сверки; не спрашивать её второй раз.
+    """
+    database = tmp_path / "base.sqlite3"
+    hole = {date(2026, 9, 7) + timedelta(days=n) for n in range(10)}
+    line = "MXU6: нет свечей за 07.09–16.09 — сделки за эти дни не посчитаны."
+    for press in (1, 2):
+        chain = Quarters(OWNER_TODAY, holes={"MXU6": hole})
+        _, heard = _run(loop, database, chain, _load_since("MXZ6", date(2026, 6, 17)),
+                        instrument="MXZ6")
+        outcome = heard.finished[-1]
+        assert not outcome.ok and line in outcome.trouble, f"нажатие {press}: {outcome.trouble}"
+        with CandleStore(database) as store:
+            settled = store.settled_days("MXU6")
+        assert not settled & hole, f"нажатие {press}: дыра отмечена: {sorted(settled & hole)}"
+    asked = _asked_days(chain, "MXU6")
+    assert hole <= set(asked), f"вторая загрузка не спросила дыру снова: {asked}"
+    assert asked[-1] == LAST_DAYS["MXU6"], f"доказательство дыры не по 17.09: {asked[-3:]}"
+
+
+def test_a_day_asked_twice_is_counted_once_in_the_asked_line(loop, tmp_path) -> None:
+    """Стережёт `D-149` (строка «X из Y»): день, спрошенный дважды, считается один раз.
+
+    Дыра MXU6 07.09–16.09: кусок 17.08–15.09 обрывается на 06.09 и передаёт
+    край следующему куску — тот начинается с 06.09, и дни 06.09–15.09 уходят
+    к бирже дважды. Счёт по отрезкам с повторами дал бы на экране «запрошено»
+    больше, чем «просили». Мутация: считать дни по `ranges`, не снимая повторов.
+    """
+    hole = {date(2026, 9, 7) + timedelta(days=n) for n in range(10)}
+    chain = Quarters(OWNER_TODAY, holes={"MXU6": hole})
+
+    _, heard = _run(loop, tmp_path / "base.sqlite3", chain,
+                    _load_since("MXZ6", date(2026, 6, 17)), instrument="MXZ6")
+
+    times: dict[date, int] = {}
+    for since, till in chain.spans_of("MXU6"):
+        for n in range((till - since).days + 1):
+            times[since + timedelta(days=n)] = times.get(since + timedelta(days=n), 0) + 1
+    twice = sorted(day for day, count in times.items() if count > 1)
+    assert twice, f"ни один день не спрошен дважды — проверка пуста: {chain.spans_of('MXU6')}"
+    detail = heard.finished[-1].detail
+    assert "Календарных дней запрошено у биржи: 118 из 118." in detail, detail
 
 
 def test_the_tester_says_the_hole_and_the_basis_in_its_report(loop, tmp_path) -> None:

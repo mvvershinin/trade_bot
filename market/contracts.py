@@ -797,10 +797,13 @@ def load_contract_minutes(
     start = max(row.active_from, request.since or row.active_from)
     load = ContractLoad(symbol, start, start, 0, warmup_bars, until=request.until)
     if request.until >= start:
+        # `proof_until`: последний день куска закрытого контракта доказывается
+        # минутами за ним, по последний день торгов (`D-149`). В базу они
+        # не пишутся — хвоста после периода нет, как нет его и до рубежа.
         load.reports.append(
             sync_minutes(store, client, symbol, market=request.market,
                          since=start, until=request.until, now=now,
-                         progress=request.progress)
+                         progress=request.progress, proof_until=row.last_trade_day)
         )
     day = start - timedelta(days=1)
     while day >= start - timedelta(days=request.look_back_days):
