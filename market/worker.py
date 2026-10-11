@@ -111,6 +111,7 @@ from market.journal import (
     StoredTrade,
     TradeRecord,
 )
+from market.paper import PaperRows, PaperRun, PaperWritten, StoredOrder
 from market.point import MARKETS_PROBED, PointValue, ask_point_value
 from market.reports import LoadReport
 from market.storage import CandleStore, ContractRow, Coverage, Source, WriteStats
@@ -976,6 +977,31 @@ class MarketWorker:
 
         return await self.call(work)
 
+    async def write_paper_rows(
+        self,
+        session_id: int,
+        rows: PaperRows,
+        *,
+        on_written: Callable[[PaperWritten], None] | None = None,
+    ) -> PaperWritten:
+        """Записать пачку строк прогона симуляции одной транзакцией.
+
+        `on_written` зовётся **в потоке базы**, сразу после фиксации
+        транзакции, и до того, как ответ дойдёт до ждущего. Приём тот же,
+        что у `_open_store`, и по той же причине: отменить `await` можно,
+        работу в потоке — нет. Вызывающий, который сдвигает по ответу свои
+        курсоры, при отмене ожидания терял бы сам факт записи и записал бы
+        ту же пачку второй раз. Отказ записи сюда не доходит: колбэк зовётся
+        только при успехе. Сам колбэк обязан быть быстрым и не трогать окно.
+        """
+        def work(store: CandleStore) -> PaperWritten:
+            written = store.write_paper_rows(session_id, rows)
+            if on_written is not None:
+                on_written(written)
+            return written
+
+        return await self.call(work)
+
     # -- остановка робота --------------------------------------------------
 
     async def standing_halt(self) -> tuple[StoredHalt, ...]:
@@ -1064,6 +1090,19 @@ class MarketWorker:
                 all_runs=all_runs,
             )
         )
+
+    async def orders(
+        self, *, session_id: int, limit: int = 5000
+    ) -> JournalPage[StoredOrder]:
+        """Заявки одного прогона по порядку записи. Номер прогона обязателен."""
+        return await self.call(
+            lambda store: store.orders(session_id=session_id, limit=limit)
+        )
+
+    async def paper_runs(self, symbols: Iterable[str]) -> tuple[PaperRun, ...]:
+        """Прогоны симуляции по кодам инструмента, старые первыми, с отметкой."""
+        wanted = list(symbols)
+        return await self.call(lambda store: store.paper_runs(wanted))
 
     async def journal_stats(self) -> JournalStats:
         """Сколько в базе журнала: прогонов, строк, сделок и байт."""

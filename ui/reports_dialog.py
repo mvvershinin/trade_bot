@@ -6,9 +6,14 @@
 поведения бота». Миниплан — `.docs/plans/reports-window-step1.md`.
 
 Шаг 1: отчёт по **прогону, показанному на экране**, — те же строки и тот же
-итог, что в журнале «Сделки» под графиком (`ShownRun`). Сохранённых сделок
-симуляции за прошлые дни здесь нет — это шаг 2, и окно говорит об этом само,
-а не оставляет догадываться.
+итог, что в журнале «Сделки» под графиком (`ShownRun`).
+
+Шаг 2 (`.docs/plans/reports-window-step2-paper-trades.md`): переключатель
+над таблицей — «Прогон на экране» (при открытии, ответ владельца В5),
+«Симуляция: как было» и «Симуляция: пересчёт с утра». Сделки симуляции
+окно просит у порта (`ask`) и получает готовыми (`set_paper`,
+`ui.trade_story.PaperReport`): строки таблицы того же вида и разбор
+каждой сделки. Отбирает их `app/paper_report.py`, не окно.
 
 ⚠️ **Здесь не считается ни одной прибыли.** Итог периода — `span_totals`,
 то самое сложение готовых столбиков, которым подводит итог «Разбор сделок»
@@ -33,6 +38,7 @@ from datetime import date, datetime, timedelta
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -65,9 +71,21 @@ from ui.formatting import (
 from ui.models import RunOrigin, TradeRow, TradesSummary
 from ui.theme import Theme, resize_within_screen, scaled
 from ui.theme import current as current_theme
+from ui.trade_story import (
+    SOURCES,
+    PaperReport,
+    ReportSource,
+    TradeStory,
+    caught_up_trades,
+    days_without_run,
+    silent_days,
+    story_lines,
+    unrecorded_runs,
+)
 
 __all__ = [
     "NO_PERIOD_TRADES",
+    "PAPER_WAIT",
     "PERIODS",
     "CardContent",
     "CommissionShare",
@@ -79,6 +97,9 @@ __all__ = [
     "card_title",
     "commission_share",
     "explanation_lines",
+    "in_period",
+    "paper_empty",
+    "paper_title",
     "period_totals",
     "run_title",
     "trade_day",
@@ -158,16 +179,17 @@ def trade_day(row: TradeRow) -> date:
     return to_msk(row.exit_time if row.exit_time is not None else row.entry_time).date()
 
 
+def in_period(row: TradeRow, since: date | None, until: date | None) -> bool:
+    """Сделка в периоде по дню выхода МСК. `None` у границы — граница не задана."""
+    day = trade_day(row)
+    return (since is None or day >= since) and (until is None or day <= until)
+
+
 def trades_in_period(
     rows: Sequence[TradeRow], since: date | None, until: date | None
 ) -> list[TradeRow]:
     """Сделки периода в их порядке. `None` у границы — граница не задана."""
-    return [
-        row
-        for row in rows
-        if (since is None or trade_day(row) >= since)
-        and (until is None or trade_day(row) <= until)
-    ]
+    return [row for row in rows if in_period(row, since, until)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,12 +672,134 @@ def _bar_style(colour: str, *, left: bool, right: bool) -> str:
     )
 
 
+#: Что сказано над таблицей — по положению переключателя. Симуляции
+#: дописываются оговорки прочитанного (`_paper_notes`).
+_SCOPES = {
+    ReportSource.SHOWN: (
+        "Здесь сделки прогона, показанного сейчас на графике, — те же, что "
+        "в журнале «Сделки». Сделки симуляции прошлых дней и прошлых прогонов — "
+        "в положениях «Симуляция: …» переключателя."
+    ),
+    ReportSource.AS_WAS: (
+        "Сделки симуляции, которые робот закрыл вживую, — по всем прогонам "
+        "инструмента, все контракты одним рядом. Позиция, открытая пересчётом "
+        "истории при старте прогона или разбором пропущенных свечей после "
+        "подключения и закрытая вживую, помечена «вход из пересчёта» или «вход "
+        "на догоне»; открытая вживую и закрытая разбором пропущенных свечей — "
+        "«выход на догоне». Все они в итоге. Сделки, где ни вход, ни выход "
+        "робот вживую не решал, сюда не входят."
+    ),
+    ReportSource.RECOUNT: (
+        "За каждый день — сделки последнего прогона симуляции, шедшего в этот "
+        "день: как он посчитал день с утра своими настройками. Сделка "
+        "относится к дню выхода, МСК."
+    ),
+}
+
+#: Пока порт читает базу — эта строка вместо таблицы.
+PAPER_WAIT = "Читаю сделки симуляции из базы…"
+
+#: Сколько дат без прогона назвать поимённо; остальные — числом.
+_DAYS_NAMED = 12
+
+
+def _runs_text(count: int) -> str:
+    """«1 прогон», «3 прогона», «11 прогонов» — склонение по двум последним цифрам."""
+    if count % 100 in range(11, 15) or count % 10 not in range(1, 5):
+        return f"{count} прогонов"
+    return f"{count} прогон" if count % 10 == 1 else f"{count} прогона"
+
+
+def _days_list(days: Sequence[date]) -> str:
+    """«04.10, 05.10 и ещё 3 дн.» — первые даты поимённо, остальные числом. С точкой."""
+    named = ", ".join(f"{day:%d.%m}" for day in days[:_DAYS_NAMED])
+    rest = len(days) - _DAYS_NAMED
+    return named + (f" и ещё {_days_text(rest)}." if rest > 0 else ".")
+
+
+def paper_title(report: PaperReport | None, source: ReportSource, *, waiting: bool) -> str:
+    """Заголовок окна в положениях «Симуляция»: что за отбор и по каким прогонам."""
+    label = dict((one, caption) for one, caption, _tip in SOURCES)[source]
+    # «Симуляция: как было» → «как было»: слово «симуляция» уже в начале.
+    head = f"Отчёт по симуляции на боевом потоке — {label.split(': ', 1)[-1]}"
+    if waiting or report is None:
+        return head
+    head = f"{head}, {report.instrument or EMPTY}"
+    if not report.runs:
+        return head
+    codes = ", ".join(report.codes)
+    return f"{head}\nПрогонов симуляции в базе: {len(report.runs)} ({codes})"
+
+
+def _no_runs(report: PaperReport) -> str:
+    return (
+        f"Прогонов симуляции по {report.instrument or EMPTY} в базе нет. Они "
+        "записываются сами, когда включён поток котировок: каждый ход "
+        "симуляции — прогон со своими сделками."
+    )
+
+
+def _none_recorded(report: PaperReport) -> str:
+    return (
+        f"В базе {_runs_text(len(report.runs))} симуляции, и ни один не "
+        "записывал сделки: их сделала сборка, которая сделки симуляции "
+        "в базу не писала. Сделки появятся с первого прогона этой сборки."
+    )
+
+
+#: Почему сделок симуляции нет — по порядку проверки. Цепочка, а не `if`
+#: на каждый случай: порядок — данные, и первый подошедший ответ — ответ.
+_PAPER_EMPTY: tuple[
+    tuple[Callable[[PaperReport, ReportSource], bool], Callable[[PaperReport], str]], ...
+] = (
+    (lambda report, _source: not report.runs, _no_runs),
+    (lambda report, _source: not any(run.recorded for run in report.runs), _none_recorded),
+    (
+        lambda report, source: (
+            source is ReportSource.RECOUNT and bool(silent_days(report, None, None))
+        ),
+        lambda _report: (
+            "Сделок нет: в дни прогонов симуляции последним прогоном дня шёл "
+            "прогон сборки, которая сделки симуляции в базу не писала. Какие "
+            "это дни, сказано над таблицей."
+        ),
+    ),
+    (
+        lambda _report, source: source is ReportSource.AS_WAS,
+        lambda _report: (
+            "Прогоны симуляции есть, но ни входа, ни выхода сделки робот вживую "
+            "не решал: всё, что они посчитали, — пересчёт истории при старте и разбор "
+            "пропущенных свечей после подключения. Их видно в положении "
+            "«Симуляция: пересчёт с утра»."
+        ),
+    ),
+    (
+        lambda _report, _source: True,
+        lambda _report: "В дни прогонов симуляции ни одна сделка не закрылась.",
+    ),
+)
+
+
+def paper_empty(report: PaperReport, source: ReportSource) -> str:
+    """Почему сделок симуляции нет — словами. Пусто — сделки есть.
+
+    Отказ чтения, пустая база, прогоны без записи и «вживую не закрыто
+    ни одной» — разные ответы, и ни один не выдаётся за другой (`_PAPER_EMPTY`).
+    """
+    rows = report.as_was.rows if source is ReportSource.AS_WAS else report.recount.rows
+    if report.trouble or rows:
+        return report.trouble
+    return next(words(report) for applies, words in _PAPER_EMPTY if applies(report, source))
+
+
 class ReportsDialog(QDialog):
-    """Отчёт за период по прогону на экране. Немодальное.
+    """Отчёт за период: прогон на экране либо сделки симуляции из базы. Немодальное.
 
     `today` подставляется тестом: «текущий месяц» иначе зависел бы от дня
     прогона тестов. `jump` переводит график к сделке и говорит, удалось ли;
-    `None` — двойной щелчок ничего не обещает.
+    `None` — двойной щелчок ничего не обещает. `ask` — попросить у порта
+    сделки симуляции; ответ приходит в `set_paper`. `None` — просить
+    не у кого, и положения «Симуляция» говорят это словами.
     """
 
     def __init__(
@@ -665,37 +809,42 @@ class ReportsDialog(QDialog):
         *,
         today: Callable[[], date] = msk_today,
         jump: Callable[[TradeRow], bool] | None = None,
+        ask: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._theme = current_theme()
         self._today = today
         self._jump = jump
+        self._ask = ask
         self._run: ShownRun | None = None
         self._shown: list[TradeRow] = []
+        #: Разбор строк таблицы — тот же порядок; у прогона на экране пусто.
+        self._stories: list[TradeStory] = []
         #: Какая кнопка периода нажата последней; `None` — даты правили руками.
         #: Новый прогон перечитывает период по ней: «Всё» старого прогона
         #: не должно молча обрезать новый.
         self._picked: str | None = "Месяц"
         self._all = False
+        self._source = ReportSource.SHOWN
+        self._paper: PaperReport | None = None
+        self._waiting = False
         self.setWindowTitle("Отчёты")
         resize_within_screen(self, 1240, 760)
         self._build()
+        self._mark_source()
         self.set_run(run)
 
     # ------------------------------------------------------------------ сборка
 
     def _build(self) -> None:
-        """Сверху вниз: заголовок, период, итог, таблица, разбор строки."""
+        """Сверху вниз: заголовок, переключатель, период, итог, таблица, разбор."""
         self.title_label = QLabel()
         self.title_label.setWordWrap(True)
         self.title_label.setStyleSheet("font-weight: 600;")
-        self.scope_label = QLabel(
-            "Здесь сделки прогона, показанного сейчас на графике, — те же, что "
-            "в журнале «Сделки». Сохранённые сделки симуляции за прошлые дни "
-            "появятся в этом окне следующим шагом."
-        )
+        self.scope_label = QLabel(_SCOPES[ReportSource.SHOWN])
         self.scope_label.setWordWrap(True)
 
+        source_row = self._source_row()
         self.period_buttons: dict[str, QPushButton] = {}
         period_row = self._period_row()
 
@@ -720,6 +869,7 @@ class ReportsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.title_label)
+        layout.addLayout(source_row)
         layout.addWidget(self.scope_label)
         layout.addLayout(period_row)
         layout.addWidget(self.card)
@@ -728,6 +878,39 @@ class ReportsDialog(QDialog):
         layout.addWidget(self.empty_label, 1)
         layout.addWidget(self.splitter, 1)
         layout.addWidget(buttons)
+
+    def _source_row(self) -> QHBoxLayout:
+        """Переключатель «что показать» и кнопка перечитать базу.
+
+        Кнопки с галочкой, как у периода, а не круглые переключатели: кружок
+        невыбранного положения в тёмной теме почти не виден (снимок 11.10.2026),
+        и три положения читались как одна подпись.
+        """
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Показать:"))
+        self.source_group = QButtonGroup(self)
+        self.source_group.setExclusive(True)
+        self.source_buttons: dict[ReportSource, QPushButton] = {}
+        for source, caption, tip in SOURCES:
+            button = QPushButton(caption)
+            button.setToolTip(tip)
+            button.setCheckable(True)
+            button.setAutoDefault(False)
+            button.clicked.connect(lambda _=False, picked=source: self.pick_source(picked))
+            self.source_group.addButton(button)
+            self.source_buttons[source] = button
+            row.addWidget(button)
+        self.reread_button = QPushButton("Перечитать из базы")
+        self.reread_button.setToolTip(
+            "Прочитать сделки симуляции заново: живой ход дописывает их "
+            "в базу на каждом закрытом баре."
+        )
+        self.reread_button.setAutoDefault(False)
+        self.reread_button.clicked.connect(self._ask_paper)
+        self.reread_button.setVisible(False)
+        row.addWidget(self.reread_button)
+        row.addStretch(1)
+        return row
 
     def _period_row(self) -> QHBoxLayout:
         """Кнопки периода и две даты с календарём."""
@@ -760,7 +943,7 @@ class ReportsDialog(QDialog):
         return period_row
 
     def _build_table(self) -> None:
-        """Таблица позиций: колонки — из `_COLUMNS`."""
+        """Таблица позиций: колонки — из `_COLUMNS`, у симуляции ещё «Прогон»."""
         self.table = QTableWidget(0, len(_COLUMNS))
         for index, (name, _, _) in enumerate(_COLUMNS):
             item = QTableWidgetItem(name)
@@ -808,17 +991,89 @@ class ReportsDialog(QDialog):
     # ------------------------------------------------------------------ данные
 
     def set_run(self, run: ShownRun | None) -> None:
-        """Новый прогон — окно перестраивается, выбранный период остаётся."""
+        """Новый прогон — окно перестраивается, выбранный период остаётся.
+
+        В положениях «Симуляция» прогон только запоминается: таблица там
+        из базы, и каждая сделка живого хода сбрасывала бы выбранную строку.
+        """
         self._run = run
-        # Вторая строка заголовка — «Считается на: …» склейки (B-069).
-        self.title_label.setText(
-            "Отчёт по прогону" if run is None
-            else "\n".join(line for line in (run_title(run), run.basis) if line)
-        )
+        if self._source is not ReportSource.SHOWN:
+            return
+        self._show_title()
         if self._picked is not None:
             self.pick_period(self._picked)
         else:
             self._refresh()
+
+    def source(self) -> ReportSource:
+        """Что показано: прогон на экране или отбор симуляции."""
+        return self._source
+
+    def pick_source(self, source: ReportSource) -> None:
+        """Переключатель: прогон на экране либо сделки симуляции из базы.
+
+        Симуляция всякий раз перечитывается: живой ход дописывает базу
+        на каждом баре, и ответ, прочитанный минуту назад, уже неполон.
+        """
+        self._source = source
+        self._mark_source()
+        self.scope_label.setText(_SCOPES[source])
+        self.reread_button.setVisible(source is not ReportSource.SHOWN)
+        if source is not ReportSource.SHOWN:
+            self._ask_paper()
+            return
+        self._show_title()
+        self._reperiod()
+
+    def _mark_source(self) -> None:
+        """Нажата ровно кнопка выбранного положения: галочка и жирный шрифт."""
+        for source, button in self.source_buttons.items():
+            picked = source is self._source
+            caption = next(text for one, text, _tip in SOURCES if one is source)
+            button.setChecked(picked)
+            button.setText(f"✓ {caption}" if picked else caption)
+            font = button.font()
+            font.setBold(picked)
+            button.setFont(font)
+
+    def _ask_paper(self) -> None:
+        """Попросить сделки симуляции. Просить не у кого — сказать это."""
+        if self._ask is None:
+            self.set_paper(PaperReport(
+                trouble="Сделки симуляции прочитать нечем: окно открыто без "
+                        "торговой части программы."
+            ))
+            return
+        self._waiting = True
+        self._show_title()
+        self._refresh()
+        self._ask()
+
+    def set_paper(self, report: PaperReport) -> None:
+        """Ответ порта: сделки симуляции из базы. Выбранный период остаётся."""
+        self._paper = report
+        self._waiting = False
+        if self._source is ReportSource.SHOWN:
+            return
+        self._show_title()
+        self._reperiod()
+
+    def _reperiod(self) -> None:
+        if self._picked is not None:
+            self.pick_period(self._picked)
+        else:
+            self._refresh()
+
+    def _show_title(self) -> None:
+        """Заголовок по положению переключателя."""
+        if self._source is not ReportSource.SHOWN:
+            text = paper_title(self._paper, self._source, waiting=self._waiting)
+        elif self._run is None:
+            text = "Отчёт по прогону"
+        else:
+            # Вторая строка заголовка — «Считается на: …» склейки (B-069).
+            text = "\n".join(line for line in (run_title(self._run), self._run.basis) if line)
+        self.title_label.setText(text)
 
     def pick_period(self, name: str) -> None:
         """Нажата кнопка периода: даты в полях встают по таблице `PERIODS`."""
@@ -849,10 +1104,11 @@ class ReportsDialog(QDialog):
             button.setFont(font)
 
     def _run_bounds(self) -> tuple[date, date] | None:
-        """«Всё» — от первой до последней сделки прогона; сделок нет — `None`."""
-        if self._run is None or not self._run.trades:
+        """«Всё» — от первой до последней сделки показанного; сделок нет — `None`."""
+        rows, _stories = self._source_rows()
+        if not rows:
             return None
-        days = [trade_day(row) for row in self._run.trades]
+        days = [trade_day(row) for row in rows]
         return min(days), max(days)
 
     def _dates_edited(self, *_: object) -> None:
@@ -871,41 +1127,120 @@ class ReportsDialog(QDialog):
         """Сделки выбранного периода — те, что стоят в таблице, в её порядке."""
         return list(self._shown)
 
+    def shown_stories(self) -> list[TradeStory]:
+        """Разбор строк таблицы в её порядке; у прогона на экране — пусто."""
+        return list(self._stories)
+
     # ------------------------------------------------------------------ показ
+
+    def _source_rows(self) -> tuple[tuple[TradeRow, ...], tuple[TradeStory, ...]]:
+        """Строки и разборы выбранного положения переключателя — всё, без периода."""
+        if self._source is ReportSource.SHOWN:
+            return (self._run.trades if self._run is not None else ()), ()
+        if self._paper is None or self._waiting or self._paper.trouble:
+            return (), ()
+        picked = (
+            self._paper.as_was if self._source is ReportSource.AS_WAS else self._paper.recount
+        )
+        return picked.rows, picked.stories
 
     def _refresh(self) -> None:
         since, until = self.period()
-        rows = list(self._run.trades) if self._run is not None else []
-        self._shown = trades_in_period(rows, since, until)
+        rows, stories = self._source_rows()
+        kept = [index for index, row in enumerate(rows) if in_period(row, since, until)]
+        self._shown = [rows[index] for index in kept]
+        self._stories = [stories[index] for index in kept] if stories else []
         empty = self._empty_text(rows, since, until)
         self.empty_label.setText(empty)
         self.empty_label.setVisible(bool(empty))
         self.splitter.setVisible(not empty)
+        self._show_scope(since, until)
         self._fill_table()
         self._show_card(rows)
         self.explanation.clear()
         self.jump_label.clear()
 
+    def _show_scope(self, since: date | None, until: date | None) -> None:
+        """Строка над таблицей: что показано и оговорки прочитанного за период."""
+        lines = [_SCOPES[self._source]]
+        if self._source is not ReportSource.SHOWN and self._paper is not None:
+            lines += self._paper_notes(self._paper, since, until)
+        self.scope_label.setText("\n".join(lines))
+
+    def _paper_notes(
+        self, report: PaperReport, since: date | None, until: date | None
+    ) -> list[str]:
+        """Прогоны без записи, дни без прогона и сделки догона — словами (правило 13)."""
+        if self._waiting or report.trouble:
+            return []
+        notes = list(report.notes)
+        silent = unrecorded_runs(report, since, until)
+        if silent:
+            notes.append(
+                f"{_runs_text(silent)} симуляции за период: сделки не записывались — "
+                "прогоны сделаны сборкой, которая сделки симуляции в базу не писала."
+            )
+        late = caught_up_trades(report, since, until)
+        if self._source is ReportSource.AS_WAS and late:
+            notes.append(
+                "Сделок, решённых на догоне (программа была закрыта или поток "
+                f"обрывался): {late}. В таблицу и итог они не вошли: ни вход, "
+                "ни выход робот вживую не решал."
+            )
+        if self._source is ReportSource.RECOUNT:
+            gaps = days_without_run(report, since, until, self._today())
+            if gaps:
+                notes.append(f"Прогона симуляции не было: {_days_list(gaps)}")
+            quiet = silent_days(report, since, until)
+            if quiet:
+                notes.append(
+                    "Последний прогон дня сделки не записывал — сделок этих дней "
+                    f"нет: {_days_list(quiet)}"
+                )
+        return notes
+
     def _empty_text(
         self, rows: Sequence[TradeRow], since: date | None, until: date | None
     ) -> str:
         """Почему таблицы нет — словами. Пусто — таблица есть."""
-        if self._run is None:
-            return NO_RUN
-        if not rows:
-            return NO_TRADES
-        if self._shown:
-            return ""
+        said = self._nothing_text(rows)
+        if said or self._shown:
+            return said
         if since is not None and until is not None and since > until:
             return "Начало периода позже конца — поменяйте даты местами."
         first, last = min(map(trade_day, rows)), max(map(trade_day, rows))
         # «Сделок в периоде нет» уже сказала карточка — здесь только где они есть.
+        whose = "прогона" if self._source is ReportSource.SHOWN else "симуляции"
         return (
-            f"Сделки прогона — с {first:%d.%m.%Y} по {last:%d.%m.%Y}, всего {len(rows)}: "
+            f"Сделки {whose} — с {first:%d.%m.%Y} по {last:%d.%m.%Y}, всего {len(rows)}: "
             "нажмите «Всё» или выберите даты в календаре."
         )
 
+    def _nothing_text(self, rows: Sequence[TradeRow]) -> str:
+        """Показывать нечего вовсе, при любом периоде, — почему. Пусто — есть что."""
+        if self._source is not ReportSource.SHOWN:
+            if self._waiting or self._paper is None:
+                return PAPER_WAIT
+            return paper_empty(self._paper, self._source)
+        if self._run is None:
+            return NO_RUN
+        return "" if rows else NO_TRADES
+
     def _fill_table(self) -> None:
+        """Строки периода. У симуляции последняя колонка — прогон и пометка."""
+        extra = bool(self._stories)
+        self.table.setColumnCount(len(_COLUMNS) + int(extra))
+        if extra:
+            item = QTableWidgetItem("Прогон")
+            item.setToolTip(
+                "Номер прогона симуляции и когда решена сделка: «вживую», "
+                "«вход из пересчёта» — позицию открыл пересчёт истории при старте "
+                "прогона, закрыл живой ход, «вход на догоне» — открыл разбор "
+                "пропущенных свечей после подключения, «выход на догоне» — открыл "
+                "живой ход, закрыл этот разбор, «догон» — закрыл он же без живых "
+                "решений, «пересчёт» — сделка целиком из пересчёта."
+            )
+            self.table.setHorizontalHeaderItem(len(_COLUMNS), item)
         self.table.setRowCount(len(self._shown))
         for line, row in enumerate(self._shown):
             for column, (_, text, numeric) in enumerate(_COLUMNS):
@@ -915,18 +1250,28 @@ class ReportsDialog(QDialog):
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
                 self.table.setItem(line, column, item)
+            if extra:
+                story = self._stories[line]
+                self.table.setItem(line, len(_COLUMNS), QTableWidgetItem(
+                    f"№{story.run_id} · {story.phase.label}"
+                ))
 
     def _show_card(self, rows: Sequence[TradeRow]) -> None:
         """Карточка итога: границы — из полей дат, числа — `period_totals` строк таблицы.
 
-        Прогона или сделок в нём нет — карточки нет, за окно говорит
-        `empty_label`. Начало позже конца — тоже нет: «−3 дня» не период.
+        Сделок нет — карточки нет, за окно говорит `empty_label`. Начало позже
+        конца — тоже нет: «−3 дня» не период.
         """
         since, until = _day_of(self.since_edit), _day_of(self.until_edit)
-        if self._run is None or not rows or since > until:
+        if not rows or since > until:
             self.card.setVisible(False)
             return
-        title = card_title(self._run.instrument, since, until)
+        instrument = (
+            self._run.instrument if self._source is ReportSource.SHOWN and self._run
+            else self._paper.instrument if self._paper is not None
+            else ""
+        )
+        title = card_title(instrument, since, until)
         totals = period_totals(self._shown) if self._shown else None
         self.card.show_content(card_content(title, totals))
         self.card.setVisible(True)
@@ -941,19 +1286,25 @@ class ReportsDialog(QDialog):
         if line is None or line >= len(self._shown):
             self.explanation.clear()
             return
-        self.explanation.setPlainText(
-            "\n".join(explanation_lines(line + 1, self._shown[line]))
-        )
+        lines = explanation_lines(line + 1, self._shown[line])
+        if line < len(self._stories):
+            lines += story_lines(self._stories[line])
+        self.explanation.setPlainText("\n".join(lines))
 
     def _jump_to(self, line: int, _column: int = 0) -> None:
         if self._jump is None or not 0 <= line < len(self._shown):
             return
         if self._jump(self._shown[line]):
             self.jump_label.setText(f"График переведён к сделке {line + 1}.")
-        else:
+        elif self._source is ReportSource.SHOWN:
             self.jump_label.setText(
                 f"Сделки {line + 1} на графике нет: он показывает другие свечи. "
                 "Прогон на истории заново выведет её на график."
+            )
+        else:
+            self.jump_label.setText(
+                f"Сделки {line + 1} на графике нет: он показывает другие свечи. "
+                "Увеличьте глубину показа в настройках, чтобы её дни попали на график."
             )
 
 

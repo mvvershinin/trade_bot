@@ -57,6 +57,7 @@ from ui.background import busy_cursor
 from ui.backtest_dialog import BacktestDialog
 from ui.backtest_report import BacktestReportDialog
 from ui.reports_dialog import ReportsDialog, ShownRun
+from ui.trade_story import PaperReport, PaperReportRequest
 from ui.chart_panel import ChartPanel
 from ui.confirm_changes import confirm_changes
 from ui.contract_banner import ContractBar
@@ -421,6 +422,10 @@ class MainWindow(QMainWindow):
     #: (`tests/test_function_size.py`). Значение неизменяемое, поэтому общий
     #: на класс умолчанник безопасен — у изменяемого так делать нельзя.
     _loading: QProgressDialog | None = None
+    #: Текст плашки «данных нет» (`show_missing_data`). Объявлен у класса
+    #: по тому же доводу, что `_loading`: строка неизменяемая, а сборка окна
+    #: стоит на пределе длины.
+    _missing_data: str = ""
 
     def __init__(
         self,
@@ -487,14 +492,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
         layout.addWidget(self.status_panel)
-        layout.addWidget(self.halt_banner)
-        layout.addWidget(self.stuck_banner)
-        layout.addWidget(self.settings_bar)
-        layout.addWidget(self.step_bar)
-        layout.addWidget(self.token_banner)
-        layout.addWidget(self.mode_banner)
-        layout.addWidget(self.history_banner)
-        layout.addWidget(self.contract_bar)
+        for bar in self._banner_column:
+            layout.addWidget(bar)
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
@@ -520,13 +519,19 @@ class MainWindow(QMainWindow):
         self._ready = True
 
     def _build_banners(self) -> None:
-        """Пять плашек над графиком. Порядок объявления — порядок срочности.
+        """Плашки над графиком и их порядок на экране — `_banner_column`.
 
-        Остановка сверху: пока робот остановлен, всё остальное вторично.
-        Порядок на экране задаётся раскладкой ниже и повторяет этот.
+        Порядок — по срочности. Остановка сверху: пока робот остановлен,
+        всё остальное вторично. Порядок записан **один раз**, данными:
+        раскладка в `__init__` его только обходит. Прежде объявление шло
+        в одном порядке, а раскладка — в другом, и докстринг уверял, что
+        они совпадают.
         """
         self.halt_banner = _Banner()
         self.stuck_banner = _Banner()
+        #: «Данных нет» (`show_missing_data`, `D-080`). Без крестика: снять
+        #: её нечем — данные возвращает копирование папки, а не окно.
+        self.data_banner = _Banner()
         self.token_banner = _Banner()
         self.mode_banner = _Banner()
         #: Плашка «показан прогон на истории». Живые свечи на закреплённый
@@ -542,6 +547,11 @@ class MainWindow(QMainWindow):
         self.settings_bar.open_requested.connect(self.open_settings)
         #: Биржа ещё не сообщила шаг цены (`step_wait`) — без кнопки.
         self.step_bar = StepWaitBar()
+        self._banner_column: tuple[QWidget, ...] = (
+            self.halt_banner, self.stuck_banner, self.data_banner,
+            self.settings_bar, self.step_bar, self.token_banner,
+            self.mode_banner, self.history_banner, self.contract_bar,
+        )
 
     # --------------------------------------------------------------- сборка
 
@@ -786,6 +796,7 @@ class MainWindow(QMainWindow):
         port.contract_checked.connect(self.show_contract)
         port.history_progress.connect(self._on_history_progress)
         port.history_finished.connect(self.show_history_result)
+        port.paper_report_ready.connect(self.show_paper_report)
 
     # ---------------------------------------------------------------- показ
 
@@ -826,6 +837,30 @@ class MainWindow(QMainWindow):
         # на нём может стать нечитаемой — ровно то, ради чего заведён `text_on`.
         self.status_panel.apply_state(self._state)
         self._update_banners(self._state)
+        self._paint_missing_data()
+
+    def show_missing_data(self, text: str) -> None:
+        """Плашка «данных нет» над графиком: текст готовый, окно его не сочиняет.
+
+        Текст и признак — `app/userdata_notice.py` (`D-080`, решение 0064);
+        окно только показывает. Пустая строка — плашки нет. Зовёт сборка
+        программы один раз, до показа окна, и плашка висит весь сеанс:
+        данные, скопированные при открытой программе, она всё равно
+        не подхватит — их читают при запуске.
+
+        Цвет — `warning`, а не `danger`: на новой машине это обычный первый
+        запуск, а не авария. Хранится текст, а не раскрашенная плашка:
+        `apply_theme` перекрашивает её заново (`_paint_missing_data`), иначе
+        она осталась бы в цветах прежней темы.
+        """
+        self._missing_data = text
+        self._paint_missing_data()
+
+    def _paint_missing_data(self) -> None:
+        if self._missing_data:
+            self.data_banner.show_text(self._missing_data, self.theme.warning)
+        else:
+            self.data_banner.hide_text()
 
     def apply_state(self, state: RobotState) -> None:
         """Показать состояние робота. Ничего не вычисляет — только отображает."""
@@ -1519,12 +1554,22 @@ class MainWindow(QMainWindow):
         """Окно «Отчёты» по прогону на экране. Одно: второй щелчок поднимает его."""
         if self.reports_dialog is None:
             self.reports_dialog = ReportsDialog(
-                self.shown_run(), self, jump=self._show_trade_on_chart
+                self.shown_run(), self, jump=self._show_trade_on_chart,
+                ask=self._ask_paper_report,
             )
             self.reports_dialog.finished.connect(self._forget_reports)
         self.reports_dialog.show()
         self.reports_dialog.raise_()
         self.reports_dialog.activateWindow()
+
+    def _ask_paper_report(self) -> None:
+        """«Отчёты» просят сделки симуляции — по инструменту на графике (В3)."""
+        self.port.request_paper_report(PaperReportRequest(instrument=self._chart_instrument))
+
+    def show_paper_report(self, report: PaperReport) -> None:
+        """Сделки симуляции из базы — в открытые «Отчёты». Закрыты — некуда."""
+        if self.reports_dialog is not None:
+            self.reports_dialog.set_paper(report)
 
     def _forget_reports(self, *_: object) -> None:
         if self.reports_dialog is not None:

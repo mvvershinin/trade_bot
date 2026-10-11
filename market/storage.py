@@ -175,6 +175,16 @@ from market.journal import (
     TradeSide,
     redact,
 )
+from market.paper import (
+    DecisionPhase,
+    OrderKind,
+    OrderRecord,
+    PaperRows,
+    PaperRun,
+    PaperWritten,
+    RunRowsMark,
+    StoredOrder,
+)
 from market.paths import default_db_path, ensure_userdata_dir
 from market.reports import LoadReport
 from market.synthetic import (
@@ -237,6 +247,16 @@ __all__ = ["Source", "Coverage", "ContractRow", "WriteStats", "CandleStore", "SC
 #: не знает таблицы и продолжала бы торговать тикером из настроек после
 #: того, как база уже знает, что контракт закрыт. Отказ при открытии
 #: честнее, чем торговля истёкшим кодом.
+#:
+#: 7 без подъёма (11.10.2026). В базе поселились строки прогона симуляции:
+#: заявки (`journal_order`) и отметка «строки записаны» (`journal_run_rows`,
+#: `market.paper`). `CREATE TABLE IF NOT EXISTS` заводит их на базе любой
+#: схемы. Версия **не** поднята, и это вывод из правила выше, а не забывчивость:
+#: смысл прежних строк не меняется, а сборка 0.2.4 на такой базе не теряет
+#: ни предохранителя, ни строки — новых таблиц она просто не читает. Поднятая
+#: версия отняла бы откат на 0.2.4 без копии `userdata/`, ничего не защитив.
+#: Фаза заявки (`journal_order.phase`, 12.10.2026) — тоже без подъёма:
+#: таблица не выпускалась, колонку дописывает открытие (`_add_order_phase`).
 SCHEMA_VERSION = 7
 
 #: Начиная с этой версии ключ `ts` — гарантированно начало минуты. База
@@ -259,7 +279,10 @@ _SCHEMA_WITH_CONTRACT_VOLUME = 5
 
 #: Таблицы журнала. Пересборка прогонов (`_rebuild_journal_session`) обязана
 #: вернуть каждую строку каждой из них — это и проверяется счётом до и после.
-_JOURNAL_TABLES: tuple[str, ...] = ("journal_session", "journal_decision", "journal_trade")
+_JOURNAL_TABLES: tuple[str, ...] = (
+    "journal_session", "journal_decision", "journal_trade",
+    "journal_order", "journal_run_rows",
+)
 
 #: Счётчик номеров прогонов в снимке журнала (`_journal_snapshot`): строка
 #: `sqlite_sequence` таблицы прогонов. Пересборка обязана вернуть и его —
@@ -386,6 +409,25 @@ _ORIGIN_VALUES: tuple[str, ...] = tuple(origin.value for origin in RunOrigin)
 _LEVEL_VALUES: tuple[str, ...] = tuple(level.value for level in DecisionLevel)
 _SIDE_VALUES: tuple[str, ...] = tuple(side.value for side in TradeSide)
 _HALT_KIND_VALUES: tuple[str, ...] = tuple(kind.value for kind in HaltKind)
+_ORDER_KIND_VALUES: tuple[str, ...] = tuple(kind.value for kind in OrderKind)
+_DECISION_PHASE_VALUES: tuple[str, ...] = tuple(phase.value for phase in DecisionPhase)
+
+#: Колонка фазы заявки — **одним** определением на два места: `_SCHEMA`
+#: создаёт с ней новую таблицу, `_add_order_phase` дописывает её в таблицу,
+#: заведённую отладочной сборкой без фазы. Два текста разошлись бы молча:
+#: у новой базы `CHECK` один, у дописанной — другой, и отказ записи
+#: зависел бы от того, какой сборкой база создана.
+#:
+#: Умолчание — пересчёт, безопасная сторона: строка прежней сборки
+#: не знает, вживую ли решена, и в «как было» не попадает.
+#:
+#: ⚠️ `CHECK` дописанной колонки после не правится ничем, кроме пересборки
+#: таблицы: четвёртая фаза, заведённая в `DecisionPhase`, на такой базе
+#: будет отвергнута при записи — громко, а не молча.
+_ORDER_PHASE_COLUMN = (
+    f"phase TEXT NOT NULL DEFAULT '{DecisionPhase.RECOUNT.value}' "
+    f"CHECK (phase IN ({_sql_values(_DECISION_PHASE_VALUES)}))"
+)
 
 #: Таблица прогонов — **одним** определением на два места: `_SCHEMA` создаёт её
 #: на новой базе, `_rebuild_journal_session` пересобирает по нему же старую.
@@ -468,6 +510,29 @@ _TRADE_IDENTITY_MATCH = "\n              AND ".join(
 #: значений. Значения подставляются **в том же порядке**, потому что берутся
 #: из того же списка (`_trade_values`).
 _TRADE_IDENTITY_WHERE = " AND ".join(f"{name} = ?" for name in _TRADE_IDENTITY)
+
+#: Колонки заявки прогона — в порядке записи и чтения (`_order_of`). Имена
+#: совпадают с полями `market.paper.OrderRecord`: запись берёт значения
+#: по имени, а не по счёту.
+_ORDER_COLUMNS: tuple[str, ...] = (
+    "order_id", "at", "kind", "action", "side", "volume", "reason",
+    "exit_reason", "target_id", "close_price", "average", "level", "limit_price",
+    "phase",
+)
+
+#: Текстовые колонки заявки — те, что идут через чистку от секретов (0011 п. 9).
+#: Полноту списка сверяет тест с `PRAGMA table_info(journal_order)`:
+#: текстовая колонка, не попавшая сюда, легла бы на диск нечищеной.
+_ORDER_TEXT_COLUMNS: tuple[str, ...] = (
+    "order_id", "action", "reason", "exit_reason", "target_id",
+)
+
+#: Текстовые колонки заявки под `CHECK` из наших перечислений. Чужого текста
+#: в них не бывает — база отвергнет любое значение вне списка.
+_ORDER_CHECKED_COLUMNS: tuple[str, ...] = ("kind", "side", "phase")
+
+#: Необязательные числа заявки: `None` — числа у заявки нет, а не ноль.
+_ORDER_NUMBERS: tuple[str, ...] = ("close_price", "average", "level", "limit_price")
 
 
 def _session_table(name: str) -> str:
@@ -587,6 +652,42 @@ CREATE INDEX IF NOT EXISTS journal_trade_of_session
 CREATE INDEX IF NOT EXISTS journal_trade_identity
     ON journal_trade ({trade_identity});
 
+-- Заявки прогона симуляции (`market.paper`). Строка на каждое событие заявки:
+-- подачу движком и касание её уровня. Уникального ключа на имя заявки нет
+-- намеренно: вооружение тейка повторяется на каждом баре под тем же именем
+-- (`engine.OrderAction.ARM_TAKE_PROFIT`), и все повторы — правда.
+CREATE TABLE IF NOT EXISTS journal_order (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES journal_session (id) ON DELETE CASCADE,
+    order_id    TEXT    NOT NULL,
+    at          INTEGER NOT NULL,
+    kind        TEXT    NOT NULL CHECK (kind IN ({order_kinds})),
+    action      TEXT    NOT NULL,
+    side        TEXT    NOT NULL CHECK (side IN ({sides})),
+    volume      REAL    NOT NULL,
+    reason      TEXT    NOT NULL DEFAULT '',
+    exit_reason TEXT    NOT NULL DEFAULT '',
+    target_id   TEXT    NOT NULL DEFAULT '',
+    close_price REAL,
+    average     REAL,
+    level       REAL,
+    limit_price REAL,
+    {order_phase}
+);
+
+CREATE INDEX IF NOT EXISTS journal_order_of_session
+    ON journal_order (session_id, id);
+
+-- Отметка «строки прогона записаны» и границы записанного (`market.paper.
+-- RunRowsMark`). Нет строки — строк прогона нет вовсе: так у прогонов,
+-- сделанных до сборки, которая их пишет. Пустые границы — при сборке хода
+-- движку не дали ни одного бара.
+CREATE TABLE IF NOT EXISTS journal_run_rows (
+    session_id INTEGER PRIMARY KEY REFERENCES journal_session (id) ON DELETE CASCADE,
+    kept_since INTEGER,
+    live_from  INTEGER
+);
+
 -- Остановка робота. **Строка на причину, а не строка на остановку**: причин
 -- бывает несколько, они не отменяют друг друга и снимаются по одной, самой
 -- ранней (`app/port.py::_Halt`, `D-086`). Склеенная в одну строку остановка
@@ -649,6 +750,8 @@ CREATE TABLE IF NOT EXISTS contract (
     levels=_sql_values(_LEVEL_VALUES),
     sides=_sql_values(_SIDE_VALUES),
     halt_kinds=_sql_values(_HALT_KIND_VALUES),
+    order_kinds=_sql_values(_ORDER_KIND_VALUES),
+    order_phase=_ORDER_PHASE_COLUMN,
     trade_identity=", ".join(_TRADE_IDENTITY),
 )
 
@@ -690,6 +793,132 @@ _PRUNABLE_ORIGINS: tuple[str, ...] = tuple(
     origin.value for origin in RunOrigin if not origin.evidence
 )
 
+#: Три сторожа на каждую таблицу строк прогона — **одной таблицей**, а не
+#: двенадцатью телами руками (правило 9). Формы у них общие, различаются они
+#: только именем таблицы и словами отказа; четвёртая таблица строк получает
+#: всех трёх сторожей одной строкой в `_ROW_TABLES`, а забыть одного из трёх
+#: нельзя по построению.
+#:
+#: ⚠️ Тела двух прежних таблиц (решения и сделки) обязаны совпасть с теми,
+#: что уже лежат в базах владельца, — иначе каждое открытие объявило бы их
+#: подменёнными снаружи (`replaced_guards`). Совпадение стережёт тест на базе
+#: прежней сборки: открытие обязано пройти с пустым `replaced_guards`.
+#:
+#: **Строка не переписывается задним числом.** Никакая: правило не знает
+#: происхождения, потому что переписанная строка прогона по истории — это
+#: тоже неправда, просто дешевле.
+_APPEND_ONLY = """
+        CREATE TRIGGER {table}_is_append_only
+        BEFORE UPDATE ON {table}
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                '{rewrite} переписать нельзя: журнал — свидетельство'
+            );
+        END
+    """
+
+#: **Строка живёт ровно столько, сколько её прогон.** Условие `WHEN EXISTS`
+#: разделяет два удаления, которые для SQLite выглядят одинаково: прямое
+#: `DELETE` (прогон на месте — отказ) и каскад от удаления прогона (прогона
+#: уже нет — пропускаем). Проверено пробой: каскад проходит, прямое удаление
+#: и REPLACE — нет.
+_DIES_WITH_ITS_RUN = """
+        CREATE TRIGGER {table}_dies_with_its_run
+        BEFORE DELETE ON {table}
+        WHEN EXISTS (SELECT 1 FROM journal_session WHERE id = old.session_id)
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                '{delete} удалить нельзя: она живёт, пока жив её прогон'
+            );
+        END
+    """
+
+#: **Дозапись идёт только в открытый прогон.** Закрытый — законченное
+#: свидетельство: строка, приписанная к нему задним числом, ничем
+#: не отличается от переписанной, только следов от неё ещё меньше.
+#:
+#: ⚠️ Чего сторож не делает: он не отличает нашу запись от чужой, пока
+#: прогон открыт. Открытый прогон обязан принимать строки — в этом его
+#: работа, и правило «дописывать может только движок» на уровне базы
+#: не выражается вовсе.
+#:
+#: Прогона с таким номером может не быть вовсе: тогда подзапрос даёт NULL,
+#: условие ложно, и вставку отвергает внешний ключ — с ошибкой про него,
+#: а не про закрытый прогон.
+_JOINS_AN_OPEN_RUN = """
+        CREATE TRIGGER {table}_joins_an_open_run
+        BEFORE INSERT ON {table}
+        WHEN (
+            SELECT finished_at FROM journal_session WHERE id = new.session_id
+        ) IS NOT NULL
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'прогон закрыт: {join} в него больше не дописать'
+            );
+        END
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class _RowTable:
+    """Таблица строк прогона и как назвать её строку в трёх отказах сторожей.
+
+    Слов три, а не одно, потому что так уже стоит в базах владельца:
+    у сделки отказ на правку — «строку журнала сделок», на удаление —
+    «сделку из журнала», на дозапись — «сделку». Свести их к одному слову
+    значило бы поменять тело сторожа, а смена тела без записи в
+    `_SUPERSEDED_GUARDS` читается при открытии как подмена снаружи.
+    """
+
+    table: str
+    rewrite: str
+    delete: str
+    join: str
+
+
+_ROW_TABLES: tuple[_RowTable, ...] = (
+    _RowTable(
+        "journal_decision",
+        rewrite="строку журнала решений",
+        delete="строку журнала решений",
+        join="строку журнала решений",
+    ),
+    _RowTable(
+        "journal_trade",
+        rewrite="строку журнала сделок",
+        delete="сделку из журнала",
+        join="сделку",
+    ),
+    _RowTable(
+        "journal_order",
+        rewrite="заявку прогона",
+        delete="заявку прогона",
+        join="заявку",
+    ),
+    _RowTable(
+        "journal_run_rows",
+        rewrite="отметку о строках прогона",
+        delete="отметку о строках прогона",
+        join="отметку о строках",
+    ),
+)
+
+
+def _row_guards() -> dict[str, str]:
+    """Три сторожа на каждую таблицу строк: имя → тело."""
+    found: dict[str, str] = {}
+    for row in _ROW_TABLES:
+        for body in (_APPEND_ONLY, _DIES_WITH_ITS_RUN, _JOINS_AN_OPEN_RUN):
+            text = body.format(
+                table=row.table, rewrite=row.rewrite, delete=row.delete, join=row.join
+            )
+            found[text.split()[2]] = text
+    return found
+
+
 #: Сторожа журнала: имя → тело. Пересоздаются при **каждом** открытии базы
 #: (`_install_guards`), поэтому тело всегда то, которое написано здесь.
 #:
@@ -706,56 +935,8 @@ _PRUNABLE_ORIGINS: tuple[str, ...] = tuple(
 #: и от неосторожной правки руками, а не от злоумышленника с доступом к диску;
 #: от него защищает резервная копия папки, а не база.
 _GUARDS: dict[str, str] = {
-    # Строка журнала не переписывается задним числом. Никакая: правило не знает
-    # происхождения, потому что переписанная строка прогона по истории — это
-    # тоже неправда, просто дешевле.
-    "journal_decision_is_append_only": """
-        CREATE TRIGGER journal_decision_is_append_only
-        BEFORE UPDATE ON journal_decision
-        BEGIN
-            SELECT RAISE(
-                ABORT,
-                'строку журнала решений переписать нельзя: журнал — свидетельство'
-            );
-        END
-    """,
-    "journal_trade_is_append_only": """
-        CREATE TRIGGER journal_trade_is_append_only
-        BEFORE UPDATE ON journal_trade
-        BEGIN
-            SELECT RAISE(
-                ABORT,
-                'строку журнала сделок переписать нельзя: журнал — свидетельство'
-            );
-        END
-    """,
-    # Строка живёт ровно столько, сколько её прогон. Условие `WHEN EXISTS`
-    # разделяет два удаления, которые для SQLite выглядят одинаково:
-    # прямое `DELETE FROM journal_decision` (прогон на месте — отказ)
-    # и каскад от удаления прогона (прогона уже нет — пропускаем).
-    # Проверено пробой: каскад проходит, прямое удаление и REPLACE — нет.
-    "journal_decision_dies_with_its_run": """
-        CREATE TRIGGER journal_decision_dies_with_its_run
-        BEFORE DELETE ON journal_decision
-        WHEN EXISTS (SELECT 1 FROM journal_session WHERE id = old.session_id)
-        BEGIN
-            SELECT RAISE(
-                ABORT,
-                'строку журнала решений удалить нельзя: она живёт, пока жив её прогон'
-            );
-        END
-    """,
-    "journal_trade_dies_with_its_run": """
-        CREATE TRIGGER journal_trade_dies_with_its_run
-        BEFORE DELETE ON journal_trade
-        WHEN EXISTS (SELECT 1 FROM journal_session WHERE id = old.session_id)
-        BEGIN
-            SELECT RAISE(
-                ABORT,
-                'сделку из журнала удалить нельзя: она живёт, пока жив её прогон'
-            );
-        END
-    """,
+    # Правка, удаление и дозапись строк прогона — таблицей выше.
+    **_row_guards(),
     # Условия прогона задаются при открытии и дальше не меняются. Иначе отчёт
     # о боевом дне можно было бы задним числом объявить прогоном по истории,
     # переписать инструмент или подменить снимок настроек.
@@ -815,44 +996,6 @@ _GUARDS: dict[str, str] = {
             SELECT RAISE(
                 ABORT,
                 'заметка о завершении пишется один раз, вместе с закрытием прогона'
-            );
-        END
-    """,
-    # Дозапись идёт только в **открытый** прогон. Закрытый — законченное
-    # свидетельство: строка, приписанная к нему задним числом, ничем
-    # не отличается от переписанной, только следов от неё ещё меньше.
-    #
-    # ⚠️ Чего сторож не делает: он не отличает нашу запись от чужой, пока
-    # прогон открыт. Открытый прогон обязан принимать строки — в этом его
-    # работа, и правило «дописывать может только движок» на уровне базы
-    # не выражается вовсе.
-    #
-    # Прогона с таким номером может не быть вовсе: тогда подзапрос даёт NULL,
-    # условие ложно, и вставку отвергает внешний ключ — с ошибкой про него,
-    # а не про закрытый прогон.
-    "journal_decision_joins_an_open_run": """
-        CREATE TRIGGER journal_decision_joins_an_open_run
-        BEFORE INSERT ON journal_decision
-        WHEN (
-            SELECT finished_at FROM journal_session WHERE id = new.session_id
-        ) IS NOT NULL
-        BEGIN
-            SELECT RAISE(
-                ABORT,
-                'прогон закрыт: строку журнала решений в него больше не дописать'
-            );
-        END
-    """,
-    "journal_trade_joins_an_open_run": """
-        CREATE TRIGGER journal_trade_joins_an_open_run
-        BEFORE INSERT ON journal_trade
-        WHEN (
-            SELECT finished_at FROM journal_session WHERE id = new.session_id
-        ) IS NOT NULL
-        BEGIN
-            SELECT RAISE(
-                ABORT,
-                'прогон закрыт: сделку в него больше не дописать'
             );
         END
     """,
@@ -1052,6 +1195,40 @@ def _session_of(row: tuple[Any, ...]) -> JournalSession:
     )
 
 
+def _maybe_moment(ts: int | None) -> datetime | None:
+    """Время из необязательной колонки. Пусто — `None`, а не начало эпохи."""
+    return None if ts is None else _from_ts(int(ts))
+
+
+def _maybe_number(value: float | None) -> float | None:
+    """Необязательное число заявки. Пусто — `None`, а не ноль."""
+    return None if value is None else float(value)
+
+
+def _order_of(row: tuple[Any, ...]) -> StoredOrder:
+    """Собрать заявку из строки `orders`: номер, прогон, происхождение, колонки."""
+    named = dict(zip(_ORDER_COLUMNS, row[3:], strict=True))
+    return StoredOrder(
+        id=int(row[0]),
+        session_id=int(row[1]),
+        origin=RunOrigin(str(row[2])),
+        order_id=str(named["order_id"]),
+        at=_from_ts(int(named["at"])),
+        kind=OrderKind(str(named["kind"])),
+        action=str(named["action"]),
+        side=TradeSide(str(named["side"])),
+        volume=float(named["volume"]),
+        reason=str(named["reason"]),
+        exit_reason=str(named["exit_reason"]),
+        target_id=str(named["target_id"]),
+        close_price=_maybe_number(named["close_price"]),
+        average=_maybe_number(named["average"]),
+        level=_maybe_number(named["level"]),
+        limit_price=_maybe_number(named["limit_price"]),
+        phase=DecisionPhase(str(named["phase"])),
+    )
+
+
 #: Колонки прогона для чтения — в том же порядке, которого ждёт `_session_of`.
 #: Собирается из `_SESSION_COLUMNS`, а не пишется отдельной строкой: два
 #: списка одних и тех же колонок разошлись бы молча.
@@ -1198,6 +1375,7 @@ class CandleStore:
             # триггеры; поставленные до неё сторожа исчезли бы молча, и база
             # осталась бы открытой без охраны до следующего запуска.
             taken_down = self._check_version()
+            self._add_order_phase()
             #: Сторожа, чьё тело в базе разошлось с телом в коде и было заменено
             #: при открытии. Пусто — норма. Не пусто означает, что базу правили
             #: мимо программы: сторожа вернули, данные — нет.
@@ -1323,6 +1501,23 @@ class CandleStore:
                     f"ALTER TABLE data_load ADD COLUMN {column} "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+
+    def _add_order_phase(self) -> None:
+        """Дописать фазу в таблицу заявок, заведённую отладочной сборкой без неё.
+
+        Вне цепочки версий, при **каждом** открытии и по наличию колонки:
+        номер схемы не поднят (шапка `SCHEMA_VERSION`, «7 без подъёма») —
+        таблица заявок не выпускалась, а откат на 0.2.4 обязан остаться
+        целым. `ADD COLUMN` не пересобирает таблицу: строки, сторожа и индекс
+        остаются на месте, `CHECK` SQLite сверяет с лежащими строками
+        сама, и умолчание его проходит. Строки прежней сборки получают
+        пересчёт — безопасную сторону (`_ORDER_PHASE_COLUMN`).
+        """
+        columns = {
+            str(row[1]) for row in self._db.execute("PRAGMA table_info(journal_order)")
+        }
+        if "phase" not in columns:
+            self._db.execute(f"ALTER TABLE journal_order ADD COLUMN {_ORDER_PHASE_COLUMN}")
 
     def _drop_provisional_minutes(self) -> int:
         """Снять минуты догрузки у брокера: в них оборот, а не контракты.
@@ -2478,23 +2673,29 @@ class CandleStore:
         :raises sqlite3.IntegrityError: прогон уже закрыт — дозапись
             в законченное свидетельство отвергает сторож.
         """
-        written: list[int] = []
         with self._transaction():
-            for record in records:
-                cursor = self._db.execute(
-                    """
-                    INSERT INTO journal_decision (session_id, at, event, reason, level)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        session_id,
-                        _to_ts(record.at),
-                        self._clean(record.event),
-                        self._clean(record.reason),
-                        DecisionLevel(record.level).value,
-                    ),
-                )
-                written.append(int(cursor.lastrowid or 0))
+            return self._put_decisions(session_id, records)
+
+    def _put_decisions(
+        self, session_id: int, records: Iterable[DecisionRecord]
+    ) -> list[int]:
+        """Строки журнала решений — **внутри уже открытой** транзакции."""
+        written: list[int] = []
+        for record in records:
+            cursor = self._db.execute(
+                """
+                INSERT INTO journal_decision (session_id, at, event, reason, level)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    _to_ts(record.at),
+                    self._clean(record.event),
+                    self._clean(record.reason),
+                    DecisionLevel(record.level).value,
+                ),
+            )
+            written.append(int(cursor.lastrowid or 0))
         return written
 
     def _trade_values(
@@ -2620,25 +2821,169 @@ class CandleStore:
         # Отчёт о повторах обнуляется до работы, а не после: отказ посреди
         # пачки не должен оставить в поле след прошлого вызова.
         self.repeated_trades = ()
-        written: list[int] = []
-        repeats: list[int] = []
         with self._transaction():
-            for record in records:
-                values = self._trade_values(session_id, record, at)
-                already = self._same_trade_already(values)
-                if already is not None:
-                    repeats.append(already)
-                    written.append(already)
-                    continue
-                columns = ", ".join(values)
-                cursor = self._db.execute(
-                    f"INSERT INTO journal_trade ({columns}) "
-                    f"VALUES ({', '.join('?' * len(values))})",
-                    tuple(values.values()),
-                )
-                written.append(int(cursor.lastrowid or 0))
+            written, repeats = self._put_trades(session_id, records, at)
         self.repeated_trades = tuple(repeats)
         return written
+
+    def _put_trades(
+        self, session_id: int, records: Iterable[TradeRecord], at: int
+    ) -> tuple[list[int], list[int]]:
+        """Сделки — **внутри уже открытой** транзакции. Повтор пропускается.
+
+        Отдаёт номер строки на каждую поданную сделку и, отдельно, номера
+        тех, что уже лежали (правило — у `write_trades`).
+        """
+        written: list[int] = []
+        repeats: list[int] = []
+        for record in records:
+            values = self._trade_values(session_id, record, at)
+            already = self._same_trade_already(values)
+            if already is not None:
+                repeats.append(already)
+                written.append(already)
+                continue
+            columns = ", ".join(values)
+            cursor = self._db.execute(
+                f"INSERT INTO journal_trade ({columns}) "
+                f"VALUES ({', '.join('?' * len(values))})",
+                tuple(values.values()),
+            )
+            written.append(int(cursor.lastrowid or 0))
+        return written, repeats
+
+    # -- строки прогона симуляции (`market.paper`) --------------------------
+
+    def write_paper_rows(self, session_id: int, rows: PaperRows) -> PaperWritten:
+        """Записать пачку строк прогона **одной транзакцией**: всё или ничего.
+
+        Пачка — отметка (с первой пачкой), строки решений, заявки и сделки.
+        Половина пачки в базе не бывает: отказ на любой строке откатывает
+        все, и вызывающий повторит пачку целиком, не гадая, что из неё легло.
+
+        Сделка, уже лежащая в прогоне, второй строкой не пишется и пачку
+        не отвергает — правило и ключ те же, что у `write_trades`
+        (`_TRADE_IDENTITY`); сколько отсеяно, сказано в ответе. Решения
+        и заявки естественного ключа не имеют (`write_decisions`), и от их
+        повтора вызывающего держит его собственный курсор.
+
+        :raises LookupError: прогона с таким номером нет.
+        :raises ValueError: прогон повторимый (по истории) — его строки
+            не пишутся вовсе, на этом стоит хранение двухсот его прогонов;
+            строки поданы без отметки, а отметки в базе нет — прогон
+            со строками читался бы как «сделки не записывались»; отметка
+            подана снова и с другими границами; сделка с ключом записанной
+            и другим содержимым (`_same_trade_already`).
+        :raises sqlite3.IntegrityError: прогон уже закрыт — дозапись
+            отвергает сторож.
+        """
+        at = _to_ts(datetime.now(MSK))
+        with self._transaction():
+            self._refuse_repeatable_run(session_id)
+            marked = self._put_mark(session_id, rows.mark)
+            if not (marked or self._has_mark(session_id)) and not rows.empty:
+                raise ValueError(
+                    f"строки прогона {session_id} поданы без отметки «строки "
+                    "записаны», а отметки в базе нет: такой прогон читался бы "
+                    "как «сделки не записывались». Отметка подаётся с первой пачкой"
+                )
+            decisions = self._put_decisions(session_id, rows.decisions)
+            orders = self._put_orders(session_id, rows.orders)
+            trades, repeats = self._put_trades(session_id, rows.trades, at)
+        return PaperWritten(
+            decisions=len(decisions),
+            orders=len(orders),
+            trades=len(trades) - len(repeats),
+            repeated_trades=len(repeats),
+            marked=marked,
+        )
+
+    def _refuse_repeatable_run(self, session_id: int) -> None:
+        """Отказ, если прогона нет или его можно повторить командой."""
+        row = self._db.execute(
+            "SELECT origin FROM journal_session WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"прогона {session_id} в журнале нет, писать строки некуда")
+        origin = RunOrigin(str(row[0]))
+        if not origin.evidence:
+            raise ValueError(
+                f"прогон {session_id} — {origin.label}: его строки не пишутся. "
+                "Он повторяется командой, а двести прогонов со строками — это "
+                "сотни мегабайт (`app.runs.RUNS_KEPT`)"
+            )
+
+    def _has_mark(self, session_id: int) -> bool:
+        return self._db.execute(
+            "SELECT 1 FROM journal_run_rows WHERE session_id = ?", (session_id,)
+        ).fetchone() is not None
+
+    def _put_mark(self, session_id: int, mark: RunRowsMark | None) -> bool:
+        """Отметка «строки записаны». Отвечает, легла ли она сейчас.
+
+        Повтор той же отметки — не отказ, а `False`: пачку повторяют после
+        таймаута целиком. Другая граница у того же прогона — отказ: отметка
+        одна, и какой из двух верить, из базы не видно.
+        """
+        if mark is None:
+            return False
+        wanted = (
+            None if mark.kept_since is None else _to_ts(mark.kept_since),
+            None if mark.live_from is None else _to_ts(mark.live_from),
+        )
+        row = self._db.execute(
+            "SELECT kept_since, live_from FROM journal_run_rows WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is not None:
+            if tuple(row) != wanted:
+                raise ValueError(
+                    f"отметка строк прогона {session_id} уже лежит с другими "
+                    f"границами: {tuple(row)} против поданных {wanted}"
+                )
+            return False
+        self._db.execute(
+            "INSERT INTO journal_run_rows (session_id, kept_since, live_from) "
+            "VALUES (?, ?, ?)",
+            (session_id, *wanted),
+        )
+        return True
+
+    def _put_orders(self, session_id: int, records: Iterable[OrderRecord]) -> list[int]:
+        """Заявки прогона — **внутри уже открытой** транзакции."""
+        written: list[int] = []
+        for record in records:
+            values = self._order_values(session_id, record)
+            columns = ", ".join(values)
+            cursor = self._db.execute(
+                f"INSERT INTO journal_order ({columns}) "
+                f"VALUES ({', '.join('?' * len(values))})",
+                tuple(values.values()),
+            )
+            written.append(int(cursor.lastrowid or 0))
+        return written
+
+    def _order_values(self, session_id: int, record: OrderRecord) -> dict[str, object]:
+        """Заявка по колонкам: имя → значение, готовое к записи.
+
+        Текст чистится **списком** `_ORDER_TEXT_COLUMNS`, а не перечислением
+        здесь: колонку, заведённую завтра, достаточно дописать в список,
+        а его полноту сверяет тест с самой таблицей.
+        """
+        values: dict[str, object] = {
+            "session_id": session_id,
+            "at": _to_ts(record.at),
+            "kind": OrderKind(record.kind).value,
+            "side": TradeSide(record.side).value,
+            "volume": float(record.volume),
+            "phase": DecisionPhase(record.phase).value,
+        }
+        for name in _ORDER_TEXT_COLUMNS:
+            values[name] = self._clean(str(getattr(record, name)))
+        for name in _ORDER_NUMBERS:
+            number = getattr(record, name)
+            values[name] = None if number is None else float(number)
+        return values
 
     # -- чтение журналов ----------------------------------------------------
 
@@ -2855,6 +3200,73 @@ class CandleStore:
             session_id=chosen,
         )
 
+    def orders(self, *, session_id: int, limit: int = 5000) -> JournalPage[StoredOrder]:
+        """Заявки **одного** прогона по порядку записи, старые первыми.
+
+        Номер прогона обязателен и умолчания не имеет: заявки разных прогонов
+        вперемешку — это разбор сделки по чужим заявкам. Происхождение едет
+        со строкой обязательным полем (решение 0011 п. 4). Обрезка по лимиту
+        отсекает старые строки и названа (`JournalPage.truncated`).
+        """
+        columns = ", ".join(f"o.{name}" for name in _ORDER_COLUMNS)
+        rows = list(self._db.execute(
+            f"SELECT o.id, o.session_id, s.origin, {columns} "
+            "FROM journal_order AS o "
+            "JOIN journal_session AS s ON s.id = o.session_id "
+            "WHERE o.session_id = ? ORDER BY o.id DESC LIMIT ?",
+            (session_id, _limit_probe(limit)),
+        ))
+        truncated = len(rows) > limit
+        del rows[limit:]
+        rows.reverse()
+        return JournalPage(
+            rows=tuple(_order_of(row) for row in rows),
+            limit=limit,
+            truncated=truncated,
+            session_id=session_id,
+        )
+
+    def paper_runs(self, symbols: Iterable[str]) -> tuple[PaperRun, ...]:
+        """Прогоны симуляции по кодам инструмента, старые первыми, с отметкой.
+
+        Коды — списком, а не одним: отчёт идёт по инструменту на экране,
+        и все его контракты стоят одним рядом (ответ владельца счёта В3).
+        Какие коды принадлежат одному инструменту, решает вызывающий
+        по таблице контрактов — слой хранения цепочек не знает.
+
+        Порядок — по началу прогона, равные — по номеру: «последний прогон
+        дня» выбирается по этому порядку.
+        """
+        wanted = list(dict.fromkeys(symbols))
+        if not wanted:
+            return ()
+        session = ", ".join(f"s.{name}" for name in _SESSION_COLUMNS)
+        marks = ", ".join("?" * len(wanted))
+        rows = self._db.execute(
+            f"SELECT {session}, m.session_id, m.kept_since, m.live_from, "
+            "MAX("
+            "  COALESCE((SELECT MAX(at) FROM journal_order WHERE session_id = s.id), 0),"
+            "  COALESCE((SELECT MAX(at) FROM journal_decision WHERE session_id = s.id), 0)"
+            ") "
+            "FROM journal_session AS s "
+            "LEFT JOIN journal_run_rows AS m ON m.session_id = s.id "
+            f"WHERE s.origin = ? AND s.symbol IN ({marks}) "
+            "ORDER BY s.started_at, s.id",
+            (RunOrigin.PAPER.value, *wanted),
+        )
+        width = len(_SESSION_COLUMNS)
+        return tuple(
+            PaperRun(
+                session=_session_of(row[:width]),
+                mark=None if row[width] is None else RunRowsMark(
+                    kept_since=_maybe_moment(row[width + 1]),
+                    live_from=_maybe_moment(row[width + 2]),
+                ),
+                last_at=_from_ts(int(row[width + 3])) if row[width + 3] else None,
+            )
+            for row in rows
+        )
+
     # -- остановка робота ---------------------------------------------------
 
     def put_contracts(
@@ -3036,6 +3448,12 @@ class CandleStore:
         trades = int(
             self._db.execute("SELECT COUNT(*) FROM journal_trade").fetchone()[0]
         )
+        orders = int(
+            self._db.execute("SELECT COUNT(*) FROM journal_order").fetchone()[0]
+        )
+        run_rows = int(
+            self._db.execute("SELECT COUNT(*) FROM journal_run_rows").fetchone()[0]
+        )
         by_origin = tuple(
             (RunOrigin(str(name)), int(count))
             for name, count in self._db.execute(
@@ -3050,6 +3468,8 @@ class CandleStore:
             trades=trades,
             sessions_by_origin=by_origin,
             database_bytes=pages * page_size,
+            orders=orders,
+            run_rows=run_rows,
         )
 
     def prune_journal(

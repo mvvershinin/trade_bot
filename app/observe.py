@@ -21,7 +21,8 @@
 * `ShadowExecutor` — порт «исполнитель заявок», который **никуда не ходит**:
   та же модель исполнения, что в прогоне по истории, плюс счёт поданного;
 * `LiveObserver` — склейка: движок, ход по ленте и снимок результата
-  в том же виде (`HistoryRun`), в каком его показывает окно.
+  в том же виде (`HistoryRun`), в каком его показывает окно. Строки хода —
+  решения, заявки, сделки — он же отдаёт в базу (`app/paper_log.py`).
 
 ⚠️ Заявки к брокеру отсюда не уходят, и это доказано устройством
 ------------------------------------------------------------------
@@ -61,6 +62,8 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
+from app import convert
+from app.paper_log import PaperLog, PaperSource
 from backtest import (
     BREATHE_EVERY,
     Costs,
@@ -77,7 +80,13 @@ from engine import (
     close_time,
     in_moscow,
 )
-from market import DEFAULT_WARMUP_BARS
+from market import (
+    DEFAULT_WARMUP_BARS,
+    DecisionPhase,
+    MarketWorker,
+    OrderRecord,
+    RunRowsMark,
+)
 from market import Candle as MarketCandle
 from strategies import Strategy
 from ui.models import DecisionLevel
@@ -86,6 +95,7 @@ __all__ = [
     "RECHECK_BARS",
     "LiveObserver",
     "LiveSource",
+    "RunRecording",
     "Seam",
     "ShadowExecutor",
 ]
@@ -358,15 +368,21 @@ class ShadowExecutor(HistoryExecutor):
     тест «ни одна заявка не ушла к брокеру» обязан отличать «заявок не было
     вовсе» от «заявки были и остались здесь». Без счётчика зелёным был бы
     и наблюдатель, который вообще не работает.
+
+    `orders` — сами поданные заявки по порядку. Из них ход берёт строки
+    заявок прогона для базы: причину входа, уровень тейка, предел выхода
+    по времени и момент решения (`app/paper_log.py`).
     """
 
     def __init__(self, *, costs: Costs | None = None, ruble_per_point: float = 1.0) -> None:
         super().__init__(costs=costs, ruble_per_point=ruble_per_point)
         self.submitted = 0
+        self.orders: list[OrderRequest] = []
 
     async def submit(self, order: OrderRequest) -> None:
         """Принять заявку. Дальше этого объекта она не уходит никуда."""
         self.submitted += 1
+        self.orders.append(order)
         await super().submit(order)
 
 
@@ -388,6 +404,38 @@ class _Tally:
     average: list[tuple[datetime, float]] = field(default_factory=list)
     journal: list[JournalEntry] = field(default_factory=list)
     bars: int = 0
+    #: Строки заявок прогона для базы — подачи и касания уровней в порядке
+    #: событий, с закрытием и средней своего бара. В снимок окна не входят:
+    #: у окна для заявок свой слой (`plans`).
+    orders: list[OrderRecord] = field(default_factory=list)
+    #: Начало первого бара хода и закрытие последнего: из них отметка
+    #: «строки записаны» (`RunRowsMark`). `None` — баров ещё не было.
+    first: datetime | None = None
+    last_close: datetime | None = None
+    #: Сколько заявок и касаний исполнителя уже переложено в `orders`.
+    seen_orders: int = 0
+    seen_levels: int = 0
+    #: Объём заявки по её имени: касанию уровня объём берётся у вооружения.
+    volumes: dict[str, float] = field(default_factory=dict)
+    #: Кончился ли пересчёт: проход, давший движку хоть один бар, дошёл
+    #: до конца. До этого каждый бар — пересчёт (`LiveObserver._phase`).
+    recounted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecording:
+    """Чем ход записывается в базу: строка прогона и строки хода.
+
+    `around` — обёртка хода записью в журнале прогонов (`RunLog.around`);
+    обёртка **одна на весь ход**, а не на проход: живой ход это один прогон,
+    а не двенадцать в час. `store` — поток данных для строк хода: решений,
+    заявок и сделок (`app/paper_log.py`). `None` — строки не писать,
+    только строку прогона. `symbol` — инструмент сделок: у `Deal` его нет.
+    """
+
+    around: Callable[[], AbstractAsyncContextManager[object]]
+    store: MarketWorker | None = None
+    symbol: str = ""
 
 
 class LiveObserver:
@@ -407,9 +455,8 @@ class LiveObserver:
     :param say: строка в журнал решений — событие, причина, важность.
     :param costs: издержки исполнения. `None` — тариф из настроек движка
         и нулевое проскальзывание, как в прогоне по истории.
-    :param around: чем обернуть ход, чтобы он попал в журнал прогонов.
-        `None` — не записывать. Обёртка **одна на весь ход**, а не на проход:
-        живой ход это один прогон, а не двенадцать в час.
+    :param recording: чем записать ход в базу (`RunRecording`). `None` —
+        не записывать ничего.
 
     Порога прогрева среди доводов нет намеренно: он не настройка, а следствие
     периода средней, и меняется вместе с ним (`WARMUP_BARS`). Довод здесь
@@ -425,12 +472,12 @@ class LiveObserver:
         settings: EngineSettings,
         say: Callable[[str, str, DecisionLevel], None],
         costs: Costs | None = None,
-        around: Callable[[], AbstractAsyncContextManager[object]] | None = None,
+        recording: RunRecording | None = None,
     ) -> None:
         self._strategy = strategy
         self._settings = settings
         self._say = say
-        self._around = around
+        self._recording = recording
         self._costs = costs or Costs(commission_per_side=settings.commission_per_side)
         self._tally = _Tally()
         self._engine = Engine(strategy, settings, journal=self._tally.journal.append)
@@ -446,6 +493,12 @@ class LiveObserver:
         self._failure = ""
         self._stopped = False
         self._warmed = False
+        #: Писатель строк хода. `None` — писать не просили либо прогон
+        #: в журнале не открылся (`RunEntry.id is None`).
+        self._log: PaperLog | None = None
+        #: Отметка «строки записаны». Ставится один раз, в конце первого
+        #: прохода, и дальше не меняется: граница живой части — по данным.
+        self._mark: RunRowsMark | None = None
 
     # -------------------------------------------------------------- команды
 
@@ -453,13 +506,31 @@ class LiveObserver:
         """Открыть запись о ходе в журнале прогонов. Повторный вызов молчит.
 
         Отдельно от `feed`, потому что запись открывается **один раз на весь
-        ход**, а `feed` зовётся на каждом закрытом баре. Без `around` метод
+        ход**, а `feed` зовётся на каждом закрытом баре. Без записи метод
         не делает ничего и существует ради одинакового порядка сборки.
+
+        Писатель строк хода заводится здесь же и только при открытом
+        прогоне: номер прогона нужен каждой строке. Не открылся прогон —
+        строк нет, и об этом уже сказано строкой журнала (`RunLog`).
         """
-        if self._around is None or self._record is not None or self._stopped:
+        recording = self._recording
+        if recording is None or self._record is not None or self._stopped:
             return
-        self._record = self._around()
+        self._record = recording.around()
         self._entry = await self._record.__aenter__()
+        session_id = getattr(self._entry, "id", None)
+        if recording.store is not None and isinstance(session_id, int):
+            self._log = PaperLog(
+                recording.store,
+                session_id,
+                PaperSource(
+                    journal=self._tally.journal,
+                    orders=self._tally.orders,
+                    deals=self._executor.deals,
+                    symbol=recording.symbol,
+                ),
+                self._say,
+            )
 
     async def feed(self, candles: Sequence[MarketCandle]) -> HistoryRun:
         """Показать ленте отрезок ряда и разобрать его движком до конца.
@@ -477,12 +548,24 @@ class LiveObserver:
         Ход, уже прекращённый (закрыт либо упал), новых баров не разбирает
         и отдаёт последний снимок: молча продолжить после падения нельзя,
         а притворяться, что бары учтены, — тем более.
+
+        В конце прохода строки хода уходят в базу (`PaperLog.flush`). Первый
+        проход ставит отметку «строки записаны» и ставит её всегда, даже
+        без единой строки: «ноль сделок» обязан отличаться от «не записывали».
+
+        Пересчёт кончается здесь, после разбора, и только если проход дал
+        движку хоть один бар (`_phase`). Снятый посреди разбора проход
+        (отмена) пересчёт не кончает: его недобранный остаток разберёт
+        следующий проход, и это всё ещё история, а не живые бары.
         """
         seam = self._source.offer(candles)
         self._say_seam(seam)
         if not self._stopped and not self._failure:
             await self._ride()
+            self._tally.recounted = self._tally.recounted or self._tally.bars > 0
         self._say_warmup()
+        if self._log is not None:
+            await self._log.flush(self._bounds())
         return self.run
 
     async def aclose(self) -> None:
@@ -493,13 +576,21 @@ class LiveObserver:
         времени конца читается как «программу закрыли на середине». Так и должно
         выглядеть аварийное завершение, но **не** выключение потока кнопкой:
         там ход кончился по команде, и его итог обязан быть в базе.
+
+        ⚠️ Порядок — остановить ход, дописать строки, и только потом закрыть
+        прогон. Закрытый прогон дозаписи не принимает (сторож в базе), так что
+        обратный порядок терял бы остаток при каждом выключении потока.
+        Запись, начатая проходом и не дождавшаяся его (проход сняли),
+        дожидается здесь же, до счёта остатка (`PaperLog.close`).
         """
         self._stopped = True
         record, self._record = self._record, None
         if record is None:
             return
+        log_, self._log = self._log, None
+        lost = "" if log_ is None else await log_.close(self._bounds())
         if self._entry is not None:
-            _note_result(self._entry, self.run)
+            _note_result(self._entry, self.run, lost)
         self._entry = None
         try:
             await record.__aexit__(None, None, None)
@@ -580,8 +671,15 @@ class LiveObserver:
         stream = self._source.candles()
         try:
             async for candle in stream:
+                if self._stopped:
+                    # Ход закрыт посреди прохода: остаток уже посчитан
+                    # и записан `aclose`, и бар после него в базу не попал бы.
+                    return
+                if self._tally.first is None:
+                    self._tally.first = in_moscow(candle.time)
                 self._tally.bars += 1
                 self._source.delivered += 1
+                phase = self._phase()
                 outcome = await self._engine.on_market_candle(candle, self._executor)
                 for order in outcome.orders:
                     if not order.action.is_market:
@@ -595,8 +693,11 @@ class LiveObserver:
                         exit_reason=order.exit_reason,
                     ))
                 value = getattr(self._strategy, "average", None)
-                if value is not None and not outcome.skipped:
-                    self._tally.average.append((close_time(candle), float(value)))
+                average = None if value is None or outcome.skipped else float(value)
+                if average is not None:
+                    self._tally.average.append((close_time(candle), average))
+                self._note_orders(candle, average, phase)
+                self._tally.last_close = close_time(candle)
                 if self._engine.halted:
                     return
         finally:
@@ -607,6 +708,68 @@ class LiveObserver:
             # destroyed but it is pending» при завершении, в прогоне тестов —
             # чужая обвязка, падающая на разборке нашей.
             await stream.aclose()
+
+    def _phase(self) -> DecisionPhase:
+        """Фаза бара, который сейчас разбирается, — по тому, как он пришёл.
+
+        Три ответа, порядок важен: пока пересчёт не кончился (`feed`), бар —
+        пересчёт; дальше бар, после которого в ленте ничего не осталось, —
+        живой: решение по нему принято, как только он пришёл; остальные бары
+        пачки — догон пропущенного. Таблица на три ветки была бы паттерном
+        ради паттерна.
+
+        ⚠️ Названный край: два бара, закрывшихся до одного прохода, дают
+        старшему догон — решение по нему принято на бар позже. Осознанно:
+        отличить его от бара догрузки за выходные лента не может, а выдать
+        догон за живое дороже, чем потерять из «как было» одно решение.
+        """
+        if not self._tally.recounted:
+            return DecisionPhase.RECOUNT
+        if self._source.pending:
+            return DecisionPhase.CATCH_UP
+        return DecisionPhase.LIVE
+
+    def _bounds(self) -> RunRowsMark:
+        """Отметка «строки записаны»: ставится один раз и дальше не меняется.
+
+        Ставит её конец первого прохода. Границы в ней — сведение о первом
+        проходе, а не граница живого: вживую ли решена строка, говорит её
+        фаза (`_phase`). Пустой первый проход даёт пустые границы, и это
+        больше ничего не объявляет живым.
+        """
+        if self._mark is None:
+            self._mark = RunRowsMark(
+                kept_since=self._tally.first, live_from=self._tally.last_close
+            )
+        return self._mark
+
+    def _note_orders(
+        self, candle: MarketCandle, average: float | None, phase: DecisionPhase
+    ) -> None:
+        """Заявки и касания уровней этого бара — в строки для базы, с фазой бара.
+
+        Порядок — порядок событий бара: заявка, рождённая исполнением
+        на открытии (вооружение тейка), раньше касания; касание раньше
+        решений на закрытии. Время у касания и у решений одно — закрытие
+        бара, — и при равенстве касание идёт первым: уровень задет внутри
+        бара, решение принято после.
+        """
+        executor, tally = self._executor, self._tally
+        fresh: list[tuple[datetime, int, OrderRecord]] = []
+        for order in executor.orders[tally.seen_orders:]:
+            tally.volumes[order.order_id] = order.volume
+            fresh.append((order.submitted_at, 1, convert.order_record(
+                order, close=candle.close, average=average, phase=phase
+            )))
+        for plan in executor.level_plans[tally.seen_levels:]:
+            volume = tally.volumes.get(plan.order_id, self._settings.volume)
+            fresh.append((plan.decided_at, 0, convert.level_hit_record(
+                plan, volume=volume, close=candle.close, average=average, phase=phase
+            )))
+        tally.seen_orders = len(executor.orders)
+        tally.seen_levels = len(executor.level_plans)
+        fresh.sort(key=lambda item: (item[0], item[1]))
+        tally.orders.extend(record for _, _, record in fresh)
 
     # ------------------------------------------------------------- рассказ
 
@@ -666,16 +829,21 @@ class LiveObserver:
         )
 
 
-def _note_result(entry: object, run: HistoryRun) -> None:
+def _note_result(entry: object, run: HistoryRun, lost: str = "") -> None:
     """Итог хода — в открытую запись журнала прогонов.
 
     Через `setattr`, потому что тип записи принадлежит `app/runs.py`, а брать
     его сюда значило бы связать наблюдение с журналом прогонов навсегда:
     обёртка необязательна, и без неё ход работает целиком.
+
+    `lost` — фраза о строках хода, не легших в базу (`PaperLog.close`).
+    Пусто — потерь нет. Иначе она дописывается к итогу: заметка о конце
+    прогона — то место, где через месяц ищут, почему сделок в базе меньше.
     """
     from app.runs import result_note  # noqa: PLC0415 — связь только при записи
 
-    entry.note = result_note(run)  # type: ignore[attr-defined]
+    note = result_note(run)
+    entry.note = f"{note}\n{lost}" if lost else note  # type: ignore[attr-defined]
 
 
 def _times(moments: Sequence[datetime]) -> str:

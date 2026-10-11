@@ -43,11 +43,11 @@ import enum
 import functools
 import typing
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Final
 
-from backtest import Costs, Deal, HistoryRun, MinuteOrder, Pair, headline
+from backtest import Costs, Deal, HistoryRun, MinuteOrder, Pair, Plan, headline
 from engine import (
     DayMarks,
     DayRule,
@@ -55,6 +55,7 @@ from engine import (
     JournalEntry,
     JournalLevel,
     OrderAction,
+    OrderRequest,
     Reversal,
     TimeExitOrder,
     TradingWindow,
@@ -65,7 +66,18 @@ from engine import Mode as EngineMode
 from engine import Side as EngineSide
 from market import Candle as MarketCandle
 from market import DecisionLevel as StoredDecisionLevel
-from market import DecisionRecord, StoredDecision, StoredTrade, Timeframe, TradeRecord, bar_start
+from market import (
+    DecisionPhase,
+    DecisionRecord,
+    JournalSession,
+    OrderKind,
+    OrderRecord,
+    StoredDecision,
+    StoredTrade,
+    Timeframe,
+    TradeRecord,
+    bar_start,
+)
 from market import RunOrigin as StoredRunOrigin
 from market import TradeSide as StoredTradeSide
 from strategies import StrategySettings, registry
@@ -108,6 +120,7 @@ from ui.models import (
     TradeRow,
     TradesSummary,
 )
+from ui.trade_story import OrderStep, Phase, TradeStory
 
 __all__ = [
     "MONEY_FIELDS",
@@ -144,6 +157,11 @@ __all__ = [
     "trade_row",
     "decision_record",
     "trade_record",
+    "order_record",
+    "level_hit_record",
+    "TradeLinks",
+    "row_of_decision_record",
+    "trade_story",
     "row_of_stored_decision",
     "row_of_stored_trade",
     "origin_of_stored",
@@ -1754,6 +1772,180 @@ def trade_record(deal: Deal, symbol: str) -> TradeRecord:
         commission=deal.commission,
         net=deal.net,
         ruble_per_point=deal.ruble_per_point,
+    )
+
+
+def order_record(
+    order: OrderRequest, *, close: float, average: float | None, phase: DecisionPhase
+) -> OrderRecord:
+    """Заявка движка → строка заявок прогона для базы.
+
+    `close` и `average` — закрытие и средняя бара, на разборе которого заявка
+    родилась: по ним разбор сделки говорит, почему робот решил так. `phase` —
+    как этот бар пришёл к движку (`market.DecisionPhase`). Уровень
+    тейка (`price` вооружения) и предел выхода по времени (`limit_price`)
+    кладутся своими колонками — ответ владельца счёта В4.
+
+    Действие и причина выхода — машинными значениями движка, а не подписями:
+    подпись меняется вместе с окном, значение остаётся.
+    """
+    return OrderRecord(
+        order_id=order.order_id,
+        at=order.submitted_at,
+        kind=OrderKind.SUBMITTED,
+        action=order.action.value,
+        side=_STORED_SIDES[order.side],
+        volume=order.volume,
+        reason=order.reason,
+        exit_reason="" if order.exit_reason is None else order.exit_reason.value,
+        target_id=order.target_id or "",
+        close_price=close,
+        average=average,
+        level=order.price,
+        limit_price=order.limit_price,
+        phase=phase,
+    )
+
+
+def level_hit_record(
+    plan: Plan, *, volume: float, close: float, average: float | None, phase: DecisionPhase
+) -> OrderRecord:
+    """Касание сторожимого уровня → строка заявок прогона для базы.
+
+    Касание — **решение выхода**: время у строки — закрытие бара, на котором
+    уровень задет (`Plan.decided_at`), уровень — тот, по которому робот
+    рассчитывал выйти. Сделка по нему исполняется отдельно, со своим временем
+    и своей ценой. Объём у расчёта не хранится (`backtest.Plan`) и приходит
+    от вызывающего — из заявки вооружения с тем же именем.
+    """
+    return OrderRecord(
+        order_id=plan.order_id,
+        at=plan.decided_at,
+        kind=OrderKind.LEVEL_HIT,
+        action=plan.action.value,
+        side=_STORED_SIDES[plan.side],
+        volume=volume,
+        exit_reason="" if plan.exit_reason is None else plan.exit_reason.value,
+        close_price=close,
+        average=average,
+        level=plan.price,
+        phase=phase,
+    )
+
+
+#: Что сделала строка заявки — словами. Ключ — вид строки и действие машинным
+#: значением движка; `{side}` — сторона позиции, `{reason}` — вид уровня
+#: подписью из сделки («тейк-профит», «скользящий уровень»).
+#: Таблица, а не цепочка `if`: новое действие движка — одна строка здесь,
+#: а забытое читается подписью «заявка (имя действия)», а не пустотой.
+_STEP_WORDS: dict[tuple[OrderKind, str], str] = {
+    (OrderKind.SUBMITTED, OrderAction.OPEN.value): "заявка на вход в {side}",
+    (OrderKind.SUBMITTED, OrderAction.CLOSE.value): "заявка на выход из {side}а",
+    (OrderKind.SUBMITTED, OrderAction.ARM_TAKE_PROFIT.value): "тейк {side}а выставлен",
+    (OrderKind.SUBMITTED, OrderAction.CANCEL_TAKE_PROFIT.value): "тейк {side}а снят",
+    (OrderKind.LEVEL_HIT, OrderAction.CLOSE.value): "задет уровень: {reason}",
+}
+
+
+def _step_what(record: OrderRecord, label: str) -> str:
+    """Что сделала заявка — словами, по таблице `_STEP_WORDS`.
+
+    `label` — причина выхода сделки подписью: у касания вид уровня назван
+    ею, а не машинным значением строки — подпись причины принадлежит
+    `engine/`, и второй её перевод здесь разошёлся бы с первым.
+    """
+    side = _SIDES_OF_STORED[record.side].label.lower()
+    words = _STEP_WORDS.get((record.kind, record.action))
+    if words is None:
+        return f"заявка ({record.action})"
+    return words.format(side=side, reason=label or "уровень")
+
+
+def _order_step(record: OrderRecord, label: str, *, reason: str | None = None) -> OrderStep:
+    """Строка заявки → шаг разбора. Числа — как записаны, ни одно не считается."""
+    return OrderStep(
+        at=record.at,
+        what=_step_what(record, label),
+        reason=record.reason if reason is None else reason,
+        close=record.close_price,
+        average=record.average,
+        level=record.level,
+        limit=record.limit_price,
+    )
+
+
+def _exit_step(
+    hit: OrderRecord | None, order: OrderRecord | None, label: str
+) -> OrderStep | None:
+    """Решение о выходе: касание уровня, если оно было, иначе заявка выхода.
+
+    У касания своей причины нет: она у заявки вооружения, которой уровень
+    стоял (`order`), — «тейк сторожится на уровне …». Предел выхода
+    по времени — тоже у заявки.
+    """
+    if hit is None:
+        return None if order is None else _order_step(order, label)
+    step = _order_step(hit, label, reason=order.reason if order is not None else "")
+    if order is not None and order.limit_price is not None:
+        step = replace(step, limit=order.limit_price)
+    return step
+
+
+def row_of_decision_record(record: DecisionRecord) -> DecisionRow:
+    """Строка журнала решений прогона симуляции → строка окна.
+
+    Из записи, а не из прочитанной строки: разбор сделки собирается одной
+    функцией и из памяти хода, и из базы (`app/paper_report.py`), и вход
+    у неё один — записи. Происхождение — симуляция: записи пишет только она.
+    """
+    return DecisionRow(
+        time=record.at,
+        event=record.event,
+        reason=record.reason,
+        level=_LEVELS_OF_STORED[record.level],
+        origin=RunOrigin.PAPER,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class TradeLinks:
+    """Строки прогона, принадлежащие одной сделке (миниплан §3).
+
+    Находит их `app/paper_report.py::links`; здесь только тип, чтобы перевод
+    в слова (`trade_story`) не зависел от того, как строки искались.
+    `entry` — заявка входа, `exit_order` — заявка выхода (у выхода по уровню —
+    вооружение, которым уровень стоял), `hit` — касание уровня. `None` —
+    строки в базе нет. `entry_rows` и `exit_rows` — журнал решений баров,
+    на которых решены вход и выход.
+    """
+
+    entry: OrderRecord | None = None
+    exit_order: OrderRecord | None = None
+    hit: OrderRecord | None = None
+    entry_rows: tuple[DecisionRecord, ...] = ()
+    exit_rows: tuple[DecisionRecord, ...] = ()
+
+
+def trade_story(
+    trade: TradeRecord, links: TradeLinks, *, session: JournalSession, phase: Phase
+) -> TradeStory:
+    """Сделка симуляции и её строки → разбор для окна (`ui.trade_story`).
+
+    Какие строки чьи, решает `app/paper_report.py` (связь сделки с заявками,
+    миниплан §3); здесь только перевод машинных значений в слова. Причина
+    выхода — подпись из сделки: она записана при закрытии и с окном
+    не меняется.
+    """
+    return TradeStory(
+        run_id=session.id,
+        run_started=session.started_at,
+        phase=phase,
+        exit_reason=trade.exit_reason,
+        entry=None if links.entry is None else _order_step(links.entry, trade.exit_reason),
+        exit=_exit_step(links.hit, links.exit_order, trade.exit_reason),
+        entry_rows=tuple(row_of_decision_record(row) for row in links.entry_rows),
+        exit_rows=tuple(row_of_decision_record(row) for row in links.exit_rows),
+        settings=session.settings,
     )
 
 

@@ -39,6 +39,7 @@ from ui.models import (
     Mode,
     Settings,
 )
+from ui.trade_story import PaperReport, PaperReportRequest
 
 #: Чистка секретов: текст на входе, текст без токена на выходе.
 #:
@@ -94,6 +95,7 @@ class TerminalPort(QObject):
     history_progress = Signal(int, str)   # 0…100, подпись — ход загрузки истории
     history_finished = Signal(object)     # HistoryLoadOutcome — чем кончилась
     contract_checked = Signal(object)     # ContractNotice — действующий контракт по таблице
+    paper_report_ready = Signal(object)   # PaperReport — сделки симуляции из базы
 
     # ⚠️ Два отказа — своими сигналами, а не одним `failed`, и это правило
     # 13 `CLAUDE.md`. `failed` — фраза в строку состояния на 15 секунд; окно
@@ -266,6 +268,21 @@ class TerminalPort(QObject):
     def cancel_history_load(self) -> None:
         """Остановить идущую загрузку. Скачанное к этому моменту остаётся в базе."""
         self._not_connected("Отмена загрузки истории")
+
+    def request_paper_report(self, request: PaperReportRequest) -> None:
+        """Попросить сделки симуляции из базы для окна «Отчёты».
+
+        Ответ — сигналом `paper_report_ready`, а не возвратом: чтение базы —
+        работа потока данных. Ответ приходит **всегда**, отказ тоже —
+        полем `trouble`: окно, ждущее ответа, иначе ждало бы вечно, и пустая
+        таблица читалась бы как «сделок не было».
+        """
+        self._not_connected("Чтение сделок симуляции")
+        self.paper_report_ready.emit(PaperReport(
+            instrument=request.instrument,
+            trouble="Сделки симуляции не прочитаны: окно открыто без торговой "
+                    "части, базы у него нет.",
+        ))
 
     def show_recent(self) -> None:
         """Вернуться к обычному показу последних дней вместо закреплённого отрезка.

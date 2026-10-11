@@ -42,6 +42,7 @@ from market.journal import (
     TradeSide,
     redact,
 )
+from market.paper import OrderKind, OrderRecord, PaperRows, RunRowsMark
 from market.reports import LoadReport
 from market.storage import (
     SCHEMA_VERSION,
@@ -1162,21 +1163,41 @@ def test_the_whole_database_file_holds_no_token(tmp_path: pathlib.Path) -> None:
         store.write_load_report(
             LoadReport(symbol=FAKE_JWT, source="broker", note=FAKE_JWT), now=at
         )
+        # Заявки прогона симуляции (`market.paper`): пять текстовых колонок.
+        store.write_paper_rows(
+            session.id,
+            PaperRows(
+                mark=RunRowsMark(kept_since=at, live_from=at),
+                orders=(
+                    OrderRecord(
+                        order_id=FAKE_JWT,
+                        at=at,
+                        kind=OrderKind.SUBMITTED,
+                        action=FAKE_JWT,
+                        side=TradeSide.LONG,
+                        volume=1.0,
+                        reason=FAKE_JWT,
+                        exit_reason=FAKE_JWT,
+                        target_id=FAKE_JWT,
+                    ),
+                ),
+            ),
+        )
         store.finish_journal_session(session.id, now=at, note=FAKE_JWT)
 
     raw = path.read_bytes()
     found = raw.count(b"eyJGQUtF")
     assert found == 0, f"подделка токена нашлась в файле базы {found} раз"
 
-    # Семнадцать вхождений маски — шестнадцать текстовых колонок, которые
+    # Двадцать два вхождения маски — двадцать одна текстовая колонка, которые
     # заполнил этот тест: шесть у прогона плюс заметка о конце, две у строки
-    # решения, четыре у сделки, две у отчёта о загрузке и сводка, где токен
-    # назван дважды. Новая колонка это число увеличит, поэтому сравнение
-    # «не меньше»: пересчитывать тест из-за каждого поля не нужно, а вот
-    # поле, переставшее записываться, обязано его уронить.
+    # решения, четыре у сделки, пять у заявки, две у отчёта о загрузке
+    # и сводка, где токен назван дважды. Новая колонка это число увеличит,
+    # поэтому сравнение «не меньше»: пересчитывать тест из-за каждого поля
+    # не нужно, а вот поле, переставшее записываться, обязано его уронить.
     masked = raw.count(SECRET_MASK.encode("utf-8"))
-    assert masked >= 17, (
-        f"маска нашлась в файле {masked} раз вместо семнадцати: проверка выше "
+    assert masked >= 22, (
+        f"маска нашлась в файле {masked} раз вместо двадцати двух: проверка выше "
         "зеленеет не потому, что токен вычищен, а потому, что писать было нечего"
     )
 

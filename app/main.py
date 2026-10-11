@@ -56,6 +56,7 @@ import os
 import pathlib
 import signal
 import sys
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from app.collector import collect_in_main_thread  # Qt внутри, не при ввозе
@@ -717,13 +718,14 @@ async def _run(
     """
     # Все пять — после того, как `main()` выставил QT_API и QT_QPA_PLATFORM.
     from app.port import HistoryPort  # noqa: PLC0415
+    from app.userdata_notice import missing_data_notice  # noqa: PLC0415
     from broker.redaction import scrub  # noqa: PLC0415
     from market import MarketWorker  # noqa: PLC0415
-    from ui.main_window import MainWindow  # noqa: PLC0415
     from ui.models import DecisionLevel  # noqa: PLC0415
 
     if not _database_ready(database, _named_userdata(args)):  # см. её докстринг, D-041/D-129
         return 1
+    missing = missing_data_notice(database)  # до чтения настроек — шапка модуля, D-080
     store, loaded, values, depth = _stored_settings(database.parent, args)
 
     # ⚠️ Чистка секретов ставится ЗДЕСЬ, при сборке, а не внутри слоя данных.
@@ -766,14 +768,13 @@ async def _run(
                            until=args.until, sanitize=scrub)
         port.attach_exchange(worker.point_value)
 
-        window = MainWindow(port=port, settings=port.values, sanitize=scrub)  # B-050
-        window.resize(1440, 900)
+        window = _main_window(port, scrub, missing)
 
         closed = asyncio.Event()
         application.lastWindowClosed.connect(closed.set)
         _on_interrupt(closed)
 
-        _announce(port, database, level=DecisionLevel.WARNING)
+        _announce(port, database, missing=missing, level=DecisionLevel.WARNING)
         await _restore_halt(port, database)
         _wire_settings_and_log(
             port, store, loaded, values, _named_userdata(args), level=DecisionLevel.WARNING)
@@ -935,15 +936,21 @@ def _say_where_the_log_goes(port: HistoryPort, setup: LogSetup, *, level: Decisi
         )
 
 
-def _announce(port: HistoryPort, database: pathlib.Path, *, level: DecisionLevel) -> None:
-    """Строки старта (`HistoryPort.announce`) и — следом — о переменной папки данных.
+def _announce(
+    port: HistoryPort, database: pathlib.Path, *, missing: str = "", level: DecisionLevel
+) -> None:
+    """Строки старта (`HistoryPort.announce`) и — следом — о папке данных.
 
-    Вторая пишется, если переменная задана и не действует
+    Вторая пишется, если переменная папки данных задана и не действует
     (`market.paths.ignored_override`): человек, выставивший её, иначе
     искал бы базу и остановку робота не там. `database` — база этого запуска:
     названная ключом `--database`, она и называется в строке, а не папка
     по умолчанию (`D-124`). Рядом со строкой «База свечей», а не в
     `_wire_settings_and_log`: база к настройкам отношения не имеет.
+
+    Третья — `missing`, «данных нет» (`app/userdata_notice.py`, `D-080`):
+    та же фраза, что на плашке окна, уровнем INFO — на новой машине это
+    обычный первый запуск, а не беда. Пусто — строки нет.
     """
     from market.paths import ignored_override  # noqa: PLC0415 — слои после разбора ключей
 
@@ -952,6 +959,32 @@ def _announce(port: HistoryPort, database: pathlib.Path, *, level: DecisionLevel
     if ignored:
         log.warning("%s", ignored)
         port.note("Папка данных", ignored, level)
+    if missing:
+        log.info("%s", missing)
+        port.note("Папка данных", missing)
+
+
+def _main_window(port: HistoryPort, scrub: Callable[[str], str], missing: str) -> MainWindow:
+    """Окно программы — собранное, с плашкой «данных нет», но ещё не показанное.
+
+    `settings=port.values`, а не прочитанное из файла (`B-050`): порт
+    подменяет то, чего робот не умеет, и окно держит подменённое с первой
+    секунды. `missing` — текст плашки (`app/userdata_notice.py`, `D-080`)
+    или пусто. Прямой вызов метода окна из сборки — тот же приём, что
+    `open_settings` у снимка (`_shot_of_dialog`).
+
+    `scrub` — та же чистка и **под тем же именем**, что у слоя данных и порта
+    в `_run`: одно имя на три места сверяет `tests/test_app_port.py`.
+
+    Отдельной функцией, а не тремя строками в `_run`: главная корутина стоит
+    на пределе длины (`tests/test_function_size.py`) и числа операторов.
+    """
+    from ui.main_window import MainWindow  # noqa: PLC0415 — слои после QT_API
+
+    window = MainWindow(port=port, settings=port.values, sanitize=scrub)  # B-050
+    window.resize(1440, 900)
+    window.show_missing_data(missing)
+    return window
 
 
 def _wire_settings_and_log(  # noqa: PLR0913 — шестой довод это папка лога: `named_userdata` (D-041)

@@ -47,9 +47,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
-from app import contract_view, convert, stitched_view
+from app import contract_view, convert, paper_report, stitched_view
 from app.minutes import minute_plan, minutes_under
-from app.observe import LiveObserver
+from app.observe import LiveObserver, RunRecording
 from app.runs import ProgramFields, RunConditions, RunLog, result_note, settings_text
 from backtest import HistoryRun, Summary, pairs, replay, reversal_entries, summarise
 from engine import MSK, EngineSettings, PositionState, close_time, in_moscow
@@ -122,6 +122,7 @@ from ui.models import (
     switch_blocked_reason,
 )
 from ui.ports import Sanitize, TerminalPort
+from ui.trade_story import PaperReport, PaperReportRequest
 from ui.version import version
 
 if TYPE_CHECKING:  # только для проверки типов: в рантайме модуль не нужен
@@ -344,6 +345,7 @@ _WORKS: tuple[_Work, ...] = (
         "скачанное к этому времени в базе остаётся.",
     ),
     _Work("facts", "чтение описи базы свечей", STUCK_AFTER),
+    _Work("paper", "чтение сделок симуляции из базы", STUCK_AFTER),
     _Work("contract", "чтение таблицы контрактов", STUCK_AFTER),
     _Work("options", "чтение списка инструментов из базы", STUCK_AFTER),
     _Work("draw", "дорисовка свечи по живому потоку", STUCK_AFTER),
@@ -361,6 +363,11 @@ _SYNC_LOOK_MS = 60 * 60 * 1000
 #: Та же таблица ключом наружу. Собирается из `_WORKS`, а не пишется руками:
 #: два списка одних и тех же работ разошлись бы молча.
 _BY_KEY: dict[str, _Work] = {work.key: work for work in _WORKS}
+
+#: Сколько строк прогона симуляции читать за раз для «Отчётов». Не торговое
+#: число: месяц пересчёта — полторы тысячи заявок; обрезка, если случится,
+#: названа оговоркой в окне.
+_PAPER_LIMIT = 200_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -501,6 +508,8 @@ class _History:
     filling: bool = False
     #: Чтение таблицы контрактов: какой действующий (решение 0061).
     contract: asyncio.Task[None] | None = None
+    #: Чтение сделок симуляции для окна «Отчёты» (`request_paper_report`).
+    paper: asyncio.Task[None] | None = None
     #: Что про действующий контракт уже сказано в журнал: повтор молчит.
     told: ContractNotice | None = None
     #: Срок торгуемого кода по той же таблице (ТЗ §4.6, решение 0016).
@@ -1847,6 +1856,97 @@ class HistoryPort(TerminalPort):
             )
         self._send(self.history_facts_ready, facts)
 
+    def request_paper_report(self, request: PaperReportRequest) -> None:
+        """Сделки симуляции из базы для окна «Отчёты». Ответ — `paper_report_ready`.
+
+        Возврат немедленный: чтение идёт в потоке данных, и прогон симуляции
+        с месяцем пересчёта — это полторы тысячи заявок и тысяча строк
+        журнала на каждый. Новая просьба снимает прежнюю, недочитанную:
+        окну нужен ответ на последний вопрос.
+        """
+        code = request.instrument.strip() or self._values.instrument.strip()
+        before = self._history.paper
+        if before is not None and not before.done():
+            before.cancel()
+        self._history.paper = self._begin("paper", self._paper_report(code))
+
+    async def _paper_report(self, instrument: str) -> None:
+        """Прочитать прогоны симуляции инструмента, отобрать и отправить окну.
+
+        Отказ базы — не пустой отчёт, а названная причина: пустая таблица
+        читается как «сделок не было», и это другое утверждение (правило 13).
+        """
+        try:
+            found = await self._paper_read(instrument)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # окно не должно падать вместе с базой
+            log.exception("сделки симуляции не прочитаны")
+            found = PaperReport(
+                instrument=instrument,
+                trouble=f"Сделки симуляции из базы {self._worker.path} прочитать "
+                        f"не удалось: {_plain(error)}. Таблица не показана, чтобы "
+                        "не выдать отказ за «сделок не было».",
+            )
+        self._send(self.paper_report_ready, found)
+
+    async def _paper_read(self, instrument: str) -> PaperReport:
+        """Чтение и отбор: прогоны, их сделки и заявки, журнал нужных прогонов."""
+        notes: list[str] = []
+        codes = await self._paper_codes(instrument, notes)
+        rows: list[paper_report.RunRows] = []
+        for run in await self._worker.paper_runs(codes):
+            if run.mark is None:
+                rows.append(paper_report.RunRows(run))
+                continue
+            number = run.session.id
+            trades = await self._worker.trades(session_id=number, limit=_PAPER_LIMIT)
+            orders = await self._worker.orders(session_id=number, limit=_PAPER_LIMIT)
+            if trades.truncated or orders.truncated:
+                notes.append(f"Прогон №{number}: прочитаны не все строки — в базе их "
+                             f"больше {_PAPER_LIMIT}, разбор неполон.")
+            rows.append(paper_report.RunRows(
+                run, trades.rows, tuple(order.record for order in orders)
+            ))
+        books: dict[int, paper_report.RunBook] = {}
+        wanted = set(paper_report.needed(rows))
+        for item in rows:
+            if item.run.session.id not in wanted:
+                continue
+            journal = await self._worker.decisions(
+                session_id=item.run.session.id, limit=_PAPER_LIMIT
+            )
+            if journal.truncated:
+                notes.append(f"Прогон №{item.run.session.id}: журнал решений прочитан "
+                             f"не весь — строк больше {_PAPER_LIMIT}, разбор неполон.")
+            books[item.run.session.id] = paper_report.RunBook.of(
+                item.run.session, item.orders, (row.record for row in journal)
+            )
+        return paper_report.report(instrument, rows, books, notes)
+
+    async def _paper_codes(self, instrument: str, notes: list[str]) -> list[str]:
+        """Коды инструмента на экране: все контракты актива одним рядом (В3).
+
+        Таблица контрактов — главный источник; цепочка вокруг кода добавлена
+        на случай, если таблица ещё не знает прошлых контрактов. Отказ таблицы
+        не роняет отчёт: прогоны ищутся по цепочке, и это сказано оговоркой.
+        """
+        asset = _asset_or_empty(instrument)
+        if not asset:
+            return [instrument]
+        codes = [instrument, *_chain_of(instrument)]
+        try:
+            table = await self._worker.contracts()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.exception("таблица контрактов не прочитана для отчёта симуляции")
+            notes.append(f"Таблица контрактов не прочитана ({_plain(error)}): прогоны "
+                         f"искались по {instrument} и соседним контрактам цепочки.")
+            table = []
+        codes += [row.symbol for row in rows_of_asset(table, asset)]
+        return list(dict.fromkeys(codes))
+
     def load_history(self, request: HistoryLoadRequest) -> None:
         """Скачать историю с биржи и положить в базу. Ход и конец — сигналами.
 
@@ -2827,7 +2927,7 @@ class HistoryPort(TerminalPort):
             for task in (
                 self._point.task, self._growing, self._draw, self._task,
                 self._watch.retiring, self._back.options,
-                self._history.contract, self._halt.saving,
+                self._history.contract, self._halt.saving, self._history.paper,
                 # Загрузка — и та, что заводит уточнение контрактов при
                 # запуске (`sync_contracts`): снимок экрана без неё ловил
                 # окно до перехода на действующий контракт.
@@ -2871,7 +2971,7 @@ class HistoryPort(TerminalPort):
         for task in (
             self._point.task, self._growing, self._draw, self._task,
             self._back.options, self._history.facts, self._history.load,
-            self._history.contract,
+            self._history.contract, self._history.paper,
         ):
             if task is not None and not task.done():
                 task.cancel()
@@ -2884,6 +2984,7 @@ class HistoryPort(TerminalPort):
         self._history.facts = None
         self._history.load = None
         self._history.contract = None
+        self._history.paper = None
         # ⚠️ Запись остановки **дожидается**, а не снимается. Она и заведена
         # ради того, чтобы пережить закрытие программы (`D-043`); отменённая
         # на выходе, она теряла бы предохранитель ровно в тот момент, когда
@@ -2953,6 +3054,7 @@ class HistoryPort(TerminalPort):
             "retire": self._watch.retiring,
             "options": self._back.options,
             "facts": self._history.facts,
+            "paper": self._history.paper,
             "load": self._history.load,
             "contract": self._history.contract,
             "halt": self._halt.saving,
@@ -4013,8 +4115,10 @@ class HistoryPort(TerminalPort):
         Теперь у живого хода одна запись, и чистка её не тронет: происхождение
         `PAPER`, а `market/storage.py` убирает только прогоны по истории.
 
-        Итог дописывается **при закрытии хода** — выключили поток, сменили
-        настройку, закрыли программу. Обновлять его по дороге нельзя: колонка
+        Строки хода — решения, заявки и сделки — ложатся в базу в конце
+        каждого прохода (`app/paper_log.py`); итог дописывается **при
+        закрытии хода** — выключили поток, сменили настройку, закрыли
+        программу. Обновлять итог по дороге нельзя: колонка
         называется «чем прогон кончился», и промежуточное число в ней было бы
         неправдой ровно там, где человек ищет, что случилось. Ход, оборванный
         закрытием программы, остаётся без времени конца, то есть читается
@@ -4043,7 +4147,14 @@ class HistoryPort(TerminalPort):
             settings=frame.engine,
             say=self.note,
             costs=convert.run_costs(frame.values),
-            around=lambda: self._runs.around(record),
+            # Строки хода — решения, заявки, сделки — пишутся в ту же базу
+            # (`app/paper_log.py`): симуляцию после перезапуска иначе
+            # не открыть. Проход по истории (`_replay`) их не пишет.
+            recording=RunRecording(
+                around=lambda: self._runs.around(record),
+                store=self._worker,
+                symbol=symbol,
+            ),
         )
         return observer
 

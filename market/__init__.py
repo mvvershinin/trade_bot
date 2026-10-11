@@ -147,6 +147,16 @@ from market.journal import (
     TradeSide,
     redact,
 )
+from market.paper import (
+    DecisionPhase,
+    OrderKind,
+    OrderRecord,
+    PaperRows,
+    PaperRun,
+    PaperWritten,
+    RunRowsMark,
+    StoredOrder,
+)
 from market.paths import default_db_path, ensure_userdata_dir, userdata_dir
 from market.point import MARKETS_PROBED, PointValue, ask_point_value
 from market.reports import LoadReport
@@ -296,6 +306,14 @@ __all__ = [
     "JournalPage",
     "JournalStats",
     "PruneReport",
+    "DecisionPhase",
+    "OrderKind",
+    "OrderRecord",
+    "StoredOrder",
+    "RunRowsMark",
+    "PaperRows",
+    "PaperWritten",
+    "PaperRun",
     "BACKTEST_SESSIONS_KEPT",
     "SECRET_MASK",
     "redact",

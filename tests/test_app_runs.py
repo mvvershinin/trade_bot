@@ -204,29 +204,65 @@ def test_each_new_pass_makes_its_own_row(loop, database) -> None:
     assert any("Период средней: 15" in text for text in snapshots)
 
 
-def test_the_port_writes_no_decisions_and_no_trades_and_that_holds_the_limit(
+def test_a_pass_over_history_writes_no_rows_and_that_holds_the_limit(
     loop, database
 ) -> None:
-    """Стережёт опору под `RUNS_KEPT`: порт кладёт строку прогона и больше ничего.
+    """Стережёт опору под `RUNS_KEPT`: проход по истории кладёт строку прогона и всё.
 
     Двести прогонов помещаются в базу только потому, что прогон стоит около
-    двух килобайт. Начни порт писать журнал решений и сделок — та же двести
-    станет сотней мегабайт, и число обязано вернуться к порядку
-    `BACKTEST_SESSIONS_KEPT`. Тест падает ровно в тот день, когда это случится.
+    двух килобайт. Начни проход по истории писать решения, сделки, заявки или
+    отметку о строках — те же двести станут сотней мегабайт, и число обязано
+    вернуться к порядку `BACKTEST_SESSIONS_KEPT`. Тест падает ровно в тот
+    день, когда это случится. Строки пишет только живой ход симуляции —
+    его стережёт соседний тест.
     """
     _passes(loop, database, Settings())
 
     with CandleStore(database) as store:
         stats = store.journal_stats()
     assert stats.sessions == 1
-    assert stats.decisions == 0 and stats.trades == 0, (
-        "порт начал писать строки журналов — пересмотрите RUNS_KEPT: "
-        f"{RUNS_KEPT} прогонов со строками это уже не мегабайты"
+    rows = (stats.decisions, stats.trades, stats.orders, stats.run_rows)
+    assert rows == (0, 0, 0, 0), (
+        "проход по истории начал писать строки (решения, сделки, заявки, "
+        f"отметки: {rows}) — пересмотрите RUNS_KEPT: {RUNS_KEPT} прогонов "
+        "со строками это уже не мегабайты"
     )
     assert RUNS_KEPT > BACKTEST_SESSIONS_KEPT, (
         "своё число хранения потеряло смысл: оно и заведено ради того, "
         "что строка прогона здесь дешевле полного прогона"
     )
+
+
+def test_a_live_simulation_writes_its_rows(loop, database) -> None:
+    """Стережёт: живой ход симуляции пишет свои строки — решения и отметку.
+
+    Пара к тесту выше. Без неё сторож «проход по истории строк не пишет»
+    зеленел бы и тогда, когда строки не пишет никто, — то есть ровно в том
+    состоянии, из которого задача выводила владельца счёта: сделку
+    симуляции после перезапуска не открыть.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        port.attach_stream(lambda on: None)  # подключение «удалось»
+        try:
+            port.stream(True)
+            await port.wait()
+            port.refresh("закрылся бар")
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+    with CandleStore(database) as store:
+        stats = store.journal_stats()
+        paper = store.paper_runs([SYMBOL])
+    assert len(paper) == 1, "живой ход не записан прогоном симуляции"
+    assert paper[0].mark is not None, "строки живого хода не записаны: отметки нет"
+    assert stats.decisions > 0, "решения живого хода не легли в базу"
 
 
 # ------------------------------------------------------------ полнота полей
