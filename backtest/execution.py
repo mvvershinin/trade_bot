@@ -697,6 +697,14 @@ class ExecutionModel:
         #: Разбор этой ошибки — в миниплане `B-046`, раздел 7.
         self._previous_close: float | None = None
         self._current: tuple[datetime, float] | None = None
+        #: Начала незакрытых свечей, показанных после последнего закрытого
+        #: интервала (решение 0065), и признак «прошлый интервал показан только
+        #: незакрытым»: тогда закрытие прошлого бара неизвестно, и сторож
+        #: разрыва судить не может (`_gapped`). Набор, а не одно последнее
+        #: время: незакрытая T+1, показанная до закрытой T+1, затёрла бы
+        #: память о незакрытой T, чья закрытая так и не пришла (`_remember`).
+        self._partials: set[datetime] = set()
+        self._blind = False
         #: Минутки, отсортированные по времени, и их времена для поиска
         #: по интервалу бара. Пусто — внутрибарные события по размаху бара,
         #: ровно как до минуток.
@@ -781,7 +789,20 @@ class ExecutionModel:
         до минуток. Выбор — по наличию минуток **под этим баром**, а не по
         тому, что вернул обход: исчерпанный обход, свалившийся в размах бара,
         проверил бы сдвинутый уровень по накопленному размаху.
+
+        **Незакрытая свеча** (`unsettled`, решение 0065) — только исполнения
+        по открытию: её `open` уже известен и закрытым баром не изменится.
+        Ни закрытие прошлого интервала (`_remember`), ни обход минуток, ни
+        сторожа уровней по ней не трогаются: размах огрызка неполон, а время
+        закрытия лежит в будущем. Всё это делает закрытая свеча того же
+        интервала, и сделки выходят те же, что без незакрытых показов
+        (`tests/test_forming_bar_equivalence.py`).
         """
+        if getattr(candle, "unsettled", False):
+            self._partials.add(candle.time)
+            opened = self._market_fills(candle)
+            self.fills.extend(opened)
+            return opened
         self._remember(candle)
         fills = self._market_fills(candle)
         if not fills:
@@ -876,10 +897,31 @@ class ExecutionModel:
 
         Свеча из прошлого (источник отдал ряд не по порядку) прошлым баром
         тоже не становится — она уже позади.
+
+        ⚠️ **Прошлый интервал показан только незакрытым** (решение 0065):
+        живой ход исполнил заявку по открытию частичной T, а закрытая T так
+        и не пришла — порт выбросил её как неполную (`HistoryPort._trusted`).
+        Закрытие T неизвестно, а закрытие T-1 прошлым не является: уровень
+        от `T.open` им не судится. Прошлое тогда пусто, и сторож разрыва
+        считает уровень вне размаха разрывом, а не дефектом (`_blind`).
+
+        Признак — «между прошлым закрытым интервалом и этим показан хоть один
+        незакрытый», а не «последний показ раньше этого». Конец T порт
+        замечает на первой минуте T+1 и тем же проходом показывает T+1
+        незакрытой: по последнему показу закрытая T+1 судилась бы
+        по закрытию T-1. Показы до этого интервала включительно здесь же
+        и забываются: дальше они ничего не решают.
         """
         now = candle.close
         if self._current is None or candle.time > self._current[0]:
-            self._previous_close = None if self._current is None else self._current[1]
+            after = None if self._current is None else self._current[0]
+            self._blind = any(
+                (after is None or after < shown) and shown < candle.time
+                for shown in self._partials
+            )
+            self._partials = {shown for shown in self._partials if shown > candle.time}
+            known = None if self._current is None else self._current[1]
+            self._previous_close = None if self._blind else known
         elif candle.time < self._current[0]:
             return
         self._current = (candle.time, now)
@@ -1180,10 +1222,19 @@ class ExecutionModel:
         Общая часть сторожа `_reachable` для уровня тейка и предела заявки
         на выход; что считать разрывом, решает вызывающий.
 
+        ⚠️ Прошлое пусто, потому что прошлый интервал показан только
+        незакрытым (`_blind`, решение 0065), — уровень вне размаха считается
+        разрывом без проверки: закрытие прошлого бара неизвестно, и судить
+        по закрытию позапрошлого значило бы остановить робота «ошибкой
+        исполнителя» на цене, которая была. Разрыв идёт в `LevelGaps`,
+        то есть виден в допущениях прогона, а не проглочен.
+
         :raises AssertionError: уровень вне размаха, и разрыва не было.
         """
-        if candle.low <= level <= candle.high or previous is None:
+        if candle.low <= level <= candle.high:
             return False
+        if previous is None:
+            return self._blind
         opened = candle.open
         gap = (
             previous < level < opened

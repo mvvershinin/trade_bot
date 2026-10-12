@@ -56,13 +56,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from app import convert
+from app import convert, debug_feed
 from app.paper_log import PaperLog, PaperSource
 from backtest import (
     BREATHE_EVERY,
@@ -150,6 +151,13 @@ class Seam:
     `gaps` — пропуски в живой части ленты: между соседними барами больше
     одного таймфрейма. Различить «сделок не было» и «связи не было» по самому
     ряду нельзя, поэтому строка журнала называет обе причины.
+
+    `reopened` — закрытые бары, чьё открытие разошлось с открытием их же
+    незакрытого показа (решение 0065): начало бара, открытие показа,
+    открытие закрытого. Заявка, исполненная по открытию показа, исполнена
+    по цене, которой у закрытого бара нет (минутку начала переписала
+    догрузка, `D-149`). Говорит об этом наблюдатель — он знает, было ли
+    исполнение (`LiveObserver._say_seam`).
     """
 
     taken: int = 0
@@ -157,11 +165,12 @@ class Seam:
     late: tuple[datetime, ...] = ()
     changed: tuple[datetime, ...] = ()
     gaps: tuple[tuple[datetime, datetime], ...] = ()
+    reopened: tuple[tuple[datetime, float, float], ...] = ()
 
     @property
     def quiet(self) -> bool:
         """Ничего, о чём стоит говорить, не случилось."""
-        return not (self.late or self.changed or self.gaps)
+        return not (self.late or self.changed or self.gaps or self.reopened)
 
 
 def _mark(candle: MarketCandle) -> tuple[float, int]:
@@ -196,10 +205,14 @@ class LiveSource:
     сюда весь отрезок целиком, то есть повторяются сотни баров подряд. Второй
     из них ушёл бы движку как ход назад.
 
-    Незакрытые бары в ленту не берутся (решение 0033). Контракт это разрешает
-    («отдавать может»), а живому ходу это даёт то же поведение, что и прогону
-    по истории: тейк срабатывает на закрытии бара, в котором цена задела
-    уровень, а не по незакрытому бару с временем закрытия в будущем.
+    Незакрытые бары в ленту не берутся (решение 0033). Незакрытый бар,
+    собранный портом без дыр (`forming`), ждёт отдельно и показывается движку
+    **после** ленты, без счёта бара (решение 0065): по его открытию
+    исполняется заявка, поданная на прошлом закрытии, — и только это.
+    Тейк по-прежнему срабатывает на закрытии бара: исполнитель по незакрытой
+    свече уровни не судит (`ExecutionModel.fills_at`). После показа
+    незакрытой T закрытый бар раньше T в ленту не берётся — он позади
+    исполнителя, и называется он вслух (`Seam.late`).
 
     :param breathe_every: через сколько отданных баров лента возвращает
         управление циклу событий. Прогрев — это тысячи баров подряд в одной
@@ -221,18 +234,30 @@ class LiveSource:
         #: Сколько баров прошло через ленту всего. Нужен прогреву: он считает
         #: бары, чтобы сказать, хватило ли их средней.
         self.delivered = 0
+        #: Незакрытый бар, который ждёт показа движку после ленты (`take_forming`).
+        self._forming: MarketCandle | None = None
+        #: Начало и открытие последнего показанного незакрытого бара: забор
+        #: для закрытых баров раньше него и сверка открытия (`Seam.reopened`).
+        self._opened: tuple[datetime, float] | None = None
 
     @property
     def last(self) -> datetime | None:
         """Начало последнего бара, взятого в ленту. `None` — не было ни одного."""
         return self._last
 
-    def offer(self, candles: Sequence[MarketCandle]) -> Seam:
+    def offer(
+        self, candles: Sequence[MarketCandle], forming: MarketCandle | None = None
+    ) -> Seam:
         """Предложить ленте отрезок ряда. Взято будет только новое.
 
         Отрезок приходит **целиком**, а не приростом: порт читает базу за весь
         период на каждом проходе, и просить его помнить, что он уже отдавал,
         значило бы завести вторую память о том же — расходящуюся молча.
+
+        `forming` — незакрытый бар, собранный портом без дыр (решение 0065).
+        Он ждёт показа после ленты (`take_forming`), если он позже всего
+        взятого; иначе он устарел и молча отбрасывается — его интервал уже
+        закрыт и взят.
 
         :return: что взято и о чём надо сказать в журнал.
         """
@@ -240,6 +265,7 @@ class LiveSource:
         repeated = 0
         late: list[datetime] = []
         changed: list[datetime] = []
+        reopened: list[tuple[datetime, float, float]] = []
         for candle in candles:
             if candle.unsettled:
                 continue
@@ -257,18 +283,47 @@ class LiveSource:
                 else:
                     repeated += 1
                 continue
+            shown = self._opened
+            if shown is not None and moment < shown[0]:
+                # Забор: незакрытый бар позже этого уже показан, и исполнитель
+                # исполнил по его открытию. Этот бар — ход назад.
+                late.append(moment)
+                continue
+            if shown is not None and moment == shown[0] and candle.open != shown[1]:
+                reopened.append((moment, shown[1], candle.open))
             taken.append(candle)
             self._last = moment
             self._remember(moment, candle)
         gaps = self._gaps(taken)
         self._buffer.extend(taken)
+        self._forming = self._fresh(forming)
         return Seam(
             taken=len(taken),
             repeated=repeated,
             late=tuple(late),
             changed=tuple(changed),
             gaps=gaps,
+            reopened=tuple(reopened),
         )
+
+    def _fresh(self, forming: MarketCandle | None) -> MarketCandle | None:
+        """Незакрытый бар, если он позже всего взятого и всего показанного."""
+        if forming is None or not forming.unsettled:
+            return None
+        moment = in_moscow(forming.time)
+        if self._last is not None and moment <= self._last:
+            return None
+        if self._opened is not None and moment < self._opened[0]:
+            return None
+        if self._opened is None or moment > self._opened[0]:
+            # Открытие запоминается по первому показу: по нему и исполнено.
+            self._opened = (moment, forming.open)
+        return forming
+
+    def take_forming(self) -> MarketCandle | None:
+        """Забрать незакрытый бар для показа движку. Второй вызов — `None`."""
+        forming, self._forming = self._forming, None
+        return forming
 
     @property
     def pending(self) -> int:
@@ -415,6 +470,13 @@ class _Tally:
     #: Сколько заявок и касаний исполнителя уже переложено в `orders`.
     seen_orders: int = 0
     seen_levels: int = 0
+    #: Курсор ленты «Отладка» (`LiveObserver._tell`): сколько исполнений,
+    #: закрытых сделок и строк журнала движка уже показано. Один на оба
+    #: пути — незакрытый показ и закрытый бар. В базу они идут своим путём
+    #: (`PaperSource`), здесь — только курсор ленты.
+    seen_fills: int = 0
+    seen_deals: int = 0
+    seen_words: int = 0
     #: Объём заявки по её имени: касанию уровня объём берётся у вооружения.
     volumes: dict[str, float] = field(default_factory=dict)
     #: Кончился ли пересчёт: проход, давший движку хоть один бар, дошёл
@@ -516,6 +578,9 @@ class LiveObserver:
         recording = self._recording
         if recording is None or self._record is not None or self._stopped:
             return
+        debug_feed.tell(
+            debug_feed.SOURCE_ENGINE, "живой ход движка начат: прогрев и пересчёт — по базе"
+        )
         self._record = recording.around()
         self._entry = await self._record.__aenter__()
         session_id = getattr(self._entry, "id", None)
@@ -532,8 +597,14 @@ class LiveObserver:
                 self._say,
             )
 
-    async def feed(self, candles: Sequence[MarketCandle]) -> HistoryRun:
+    async def feed(
+        self, candles: Sequence[MarketCandle], forming: MarketCandle | None = None
+    ) -> HistoryRun:
         """Показать ленте отрезок ряда и разобрать его движком до конца.
+
+        `forming` — незакрытый бар, собранный портом без дыр (решение 0065):
+        показывается движку после ленты, и по его открытию исполняется
+        заявка, поданная на прошлом закрытии (`_show_forming`).
 
         Возврат — снимок хода, в который **уже вошёл** последний бар отрезка.
         Иначе окно рисовало бы бар, по которому решение ещё не принято, и метка
@@ -558,15 +629,24 @@ class LiveObserver:
         (отмена) пересчёт не кончает: его недобранный остаток разберёт
         следующий проход, и это всё ещё история, а не живые бары.
         """
-        seam = self._source.offer(candles)
+        seam = self._source.offer(candles, forming)
         self._say_seam(seam)
+        recounting, started = not self._tally.recounted, time.monotonic()
         if not self._stopped and not self._failure:
             await self._ride()
             self._tally.recounted = self._tally.recounted or self._tally.bars > 0
         self._say_warmup()
         if self._log is not None:
             await self._log.flush(self._bounds())
-        return self.run
+        run = self.run
+        if recounting and self._tally.recounted:
+            # Пересчёт в ленте — одна строка итога, а не строка на каждый
+            # из тысяч баров: бары пересчёта в ленте молчат (`_walk`).
+            debug_feed.recount_done(
+                run, self._tally.first, self._tally.last_close,
+                self._executor.submitted, time.monotonic() - started,
+            )
+        return run
 
     async def aclose(self) -> None:
         """Прекратить ход и дописать итог в журнал прогонов.
@@ -587,6 +667,7 @@ class LiveObserver:
         record, self._record = self._record, None
         if record is None:
             return
+        debug_feed.run_closed(self.run)
         log_, self._log = self._log, None
         lost = "" if log_ is None else await log_.close(self._bounds())
         if self._entry is not None:
@@ -629,12 +710,25 @@ class LiveObserver:
             limit_exits=replace(self._executor.limits, unfilled=sum(
                 1 for order in self._executor.pending if order.limit_price is not None
             )),
+            # Заявки, ждущие открытия бара: по ним окно рисует «ждёт», а не ⊗
+            # (решение 0065). Забытое здесь поле молча даёт `()`.
+            waiting=tuple(order.order_id for order in self._executor.pending),
         )
 
     @property
     def submitted(self) -> int:
         """Сколько заявок подано исполнителю. К брокеру не ушла ни одна."""
         return self._executor.submitted
+
+    @property
+    def awaits_open(self) -> bool:
+        """Заявка ждёт открытия бара, и ход её исполнит, — нужен проход.
+
+        По нему порт ставит один проход на первой минуте бара (решение 0065).
+        Ход остановлен, закрыт или упал — ждать нечего: заявка не исполнится.
+        """
+        stopped = self._stopped or self._failure or self._engine.halted
+        return not stopped and bool(self._executor.pending)
 
     # ---------------------------------------------------------- внутреннее
 
@@ -649,10 +743,13 @@ class LiveObserver:
         """
         try:
             await self._walk()
+            await self._show_forming()
         except asyncio.CancelledError:
             raise
         except Exception as error:  # трассировка уходит в технический лог
-            log.exception("живой ход движка прекращён ошибкой программы")
+            # Мимо ленты: в ней эта беда стоит строкой журнала ниже (`_say`).
+            log.exception("живой ход движка прекращён ошибкой программы",
+                          extra={"panel": False})
             self._failure = (
                 f"Живой ход движка прекращён: {type(error).__name__}: {error}. "
                 "Решения по новым свечам больше не принимаются. Подробность — "
@@ -696,7 +793,8 @@ class LiveObserver:
                 average = None if value is None or outcome.skipped else float(value)
                 if average is not None:
                     self._tally.average.append((close_time(candle), average))
-                self._note_orders(candle, average, phase)
+                records = self._note_orders(candle, average, phase)
+                self._tell(phase, records, debug_feed.BarSeen(candle, outcome, average, phase))
                 self._tally.last_close = close_time(candle)
                 if self._engine.halted:
                     return
@@ -708,6 +806,26 @@ class LiveObserver:
             # destroyed but it is pending» при завершении, в прогоне тестов —
             # чужая обвязка, падающая на разборке нашей.
             await stream.aclose()
+
+    async def _show_forming(self) -> None:
+        """Показать движку незакрытый бар — после ленты и без счёта бара.
+
+        Решение 0065: заявка, поданная на прошлом закрытии, исполняется
+        по открытию этого бара сейчас, а не на его закрытии. Движок по такой
+        свече ничего не решает (`engine/bars.py`), исполнитель судит по ней
+        только открытие (`ExecutionModel.fills_at`). Поэтому ни счёта бара,
+        ни точки средней, ни строк заявок с огрызком закрытия здесь нет:
+        вооружение, рождённое сделкой, уходит в строки на закрытии этого бара
+        (`_note_orders`) — с его закрытием и средней, как без показа.
+
+        Исполнение и слова движка о нём уходят в ленту «Отладка» здесь же,
+        а не на закрытии: в ленте сделка стоит тогда, когда случилась.
+        """
+        forming = self._source.take_forming()
+        if forming is None or self._stopped or self._engine.halted:
+            return
+        await self._engine.on_market_candle(forming, self._executor)
+        self._tell(self._phase())
 
     def _phase(self) -> DecisionPhase:
         """Фаза бара, который сейчас разбирается, — по тому, как он пришёл.
@@ -745,7 +863,7 @@ class LiveObserver:
 
     def _note_orders(
         self, candle: MarketCandle, average: float | None, phase: DecisionPhase
-    ) -> None:
+    ) -> list[OrderRecord]:
         """Заявки и касания уровней этого бара — в строки для базы, с фазой бара.
 
         Порядок — порядок событий бара: заявка, рождённая исполнением
@@ -753,6 +871,8 @@ class LiveObserver:
         решений на закрытии. Время у касания и у решений одно — закрытие
         бара, — и при равенстве касание идёт первым: уровень задет внутри
         бара, решение принято после.
+
+        :return: новые строки — их же показывает лента (`_tell`).
         """
         executor, tally = self._executor, self._tally
         fresh: list[tuple[datetime, int, OrderRecord]] = []
@@ -769,12 +889,41 @@ class LiveObserver:
         tally.seen_orders = len(executor.orders)
         tally.seen_levels = len(executor.level_plans)
         fresh.sort(key=lambda item: (item[0], item[1]))
-        tally.orders.extend(record for _, _, record in fresh)
+        records = [record for _, _, record in fresh]
+        tally.orders.extend(records)
+        return records
+
+    def _tell(
+        self,
+        phase: DecisionPhase,
+        records: Sequence[OrderRecord] = (),
+        bar: debug_feed.BarSeen | None = None,
+    ) -> None:
+        """Всё, что случилось с прошлой строки ленты, — в ленту «Отладка».
+
+        Одна процедура на оба места, где у исполнителя появляются сделки:
+        незакрытый показ (`_show_forming`) и закрытый бар (`_walk`). Курсор
+        тоже один (`_Tally.seen_fills`): исполнение по первой минуте бара
+        уходит в ленту сразу, а на закрытии уже не повторяется. Строки
+        журнала движка идут тем же курсором: слова о сделке, сказанные
+        на показе, иначе не дошли бы до ленты ни разу. Порядок строк —
+        порядок событий (`debug_feed.happened`).
+
+        Курсор двигается и в пересчёте: иначе первый живой бар вывалил бы
+        в ленту все исполнения истории разом.
+        """
+        executor, tally = self._executor, self._tally
+        fills, deals = executor.fills[tally.seen_fills:], executor.deals[tally.seen_deals:]
+        words = tally.journal[tally.seen_words:]
+        tally.seen_fills, tally.seen_deals = len(executor.fills), len(executor.deals)
+        tally.seen_words = len(tally.journal)
+        if phase is not DecisionPhase.RECOUNT:
+            debug_feed.happened(fills=fills, deals=deals, words=words, records=records, bar=bar)
 
     # ------------------------------------------------------------- рассказ
 
     def _say_seam(self, seam: Seam) -> None:
-        """Три события стыка — в журнал. Молчаливой потери свечи не бывает."""
+        """События стыка — в журнал. Молчаливой потери свечи не бывает."""
         if seam.late:
             self._say(
                 "Свеча пришла поздно",
@@ -800,6 +949,20 @@ class LiveObserver:
                 f"Между {_moment(after)} и {_moment(before)} баров нет. "
                 "Либо в это время не было сделок, либо не было связи — "
                 "по самому ряду это неразличимо. Средняя посчитана без них.",
+                DecisionLevel.WARNING,
+            )
+        for moment, shown, closed in seam.reopened:
+            # Говорить есть о чём, только если по открытию показа исполнено:
+            # закрытый бар ещё не разобран, значит сделка с его временем —
+            # сделка по открытию незакрытого показа (решение 0065).
+            if not any(fill.at == moment for fill in self._executor.fills):
+                continue
+            self._say(
+                "Открытие свечи изменилось после сделки",
+                f"Бар {_moment(moment)}: заявка исполнена по открытию {shown:g} "
+                f"по первой записанной минуте, а у закрытого бара открытие "
+                f"{closed:g} — минуту начала переписали позже (догрузка). "
+                "Расчётная цена сделки осталась прежней и переигрываться не будет.",
                 DecisionLevel.WARNING,
             )
 

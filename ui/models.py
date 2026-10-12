@@ -149,6 +149,11 @@ class MarkerKind(enum.Enum):
     `UNPLANNED` — сделка, которой алгоритм не предполагал (DOMAIN.md §8, последняя
     строка таблицы). Окно обязано делать её заметной, а не растворять среди прочих;
     решение «это она» принимает не окно.
+
+    `WAITING` — расчёт есть, заявка подана и исполнится по открытию следующей
+    свечи. Отдельно от `MISSED` по просьбе владельца счёта 12.10.2026: ⊗ на
+    поданной заявке читается как «заявки не было». Выбирает вид тоже не окно,
+    а `app/convert.py::_plan_kind`.
     """
 
     ENTRY_LONG = "entry_long"
@@ -157,6 +162,7 @@ class MarkerKind(enum.Enum):
     REVERSAL = "reversal"
     UNPLANNED = "unplanned"
     MISSED = "missed"
+    WAITING = "waiting"
 
     @property
     def label(self) -> str:
@@ -167,6 +173,7 @@ class MarkerKind(enum.Enum):
             MarkerKind.REVERSAL: "Переворот",
             MarkerKind.UNPLANNED: "Сделка вне расчёта",
             MarkerKind.MISSED: "Сигнал пропущен",
+            MarkerKind.WAITING: "Заявка подана",
         }[self]
 
 
@@ -903,6 +910,40 @@ class DecisionRow:
     reason: str
     level: DecisionLevel = DecisionLevel.INFO
     origin: RunOrigin | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DebugLine:
+    """Строка ленты «Отладка»: что программа делала, по времени МСК.
+
+    `seq` — сквозной номер строки в ленте: по нему окно забирает только новое
+    и видит, сколько строк вытеснено, пока панель была свёрнута. `source` —
+    откуда строка: «поток», «движок», «заявки» — или имя логгера техлога.
+    `text` приходит уже очищенным от секретов (`app/debug_feed.py`).
+    """
+
+    seq: int
+    time: datetime
+    level: DecisionLevel
+    source: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class DebugBatch:
+    """Порция ленты для окна: новые строки и два счёта.
+
+    `evicted` — строк после последней прочитанной, которые буфер вытеснил
+    непрочитанными: окно ставит на этом месте отметку. `lost` — строк,
+    которые не удалось собрать из-за ошибки, с начала работы: число
+    показывается в шапке панели, а не глотается. `cause` — причина первой
+    такой потери, уже очищенная: шапка показывает её рядом с числом.
+    """
+
+    lines: tuple[DebugLine, ...] = ()
+    evicted: int = 0
+    lost: int = 0
+    cause: str = ""
 
 
 # --------------------------------------------------------------------------

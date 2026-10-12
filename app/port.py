@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
-from app import contract_view, convert, paper_report, stitched_view
+from app import contract_view, convert, debug_feed, paper_report, stitched_view
 from app.minutes import minute_plan, minutes_under
 from app.observe import LiveObserver, RunRecording
 from app.runs import ProgramFields, RunConditions, RunLog, result_note, settings_text
@@ -567,11 +567,12 @@ class _Edge:
 
 @dataclass(slots=True)
 class _Watch:
-    """Живой ход движка в порту: четыре поля, которые живут и гаснут вместе.
+    """Живой ход движка в порту: поля, которые живут и гаснут вместе.
 
     Значение, а не россыпь в `__init__`, по двум причинам сразу. Первая —
-    они действительно одна вещь: наблюдение либо идёт, либо нет, и все четыре
-    меняются в двух местах (`_observe`, `_retire`). Вторая названа замером
+    они действительно одна вещь: наблюдение либо идёт, либо нет, и первые
+    четыре меняются в двух местах (`_observe`, `_retire`); `forming`
+    и `opened` — у прохода на первой минуте бара (решение 0065). Вторая названа замером
     `tests/test_function_size.py`: поля с объяснениями раздували `__init__`
     порта за предел длины, а объяснение полей — не то, ради чего читают
     сборку объекта.
@@ -595,6 +596,11 @@ class _Watch:
     observer: LiveObserver | None = None
     key: tuple[object, ...] | None = None
     retiring: asyncio.Task[None] | None = None
+    #: Незакрытый бар этого прохода, собранный без дыр (`_forming_of`),
+    #: и начало бара, на первой минуте которого проход уже просили
+    #: (`_first_minute`). Решение 0065: исполнение по первой минуте бара.
+    forming: MarketCandle | None = None
+    opened: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2317,7 +2323,9 @@ class HistoryPort(TerminalPort):
             self._monthly_found(symbol, error)
             return
         except Exception as error:  # нет связи — работа идёт как раньше
-            log.exception("таблица контрактов не уточнена у биржи (%s)", why)
+            log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                "таблица контрактов не уточнена у биржи (%s)", why, extra={"panel": False}
+            )
             text = (
                 f"{_plain(error)}. Программа работает по таблице, что уже есть "
                 "в базе: истёк ли контракт из настроек, она может не знать. "
@@ -2376,7 +2384,9 @@ class HistoryPort(TerminalPort):
         try:
             return self._switch_to_current(symbol, notice, rows)
         except Exception as error:  # окно не должно встать из-за перехода
-            log.exception("переход на действующий контракт не удался")
+            log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                "переход на действующий контракт не удался", extra={"panel": False}
+            )
             # Строка — по факту, а не по намерению: исключение могло
             # случиться и после того, как инструмент уже сменён.
             now_on = self._values.instrument.strip()
@@ -2756,6 +2766,8 @@ class HistoryPort(TerminalPort):
         )
         self._notes.append(row)
         self._send(self.decision_appended, row)
+        # Единственный выход строк журнала программы в ленту «Отладка».
+        debug_feed.note(event, reason, level)
 
     def refresh(self, why: str = "") -> None:
         """Поставить прогон в очередь цикла событий. Возврат — немедленный."""
@@ -2834,7 +2846,9 @@ class HistoryPort(TerminalPort):
 
         * бар ещё набирается — только рисунок: `candle_appended` на новый бар,
           `candle_updated` на растущий текущий. Прогон не нужен, потому что
-          решать не на чем;
+          решать не на чем. Исключение одно (решение 0065): первая минута
+          бара, когда живой ход ждёт его открытия, — один проход на бар,
+          и заявка исполняется по открытию сейчас (`_first_minute`);
         * бар закрылся — **прогон, как прежде**, со всеми метками, средней,
           уровнями и затенением. Он больше не сбрасывает масштаб: `show_chart`
           на обеих поверхностях сохраняет вид, когда инструмент и размер свечи
@@ -3234,6 +3248,7 @@ class HistoryPort(TerminalPort):
             # `_ask_point_value`.
             self._ask_point_value(symbol)
             candles, stitch = await self._series(frame, symbol, timeframe)
+            debug_feed.bars_read(symbol, frame.values.timeframe, candles)
             # Чтение базы долей сделанного не отчитывается: это один запрос
             # в поток данных. Отметка здесь делит проход надвое, и молчанием
             # считается каждая половина отдельно, а не проход целиком.
@@ -3270,7 +3285,11 @@ class HistoryPort(TerminalPort):
             # технического лога у программы пока нет (он ставится вместе
             # с чисткой токена, `ROADMAP.md` §9.1): трассировка уходит
             # в стандартный вывод ошибок, и обещать файл нельзя.
-            log.exception("прогон по истории не удался (%s)", why or "старт")
+            # Мимо ленты «Отладка»: отказ стоит в ней строкой журнала `_refuse`,
+            # и второй строкой, красной, тот же отказ читался бы как два.
+            log.exception(
+                "прогон по истории не удался (%s)", why or "старт", extra={"panel": False}
+            )
             self._refuse(
                 "Прогон не удался",
                 f"Не удалось построить прогон по истории: {_plain(error)}. "
@@ -3678,7 +3697,9 @@ class HistoryPort(TerminalPort):
             self._watch.observer = self._watcher(frame, symbol, candles)
             self._watch.key = key
             await self._watch.observer.start()
-        run = await self._watch.observer.feed(candles)
+        # Незакрытый бар, собранный без дыр, — тем же проходом (решение 0065):
+        # заявка, поданная на прошлом закрытии, исполняется по его открытию.
+        run = await self._watch.observer.feed(candles, self._watch.forming)
         # Остановка снимается с хода **до** того, как ход будет закрыт.
         # Забрать её позже неоткуда: закрытый наблюдатель уносит `halted`
         # с собой, и следующий проход увидит чистого движка.
@@ -3766,7 +3787,9 @@ class HistoryPort(TerminalPort):
             except Exception as error:
                 # Тип отказа базы человеку не говорит ничего, а фраза говорит:
                 # разбор по типам ушёл бы в технический лог и остался там.
-                log.exception("остановка робота не записана в базу")
+                log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                    "остановка робота не записана в базу", extra={"panel": False}
+                )
                 self.note(
                     "Остановка робота и база",
                     f"{write.trouble} Причина отказа базы: {error}",
@@ -4452,6 +4475,9 @@ class HistoryPort(TerminalPort):
             if edge is not None:
                 self._edge = dataclasses.replace(edge, forming=None)
             self.refresh(f"живая свеча: закрылся бар {symbol}")
+            # После `refresh`, а не до: строка ленты не стоит между отметкой
+            # закрытого бара и пересчётом по нему (`app/debug_feed.py`).
+            debug_feed.bar_due(symbol, frame.values.timeframe, closed)
             return
 
         if edge is None or (edge.instrument, edge.timeframe) != (symbol, frame.values.timeframe):
@@ -4460,6 +4486,25 @@ class HistoryPort(TerminalPort):
             return
 
         self._put_on_edge(frame, symbol, bars[-1])
+        # После рисунка, а не до: проход вернёт набирающийся бар на график
+        # с края (`_keep_forming`), и края без него не должно быть.
+        self._first_minute(symbol, bars[-1])
+
+    def _first_minute(self, symbol: str, bar: MarketCandle) -> None:
+        """Первая записанная минута бара при ждущей заявке — один проход на бар.
+
+        Решение 0065: заявка, поданная на закрытии прошлого бара, исполняется
+        по открытию этого, и владелец счёта видит сделку сейчас, а не через
+        пять минут. Проход один на бар: следующие минуты того же бара прогон
+        не гоняют (`B-009`), заявки ждать нечего — ход ничего не ждёт.
+        """
+        observer = self._watch.observer
+        if not bar.unsettled or observer is None or not observer.awaits_open:
+            return
+        if self._watch.opened is not None and bar.time <= self._watch.opened:
+            return
+        self._watch.opened = bar.time
+        self.refresh(f"живая свеча: открылся бар {symbol}, заявка ждёт исполнения")
 
     async def _draw_growing(self, symbol: str, minute: MarketCandle) -> None:
         """Одна растущая минута: собрать её бар и положить на правый край.
@@ -4644,6 +4689,7 @@ class HistoryPort(TerminalPort):
         settled = [candle for candle in candles if not candle.unsettled]
         if settled:
             self._settled_seen = settled[-1].close_time
+        self._watch.forming = self._forming_of(candles, known_until, timeframe)
         trusted = self._trusted(symbol, candles, timeframe)
         if not trusted:
             self._empty(
@@ -4653,6 +4699,26 @@ class HistoryPort(TerminalPort):
                 f"{timeframe.name} за выбранный период.",
             )
         return trusted
+
+    def _forming_of(
+        self, candles: list[MarketCandle], known_until: datetime, timeframe: Timeframe
+    ) -> MarketCandle | None:
+        """Незакрытый бар для живого хода — или `None` (решение 0065).
+
+        Только когда проход пойдёт живым ходом (наблюдение просили, отрезок
+        не закреплён, робот не остановлен) и только бар **без дыр**: минуток
+        в нём столько, сколько минут интервала прошло (`known_until`). Бар,
+        у которого первая минута потеряна, открыт чужой ценой — заявка по ней
+        не исполняется, она ждёт следующего бара, как и прежде (то же правило
+        сомнительных, что у `_trusted`).
+        """
+        if not self._watch.observing or self._back.span is not None or self._halt.reason:
+            return None
+        if not candles or not candles[-1].unsettled:
+            return None
+        bar = candles[-1]
+        passed = min((known_until - bar.time) // timedelta(minutes=1), timeframe.minutes)
+        return bar if bar.filled_minutes == passed else None
 
     def _trusted(
         self, symbol: str, candles: list[MarketCandle], timeframe: Timeframe
@@ -4684,9 +4750,16 @@ class HistoryPort(TerminalPort):
         Чего правило не закрывает: дыры прошлых сеансов — после перезапуска
         вчерашняя дыра лежит до `_Trust.end` и выглядит как «сделок не было»;
         лечит только догрузка (миниплан Э1-5, §4.6).
+
+        ⚠️ Незакрытый бар, который живой ход покажет движку (`_Watch.forming`,
+        решение 0065), в счёт строки не входит: рядом с ней встала бы сделка
+        по открытию того же бара, и «такой бар не участвует» прочлось бы
+        как «заявки не было». Решений по нему робот и правда не принимает —
+        только исполняет ждущую заявку, и об этом говорит строка сделки.
         """
         settled = [candle for candle in candles if not candle.unsettled]
-        dropped = len(candles) - len(settled)
+        fed = 0 if self._watch.forming is None else 1
+        dropped = len(candles) - len(settled) - fed
         if dropped:
             self.note(
                 "Незакрытые свечи не в прогоне",
@@ -4868,6 +4941,7 @@ class HistoryPort(TerminalPort):
             pairs(run, ruble_per_point=frame.engine.ruble_per_point),
             reversal_entries(run.deals),
             timeframe,
+            pending=_pending_of(pinned=self._back.span is not None, halted=self.halted),
         )
         before = self._edge
         context = self._context
@@ -5137,6 +5211,32 @@ def _restored_halt_words(standing: Sequence[StoredHalt]) -> str:
             "работу…» на панели сверху: сначала самая ранняя, потом следующая."
         )
     return f"{head}\n{listed}\n{tail}"
+
+
+def _pending_of(*, pinned: bool, halted: str) -> convert.Unfilled:
+    """Что будет с заявками из `run.waiting` по сведениям порта — одна причина.
+
+    Движок этого не знает, а порт знает: прогон идёт по закреплённому
+    отрезку, или робот остановлен причиной не из движка. Остановку **движка**
+    (`run.halted`) проверяет `convert.markers_and_paths`, и она главнее.
+
+    Цепочка «условие → ответ», порядок — данные, первая подошедшая главнее:
+
+    1. закреплённый отрезок тестера (`_back.span`, решение 0050) — прогон
+       кончился на его границе, следующая свеча в прогон не войдёт, даже
+       если она есть в базе. Раньше остановки порта: показан прогон тестера,
+       а не живой ход, и его заявке помешала граница отрезка, а не то,
+       что остановлен живой робот;
+    2. робот остановлен у порта (`halted`) — ход закрыт, исполнять некому:
+       показан прогон по истории, у которого `run.halted` пуст (решение 0065).
+
+    Ни одно не подошло — заявка исполнится по открытию следующей свечи.
+    """
+    chain = (
+        (pinned, convert.Unfilled.CUT),
+        (bool(halted), convert.Unfilled.MISSED),
+    )
+    return next((fate for hit, fate in chain if hit), convert.Unfilled.WAITING)
 
 
 def _levels(run: HistoryRun) -> tuple[PriceLevel, ...]:

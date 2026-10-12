@@ -42,6 +42,8 @@ from ui.models import (
     AverageKind,
     DecisionLevel,
     Layer,
+    Marker,
+    MarkerKind,
     Mode,
     ReversalMoment,
     Settings,
@@ -175,7 +177,8 @@ def test_the_markers_of_a_trade_stand_on_the_candles_of_the_chart() -> None:
         at=fill_at, order_id="open:long:тест",
     )
     markers, _ = convert.markers_and_paths(
-        HistoryRun(), (Pair("open:long:тест", plan, fill),), frozenset(), frame
+        HistoryRun(), (Pair("open:long:тест", plan, fill),), frozenset(), frame,
+        pending=convert.Unfilled.WAITING,
     )
     plan_marker = next(m for m in markers if m.layer is Layer.PLAN)
     fact_marker = next(m for m in markers if m.layer is Layer.FACT)
@@ -221,7 +224,8 @@ def test_the_trade_paths_of_both_layers_are_drawn_on_the_axis_of_the_candles() -
         )),
     )
     _, paths = convert.markers_and_paths(
-        HistoryRun(deals=(deal,)), plans, frozenset(), frame
+        HistoryRun(deals=(deal,)), plans, frozenset(), frame,
+        pending=convert.Unfilled.WAITING,
     )
     fact = next(p for p in paths if p.layer is Layer.FACT)
     assert fact.entry_time == datetime(2026, 6, 19, 10, 10, tzinfo=MSK)
@@ -239,6 +243,158 @@ def test_the_trade_paths_of_both_layers_are_drawn_on_the_axis_of_the_candles() -
     assert fact.entry_time - plan_path.entry_time == frame.delta, (
         "расчётная линия и линия факта совпали по времени входа — наложение "
         "слоёв перестало показывать задержку исполнения"
+    )
+
+
+# ------------------------------------------------ заявка ждёт открытия свечи
+#
+# Просьба владельца счёта 12.10.2026: решение «вход в лонг» на закрытии
+# свечи 09:55 до 10:00 стояло с ⊗ «сигнал пропущен», хотя заявка была
+# подана и исполнилась по открытию следующей свечи. Он решил, что заявки
+# не было. Решение 0065: план без исполнения, чья заявка ещё ждёт
+# (`HistoryRun.waiting`), — «заявка подана»; у остановленного робота ждущих
+# нет, его заявка уже не исполнится.
+
+_PENDING = "open:long:ждёт"
+
+
+def _waiting_plan_marker(
+    run: HistoryRun, *, pending: convert.Unfilled = convert.Unfilled.WAITING
+) -> Marker:
+    """Метка слоя «прогноз» решения на последней свече, исполнения ещё нет.
+
+    `pending` — что про ждущие заявки сказал порт (`app.port._pending_of`);
+    умолчание — порт ничему не мешает, живой ход.
+    """
+    plan = Plan(
+        order_id=_PENDING, decided_at=datetime(2026, 6, 19, 10, 0, tzinfo=MSK),
+        price=100.0, side=EngineSide.LONG, action=OrderAction.OPEN,
+    )
+    markers, _ = convert.markers_and_paths(
+        run, (Pair(_PENDING, plan),), frozenset(), Timeframe(5), pending=pending,
+    )
+    (marker,) = markers
+    assert marker.layer is Layer.PLAN
+    return marker
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [
+        (HistoryRun(waiting=(_PENDING,)), MarkerKind.WAITING),
+        (HistoryRun(waiting=(_PENDING,), halted="Дневной лимит убытка"), MarkerKind.MISSED),
+        (HistoryRun(waiting=("open:short:чужая",)), MarkerKind.MISSED),
+    ],
+    ids=["ждёт-и-робот-работает", "робот-остановлен", "заявки-нет-среди-ждущих"],
+)
+def test_a_plan_without_a_fill_is_waiting_only_while_its_order_waits(
+    run: HistoryRun, expected: MarkerKind
+) -> None:
+    """Без исполнения: «заявка подана», только если она ждёт и робот работает.
+
+    Три случая — три обязанности `_plan_kind`: ждущую заявку не рисовать ⊗;
+    у остановленного робота «ждёт» не обещать; чужое имя среди ждущих
+    не делать «ждущим» любой план без исполнения.
+    """
+    marker = _waiting_plan_marker(run)
+    assert marker.kind is expected, (
+        f"план без исполнения при waiting={run.waiting}, halted={run.halted!r} "
+        f"нарисован «{marker.kind.label}», а надо «{expected.label}»"
+    )
+
+
+def test_the_hint_of_a_waiting_order_says_it_is_in_and_not_that_it_failed() -> None:
+    """Подсказка «заявка подана» говорит, что она подана, а не «не состоялся».
+
+    Метка сменилась, а подсказка при наведении осталась бы прежней —
+    и человек, наведя мышь, прочёл бы ровно то, что прочёл 12.10.2026.
+    Подсказка ⊗ рядом сверяется тоже: проверка обязана различать два случая,
+    а не совпадать с обоими.
+    """
+    waiting = _waiting_plan_marker(HistoryRun(waiting=(_PENDING,))).tooltip
+    missed = _waiting_plan_marker(HistoryRun()).tooltip
+
+    assert "не состоялся" in missed, f"подсказка ⊗ изменилась: «{missed}»"
+    for wrong in ("не состоялся", "пропущ"):
+        assert wrong not in waiting, (
+            f"подсказка ждущей заявки говорит «{wrong}»: «{waiting}»"
+        )
+    assert "подана" in waiting and "следующей свечи" in waiting, (
+        f"подсказка не говорит, что заявка подана и когда исполнится: «{waiting}»"
+    )
+
+
+# Находка `/review` 12.10.2026: на закреплённом отрезке тестера (решение 0050)
+# ждущая заявка не исполнится — следующая свеча за границей отрезка, хотя
+# в базе она есть. Часы там — обещание сделки, которой не будет.
+
+_CUT = "прогон кончился до исполнения"
+_MISSED = "не состоялся"
+_WAITS = "исполнится по открытию следующей свечи"
+
+
+def test_a_waiting_order_on_a_pinned_span_is_cut_and_says_so() -> None:
+    """Стережёт: «отрезок кончился» (`CUT`) — ⊗ со своей подсказкой; без него — часы.
+
+    Один и тот же план, одна и та же ждущая заявка, разница — только то,
+    что сказал порт про закреплённый отрезок (`app.port._pending_of`).
+    Подсказка говорит, что прогон кончился, а не «пропущен»
+    и не «не состоялся»: заявка была подана, и человек должен это прочесть.
+    """
+    run = HistoryRun(waiting=(_PENDING,))
+    cut = _waiting_plan_marker(run, pending=convert.Unfilled.CUT)
+    free = _waiting_plan_marker(run, pending=convert.Unfilled.WAITING)
+
+    assert free.kind is MarkerKind.WAITING, (
+        f"без закрепления ждущая заявка нарисована «{free.kind.label}», а не часами"
+    )
+    assert cut.kind is MarkerKind.MISSED, (
+        f"на закреплённом отрезке ждущая заявка нарисована «{cut.kind.label}», а не ⊗"
+    )
+    assert _CUT in cut.tooltip and "подана" in cut.tooltip, (
+        f"подсказка не говорит, что заявка подана, а прогон кончился: «{cut.tooltip}»"
+    )
+    for wrong in ("пропущ", _MISSED, _WAITS):
+        assert wrong not in cut.tooltip, (
+            f"подсказка ждущей заявки на конце отрезка говорит «{wrong}»: «{cut.tooltip}»"
+        )
+
+
+_ENGINE_HALTED = HistoryRun(waiting=(_PENDING,), halted="Дневной лимит убытка")
+
+
+@pytest.mark.parametrize(
+    ("run", "pending", "kind", "says"),
+    [
+        (HistoryRun(waiting=(_PENDING,)), convert.Unfilled.WAITING,
+         MarkerKind.WAITING, _WAITS),
+        (HistoryRun(waiting=(_PENDING,)), convert.Unfilled.CUT, MarkerKind.MISSED, _CUT),
+        (_ENGINE_HALTED, convert.Unfilled.CUT, MarkerKind.MISSED, _MISSED),
+        (_ENGINE_HALTED, convert.Unfilled.WAITING, MarkerKind.MISSED, _MISSED),
+        (HistoryRun(waiting=(_PENDING,)), convert.Unfilled.MISSED,
+         MarkerKind.MISSED, _MISSED),
+        (HistoryRun(waiting=("open:short:чужая",)), convert.Unfilled.CUT,
+         MarkerKind.MISSED, _MISSED),
+    ],
+    ids=[
+        "ждёт", "отрезок", "отрезок-и-остановка-движка", "остановка-движка",
+        "остановка-порта", "отрезок-заявки-нет-среди-ждущих",
+    ],
+)
+def test_the_reason_of_an_unfilled_plan_follows_the_order_of_the_chain(
+    run: HistoryRun, pending: convert.Unfilled, kind: MarkerKind, says: str
+) -> None:
+    """Стережёт: остановка движка главнее того, что сказал порт.
+
+    Остановка движка на прогоне главнее отрезка: заявка не исполнилась
+    из-за неё. Отрезок не делает «оборванной» заявку, которой нет среди
+    ждущих. Порядок «отрезок главнее остановки порта» считает порт —
+    его стережёт `tests/test_app_port.py::test_the_port_says_a_pinned_span_before_its_own_halt`.
+    """
+    marker = _waiting_plan_marker(run, pending=pending)
+    assert (marker.kind, says in marker.tooltip) == (kind, True), (
+        f"run.halted={run.halted!r}, pending={pending.name}: "
+        f"«{marker.kind.label}», «{marker.tooltip}»; надо «{kind.label}» и «{says}»"
     )
 
 

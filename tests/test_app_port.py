@@ -1479,6 +1479,35 @@ def test_the_day_of_the_panel_refuses_a_naive_moment() -> None:
         _day_summary(run, [naive])
 
 
+@pytest.mark.parametrize(
+    ("pinned", "halted", "expected"),
+    [
+        (False, "", convert.Unfilled.WAITING),
+        (True, "", convert.Unfilled.CUT),
+        (False, "Исход заявки неизвестен", convert.Unfilled.MISSED),
+        (True, "Исход заявки неизвестен", convert.Unfilled.CUT),
+    ],
+    ids=["живой-ход", "отрезок", "остановка-порта", "отрезок-и-остановка-порта"],
+)
+def test_the_port_says_a_pinned_span_before_its_own_halt(
+    pinned: bool, halted: str, expected: convert.Unfilled
+) -> None:
+    """Стережёт: что будет с ждущей заявкой — по порядку «отрезок, остановка порта».
+
+    Закреплённый отрезок главнее остановки порта: показан прогон тестера,
+    а не живой ход, и его заявке помешала граница отрезка — подсказка
+    обязана сказать «прогон кончился», а не «не состоялся». Без отрезка
+    и без остановки — заявка исполнится, часы. Остановку движка поверх
+    этого стережёт `tests/test_app_convert.py`.
+    """
+    from app.port import _pending_of
+
+    got = _pending_of(pinned=pinned, halted=halted)
+    assert got is expected, (
+        f"pinned={pinned}, halted={halted!r}: порт сказал {got.name}, а надо {expected.name}"
+    )
+
+
 # -- чистка секретов доезжает не только до базы -------------------------------
 
 

@@ -516,6 +516,23 @@ def _named_userdata(args: argparse.Namespace) -> pathlib.Path | None:
     return pathlib.Path(named).parent if named else None
 
 
+def _start_logging(named_userdata: pathlib.Path | None) -> None:
+    """Технический лог и сразу за ним лента «Отладка» — до всех веток.
+
+    Лента ставится здесь, а не при сборке окна: строки, сказанные до окна
+    (чтение настроек, подмены при сборке порта), иначе в неё не попали бы.
+    Ветки без окна (`--fetch`, `--inspect`, `--runs`) её не читают, и цена
+    этому — буфер не больше `debug_feed.BUFFER` строк. Модуль ленты PySide6
+    не тянет (сторож в `tests/test_debug_panel.py`), ветки без экрана
+    остаются без Qt.
+    """
+    from app.debug_feed import install  # noqa: PLC0415 — слои после разбора ключей
+    from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
+
+    setup_logging(userdata=named_userdata)
+    install()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Собрать и запустить программу. Возвращает код возврата процесса."""
     _speak_utf8()
@@ -524,14 +541,13 @@ def main(argv: list[str] | None = None) -> int:
     # они тоже пишут в логгеры. Без этой строки любое предупреждение любого
     # слоя летело владельцу счёта в консоль сырым текстом (`D-021`).
     # Здесь же встаёт чистка секретов — тем же вызовом, на все ветки сразу.
-    from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
     from market import default_db_path  # noqa: PLC0415 — Qt не трогает
 
     # ⚠️ `database` — до первой строки лога, `named_userdata` — её адрес,
     # см. докстринг `_named_userdata` (`D-041`).
     named_userdata = _named_userdata(args)
     database = pathlib.Path(args.database) if args.database else default_db_path()
-    setup_logging(userdata=named_userdata)
+    _start_logging(named_userdata)
 
     if args.fetch or args.inspect or args.runs is not None:
         # ⚠️ Ветка стоит ДО первого касания Qt намеренно: загрузка истории
@@ -957,10 +973,10 @@ def _announce(
     port.announce(database)
     ignored = ignored_override(database)
     if ignored:
-        log.warning("%s", ignored)
+        log.warning("%s", ignored, extra={"panel": False})  # в ленте — строка журнала
         port.note("Папка данных", ignored, level)
     if missing:
-        log.info("%s", missing)
+        log.info("%s", missing, extra={"panel": False})  # в ленте — строка журнала
         port.note("Папка данных", missing)
 
 
@@ -979,9 +995,13 @@ def _main_window(port: HistoryPort, scrub: Callable[[str], str], missing: str) -
     Отдельной функцией, а не тремя строками в `_run`: главная корутина стоит
     на пределе длины (`tests/test_function_size.py`) и числа операторов.
     """
+    from app.debug_feed import install  # noqa: PLC0415 — слои после разбора ключей
     from ui.main_window import MainWindow  # noqa: PLC0415 — слои после QT_API
 
-    window = MainWindow(port=port, settings=port.values, sanitize=scrub)  # B-050
+    # `install` повторный вызов не дублирует: отдаёт ленту, поставленную
+    # в `_start_logging`, а при сборке мимо `main()` (проверки) ставит свою.
+    window = MainWindow(port=port, settings=port.values, sanitize=scrub,  # B-050
+                        debug=install())
     window.resize(1440, 900)
     window.show_missing_data(missing)
     return window

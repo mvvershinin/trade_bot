@@ -52,6 +52,7 @@ from engine import (
     DayMarks,
     DayRule,
     EngineSettings,
+    ExitReason,
     JournalEntry,
     JournalLevel,
     OrderAction,
@@ -158,6 +159,7 @@ __all__ = [
     "decision_record",
     "trade_record",
     "order_record",
+    "order_words",
     "level_hit_record",
     "TradeLinks",
     "row_of_decision_record",
@@ -173,6 +175,7 @@ __all__ = [
     "average_line",
     "shades_of",
     "markers_and_paths",
+    "Unfilled",
     "bar_open",
     "chart_time",
 ]
@@ -1861,6 +1864,17 @@ def _step_what(record: OrderRecord, label: str) -> str:
     return words.format(side=side, reason=label or "уровень")
 
 
+def order_words(record: OrderRecord) -> str:
+    """Что сделала строка заявки — словами, для ленты «Отладка».
+
+    Та же таблица `_STEP_WORDS`, что у разбора сделки: второй перевод
+    действий движка разошёлся бы с первым. Вид уровня у касания — подписью
+    причины выхода из `engine/`, а не машинным значением строки.
+    """
+    label = ExitReason(record.exit_reason).label if record.exit_reason else ""
+    return _step_what(record, label)
+
+
 def _order_step(record: OrderRecord, label: str, *, reason: str | None = None) -> OrderStep:
     """Строка заявки → шаг разбора. Числа — как записаны, ни одно не считается."""
     return OrderStep(
@@ -2171,6 +2185,8 @@ def markers_and_paths(
     pairs: Sequence[Pair],
     reversals: frozenset[str],
     timeframe: Timeframe,
+    *,
+    pending: Unfilled,
 ) -> tuple[tuple[Marker, ...], tuple[TradePath, ...]]:
     """Метки и линии обоих слоёв: «прогноз» и «факт» (DOMAIN.md §8).
 
@@ -2182,17 +2198,42 @@ def markers_and_paths(
 
     * обе метки есть — пара, подсказка называет расхождение в пунктах и рублях;
     * **факта нет** — метка «сигнал пропущен» на слое прогноза;
+    * **факта нет, а заявка ждёт** открытия следующей свечи (`run.waiting`) —
+      метка «заявка подана», а не ⊗: просьба владельца счёта 12.10.2026,
+      решение 0065. У остановленного робота ждущих нет: его заявка уже
+      не исполнится, и честная метка у неё — ⊗. На закреплённом отрезке —
+      тоже ⊗, но со своей подсказкой: прогон кончился до исполнения
+      (`Unfilled.CUT`);
     * **прогноза нет** — метка «сделка вне расчёта» на слое факта. Разбирается
       как дефект, поэтому у неё своя форма и свой цвет, а не общая.
+
+    :param pending: что будет с заявками из `run.waiting` по сведениям
+        **порта** — того, чего движок этого прогона не знает. Считает порт
+        (`app.port._pending_of`), порядок причин — там. `WAITING` — исполнятся
+        по открытию следующей свечи, часы. `CUT` — прогон идёт
+        по закреплённому отрезку тестера (решение 0050): свечи после отрезка
+        в прогон не войдут, даже если они есть в базе (находка `/review`
+        12.10.2026). `MISSED` — робот остановлен у порта: остановка
+        не из движка (исход заявки у брокера неизвестен, остановка, поднятая
+        из базы после перезапуска, решение 0054) закрывает живой ход,
+        и окну показан прогон по истории, у движка которого `halted` пуст,
+        а заявка в `waiting`. По одному `run.halted` её рисовало бы часами
+        «заявка подана» — обещание сделки, которой не будет.
+
+        Остановка **движка** (`run.halted`) проверяется здесь и главнее
+        всего, что сказал порт: заявке не исполниться по её причине,
+        и подсказка отсылает к журналу, а не к границе отрезка.
     """
+    fate = Unfilled.MISSED if run.halted else pending
+    unfilled = {order_id: fate for order_id in run.waiting}
     markers: list[Marker] = []
     for pair in pairs:
-        note = _divergence(pair)
+        note = _divergence(pair, unfilled)
         if pair.plan is not None:
             markers.append(Marker(
                 time=chart_time(pair.plan.decided_at, timeframe),
                 price=pair.plan.price,
-                kind=_plan_kind(pair, reversals),
+                kind=_plan_kind(pair, reversals, unfilled),
                 layer=Layer.PLAN,
                 tooltip=note,
                 pair_id=pair.order_id,
@@ -2245,11 +2286,54 @@ def _entry_kind(side: EngineSide, order_id: str, reversals: frozenset[str]) -> M
     return MarkerKind.ENTRY_LONG if side is EngineSide.LONG else MarkerKind.ENTRY_SHORT
 
 
-def _plan_kind(pair: Pair, reversals: frozenset[str]) -> MarkerKind:
-    """Метка слоя «прогноз». Расчёт без сделки — «сигнал пропущен»."""
+class Unfilled(enum.Enum):
+    """Почему у расчёта нет исполнения. От этого метка и подсказка.
+
+    Открыт порту: что будет с ждущими заявками прогона, знает он, а метку
+    и подсказку по причине выбирает эта таблица (`_UNFILLED`).
+    """
+
+    #: Заявки нет среди ждущих, или робот остановлен: «не состоялся».
+    MISSED = enum.auto()
+    #: Заявка подана и исполнится по открытию следующей свечи (решение 0065).
+    WAITING = enum.auto()
+    #: Заявка подана, но закреплённый отрезок кончился раньше исполнения.
+    CUT = enum.auto()
+
+
+#: Метка и хвост подсказки после цены расчёта — по причине. Таблица, а не
+#: ветки: метка и подсказка одного случая обязаны говорить одно и то же,
+#: и здесь они стоят в одной строке.
+_UNFILLED: Final[dict[Unfilled, tuple[MarkerKind, str]]] = {
+    Unfilled.MISSED: (
+        MarkerKind.MISSED,
+        " — не состоялся. Причина — в журнале решений.",
+    ),
+    Unfilled.WAITING: (
+        MarkerKind.WAITING,
+        "\nЗаявка подана и исполнится по открытию следующей свечи — "
+        "тогда рядом встанет метка факта.",
+    ),
+    Unfilled.CUT: (
+        MarkerKind.MISSED,
+        "\nЗаявка подана на последней свече отрезка, но прогон кончился "
+        "до исполнения: она исполнилась бы по открытию следующей свечи, "
+        "а та — за границей отрезка и в прогон не входит.",
+    ),
+}
+
+
+def _plan_kind(
+    pair: Pair, reversals: frozenset[str], unfilled: Mapping[str, Unfilled]
+) -> MarkerKind:
+    """Метка слоя «прогноз». Расчёт без сделки — по причине (`_UNFILLED`).
+
+    Ждущая заявка — «заявка подана»; прочее без сделки — ⊗.
+    """
     assert pair.plan is not None
     if pair.fill is None:
-        return MarkerKind.MISSED
+        kind, _ = _UNFILLED[unfilled.get(pair.order_id, Unfilled.MISSED)]
+        return kind
     if pair.plan.action is OrderAction.OPEN:
         return _entry_kind(pair.plan.side, pair.order_id, reversals)
     return MarkerKind.EXIT
@@ -2263,11 +2347,15 @@ def _fill_kind(pair: Pair, reversals: frozenset[str]) -> MarkerKind:
     return MarkerKind.EXIT
 
 
-def _divergence(pair: Pair) -> str:
+def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
     """Подсказка при наведении: расчёт, факт и расхождение (ТЗ §4.5).
 
     Оформление берётся у окна (`ui.formatting`), а не пишется здесь заново:
     цена в подсказке обязана выглядеть так же, как в таблице сделок.
+
+    У поданной заявки без исполнения (`unfilled`, таблица `_UNFILLED`)
+    подсказка говорит, что она подана, — а не «не состоялся»: ровно эти
+    слова владелец счёта 12.10.2026 прочёл как «заявки не было».
     """
     if pair.plan is None:
         return (
@@ -2280,10 +2368,8 @@ def _divergence(pair: Pair) -> str:
             f" ({pair.plan.exit_reason.label})"
             if pair.plan.exit_reason is not None else ""
         )
-        return (
-            f"{what} по расчёту{reason}: {fmt_price(pair.plan.price)} — "
-            "не состоялся. Причина — в журнале решений."
-        )
+        _, tail = _UNFILLED[unfilled.get(pair.order_id, Unfilled.MISSED)]
+        return f"{what} по расчёту{reason}: {fmt_price(pair.plan.price)}{tail}"
     lines = [
         f"{what}. Расчётная цена: {fmt_price(pair.plan.price)}",
         f"Фактическая: {fmt_price(pair.fill.price)}, {fmt_datetime(pair.fill.at)} МСК",

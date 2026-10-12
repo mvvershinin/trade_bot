@@ -820,7 +820,9 @@ class Backfiller:
         except OutcomeUnknown as unknown:
             halt_on_unknown_outcome(unknown, self._say.halt)
         except Exception as error:  # трассировка — в log.exception ниже
-            log.exception("догрузка пропущенного не удалась (%s)", self._ticker)
+            log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                "догрузка пропущенного не удалась (%s)", self._ticker, extra={"panel": False}
+            )
             self._tell(
                 "Догрузка не удалась",
                 f"Пропущенное догрузить не вышло: {type(error).__name__}: {error}. "

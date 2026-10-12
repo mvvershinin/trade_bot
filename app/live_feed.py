@@ -173,6 +173,7 @@ from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Final, Protocol
 
+from app import debug_feed
 from app.backfill import Backfiller
 from app.halt import halt_on_unknown_outcome
 from broker.account import SNAPSHOT_INTERVAL, Account, AccountSnapshot
@@ -1038,7 +1039,8 @@ class LiveFeed:
                 self._complain(str(error), error.technical)
             except Exception as error:  # трассировка уходит в log.exception ниже
                 final = True
-                log.exception("поток котировок снят ошибкой программы")
+                # Мимо ленты: в ней эта беда — строкой журнала из `_complain`.
+                log.exception("поток котировок снят ошибкой программы", extra={"panel": False})
                 self._complain(
                     f"Ошибка программы, а не связи: {type(error).__name__}: {error}. "
                     "Подробность — в выводе программы в консоли."
@@ -1124,7 +1126,9 @@ class LiveFeed:
         except asyncio.CancelledError:
             raise
         except Exception:  # трассировка уходит в log.exception
-            log.exception("расписание торгов не спрошено (%s)", self._class_code)
+            log.exception(  # мимо ленты: в ней — строка журнала `_say_doubt`
+                "расписание торгов не спрошено (%s)", self._class_code, extra={"panel": False}
+            )
             self._say_doubt(ScheduleDoubt.BROKEN, None)
             return None
         now = datetime.now(MSK)
@@ -1181,7 +1185,9 @@ class LiveFeed:
             return
         self._doubted.add(doubt)
         line, level = doubt_words(doubt, failure)
-        log.warning("расписание торгов: %s (%s)", doubt.value, self._class_code)
+        log.warning(  # мимо ленты: строка журнала ниже говорит то же самое
+            "расписание торгов: %s (%s)", doubt.value, self._class_code, extra={"panel": False}
+        )
         self._watch.say(SCHEDULE_EVENT, line, level)
 
     def _phase(self, phase: LinkPhase, detail: str = "") -> None:
@@ -1228,6 +1234,10 @@ class LiveFeed:
             self._class_code,
             text,
             f" [{technical}]" if technical else "",
+            # Мимо ленты: в ней причина стоит строкой журнала ниже. Повтор
+            # той же причины журнал не говорит — лента его тоже не повторяет,
+            # а каждый заход виден строкой фазы (`_phase`).
+            extra={"panel": False},
         )
         self._say_once("Связь с брокером", text, DecisionLevel.WARNING)
 
@@ -1381,14 +1391,16 @@ class LiveFeed:
                     DecisionLevel.WARNING,
                 )
             return
-        self._last = snapshot
+        first, self._last = self._last is None, snapshot
         # Снимок принят — растущая минута идёт в окно. **После** записи
         # закрытой минуты выше: тот, кто рисует, читает из базы минутки этого
         # же бара, и порядок «сначала записали, потом рисуем» не даёт бару
         # мигнуть без только что закончившейся минуты.
-        self._watch.growing_minute(
-            self._ticker, to_minute(snapshot, after.contracts, unsettled=True)
-        )
+        growing = to_minute(snapshot, after.contracts, unsettled=True)
+        if first:
+            # В ленту — первый принятый снимок минуты, а не каждый из девяти.
+            debug_feed.minute_started(self._ticker, growing)
+        self._watch.growing_minute(self._ticker, growing)
 
     async def _close_minute(self, last: CandleSnapshot, tally: MinuteTally) -> None:
         """Минута закончилась — теперь, и только теперь, она пишется в базу.
@@ -1402,9 +1414,8 @@ class LiveFeed:
         сам, что с этим делать — дорисовать закрытую свечу или гнать прогон
         (`HistoryPort.live_candle`). Поток знает только, что минута записана.
         """
-        await self._worker.put_minutes(
-            self._ticker, [to_minute(last, tally.contracts)], Source.BROKER
-        )
+        written = to_minute(last, tally.contracts)
+        await self._worker.put_minutes(self._ticker, [written], Source.BROKER)
         self._last = None
         log.info(
             "минута %s: оборот %.0f → %d контрактов%s",
@@ -1412,7 +1423,10 @@ class LiveFeed:
             tally.turnover,
             tally.contracts,
             f", отвергнуто снимков: {tally.refused}" if tally.refused else "",
+            # Мимо ленты: её числа уже есть в строке ленты ниже, с ценами.
+            extra={"panel": False},
         )
+        debug_feed.minute_closed(self._ticker, written, tally.refused)
         self._watch.closed_minute(self._ticker)
         self._tell_clock()
 
@@ -1745,11 +1759,14 @@ class FundsWatch:
                 "состояние счёта не получено: %s%s",
                 failure.human,
                 f" [{failure.technical}]" if failure.technical else "",
+                extra={"panel": False},  # в ленте — строка журнала из `_blind`
             )
             self._blind(str(failure))
             return
         except Exception as error:  # трассировка уходит в log.exception
-            log.exception("опрос состояния счёта упал ошибкой программы")
+            log.exception(  # мимо ленты: в ней — строка журнала из `_blind`
+                "опрос состояния счёта упал ошибкой программы", extra={"panel": False}
+            )
             self._blind(
                 f"Ошибка программы, а не связи: {type(error).__name__}: {error}. "
                 "Подробность — в выводе программы в консоли."
@@ -2053,8 +2070,9 @@ class LiveLink:
             #
             # Человеку — фраза, её отдаст порт; технику — причина с путём.
             # Оба текста отказ брокера чистит сам при создании (`broker/errors.py`).
-            log.warning(
-                "подключение к брокеру не собрано: %s", error.technical or error.human
+            log.warning(  # мимо ленты: отказ скажет порт строкой журнала
+                "подключение к брокеру не собрано: %s", error.technical or error.human,
+                extra={"panel": False},
             )
             return str(error)
         self._feed = feed

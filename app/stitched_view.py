@@ -244,7 +244,16 @@ def as_history(stitched: StitchedRun, costs: Costs) -> HistoryRun:
         # здесь счёт убрал бы из допущений склейки неисполненную заявку,
         # остановившую робота (правило 13).
         limit_exits=sum((one.run.limit_exits for one in stitched.pieces), LimitExits()),
+        # Ждущие заявки — только у последнего куска и только без стыка: стык
+        # закрывает позицию, и заявки прежних кусков не исполнятся никогда.
+        waiting=_waiting(stitched),
     )
+
+
+def _waiting(stitched: StitchedRun) -> tuple[str, ...]:
+    """Заявки, ждущие открытия бара, у склейки — те же правила, что у позиции."""
+    last = stitched.pieces[-1] if stitched.pieces else None
+    return () if last is None or last.seam is not None else last.run.waiting
 
 
 def _neighbours(stitched: StitchedRun) -> list[str]:

@@ -81,5 +81,6 @@ def halt_on_unknown_outcome(unknown: OutcomeUnknown, halt: Halt) -> None:
     чужой и падать вправе; запись в технический лог обязана остаться
     в любом случае — иначе разбирать будет нечего.
     """
-    log.warning("исход команды брокеру неизвестен: %s", unknown.technical)
+    # Мимо ленты «Отладка»: в ней остановка стоит строкой журнала (`halt`).
+    log.warning("исход команды брокеру неизвестен: %s", unknown.technical, extra={"panel": False})
     halt(HALT_EVENT, halt_reason(unknown))

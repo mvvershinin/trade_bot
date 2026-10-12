@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from collections.abc import Callable
 from datetime import datetime, timedelta
 
 import pytest
@@ -39,7 +40,7 @@ from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QImage, QKeyEvent, QMouseEvent, QPalette, QRegion
 from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QWidget
 
-from ui.chart.glyphs import GlyphStyle
+from ui.chart.glyphs import MARKER_SIZE, GlyphStyle
 from ui.chart.painter_surface import AXIS_HEIGHT, AXIS_WIDTH, PADDING, PainterChartSurface
 from ui.chart_panel import (
     SPAN_FIELDS,
@@ -273,6 +274,139 @@ def test_the_forecast_glyph_is_hollow_and_the_fact_glyph_is_filled(qapp) -> None
     finally:
         host.deleteLater()
         qapp.processEvents()
+
+
+def _inside(image: QImage, theme: Theme, keep: Callable[[float, float], bool]) -> int:
+    """Сколько закрашенных точек внутри круга метки, не задевая обвода.
+
+    `keep(dx, dy)` отбирает точки по смещению от центра значка: «вниз»
+    — положительное `dy`. Внутренность — круг радиусом на две точки меньше
+    метки: обвод в неё не попадает, и в счёт идёт только то, что нарисовано
+    внутри — крест, стрелки или ничего.
+    """
+    background = QColor(theme.background)
+    ratio = image.devicePixelRatio()
+    centre_x, centre_y = image.width() / 2, image.height() / 2
+    radius = (MARKER_SIZE - 2) * ratio
+    found = 0
+    for y in range(image.height()):
+        for x in range(image.width()):
+            dx, dy = x + 0.5 - centre_x, y + 0.5 - centre_y
+            if dx * dx + dy * dy >= radius * radius or not keep(dx, dy):
+                continue
+            pixel = QColor(image.pixel(x, y))
+            if max(
+                abs(pixel.red() - background.red()),
+                abs(pixel.green() - background.green()),
+                abs(pixel.blue() - background.blue()),
+            ) > 24:
+                found += 1
+    return found
+
+
+def test_the_waiting_glyph_is_neither_the_missed_cross_nor_an_empty_circle(qapp) -> None:
+    """«Заявка подана» — часы, а не ⊗ «пропущен» и не пустой круг прогноза.
+
+    Просьба владельца счёта 12.10.2026: ⊗ на поданной заявке он прочёл как
+    «заявки не было». Проверка по нарисованному значку: у креста ⊗ есть
+    линия в левой нижней четверти круга, у часов там пусто — стрелки идут
+    вверх и вправо. И внутри часов что-то нарисовано, иначе значок
+    не отличить от полой метки обычного прогноза.
+    """
+    host = QWidget()
+    try:
+        waiting = _glyph(MarkerKind.WAITING, Layer.PLAN, LIGHT, host)
+        missed = _glyph(MarkerKind.MISSED, Layer.PLAN, LIGHT, host)
+
+        def lower_left(dx: float, dy: float) -> bool:
+            return dx < -0.5 and dy > 0.5
+
+        assert _inside(missed, LIGHT, lower_left) > 0, (
+            "у ⊗ «пропущен» нет линии в левой нижней четверти — проверка "
+            "сломалась сама, а не нашла различие"
+        )
+        assert _inside(waiting, LIGHT, lower_left) == 0, (
+            "у значка «заявка подана» линия в левой нижней четверти круга — "
+            "это крест ⊗ «пропущен», а не часы"
+        )
+        assert _inside(waiting, LIGHT, lambda dx, dy: True) > 0, (
+            "внутри значка «заявка подана» пусто — это полый круг "
+            "обычного прогноза"
+        )
+    finally:
+        host.deleteLater()
+        qapp.processEvents()
+
+
+@pytest.mark.parametrize("theme", [LIGHT, DARK], ids=["светлая", "тёмная"])
+def test_the_waiting_glyph_has_its_own_colour_and_not_that_of_the_forecast(
+    qapp, theme: Theme
+) -> None:
+    """Значок «заявка подана» нарисован цветом `waiting`, а не цветом прогноза.
+
+    Фиолетовый цвет прогноза носит ⊗ «пропущен»; одной формы в шесть точек
+    мало, чтобы рядом их не спутать. Берётся самая насыщенная точка
+    значка — середина стрелки, без сглаживания с фоном.
+    """
+    host = QWidget()
+    try:
+        image = _glyph(MarkerKind.WAITING, Layer.PLAN, theme, host)
+        background = QColor(theme.background)
+
+        def distance(one: QColor, other: QColor) -> int:
+            return max(
+                abs(one.red() - other.red()),
+                abs(one.green() - other.green()),
+                abs(one.blue() - other.blue()),
+            )
+
+        ink = max(
+            (QColor(image.pixel(x, y)) for y in range(image.height())
+             for x in range(image.width())),
+            key=lambda pixel: distance(pixel, background),
+        )
+        assert distance(ink, QColor(theme.waiting)) <= 12, (
+            f"значок «заявка подана» нарисован цветом {ink.name()}, "
+            f"а не своим {theme.waiting}"
+        )
+        assert distance(ink, QColor(theme.plan)) > 40, (
+            f"значок «заявка подана» нарисован цветом прогноза {theme.plan} — "
+            "рядом с ⊗ «пропущен» их не различить"
+        )
+    finally:
+        host.deleteLater()
+        qapp.processEvents()
+
+
+def test_the_waiting_row_of_the_legend_says_the_order_is_in_and_not_missed() -> None:
+    """Строка легенды «заявка подана» не повторяет слов «сигнал пропущен».
+
+    Легенда — то место, где владелец счёта проверяет, что значит значок.
+    Строка, скопированная со строки ⊗, вернула бы ровно ту путаницу,
+    которую снимает отдельная метка: «расчёт был, а сделки не случилось».
+    Строка видна только со слоем «Прогноз» — метка стоит на нём.
+    """
+    row = next(
+        item for item in LEGEND
+        if isinstance(item.sample, MarkerSample) and item.sample.kind is MarkerKind.WAITING
+    )
+    assert isinstance(row.sample, MarkerSample)
+    words = f"{row.title} {row.meaning} {row.detail}".lower()
+
+    assert row.title == MarkerKind.WAITING.label, (
+        f"легенда называет метку «{row.title}», а разбор участка — "
+        f"«{MarkerKind.WAITING.label}»"
+    )
+    assert "следующей свечи" in row.meaning, (
+        f"строка не говорит, когда заявка исполнится: «{row.meaning}»"
+    )
+    for wrong in ("пропущ", "не случил", "не состоял"):
+        assert wrong not in words, (
+            f"строка «заявка подана» говорит «{wrong}…» — читается как пропуск"
+        )
+    assert row.sample.layer is Layer.PLAN and row.needs_plan, (
+        "метка стоит на слое «Прогноз», а строка легенды живёт без него"
+    )
 
 
 class WatchfulSurface(PainterChartSurface):

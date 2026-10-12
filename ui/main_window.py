@@ -61,6 +61,7 @@ from ui.trade_story import PaperReport, PaperReportRequest
 from ui.chart_panel import ChartPanel
 from ui.confirm_changes import confirm_changes
 from ui.contract_banner import ContractBar
+from ui.debug_panel import DebugPanel
 from ui.export import decisions_table, trades_table, write_csv
 from ui.formatting import MSK, fmt_time
 from ui.history_dialog import HistoryDialog
@@ -93,7 +94,7 @@ from ui.notices import (
     resume_question,
     unmanaged_note,
 )
-from ui.ports import DetachedPort, Sanitize, TerminalPort
+from ui.ports import DebugSource, DetachedPort, Sanitize, TerminalPort
 from ui.calendar_dialog import CalendarDialog
 from ui.settings_dialog import SettingsDialog
 from ui.status_panel import StatusPanel
@@ -434,6 +435,7 @@ class MainWindow(QMainWindow):
         parent: QWidget | None = None,
         *,
         sanitize: Sanitize,
+        debug: DebugSource | None = None,
     ) -> None:
         """:param sanitize: чистка секретов для выгрузки журналов.
 
@@ -447,6 +449,9 @@ class MainWindow(QMainWindow):
         `broker.redaction.scrub`, а `broker/` окну по ARCHITECTURE.md §2
         не положен. Функцию даёт `app/` — тем же вызовом, каким он даёт её
         слою данных и порту.
+
+        :param debug: лента панели «Отладка» (`app/debug_feed.py`). `None` —
+            окно без торговой части: панель есть и говорит, что ленты нет.
         """
         super().__init__(parent)
         self.port = port or DetachedPort(self)
@@ -497,9 +502,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
-        self._clock = QLabel()
-        self.statusBar().addPermanentWidget(self._clock)
-        self.statusBar().showMessage(self.chart.renderer_note)
+        self._build_status_bar(debug)
 
         self.journals.export_requested.connect(self.export_journals)
         self.journals.reports_requested.connect(self.open_reports)
@@ -517,6 +520,21 @@ class MainWindow(QMainWindow):
         self._tick()
         # Последняя строка сборки — и именно её проверяет `changeEvent`.
         self._ready = True
+
+    def _build_status_bar(self, debug: DebugSource | None) -> None:
+        """Строка состояния: кнопка «Отладка ▴/▾», часы МСК; над ней — док ленты.
+
+        Кнопка стоит слева от часов, прямо под доком, который она открывает.
+        Док свёрнут при запуске и живёт мимо разделителя графика и журналов:
+        «Развернуть график» его не трогает, а изоляция графика сохраняется.
+        """
+        self.debug_panel = DebugPanel(debug, sanitize=self._sanitize, theme=self.theme)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.debug_panel)
+        self.debug_panel.hide()
+        self._clock = QLabel()
+        self.statusBar().addPermanentWidget(self.debug_panel.button)
+        self.statusBar().addPermanentWidget(self._clock)
+        self.statusBar().showMessage(self.chart.renderer_note)
 
     def _build_banners(self) -> None:
         """Плашки над графиком и их порядок на экране — `_banner_column`.
@@ -831,6 +849,7 @@ class MainWindow(QMainWindow):
         self.status_panel.set_theme(self.theme)
         self.chart.set_theme(self.theme)
         self.journals.set_theme(self.theme)
+        self.debug_panel.set_theme(self.theme)
         # ⚠️ Плашки перерисовываются пересчётом состояния. Их цвет и цвет
         # надписи на них взяты из темы в момент показа: без этого уже
         # показанное предупреждение остаётся в цветах прежней темы, а надпись

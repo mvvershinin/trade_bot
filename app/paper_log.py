@@ -216,7 +216,9 @@ class PaperLog:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            log.warning("строки симуляции не записаны в базу", exc_info=True)
+            log.warning(  # мимо ленты «Отладка»: в ней — строка журнала из `_say_failure`
+                "строки симуляции не записаны в базу", exc_info=True, extra={"panel": False}
+            )
             self._error = f"{type(error).__name__}: {error}"
             if not closing:
                 self._say_failure()
@@ -264,5 +266,5 @@ class PaperLog:
             "В окне до закрытия они были видны; после перезапуска их не открыть."
         )
         self._say("Сделки симуляции потеряны", text, DecisionLevel.ERROR)
-        log.error("%s", text)
+        log.error("%s", text, extra={"panel": False})  # в ленте — строка журнала выше
         return text

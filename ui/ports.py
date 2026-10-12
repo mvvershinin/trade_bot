@@ -29,12 +29,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Protocol
 
 from PySide6.QtCore import QObject, Signal
 
 from ui.models import (
     BacktestRequest,
     ChartData,
+    DebugBatch,
     HistoryLoadRequest,
     Mode,
     Settings,
@@ -54,6 +56,22 @@ from ui.trade_story import PaperReport, PaperReportRequest
 #: быть **одна** на запись в базу, на отправку в окно и на выгрузку в файл.
 #: Две разных разошлись бы, и разошлись бы молча.
 Sanitize = Callable[[str], str]
+
+
+class DebugSource(Protocol):
+    """Откуда панель «Отладка» берёт строки. Реализация — `app/debug_feed.py`.
+
+    Протокол, а не сигнал порта, и не по вкусу. Строки пишутся из любого
+    потока и десятками в секунду при прогреве; сигнал на каждую строку
+    заваливал бы очередь Qt, пока панель свёрнута и на неё никто не смотрит.
+    Поэтому окно **само** забирает новое по таймеру и только пока панель
+    открыта (`ui/debug_panel.py`). Реализацию окно не импортирует: она
+    приходит параметром с границы `app/`, как и чистка секретов.
+    """
+
+    def since(self, after: int, limit: int) -> DebugBatch:
+        """Строки с номером больше `after`, не больше `limit`, старшие первыми."""
+        ...
 
 
 class TerminalPort(QObject):

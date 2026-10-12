@@ -60,7 +60,7 @@ from engine import (
 )
 from engine.contracts import FIELD_RULES
 from engine.pipeline import _arm_order
-from tests.engine_helpers import MSK, candle
+from tests.engine_helpers import MSK, FakeCandle, candle
 
 #: Цена входа синтетических сценариев. Круглая: числа здесь не про арифметику
 #: уровня, а про то, срабатывает он или нет.
@@ -391,6 +391,81 @@ def test_a_repeated_candle_does_not_become_its_own_previous_bar() -> None:
     filled, = run(model, order, same)
     assert [fill.price for fill in filled] == [MEASURED_LEVEL]
     assert model.gaps.fall == 1
+
+
+def shown_partly(closed: FakeCandle) -> FakeCandle:
+    """Незакрытый показ той же свечи — её первая минута (решение 0065).
+
+    Открытие то же, что у закрытой: по нему исполняется ждущая заявка.
+    Размах — одна цена открытия: огрызок, по которому уровни не судятся.
+    """
+    return replace(
+        closed, high=closed.open, low=closed.open, close=closed.open,
+        filled_minutes=1, unsettled=True,
+    )
+
+
+#: Чьи незакрытые показы стоят в ряду; закрытая свеча после каждого
+#: **пришла**. Оба случая — штатный ход живого потока (`engine/ports.py`:
+#: незакрытая T идёт после закрытой T-1 и до закрытой T).
+SHOWN_THEN_CLOSED: dict[str, frozenset[str]] = {
+    "огрызки прошлых баров": frozenset({"earlier", "previous"}),
+    "огрызок свечи касания": frozenset({"touched"}),
+}
+
+
+@pytest.mark.parametrize("shown", list(SHOWN_THEN_CLOSED))
+def test_partial_shows_followed_by_their_closed_bars_do_not_blind_the_guard(
+    shown: str,
+) -> None:
+    """Стережёт: огрызок, за которым пришла закрытая свеча, сторожа не слепит.
+
+    Слепнуть сторож вправе в одном случае (решение 0065, `_blind`): прошлый
+    интервал показан **только** незакрытым, закрытая так и не пришла,
+    и судить о разрыве не по чему. Здесь закрытые пришли все, закрытие
+    прошлого бара известно (226 800, выше уровня), и та же подделка стороны
+    касания, что в `test_a_deal_at_a_price_the_candle_never_had_is_a_defect_not_a_gap`,
+    обязана уронить прогон, а не уйти в `LevelGaps` разрывом.
+
+    Ломается, если слепящим считается огрызок самой свечи касания (граница
+    «показан раньше этого интервала» стала нестрогой) или огрызок давно
+    закрытого бара (показы не забываются и не отсекаются прошлым закрытым).
+    Огрызок есть у каждой свечи живого хода, и такой сторож молчал бы
+    на каждом баре: дефект модели исполнения стал бы разрывом в допущениях
+    прогона, а не остановкой. Сделок и разрывов при этом не меняется ни
+    на одном исправном прогоне, поэтому равенство с рядом «только закрытые»
+    (`tests/test_forming_bar_equivalence.py`) этого не видит.
+    """
+    partly = SHOWN_THEN_CLOSED[shown]
+    model = ExecutionModel()
+    earlier = replace(approaching(226_800.0), time=moment(10, 5))
+    previous = approaching(226_800.0)
+    touched = gapping(10, 15)
+    order = replace(
+        _arm_order(
+            holding(Side.LONG, MEASURED_LEVEL, trailing=True),
+            moment(10, 15), MEASURED_LEVEL,
+        ),
+        touch=LevelTouch.RISE,  # подделка — та же, что у теста дефекта выше
+    )
+    run(
+        model,
+        *([shown_partly(earlier)] if "earlier" in partly else []), earlier,
+        entering(Side.LONG, moment(10, 10)),
+        *([shown_partly(previous)] if "previous" in partly else []), previous,
+        order,
+        *([shown_partly(touched)] if "touched" in partly else []),
+    )
+    try:
+        run(model, touched)
+    except AssertionError as error:
+        assert "цене, которой в свече не было" in str(error), str(error)
+    else:
+        pytest.fail(
+            f"«{shown}»: сделка по цене, которой в свече не было, записана "
+            f"разрывом ({model.gaps}) — сторож ослеп, хотя закрытие прошлого "
+            "бара известно"
+        )
 
 
 def test_slippage_carries_the_deal_out_of_the_range_and_the_guard_stays_silent() -> None:

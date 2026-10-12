@@ -40,6 +40,7 @@ class Theme:
     plan: str            # слой «прогноз»
     fact: str            # слой «факт»
     unplanned: str       # сделка вне расчёта — DOMAIN.md §8
+    waiting: str         # заявка подана, исполнится по открытию следующей свечи
     level_entry: str
     level_take: str
     level_trailing: str
@@ -60,6 +61,8 @@ class Theme:
             return self.unplanned
         if kind is MarkerKind.MISSED:
             return self.plan
+        if kind is MarkerKind.WAITING:
+            return self.waiting
         if layer is Layer.PLAN:
             return self.plan
         return {
@@ -168,6 +171,16 @@ LIGHT_TEXT_DIM = "#4b5563"
 QUIET_BADGE_LIGHT = "#6b7280"
 QUIET_BADGE_DARK = "#9aa4b2"
 
+#: Метка «заявка подана» — жёлтый светофора: «ждите», а не «стоп» и не «едем».
+#: Свой цвет, а не цвет прогноза: на фиолетовом ⊗ «сигнал пропущен» владелец
+#: счёта 12.10.2026 прочёл поданную заявку как неподанную, и одной формы
+#: с тем же цветом рядом мало. Контраст метки на фоне графика (замер
+#: 12.10.2026): светлая `#8a6100` — 5,5:1 на белом, тёмная `#fff176` —
+#: 15:1 на `#15181d`. От оранжевого факта отличается и оттенком, и тем,
+#: что факт залит, а эта метка полая.
+LIGHT_WAITING = "#8a6100"
+DARK_WAITING = "#fff176"
+
 LIGHT = Theme(
     dark=False,
     background="#ffffff",
@@ -186,6 +199,7 @@ LIGHT = Theme(
     plan="#5e5ce6",
     fact="#ef6c00",
     unplanned="#d50000",
+    waiting=LIGHT_WAITING,
     level_entry="#455a64",
     level_take="#2e7d32",
     level_trailing="#00838f",
@@ -213,6 +227,7 @@ DARK = Theme(
     plan="#9d8cff",
     fact="#ffb74d",
     unplanned="#ff5252",
+    waiting=DARK_WAITING,
     level_entry="#b0bec5",
     level_take="#66bb6a",
     level_trailing="#4dd0e1",

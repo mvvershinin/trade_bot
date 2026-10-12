@@ -76,6 +76,9 @@ def draw_marker(
     if kind is MarkerKind.MISSED:
         _draw_missed(painter, point, size)
         return
+    if kind is MarkerKind.WAITING:
+        _draw_waiting(painter, point, size)
+        return
 
     painter.setBrush(color if layer is Layer.FACT else Qt.BrushStyle.NoBrush)
     if layer is Layer.PLAN:
@@ -135,6 +138,26 @@ def _draw_missed(painter: QPainter, point: QPointF, size: float) -> None:
     painter.drawLine(
         QPointF(point.x() - arm, point.y() + arm), QPointF(point.x() + arm, point.y() - arm)
     )
+
+
+def _draw_waiting(painter: QPainter, point: QPointF, size: float) -> None:
+    """Заявка подана, исполнится по открытию следующей свечи: часы.
+
+    Полый круг со стрелками на трёх часах. От ⊗ «сигнал пропущен» отличается
+    тем, что глазу важнее всего в мелком размере: линии внутри идут от центра
+    по вертикали и горизонтали и не доходят до края, а крест — по диагоналям
+    через весь круг. Цвет свой (`Theme.waiting`), не цвет прогноза: форма
+    одна в мелком размере держится плохо. Стрелки чуть толще обвода — иначе
+    при половине метки в шесть точек часы читаются пустым кругом прогноза.
+    """
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(point, size, size)
+    hands = QPen(painter.pen())
+    hands.setWidthF(hands.widthF() + 0.4)
+    hands.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(hands)
+    painter.drawLine(point, QPointF(point.x(), point.y() - size * 0.62))
+    painter.drawLine(point, QPointF(point.x() + size * 0.5, point.y()))
 
 
 def _triangle(point: QPointF, size: float, *, up: bool) -> QPolygonF:

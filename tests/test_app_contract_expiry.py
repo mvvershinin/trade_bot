@@ -482,9 +482,9 @@ def test_the_term_is_checked_again_when_the_day_changes(loop, base, monkeypatch)
     fed: list[str] = []
     original = LiveObserver.feed
 
-    async def spy(self, candles):
+    async def spy(self, candles, forming=None):
         fed.append(stage[0])
-        return await original(self, candles)
+        return await original(self, candles, forming)
 
     stage = ["before"]
     monkeypatch.setattr(LiveObserver, "feed", spy)
@@ -529,9 +529,9 @@ def test_an_expired_code_at_midnight_feeds_no_bar(loop, base, monkeypatch) -> No
     original = LiveObserver.feed
     stage = ["before"]
 
-    async def spy(self, candles):
+    async def spy(self, candles, forming=None):
         fed.append(stage[0])
-        return await original(self, candles)
+        return await original(self, candles, forming)
 
     monkeypatch.setattr(LiveObserver, "feed", spy)
 

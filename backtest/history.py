@@ -344,6 +344,13 @@ class HistoryRun:
     #: прогона — неисполненный выход останавливает робота, и молча
     #: посчитанный итог такого прогона неотличим от полного.
     limit_exits: LimitExits = LimitExits()
+    #: Имена рыночных заявок (и заявок с пределом), принятых исполнителем
+    #: и не исполненных к концу прогона (`ExecutionModel.pending`). По ним
+    #: окно отличает «заявка ждёт открытия бара» от «решения без исполнения»
+    #: (решение 0065). ⚠️ Заполняет каждый, кто собирает `HistoryRun` руками:
+    #: `replay`, `LiveObserver.run`, `app/stitched_view.as_history`. Забытое
+    #: поле молча даёт умолчание `()`, и ждущая заявка рисуется как ⊗.
+    waiting: tuple[str, ...] = ()
 
     @property
     def assumptions(self) -> tuple[Assumption, ...]:
@@ -948,4 +955,5 @@ async def replay(  # noqa: PLR0913 — сверх пяти идут издерж
         limit_exits=replace(executor.limits, unfilled=sum(
             1 for order in executor.pending if order.limit_price is not None
         )),
+        waiting=tuple(order.order_id for order in executor.pending),
     )

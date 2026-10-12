@@ -691,6 +691,19 @@ def logs_go_to_a_temporary_folder(tmp_path_factory) -> Iterator[pathlib.Path]:
     patch.undo()
 
 
+def _take_the_debug_feed_down() -> None:
+    """Снять ленту «Отладка» (`app/debug_feed.py`) и обнулить её счёт потерь.
+
+    Лента висит и на корне, и на своём логгере `app.panel`: снятие с корня
+    в `pristine_logging` её с `app.panel` не сняло бы, и обработчик,
+    поставленный `main()`, пережил бы проверку. Модуль ленты ввозится,
+    только если проверка его уже ввезла: сам по себе он тянет движок.
+    """
+    feed = sys.modules.get("app.debug_feed")
+    if feed is not None:
+        feed.uninstall()
+
+
 @pytest.fixture(autouse=True)
 def pristine_logging():
     """Дерево логгеров возвращается в исходное состояние после каждой проверки.
@@ -733,6 +746,7 @@ def pristine_logging():
         yield
     finally:
         close_logging()
+        _take_the_debug_feed_down()
         for handler in list(root.handlers):
             if handler not in handlers_before:
                 root.removeHandler(handler)
