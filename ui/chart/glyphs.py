@@ -12,12 +12,11 @@
 `_draw_marker`, легенда — через `ChartSurface.draw_marker_glyph`, и значок
 в легенде совпадает с меткой на графике по построению, а не по внимательности.
 
-⚠️ Чего это не решает: веб-отрисовка рисует метки средствами своей библиотеки
-(`ui/chart/web_surface.py::_shape`), и её формы задаёт библиотека, а не этот
-модуль. Пока вендорного файла нет на диске, веб-график не создаётся вовсе;
-когда появится — либо формы сводятся вручную, либо `WebChartSurface`
-переопределяет `draw_marker_glyph` под свои. Пункт записан в списке проверок
-в заголовке `web_surface.py`.
+⚠️ Что от этого зависит у будущей отрисовки: если она когда-нибудь станет
+рисовать метки чужими средствами, её формы задаст чужая библиотека, а не этот
+модуль, и легенда разойдётся с графиком. Выход у неё будет один — переопределить
+`ChartSurface.draw_marker_glyph` под свои формы. Метод для того и оставлен
+на интерфейсе, а не спрятан в `painter_surface`.
 
 Торгового здесь нет ничего: модуль знает вид метки и цвет темы, а что этот
 вид означает, решено снаружи (`app/convert.py`, `DOMAIN.md` §8).
@@ -76,6 +75,9 @@ def draw_marker(
         return
     if kind is MarkerKind.MISSED:
         _draw_missed(painter, point, size)
+        return
+    if kind is MarkerKind.WAITING:
+        _draw_waiting(painter, point, size)
         return
 
     painter.setBrush(color if layer is Layer.FACT else Qt.BrushStyle.NoBrush)
@@ -136,6 +138,26 @@ def _draw_missed(painter: QPainter, point: QPointF, size: float) -> None:
     painter.drawLine(
         QPointF(point.x() - arm, point.y() + arm), QPointF(point.x() + arm, point.y() - arm)
     )
+
+
+def _draw_waiting(painter: QPainter, point: QPointF, size: float) -> None:
+    """Заявка подана, исполнится по открытию следующей свечи: часы.
+
+    Полый круг со стрелками на трёх часах. От ⊗ «сигнал пропущен» отличается
+    тем, что глазу важнее всего в мелком размере: линии внутри идут от центра
+    по вертикали и горизонтали и не доходят до края, а крест — по диагоналям
+    через весь круг. Цвет свой (`Theme.waiting`), не цвет прогноза: форма
+    одна в мелком размере держится плохо. Стрелки чуть толще обвода — иначе
+    при половине метки в шесть точек часы читаются пустым кругом прогноза.
+    """
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(point, size, size)
+    hands = QPen(painter.pen())
+    hands.setWidthF(hands.widthF() + 0.4)
+    hands.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(hands)
+    painter.drawLine(point, QPointF(point.x(), point.y() - size * 0.62))
+    painter.drawLine(point, QPointF(point.x() + size * 0.5, point.y()))
 
 
 def _triangle(point: QPointF, size: float, *, up: bool) -> QPolygonF:

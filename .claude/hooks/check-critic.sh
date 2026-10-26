@@ -111,8 +111,10 @@ SCAN=$(jq -Rr '
     # Освобождение опять оказалось не на той цели — третий раз одна и та же болезнь,
     # уже в третьем месте. Найдено аудитом 30.08.2026.
     #
-    # `js` и `css` в списке потому, что вендоренная библиотека графика и страница
-    # для `ui/chart/web_surface.py` — поставляемая часть продукта, а не документация.
+    # `js` и `css` оставлены в списке на будущее. Заведены они были под страницу
+    # веб-графика (`ui/chart/web_surface.py`), удалённого 09.09.2026 (решение 0056):
+    # сегодня ни одного такого файла в поставке нет. Список шире факта — это дешевле,
+    # чем вспомнить про него в день, когда такой файл появится.
     def code_ext: "\\.(py|pyi|pyw|sh|sql|qss|ui|spec|js|css)";
     def sed_targets:
         if test("sed[[:space:]]+-i") then
@@ -126,7 +128,7 @@ SCAN=$(jq -Rr '
     (fromjson? // empty) as $d
     | ($d.message.content?) as $c
     | if ($c | type) == "string" then
-        if ($d.type? == "user") and ($c | test("<command-name>/(review|validate|risk|parity)</command-name>"))
+        if ($d.type? == "user") and ($c | test("<command-name>/(review|validate|risk)</command-name>"))
         then "CRIT" else empty end
       elif ($c | type) == "array" then
         $c[]
@@ -139,11 +141,11 @@ SCAN=$(jq -Rr '
               elif ($n == "Bash") then
                 ((.input.command? // "")) as $b
                 | if ($b | is_src_write) then "CODE" else empty end
-              elif (((.input.subagent_type? // "") | test("^(code-critic|architecture-validator|risk-security-officer|parity-auditor)$"))) then
+              elif (((.input.subagent_type? // "") | test("^(code-critic|architecture-validator|risk-security-officer)$"))) then
                 "CRIT"
               else empty end
           elif ($d.type? == "user") and (.type? == "text")
-               and ((.text? // "") | test("<command-name>/(review|validate|risk|parity)</command-name>"))
+               and ((.text? // "") | test("<command-name>/(review|validate|risk)</command-name>"))
           then "CRIT"
           else empty end
       else empty end
@@ -154,7 +156,7 @@ printf '%s\n' "$SCAN" | grep -qx CODE || exit 0
 
 # Последнее событие CODE означает, что код меняли после последнего критика
 if [ "$(printf '%s\n' "$SCAN" | grep -x -e CODE -e CRIT | tail -1)" = CODE ]; then
-    printf '%s' '{"decision":"block","reason":"⚡ СТОП. Код изменён после последнего запуска критика. Запусти /review перед завершением. Если тронута торговая логика — ещё и /parity. Если деньги или токен — ещё и /risk."}'
+    printf '%s' '{"decision":"block","reason":"⚡ СТОП. Код изменён после последнего запуска критика. Запусти /review перед завершением. Если тронута торговая логика — ещё и полный pytest с проверкой-образцом. Если деньги или токен — ещё и /risk."}'
 fi
 
 exit 0

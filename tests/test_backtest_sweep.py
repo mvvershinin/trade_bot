@@ -24,10 +24,12 @@ from backtest.report import Row, Verdict, block_report, forward, study
 from backtest.split import Fold, Period
 from backtest.sweep import (
     AVERAGE_PERIODS,
+    GRID_STRATEGY_ID,
     TAKE_PERCENTS,
     WINDOW_DURATIONS,
     WINDOW_STARTS,
     Block,
+    ForeignStrategy,
     Ground,
     Money,
     Point,
@@ -35,13 +37,14 @@ from backtest.sweep import (
     blocks,
     full_cross,
     lay_out,
+    refuse_foreign_strategy,
     sweep,
     trading_mode,
     trials_shown,
 )
 from backtest.table import THOUSANDS, both_columns_filled, money, plural, render
-from engine import EngineSettings, ExitReason, Side, TradingWindow
-from strategies import EmaReverseSettings
+from engine import EngineSettings, ExitReason, Reversal, Side, TradingWindow
+from strategies import MaReverseAlwaysSettings, registry
 from tests.engine_helpers import MSK, candle
 
 TUNING = Period(date(2026, 6, 1), date(2026, 6, 30))
@@ -66,7 +69,7 @@ def a_point(label: str, *, take: float = 0.5, period: int = 15) -> Point:
     return Point(
         label=label,
         engine=trading_mode(EngineSettings(commission_per_side=14.0, take_profit_percent=take)),
-        strategy=EmaReverseSettings(period=period),
+        strategy=MaReverseAlwaysSettings(period=period),
         axes=(("take", take),),
     )
 
@@ -280,7 +283,11 @@ def test_a_verdict_without_neighbours_is_a_dash_not_a_word() -> None:
 
 def _ground() -> Ground:
     return Ground(
-        engine=trading_mode(EngineSettings(commission_per_side=14.0)),
+        # Переворот в одной свече — как у `backtest/__main__.py::_ground`:
+        # его требует единственный алгоритм (решение 0063).
+        engine=trading_mode(EngineSettings(
+            commission_per_side=14.0, reversal=Reversal.SAME_BAR,
+        )),
         costs=Costs(commission_per_side=14.0),
     )
 
@@ -338,7 +345,8 @@ def test_the_defaults_row_repeats_in_every_block() -> None:
 def test_the_full_cross_is_the_product_of_every_axis() -> None:
     """Стережёт число прогонов: полное произведение считается, а не оценивается."""
     windows = len(WINDOW_STARTS) * len(WINDOW_DURATIONS) + 2
-    assert len(full_cross(_ground())) == windows * 3 * 14 * 2 * 2
+    # Момент переворота на сетке один — в одной свече (решение 0063).
+    assert len(full_cross(_ground())) == windows * 3 * 14 * 1 * 2
 
 
 def test_the_number_of_runs_is_said_before_the_run() -> None:
@@ -497,7 +505,7 @@ def test_a_deal_outside_every_period_is_counted_apart() -> None:
 def test_a_row_outside_the_grid_gets_no_verdict_instead_of_a_bad_one() -> None:
     """Стережёт: у «всего дня» соседей нет, и это не приговор «шум»."""
     off = Point(label="весь день", engine=a_point("сетка").engine,
-                strategy=EmaReverseSettings(period=20))
+                strategy=MaReverseAlwaysSettings(period=20))
     on_grid = a_point("на сетке", take=0.4)
     trials = (a_trial(off, tuning=1.0, checking=-9000.0),
               a_trial(on_grid, tuning=2.0, checking=3000.0))
@@ -505,3 +513,125 @@ def test_a_row_outside_the_grid_gets_no_verdict_instead_of_a_bad_one() -> None:
     assert report.rows[0].verdict.stable is None
     assert report.rows[0].verdict.word == "—"
     assert report.rows[1].verdict.stable is None
+
+
+# ---------------------------------------------------------------------------
+# Сетка объявляет, под какой алгоритм она написана (ловушка 14 миниплана)
+# ---------------------------------------------------------------------------
+
+
+def test_the_grid_names_an_algorithm_that_really_exists() -> None:
+    """Объявленное имя есть в реестре, и это не `DEFAULT_ID`.
+
+    ⚠️ Литерал, а не `registry.DEFAULT_ID`, — намеренно: умолчание однажды
+    сменят, и сетка тогда молча объявила бы себя написанной под алгоритм,
+    полей которого она не знает. Проверка стережёт обе стороны: имя
+    настоящее и оно именно то, чьё поле сетка меняет.
+    """
+    entry = registry.find(GRID_STRATEGY_ID)
+    assert entry.settings_type is MaReverseAlwaysSettings
+    replaced = {name for name, _ in _GRID_REPLACES}
+    known = {one.name for one in entry.fields}
+    assert replaced <= known, (
+        f"сетка меняет поля, которых у алгоритма нет: {replaced - known}"
+    )
+
+
+#: Какие поля настроек алгоритма меняет сетка — и где это написано.
+#: Список короткий намеренно: он и есть вся привязка перебора к алгоритму.
+_GRID_REPLACES = (("period", "backtest/sweep.py::_average_and_take_points"),)
+
+
+def test_the_grid_really_uses_the_field_it_declares() -> None:
+    """Канарейка: сетка действительно меняет объявленное поле.
+
+    Без неё проверка выше зеленела бы и на списке, оторванном от кода:
+    объявили `period`, а сетка перебирает что-то другое.
+    """
+    ground = _ground()
+    periods = {
+        point.strategy.period
+        for block in blocks(ground) for point in block.points
+    }
+    assert len(periods) > 1, "сетка не перебирает период средней вовсе"
+
+
+def test_a_foreign_algorithm_is_refused_with_a_reason_a_human_can_read() -> None:
+    """Отказ называет обе стороны и говорит, что перебора не будет.
+
+    Молчаливый перебор чужих полей показал бы владельцу счёта настоящие
+    числа, к выбранному правилу отношения не имеющие, — и он поставил бы
+    по ним настройки.
+    """
+    with pytest.raises(ForeignStrategy) as refusal:
+        refuse_foreign_strategy("atr_channel", MaReverseAlwaysSettings())
+    said = str(refusal.value)
+    assert "atr_channel" in said
+    assert registry.find(GRID_STRATEGY_ID).title in said
+    assert "не запущен" in said
+
+
+def test_an_algorithm_sharing_the_settings_class_is_refused_by_its_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Отказ идёт по **имени**, а не по классу настроек — класс может совпасть.
+
+    ⚠️ Предмет проверки назван точно: алгоритм, у которого класс настроек
+    **тот же**, что у алгоритма сетки, и отличается он только именем.
+    Выдуманное имя отвергается уже потому, что реестр его не знает, — на нём
+    эта проверка была бы вакуумной. Отказ обязан случиться и здесь, иначе
+    перебор перебрал бы поля алгоритма сетки и показал бы лидеров как «ваши»
+    (решение 0057).
+
+    Мутация, обязанная ронять проверку: сверять класс настроек вместо имени.
+    Класс общий, и отказа не случилось бы.
+
+    ⚠️ До 14.09.2026 эту роль играл настоящий второй алгоритм реестра
+    («Тестовый скользящий», `ma_crossing`). Он удалён решением владельца
+    счёта, и свойство «тот же класс настроек, другое имя» теперь ставится
+    подставной записью: свойство осталось предметом проверки, а не исчезло
+    вместе с модулем.
+    """
+    twin = registry.StrategyEntry(
+        id="settings_twin",
+        title="Подставной с общим классом настроек",
+        settings_type=registry.find(GRID_STRATEGY_ID).settings_type,
+        factory=registry.find(GRID_STRATEGY_ID).factory,
+        fields=registry.find(GRID_STRATEGY_ID).fields,
+        demands=registry.find(GRID_STRATEGY_ID).demands,
+        describe=registry.find(GRID_STRATEGY_ID).describe,
+    )
+    monkeypatch.setattr(
+        registry, "_ENTRIES", (*registry.entries(), twin), raising=True
+    )
+
+    others = [entry for entry in registry.entries() if entry.id != GRID_STRATEGY_ID]
+    assert others, "в сборке один алгоритм — отказывать нечему, проверка вакуумна"
+    assert any(
+        entry.settings_type is registry.find(GRID_STRATEGY_ID).settings_type
+        for entry in others
+    ), "ни у одного чужого алгоритма нет общего класса настроек — мутация не ловится"
+    for entry in others:
+        with pytest.raises(ForeignStrategy) as refusal:
+            refuse_foreign_strategy(entry.id, entry.defaults())
+        said = str(refusal.value)
+        assert entry.title in said, (
+            "отказ не называет алгоритм так, как он подписан в окне: " + said
+        )
+        assert entry.id in said, "отказ не называет id выбранного алгоритма"
+        assert registry.find(GRID_STRATEGY_ID).title in said
+        assert "не запущен" in said
+
+
+def test_the_ground_of_the_sweep_refuses_foreign_settings() -> None:
+    """Отказ живёт в модели данных: чужое не попадает в условия перебора."""
+    class SettingsOfSomeoneElse:
+        period = 15
+
+    with pytest.raises(ForeignStrategy):
+        Ground(
+            engine=EngineSettings(),
+            # Подставные настройки и есть предмет проверки: отказ обязан
+            # случиться на них, а не на правильном классе.
+            strategy=SettingsOfSomeoneElse(),  # type: ignore[arg-type]
+        )

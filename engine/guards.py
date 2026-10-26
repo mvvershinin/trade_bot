@@ -73,7 +73,9 @@
 
 from __future__ import annotations
 
-import math
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `math` держал округление объёма
+# под обеспечение (`affordable_volume`) и проверку конечности потолка.
+# import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Final
@@ -84,13 +86,16 @@ from engine.window import in_moscow
 
 __all__ = [
     "FUNDS_MAX_AGE",
-    "DayResult",
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "DayResult",
     "Sizing",
-    "Unchecked",
-    "day_result",
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "Unchecked",
+    # "day_result",
     "entry_size",
     "funds_stale",
-    "unchecked_guards",
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "unchecked_guards",
     "usable_funds",
 ]
 
@@ -117,48 +122,49 @@ __all__ = [
 FUNDS_MAX_AGE: Final[timedelta] = timedelta(minutes=2)
 
 
-@dataclass(frozen=True, slots=True)
-class DayResult:
-    """Деньги текущей даты против дневного лимита убытка.
-
-    `equity` и `snapshot_at` — размер счёта, от которого считается лимит,
-    и момент его снимка. Момент печатается в журнале потому, что «на утро» —
-    это обещание, которое движок сдержать не может: программу могли запустить
-    в середине дня, и базой стал бы счёт на момент запуска. Врать про утро
-    нельзя, показать время снимка — можно.
-
-    `realized` — зафиксировано за дату, комиссия обеих сторон уже вычтена.
-    `unrealized` — бумажная переоценка открытой позиции по цене закрытия
-    текущей свечи. Считается **вместе** с зафиксированным (решение 0014):
-    иначе лимит молчит ровно тогда, когда убыток самый большой.
-
-    ⚠️ Внутрибарного срабатывания у лимита нет и не будет. Решение принимается
-    на закрытии свечи, как и все прочие: движок не читает `high` и `low`, а всё,
-    что решается внутри бара, у нас решает исполнитель по своей заявке
-    (решение 0008). Цена этого названа вслух: убыток, сходивший за лимит
-    и вернувшийся внутри пятиминутки, робота не остановит.
-    """
-
-    equity: float
-    snapshot_at: datetime
-    limit: float
-    realized: float
-    unrealized: float
-
-    @property
-    def total(self) -> float:
-        """Результат за дату целиком: зафиксированное плюс бумажное."""
-        return self.realized + self.unrealized
-
-    @property
-    def breached(self) -> bool:
-        """Убыток дошёл до лимита.
-
-        Неравенство нестрогое: убыток **ровно** в лимит — это достигнутый
-        лимит, а не «ещё чуть-чуть можно». Владелец счёта назвал цифру, до
-        которой он согласен потерять, а не после которой.
-        """
-        return self.total <= -self.limit
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# @dataclass(frozen=True, slots=True)
+# class DayResult:
+#     """Деньги текущей даты против дневного лимита убытка.
+#
+#     `equity` и `snapshot_at` — размер счёта, от которого считается лимит,
+#     и момент его снимка. Момент печатается в журнале потому, что «на утро» —
+#     это обещание, которое движок сдержать не может: программу могли запустить
+#     в середине дня, и базой стал бы счёт на момент запуска. Врать про утро
+#     нельзя, показать время снимка — можно.
+#
+#     `realized` — зафиксировано за дату, комиссия обеих сторон уже вычтена.
+#     `unrealized` — бумажная переоценка открытой позиции по цене закрытия
+#     текущей свечи. Считается **вместе** с зафиксированным (решение 0014):
+#     иначе лимит молчит ровно тогда, когда убыток самый большой.
+#
+#     ⚠️ Внутрибарного срабатывания у лимита нет и не будет. Решение принимается
+#     на закрытии свечи, как и все прочие: движок не читает `high` и `low`, а всё,
+#     что решается внутри бара, у нас решает исполнитель по своей заявке
+#     (решение 0008). Цена этого названа вслух: убыток, сходивший за лимит
+#     и вернувшийся внутри пятиминутки, робота не остановит.
+#     """
+#
+#     equity: float
+#     snapshot_at: datetime
+#     limit: float
+#     realized: float
+#     unrealized: float
+#
+#     @property
+#     def total(self) -> float:
+#         """Результат за дату целиком: зафиксированное плюс бумажное."""
+#         return self.realized + self.unrealized
+#
+#     @property
+#     def breached(self) -> bool:
+#         """Убыток дошёл до лимита.
+#
+#         Неравенство нестрогое: убыток **ровно** в лимит — это достигнутый
+#         лимит, а не «ещё чуть-чуть можно». Владелец счёта назвал цифру, до
+#         которой он согласен потерять, а не после которой.
+#         """
+#         return self.total <= -self.limit
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,9 +179,11 @@ class Sizing:
     Ноль и `None` — разные вещи, и слить их нельзя: ноль это «денег не хватает
     даже на один», `None` это «движку не сказали».
 
-    `over_cap` — заданный объём выше потолка. Тогда заявки нет независимо
-    от денег: потолок стоит против опечатки в один знак, и «подать поменьше»
-    здесь было бы догадкой за владельца счёта.
+    ⚠️ `over_cap` — ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113), поле
+    закомментировано вместе с потолком объёма. Прежний смысл: заданный объём
+    выше потолка, заявки нет независимо от денег — потолок стоит против
+    опечатки в один знак, и «подать поменьше» здесь было бы догадкой
+    за владельца счёта.
 
     `stale` — деньги счёта движку сообщали, но последний снимок к моменту
     решения устарел, а денежный предохранитель включён. Тогда заявки нет
@@ -187,14 +195,16 @@ class Sizing:
 
     wanted: float
     volume: float
-    affordable: float | None = None
-    over_cap: bool = False
-    stale: bool = False
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # affordable: float | None = None
+    # over_cap: bool = False
+    # stale: bool = False
 
-    @property
-    def cut(self) -> bool:
-        """Объём урезан под обеспечение, но заявка будет."""
-        return self.volume > 0 and self.volume < self.wanted
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # @property
+    # def cut(self) -> bool:
+    #     """Объём урезан под обеспечение, но заявка будет."""
+    #     return self.volume > 0 and self.volume < self.wanted
 
     @property
     def blocked(self) -> bool:
@@ -202,21 +212,22 @@ class Sizing:
         return self.volume <= 0
 
 
-@dataclass(frozen=True, slots=True)
-class Unchecked:
-    """Предохранитель включён, а проверить его нечем.
-
-    Ровно тот случай, ради которого всё это писалось: число в окне стоит,
-    владелец счёта считает защиту работающей, а движок молчит. Молчать нельзя
-    и здесь — поэтому «нечем проверить» это значение, которое разбор свечи
-    обязан превратить в строку журнала.
-    """
-
-    daily_limit: bool = False
-    free_funds: bool = False
-
-    def __bool__(self) -> bool:
-        return self.daily_limit or self.free_funds
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# @dataclass(frozen=True, slots=True)
+# class Unchecked:
+#     """Предохранитель включён, а проверить его нечем.
+#
+#     Ровно тот случай, ради которого всё это писалось: число в окне стоит,
+#     владелец счёта считает защиту работающей, а движок молчит. Молчать нельзя
+#     и здесь — поэтому «нечем проверить» это значение, которое разбор свечи
+#     обязан превратить в строку журнала.
+#     """
+#
+#     daily_limit: bool = False
+#     free_funds: bool = False
+#
+#     def __bool__(self) -> bool:
+#         return self.daily_limit or self.free_funds
 
 
 def _today(state: EngineState, at: datetime) -> date | None:
@@ -288,120 +299,143 @@ def unrealized(position: Position | None, close: float, ruble_per_point: float) 
     return move * position.volume * ruble_per_point
 
 
-def day_result(
-    state: EngineState, settings: EngineSettings, close: float, at: datetime
-) -> DayResult | None:
-    """Деньги дня против лимита — или `None`, если считать не от чего.
-
-    `None` возвращается в двух разных случаях, и различает их
-    `unchecked_guards`: лимит не задан (проверять нечего) и лимит задан,
-    а размера счёта движку не сообщили (проверять нечем).
-    """
-    if settings.daily_loss_limit_percent <= 0:
-        return None
-    day = state.day
-    if day is None or _today(state, at) is None or day.opening is None:
-        return None
-    return DayResult(
-        equity=day.opening.equity,
-        snapshot_at=day.opening.at,
-        limit=abs(day.opening.equity) * settings.daily_loss_limit_percent / 100.0,
-        realized=day.realized,
-        unrealized=unrealized(state.position, close, settings.ruble_per_point),
-    )
-
-
-def unchecked_guards(
-    state: EngineState, settings: EngineSettings, at: datetime
-) -> Unchecked:
-    """Какие включённые предохранители сегодня проверить нечем.
-
-    ⚠️ Спрашивается **дата свечи**, а не «есть ли снимок вообще»: снимок
-    вчерашнего дня для сегодняшнего лимита не годится. Вчерашний счёт
-    и вчерашний результат дали бы порог, который к сегодняшнему дню
-    отношения не имеет, — и это была бы не осторожность, а неправда.
-
-    ⚠️ **Два предохранителя стареют по-разному, и это не небрежность.**
-    Дневной лимит считается от `day.opening` — первого снимка даты, — и он
-    обязан быть старым: это и есть «счёт на утро», внутри дня он
-    не пересчитывается (решение 0035). Запас средств считается от последнего
-    снимка, и он обязан быть свежим: `DOMAIN.md` §5, биржа пересматривает
-    обеспечение внутри дня. Поэтому дату сторожит `_today`, а свежесть —
-    `usable_funds`, и подменять одно другим нельзя ни в какую сторону.
-    """
-    day = state.day
-    limit_blind = settings.daily_loss_limit_percent > 0 and (
-        day is None or _today(state, at) is None or day.opening is None
-    )
-    fresh = usable_funds(state, at)
-    funds_blind = settings.free_funds_reserve_percent > 0 and (
-        fresh is None or fresh.margin_per_contract is None
-    )
-    return Unchecked(daily_limit=limit_blind, free_funds=funds_blind)
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def day_result(
+#     state: EngineState, settings: EngineSettings, close: float, at: datetime
+# ) -> DayResult | None:
+#     """Деньги дня против лимита — или `None`, если считать не от чего.
+#
+#     `None` возвращается в двух разных случаях, и различает их
+#     `unchecked_guards`: лимит не задан (проверять нечего) и лимит задан,
+#     а размера счёта движку не сообщили (проверять нечем).
+#     """
+#     if settings.daily_loss_limit_percent <= 0:
+#         return None
+#     day = state.day
+#     if day is None or _today(state, at) is None or day.opening is None:
+#         return None
+#     return DayResult(
+#         equity=day.opening.equity,
+#         snapshot_at=day.opening.at,
+#         limit=abs(day.opening.equity) * settings.daily_loss_limit_percent / 100.0,
+#         realized=day.realized,
+#         unrealized=unrealized(state.position, close, settings.ruble_per_point),
+#     )
 
 
-def affordable_volume(
-    state: EngineState, settings: EngineSettings, at: datetime
-) -> float | None:
-    """На сколько целых контрактов хватает свободных средств с учётом запаса.
-
-    `None` — считать нечем: снимка счёта нет, снимок протух или ГО в нём
-    не сообщено.
-
-    Дробных контрактов не бывает, поэтому остаток отбрасывается вниз. Запас
-    вычитается **до** деления: он и заведён на случай, когда биржа поднимает
-    требования к обеспечению прямо внутри дня, а не после того, как позиция
-    уже занята под последний рубль.
-
-    ⚠️ Протухший снимок считается отсутствующим **и здесь**, а не только
-    в вердикте `unchecked_guards`. Иначе объём заявки урезался бы по числам
-    трёхчасовой давности — то есть предохранитель делал бы вид, что работает,
-    ровно тогда, когда работать не может.
-
-    ⚠️ **Снятая галочка гасит проверку целиком, а не только запас.** Ноль
-    процентов — это «предохранитель выключен», а не «запас нулевой»: так
-    подписана галочка в окне и так обещано в трёх местах — `app/convert._Guard.off`
-    («пока не включили — ведём себя в точности как раньше»),
-    `app/port.NO_GUARDS` и подсказка группы настроек. Прежде здесь стояла
-    проверка только на наличие чисел, и при снятой галочке объём всё равно
-    резался до `floor(free / ГО)`: владелец счёта со всеми снятыми галочками
-    получил бы в бою объём 3 вместо заданных 5 и список сделок, не совпадающий
-    с проверкой на истории. Найдено ревью 05.09.2026.
-    """
-    if settings.free_funds_reserve_percent <= 0:
-        return None
-    funds = usable_funds(state, at)
-    if funds is None or funds.margin_per_contract is None:
-        return None
-    usable = funds.free * (1.0 - settings.free_funds_reserve_percent / 100.0)
-    if usable <= 0:
-        return 0.0
-    return max(0.0, float(math.floor(usable / funds.margin_per_contract)))
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def unchecked_guards(
+#     state: EngineState, settings: EngineSettings, at: datetime
+# ) -> Unchecked:
+#     """Какие включённые предохранители сегодня проверить нечем.
+#
+#     ⚠️ Спрашивается **дата свечи**, а не «есть ли снимок вообще»: снимок
+#     вчерашнего дня для сегодняшнего лимита не годится. Вчерашний счёт
+#     и вчерашний результат дали бы порог, который к сегодняшнему дню
+#     отношения не имеет, — и это была бы не осторожность, а неправда.
+#
+#     ⚠️ **Два предохранителя стареют по-разному, и это не небрежность.**
+#     Дневной лимит считается от `day.opening` — первого снимка даты, — и он
+#     обязан быть старым: это и есть «счёт на утро», внутри дня он
+#     не пересчитывается (решение 0035). Запас средств считается от последнего
+#     снимка, и он обязан быть свежим: `DOMAIN.md` §5, биржа пересматривает
+#     обеспечение внутри дня. Поэтому дату сторожит `_today`, а свежесть —
+#     `usable_funds`, и подменять одно другим нельзя ни в какую сторону.
+#     """
+#     day = state.day
+#     limit_blind = settings.daily_loss_limit_percent > 0 and (
+#         day is None or _today(state, at) is None or day.opening is None
+#     )
+#     fresh = usable_funds(state, at)
+#     funds_blind = settings.free_funds_reserve_percent > 0 and (
+#         fresh is None or fresh.margin_per_contract is None
+#     )
+#     return Unchecked(daily_limit=limit_blind, free_funds=funds_blind)
 
 
-def _money_guard_on(settings: EngineSettings) -> bool:
-    """Включён ли хоть один предохранитель, которому нужны деньги счёта.
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def affordable_volume(
+#     state: EngineState, settings: EngineSettings, at: datetime
+# ) -> float | None:
+#     """На сколько целых контрактов хватает свободных средств с учётом запаса.
+#
+#     `None` — считать нечем: снимка счёта нет, снимок протух или ГО в нём
+#     не сообщено.
+#
+#     Дробных контрактов не бывает, поэтому остаток отбрасывается вниз. Запас
+#     вычитается **до** деления: он и заведён на случай, когда биржа поднимает
+#     требования к обеспечению прямо внутри дня, а не после того, как позиция
+#     уже занята под последний рубль.
+#
+#     ⚠️ Протухший снимок считается отсутствующим **и здесь**, а не только
+#     в вердикте `unchecked_guards`. Иначе объём заявки урезался бы по числам
+#     трёхчасовой давности — то есть предохранитель делал бы вид, что работает,
+#     ровно тогда, когда работать не может.
+#
+#     ⚠️ **Снятая галочка гасит проверку целиком, а не только запас.** Ноль
+#     процентов — это «предохранитель выключен», а не «запас нулевой»: так
+#     подписана галочка в окне и так обещано в трёх местах — `app/convert._Guard.off`
+#     («пока не включили — ведём себя в точности как раньше»),
+#     `app/port.NO_GUARDS` и подсказка группы настроек. Прежде здесь стояла
+#     проверка только на наличие чисел, и при снятой галочке объём всё равно
+#     резался до `floor(free / ГО)`: владелец счёта со всеми снятыми галочками
+#     получил бы в бою объём 3 вместо заданных 5 и список сделок, не совпадающий
+#     с проверкой на истории. Найдено ревью 05.09.2026.
+#     """
+#     if settings.free_funds_reserve_percent <= 0:
+#         return None
+#     funds = usable_funds(state, at)
+#     if funds is None or funds.margin_per_contract is None:
+#         return None
+#     usable = funds.free * (1.0 - settings.free_funds_reserve_percent / 100.0)
+#     if usable <= 0:
+#         return 0.0
+#     return max(0.0, float(math.floor(usable / funds.margin_per_contract)))
 
-    Оба выключены — владелец счёта прямо сказал, что торгует без проверки
-    денег, и устаревший снимок ему входа не запрещает: запрещать было бы
-    решением за него. Проверка ГО при этом всё равно не считает по старым
-    числам (`affordable_volume`), просто молчит, как молчала бы без снимка.
-    """
-    return (
-        settings.daily_loss_limit_percent > 0
-        or settings.free_funds_reserve_percent > 0
-    )
+
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def _money_guard_on(settings: EngineSettings) -> bool:
+#     """Включён ли хоть один предохранитель, которому нужны деньги счёта.
+#
+#     Оба выключены — владелец счёта прямо сказал, что торгует без проверки
+#     денег, и устаревший снимок ему входа не запрещает: запрещать было бы
+#     решением за него. Проверка ГО при этом всё равно не считает по старым
+#     числам (`affordable_volume`), просто молчит, как молчала бы без снимка.
+#     """
+#     return (
+#         settings.daily_loss_limit_percent > 0
+#         or settings.free_funds_reserve_percent > 0
+#     )
 
 
 def entry_size(state: EngineState, settings: EngineSettings, at: datetime) -> Sizing:
-    """Объём заявки на вход: свежесть счёта, потолок, потом обеспечение.
+    """Объём заявки на вход. На этом этапе — заданный объём, без проверок.
 
-    **Порядок обязателен и назван вслух.** Потолок проверяется по **заданному**
-    объёму, до всякого урезания. Проверь его после — и опечатка «50 вместо 5»
-    прошла бы молча в тот день, когда свободных средств хватило ровно
-    на пять контрактов: заявка уложилась бы в потолок, а настройка,
-    от которой она посчитана, осталась бы вдесятеро больше задуманного.
-    Потолок ставится один раз и сторожит **настройку**, а не остаток денег.
+    ⚠️ **Все три предохранителя закомментированы** — ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН
+    НА ЭТАПЕ (D-113), и функция стала передаточной: что стоит в настройках,
+    то и уйдёт в заявку. Она оставлена на месте вместе с `Sizing` и обоими
+    неиспользуемыми аргументами намеренно — это **шов, через который
+    предохранители возвращаются** одним снятием комментариев, а не переносом
+    кода обратно в разбор свечи. Неиспользуемые `state` и `at` — не забытый
+    хвост: без них возврат потребовал бы править и подпись, и место вызова.
+
+    ⚠️ **Следствие, названное вслух: решение 0037 на этом этапе недостижимо.**
+    Запрет входа по протухшему снимку счёта срабатывал только при включённом
+    денежном предохранителе (`_money_guard_on`), а включать больше нечего.
+    Снимок счёта по-прежнему приходит и по-прежнему пишется в журнал —
+    но на вход он не влияет ничем.
+
+    Прежний разбор — ниже, вместе с кодом.
+
+    ⚠️ **Потолка объёма здесь больше нет** — ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ
+    (D-113). Прежний порядок был обязателен и назван вслух: потолок
+    проверялся по **заданному** объёму, до всякого урезания. Проверь его
+    после — и опечатка «50 вместо 5» прошла бы молча в тот день, когда
+    свободных средств хватило ровно на пять контрактов: заявка уложилась бы
+    в потолок, а настройка, от которой она посчитана, осталась бы вдесятеро
+    больше задуманного. Потолок ставился один раз и сторожил **настройку**,
+    а не остаток денег. При возврате он встаёт на прежнее место в этом
+    порядке, а не куда придётся.
 
     Дальше — обеспечение. При нехватке робот **входит уменьшенным объёмом**,
     а не пропускает сигнал и не останавливается (решение 0014). Не хватает
@@ -421,14 +455,17 @@ def entry_size(state: EngineState, settings: EngineSettings, at: datetime) -> Si
     Разбор этой границы — в `funds_stale`.
     """
     wanted = settings.volume
-    if _money_guard_on(settings) and funds_stale(state, at):
-        return Sizing(wanted=wanted, volume=0.0, stale=True)
-    cap = settings.volume_cap
-    if cap is not None and wanted > cap:
-        return Sizing(wanted=wanted, volume=0.0, over_cap=True)
-    affordable = affordable_volume(state, settings, at)
-    if affordable is None:
-        return Sizing(wanted=wanted, volume=wanted)
-    return Sizing(
-        wanted=wanted, volume=min(wanted, affordable), affordable=affordable
-    )
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): при возврате раскомментировать
+    # блок ниже и удалить живую замену под ним.
+    # if _money_guard_on(settings) and funds_stale(state, at):
+    #     return Sizing(wanted=wanted, volume=0.0, stale=True)
+    # cap = settings.volume_cap
+    # if cap is not None and wanted > cap:
+    #     return Sizing(wanted=wanted, volume=0.0, over_cap=True)
+    # affordable = affordable_volume(state, settings, at)
+    # if affordable is None:
+    #     return Sizing(wanted=wanted, volume=wanted)
+    # return Sizing(
+    #     wanted=wanted, volume=min(wanted, affordable), affordable=affordable
+    # )
+    return Sizing(wanted=wanted, volume=wanted)

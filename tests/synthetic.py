@@ -148,12 +148,16 @@ def trades() -> list[TradeRow]:
 
 
 def summary() -> TradesSummary:
-    # Профит-фактор — из тех же трёх строк, чистыми:
-    # (1180 − 28 + 1425 − 28) / (640 + 28).
+    # Итог — из тех же трёх строк `trades()`. `TradeRow.profit_rub` — результат
+    # уже ПОСЛЕ комиссии (`app/convert.py::trade_row`), поэтому чистая прибыль —
+    # сумма строк, 1180 + 1425 − 640 = 1965, а валовая — она же плюс комиссия
+    # трёх сделок по 28 ₽: 1965 + 84 = 2049 (B-018: было наоборот, 1965 / 1881).
+    # Профит-фактор — по чистым, как `backtest.history.summarize`:
+    # (1180 + 1425) / 640.
     return TradesSummary(
-        trades=3, profitable_share=2 / 3, net_profit_rub=1881.0,
-        gross_profit_rub=1965.0, commission_rub=84.0, max_drawdown_rub=-640.0, reversals=1,
-        profit_factor=2549 / 668,
+        trades=3, profitable_share=2 / 3, net_profit_rub=1965.0,
+        gross_profit_rub=2049.0, commission_rub=84.0, max_drawdown_rub=-640.0, reversals=1,
+        profit_factor=2605 / 640,
     )
 
 
@@ -201,8 +205,10 @@ def state(**changes: object) -> RobotState:
             Side.SHORT, 1, bars[16].close, bars[16].opens_at, -240.0,
             take=TakeGuard.ARMED, take_level=284_400.0, take_trailing=False,
         ),
-        day_profit_rub=1881.0,
-        day_profit_pct=0.19,
+        # Чистыми, как и итог `summary()`: сумма строк `trades()` (B-018).
+        # Процент — от счёта на утро 1 000 000 ₽ из `decisions()`.
+        day_profit_rub=1965.0,
+        day_profit_pct=1965.0 / 1_000_000 * 100,
         day_commission_rub=84.0,
         day_trades=3,
         token_read_only=False,

@@ -170,8 +170,10 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING, Final, Protocol
 
+from app import debug_feed
 from app.backfill import Backfiller
 from app.halt import halt_on_unknown_outcome
 from broker.account import SNAPSHOT_INTERVAL, Account, AccountSnapshot
@@ -202,6 +204,30 @@ TIMEFRAME: Final[str] = "M1"
 #: повтор по кругу — первый способ упереться в ограничение частоты.
 RETRY_FIRST: Final[float] = 2.0
 RETRY_CAP: Final[float] = 60.0
+
+#: Сколько ждать первого снимка после открытия сокета. У брокера это 3–17 с
+#: (замер `B-007`); потолок паузы повторов берётся с запасом втрое и новым
+#: числом не заводится. Не торговое число: робот по нему не решает ничего,
+#: оно только говорит человеку, что брокер молчит. Замер 29.09.2026: по
+#: истёкшему MXU6 брокер сокет открыл и не прислал ни одного снимка, окно
+#: ждало вечно и молчало (правило 13).
+FIRST_SNAPSHOT_WAIT: Final[float] = RETRY_CAP
+
+
+class SnapshotsLate(BrokerError):
+    """Сокет открыт, а первого снимка нет дольше `FIRST_SNAPSHOT_WAIT`."""
+
+    retryable = True
+
+    def __init__(self, ticker: str, waited: float) -> None:
+        super().__init__(
+            f"Брокер не прислал ни одного снимка по {ticker} за {waited:.0f} с "
+            "после открытия потока. Проверьте, торгуется ли ещё этот контракт: "
+            "по истёкшему коду брокер поток открывает, но котировок не шлёт. "
+            "Бывает и так, что торги по нему сейчас на паузе (клиринг). "
+            "Программа переподключится сама.",
+            f"first snapshot not received in {waited:.0f} s",
+        )
 
 #: Сколько ждать закрытия сокета при завершении программы. Мёртвый сокет
 #: не должен держать завершение (миниплан Э1-5, §4.6): по истечении задача
@@ -821,6 +847,12 @@ class LiveFeed:
         #: токене попытки идут до конца сеанса, чужие снимки могут идти потоком.
         self._complaint: str | None = None
         self._foreign: set[str] = set()
+        #: Пауза перед следующей попыткой подключения (`_ride`).
+        self._pause: float = RETRY_FIRST
+        #: Когда в этом заходе пришёл первый снимок, по `monotonic`; `None` —
+        #: не пришёл. По нему `_settle_pause` решает, заслужил ли заход сброс
+        #: паузы (`D-025`).
+        self._online_since: float | None = None
         #: Виды незнания расписания, о которых уже сказано в журнал решений.
         #: По одной строке на вид **за всё время жизни потока**, а не за круг:
         #: расписание спрашивается перед каждой попыткой подключения, и
@@ -964,18 +996,22 @@ class LiveFeed:
         Пауза повторов при этом начинается заново: биржа открылась — первая
         попытка идёт сразу, а не через минуту, накопленную за ночь.
 
+        Удачный заход — дошёл первый снимок и связь прожила не меньше
+        `RETRY_CAP` — тоже начинает паузу заново (`_settle_pause`, `D-025`).
+
         Причина говорится один раз (`_complain`), а не каждые 2…60 секунд, —
         но в **технический лог** уходит каждая: по нему обрыв и разбирают.
         """
         await self._drain()
         self._complaint = None
-        pause = RETRY_FIRST
+        self._pause = RETRY_FIRST
+        self._online_since = None
         self._phase(LinkPhase.CONNECTING)
         while True:
             shut = await self._shut()
             if shut is not None:
                 await self._wait_out(shut)
-                pause = RETRY_FIRST
+                self._pause = RETRY_FIRST
                 continue
             # ⚠️ Фаза ставится **здесь**, а не в конце круга. Иначе выход
             # из ожидания объявлял бы подключение до того, как расписание
@@ -1003,7 +1039,8 @@ class LiveFeed:
                 self._complain(str(error), error.technical)
             except Exception as error:  # трассировка уходит в log.exception ниже
                 final = True
-                log.exception("поток котировок снят ошибкой программы")
+                # Мимо ленты: в ней эта беда — строкой журнала из `_complain`.
+                log.exception("поток котировок снят ошибкой программы", extra={"panel": False})
                 self._complain(
                     f"Ошибка программы, а не связи: {type(error).__name__}: {error}. "
                     "Подробность — в выводе программы в консоли."
@@ -1019,9 +1056,26 @@ class LiveFeed:
                     DecisionLevel.WARNING,
                 )
                 return
-            self._phase(LinkPhase.PAUSED, f"{pause:.0f} с")
-            await asyncio.sleep(pause)
-            pause = min(pause * 2, RETRY_CAP)
+            self._settle_pause()
+            self._phase(LinkPhase.PAUSED, f"{self._pause:.0f} с")
+            await asyncio.sleep(self._pause)
+            self._pause = min(self._pause * 2, RETRY_CAP)
+
+    def _settle_pause(self) -> None:
+        """Начать паузу повторов заново, если оборвавшийся заход прожил долго.
+
+        Сброс — только когда от первого снимка до обрыва прошло не меньше
+        `RETRY_CAP`. Сброс на самом первом снимке (правка 27.09.2026) открывал
+        петлю: брокер отдаёт снимок и рвёт соединение (вторая сессия на том
+        же токене) → повтор каждые две секунды без нарастания, и каждый заход
+        зовёт догрузку истории у брокера — прямой путь в ограничение частоты.
+        Заход, проживший дольше потолка, сам по себе уже реже, чем повтор
+        на потолке, — сброс ничего не учащает. Короткий заход паузу не
+        сбрасывает, и она растёт дальше (`D-025`).
+        """
+        since, self._online_since = self._online_since, None
+        if since is not None and monotonic() - since >= RETRY_CAP:
+            self._pause = RETRY_FIRST
 
     async def _wait_out(self, shut: MarketShut) -> None:
         """Биржа закрыта: сказать один раз и ждать открытия вместо повторов.
@@ -1072,7 +1126,9 @@ class LiveFeed:
         except asyncio.CancelledError:
             raise
         except Exception:  # трассировка уходит в log.exception
-            log.exception("расписание торгов не спрошено (%s)", self._class_code)
+            log.exception(  # мимо ленты: в ней — строка журнала `_say_doubt`
+                "расписание торгов не спрошено (%s)", self._class_code, extra={"panel": False}
+            )
             self._say_doubt(ScheduleDoubt.BROKEN, None)
             return None
         now = datetime.now(MSK)
@@ -1129,7 +1185,9 @@ class LiveFeed:
             return
         self._doubted.add(doubt)
         line, level = doubt_words(doubt, failure)
-        log.warning("расписание торгов: %s (%s)", doubt.value, self._class_code)
+        log.warning(  # мимо ленты: строка журнала ниже говорит то же самое
+            "расписание торгов: %s (%s)", doubt.value, self._class_code, extra={"panel": False}
+        )
         self._watch.say(SCHEDULE_EVENT, line, level)
 
     def _phase(self, phase: LinkPhase, detail: str = "") -> None:
@@ -1176,6 +1234,10 @@ class LiveFeed:
             self._class_code,
             text,
             f" [{technical}]" if technical else "",
+            # Мимо ленты: в ней причина стоит строкой журнала ниже. Повтор
+            # той же причины журнал не говорит — лента его тоже не повторяет,
+            # а каждый заход виден строкой фазы (`_phase`).
+            extra={"panel": False},
         )
         self._say_once("Связь с брокером", text, DecisionLevel.WARNING)
 
@@ -1227,14 +1289,37 @@ class LiveFeed:
             await self._read(socket)
 
     async def _read(self, socket: object) -> None:
-        """Чтение сообщений открытого сокета до обрыва."""
+        """Чтение сообщений открытого сокета до обрыва.
+
+        Первый снимок ждётся не дольше `FIRST_SNAPSHOT_WAIT`: молчащий
+        брокер — отказ вслух и повтор (`SnapshotsLate`), а не вечное
+        «ждём первый снимок». Срок — на первый **снимок**, а не на первое
+        сообщение: служебные ответы брокера котировкой не являются.
+        """
+        waited = FIRST_SNAPSHOT_WAIT
+        deadline = asyncio.timeout(waited)
+        try:
+            async with deadline:
+                await self._read_all(socket, deadline)
+        except TimeoutError:
+            # Срок снят первым снимком — значит, это чужой таймаут изнутри
+            # разбора, и он летит дальше как был.
+            if deadline.when() is not None and deadline.expired():
+                raise SnapshotsLate(self._ticker, waited) from None
+            raise
+
+    async def _read_all(self, socket: object, deadline: asyncio.Timeout) -> None:
+        """Сам разбор сокета; срок первого снимка снимается на первом снимке."""
         first = True
+        announced = False
         async for raw in socket:  # type: ignore[attr-defined]
             snapshot = snapshot_of(raw)
             if snapshot is None:
                 continue
             if first:
+                deadline.reschedule(None)
                 self._complaint = None
+                self._online_since = monotonic()
                 self._phase(LinkPhase.ONLINE)
                 self._watch.say(
                     "Связь с брокером",
@@ -1242,12 +1327,16 @@ class LiveFeed:
                     DecisionLevel.INFO,
                 )
                 first = False
-                # ⚠️ Минута первого снимка объявляется **здесь и один раз
-                # за заход**: с неё и правее ряд ведёт этот заход потока.
-                # Получатель (догрузка пропущенного) обязан вернуться
-                # немедленно — ожидание остановило бы чтение сокета, минуты
-                # перестали бы закрываться, и лечение дыры само сделало бы
-                # новую. Что делать с этой минутой, поток не знает.
+            if not announced and self._foreign_of(snapshot) is None:
+                # ⚠️ Минута захода объявляется **один раз** и только по
+                # **своему** снимку (`D-023`): M5 в канале M1 или чужой
+                # инструмент задали бы догрузке границу по своему времени,
+                # и минуты между чужой меткой и первым своим снимком
+                # не догрузились бы никогда. Получатель (догрузка
+                # пропущенного) обязан вернуться немедленно — ожидание
+                # остановило бы чтение сокета, минуты перестали бы
+                # закрываться, и лечение дыры само сделало бы новую.
+                announced = True
                 self._watch.connected(floor_to_minute(snapshot.opened_at))
             await self._accept(snapshot)
 
@@ -1302,14 +1391,16 @@ class LiveFeed:
                     DecisionLevel.WARNING,
                 )
             return
-        self._last = snapshot
+        first, self._last = self._last is None, snapshot
         # Снимок принят — растущая минута идёт в окно. **После** записи
         # закрытой минуты выше: тот, кто рисует, читает из базы минутки этого
         # же бара, и порядок «сначала записали, потом рисуем» не даёт бару
         # мигнуть без только что закончившейся минуты.
-        self._watch.growing_minute(
-            self._ticker, to_minute(snapshot, after.contracts, unsettled=True)
-        )
+        growing = to_minute(snapshot, after.contracts, unsettled=True)
+        if first:
+            # В ленту — первый принятый снимок минуты, а не каждый из девяти.
+            debug_feed.minute_started(self._ticker, growing)
+        self._watch.growing_minute(self._ticker, growing)
 
     async def _close_minute(self, last: CandleSnapshot, tally: MinuteTally) -> None:
         """Минута закончилась — теперь, и только теперь, она пишется в базу.
@@ -1323,9 +1414,8 @@ class LiveFeed:
         сам, что с этим делать — дорисовать закрытую свечу или гнать прогон
         (`HistoryPort.live_candle`). Поток знает только, что минута записана.
         """
-        await self._worker.put_minutes(
-            self._ticker, [to_minute(last, tally.contracts)], Source.BROKER
-        )
+        written = to_minute(last, tally.contracts)
+        await self._worker.put_minutes(self._ticker, [written], Source.BROKER)
         self._last = None
         log.info(
             "минута %s: оборот %.0f → %d контрактов%s",
@@ -1333,7 +1423,10 @@ class LiveFeed:
             tally.turnover,
             tally.contracts,
             f", отвергнуто снимков: {tally.refused}" if tally.refused else "",
+            # Мимо ленты: её числа уже есть в строке ленты ниже, с ценами.
+            extra={"panel": False},
         )
+        debug_feed.minute_closed(self._ticker, written, tally.refused)
         self._watch.closed_minute(self._ticker)
         self._tell_clock()
 
@@ -1666,11 +1759,14 @@ class FundsWatch:
                 "состояние счёта не получено: %s%s",
                 failure.human,
                 f" [{failure.technical}]" if failure.technical else "",
+                extra={"panel": False},  # в ленте — строка журнала из `_blind`
             )
             self._blind(str(failure))
             return
         except Exception as error:  # трассировка уходит в log.exception
-            log.exception("опрос состояния счёта упал ошибкой программы")
+            log.exception(  # мимо ленты: в ней — строка журнала из `_blind`
+                "опрос состояния счёта упал ошибкой программы", extra={"panel": False}
+            )
             self._blind(
                 f"Ошибка программы, а не связи: {type(error).__name__}: {error}. "
                 "Подробность — в выводе программы в консоли."
@@ -1955,6 +2051,11 @@ class LiveLink:
             if self._funds is not None:
                 self._funds.request_stop()
             return None
+        if self._session is not None:
+            # Нажатие — то самое действие человека, после которого отвергнутый
+            # брокером токен снова пробуют (`B-062`): сам цикл переподключения
+            # и опрос счёта к сервису авторизации после `invalid_grant` не ходят.
+            self._session.allow_token_retry()
         try:
             feed = self._feed or self._build()
         except BrokerError as error:
@@ -1969,8 +2070,9 @@ class LiveLink:
             #
             # Человеку — фраза, её отдаст порт; технику — причина с путём.
             # Оба текста отказ брокера чистит сам при создании (`broker/errors.py`).
-            log.warning(
-                "подключение к брокеру не собрано: %s", error.technical or error.human
+            log.warning(  # мимо ленты: отказ скажет порт строкой журнала
+                "подключение к брокеру не собрано: %s", error.technical or error.human,
+                extra={"panel": False},
             )
             return str(error)
         self._feed = feed
@@ -2065,6 +2167,9 @@ class LiveLink:
                 "кто-то ещё, выпустите новый токен в личном кабинете БКС.",
                 DecisionLevel.WARNING,
             )
+        scope_notice = stored.scope_notice
+        if scope_notice is not None:
+            self._port.note("Тип токена", scope_notice, DecisionLevel.WARNING)
         self._hours = Schedule(self._session)
         self._backfill = self._backfiller(self._session)
         if self._funds_to is not None and self._funds is None:

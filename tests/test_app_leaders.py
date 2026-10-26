@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import date, datetime
 
@@ -192,6 +193,22 @@ TUNING = (date(2026, 5, 26), date(2026, 7, 17))
 CHECKING = (date(2026, 7, 20), date(2026, 9, 4))
 
 
+def test_a_leaders_run_records_the_program_numbers(tmp_path):
+    """D-117: прогон перебора пишет в снимок числа программы из набора.
+
+    Мутация: убрать `program=` из `RunConditions` в `app.leaders.record`.
+    Числа не умолчания — иначе проверка зеленела бы и при чужих числах.
+    """
+    values = dataclasses.replace(
+        settings_of(recipes()[0], BASE), expiry_halt_days=3, history_depth_days=17
+    )
+    with CandleStore(tmp_path / "candles.sqlite3") as store:
+        record(store, values, (a_stretch(*TUNING),), timeframe=values.timeframe)
+        (row,) = store.journal_sessions(limit=10).rows
+    assert "Остановка перед экспирацией, дней: 3" in row.settings, row.settings
+    assert "Глубина загрузки истории, дней: 17" in row.settings, row.settings
+
+
 def test_the_checking_run_is_written_last(tmp_path):
     """Проверочный отрезок записывается последним — и потому виден в списке.
 
@@ -293,3 +310,39 @@ def test_the_examples_file_holds_exactly_what_was_written():
         for place, recipe in enumerate(recipes()[:3], start=1)
     )
     assert len({one.name for one in made}) == len(made)
+
+
+# ---------------------------------------------------------------------------
+# Перебор чужому алгоритму отказывает фразой, а не трассировкой
+# ---------------------------------------------------------------------------
+
+
+def test_a_foreign_algorithm_stops_the_sweep_with_words_and_a_return_code(
+    monkeypatch, capsys
+) -> None:
+    """`python3 -m app.leaders` при чужом алгоритме говорит причину и уходит.
+
+    ⚠️ Трассировка в консоль здесь была бы тем самым молчанием, которое
+    дороже поломки (`CLAUDE.md` №13): человек видит стену Python и не видит
+    ответа на свой вопрос «почему не подобралось».
+
+    Мутация, обязанная ронять проверку: убрать `except ForeignStrategy`
+    из `app/leaders.py::main` — тогда отказ вылетит трассировкой,
+    а код возврата станет 1 от самого интерпретатора.
+    """
+    from app import leaders as app_leaders
+    from backtest.sweep import ForeignStrategy
+
+    async def refuse(_args) -> int:
+        raise ForeignStrategy(
+            "сетка перебора написана под торговый алгоритм «Реверс по "
+            "скользящей средней» (ema_reverse), а выбран «second». "
+            "Перебор не запущен."
+        )
+
+    monkeypatch.setattr(app_leaders, "work", refuse)
+    code = app_leaders.main(["--db", "нет.sqlite3"])
+    said = capsys.readouterr().err
+    assert code == 2, f"отказ вернул код {code}, а не отдельный код отказа"
+    assert "Перебор не запущен" in said, "отказ не доехал до человека"
+    assert "second" in said, "отказ не называет, какой алгоритм выбран"

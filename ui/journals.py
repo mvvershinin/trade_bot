@@ -17,10 +17,18 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QSize,
+    QSortFilterProxyModel,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
@@ -48,17 +56,20 @@ from ui.formatting import (
     summary_parts,
 )
 from ui.models import DecisionLevel, DecisionRow, TradeRow, TradesSummary
+from ui.fit_scroll import FitScrollArea
 from ui.theme import Theme, current as current_theme
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
 
-#: Ширина колонки «Причина выхода» в отчёте о прогоне, в точках.
+#: Самая длинная причина выхода движка (`engine.ExitReason.label`) —
+#: по ней меряется ширина колонки «Причина выхода» (`_hold_reason_width`).
+#: Причина выхода — единственная колонка таблицы с человеческим текстом,
+#: и обрезанная она превращается в «обратны…».
 #:
-#: Замерена по самой длинной причине движка — «обратный сигнал средней»
-#: (`engine.ExitReason.label`), плюс запас на шрифт покрупнее. Не «на глаз»
-#: и не «побольше»: причина выхода — единственная колонка этой таблицы
-#: с человеческим текстом, и обрезанная она превращается в «обратны…».
-REASON_WIDTH = 200
+#: ⚠️ До 05.10.2026 ширина стояла числом — 200 точек. С шрифтом ×1,2 число
+#: стало неверным, и меряется теперь шрифтом самой таблицы: оно верно
+#: при любом кегле, включая системный крупный шрифт на машине владельца.
+LONGEST_REASON = "обратный сигнал средней"
 
 
 class TradesModel(QAbstractTableModel):
@@ -405,12 +416,91 @@ class DecisionsModel(QAbstractTableModel):
         return None
 
 
+#: С какой длины подпись колонки в шапке таблицы разбивается на две строки.
+#: «Результат за вычетом комиссии, ₽» — 32 знака; «Цена выхода» — 11.
+#: Короче — «Сторона», «Объём»: одно слово, ломать нечего.
+HEADER_WRAP_FROM = 10
+
+#: Строка шапки короче этого не остаётся одна: «₽» на второй строке —
+#: не перенос, а обломок.
+SHORTEST_LINE = 3
+
+
+def two_lines(caption: str) -> str:
+    """Длинная подпись колонки — двумя строками, разрыв у пробела ближе к середине.
+
+    ⚠️ Только для шапки на экране. Модель и выгрузка отдают подпись
+    одной строкой (`ui.export.trade_headers`), и разбивка их не трогает.
+    """
+    if len(caption) < HEADER_WRAP_FROM or " " not in caption:
+        return caption
+    middle = len(caption) / 2
+    cut = min(
+        (at for at, letter in enumerate(caption) if letter == " "),
+        key=lambda at: abs(at - middle),
+    )
+    head, tail = caption[:cut], caption[cut + 1:]
+    if min(len(head), len(tail)) < SHORTEST_LINE:  # «Комиссия,» / «₽» — не разбивать
+        return caption
+    return head + "\n" + tail
+
+
+class _WrappedHeaders(QSortFilterProxyModel):
+    """Прослойка сортировки, которая заодно ломает длинные подписи шапки.
+
+    ⚠️ Заведена по снимку 05.10.2026. С шрифтом ×1,2 одна подпись
+    «Результат за вычетом комиссии, ₽» занимала около трёхсот точек при
+    числах в колонке втрое уже, и десять колонок журнала сделок переставали
+    влезать даже в 1440 точек: колонка комиссии — отдельная строка по
+    правилу 4 — уезжала за край. Разбивка здесь, а не в модели: модель
+    сверяется с выгрузкой знак в знак (`tests/test_ui_journals.py`).
+    """
+
+    def headerData(
+        self, section: int, orientation: Qt.Orientation,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> object:
+        """Подпись источника; длинная горизонтальная — двумя строками."""
+        shown = super().headerData(section, orientation, role)
+        if (
+            role == Qt.ItemDataRole.DisplayRole
+            and orientation is Qt.Orientation.Horizontal
+            and isinstance(shown, str)
+        ):
+            return two_lines(shown)
+        return shown
+
+
+class _Header(QHeaderView):
+    """Шапка, которая не берёт лишнего места под стрелку сортировки.
+
+    Qt прибавляет к ширине **каждой** колонки место под стрелку сортировки
+    размером с высоту её подписи. У подписи в две строки (`two_lines`) это
+    вдвое больше нужного: стрелка одна и высотой в строку. Снимок 05.10.2026,
+    1280×800: лишние ~20 точек на каждой двухстрочной колонке уводили
+    колонку комиссии за край таблицы.
+    """
+
+    def sectionSizeFromContents(self, logicalIndex: int) -> QSize:  # noqa: N803 — имя задано Qt
+        """Размер колонки по подписи — со стрелкой высотой в одну строку."""
+        size = super().sectionSizeFromContents(logicalIndex)
+        model = self.model()
+        if model is None or not self.isSortIndicatorShown():
+            return size
+        caption = model.headerData(logicalIndex, self.orientation())
+        extra = str(caption).count("\n") if caption is not None else 0
+        if extra and self.orientation() is Qt.Orientation.Horizontal:
+            size.setWidth(size.width() - extra * self.fontMetrics().lineSpacing())
+        return size
+
+
 class _Table(QTableView):
     """Таблица журнала: сортировка по колонкам, выделение строкой, только чтение."""
 
     def __init__(self, model: QAbstractTableModel, stretch_column: int, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        proxy = QSortFilterProxyModel(self)
+        self.setHorizontalHeader(_Header(Qt.Orientation.Horizontal, self))
+        proxy = _WrappedHeaders(self)
         proxy.setSourceModel(model)
         proxy.setSortRole(SORT_ROLE)
         self.setModel(proxy)
@@ -425,6 +515,24 @@ class _Table(QTableView):
         self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.horizontalHeader().setSectionResizeMode(stretch_column, QHeaderView.ResizeMode.Stretch)
         self.horizontalHeader().setHighlightSections(False)
+
+    #: Сколько строк таблица показывает при любой тесноте окна.
+    MIN_ROWS = 3
+
+    def minimumSizeHint(self) -> QSize:
+        """Шапка, `MIN_ROWS` строк и полоса прокрутки — меньше не сжимается.
+
+        ⚠️ По снимку 05.10.2026: с шрифтом ×1,2 на экране 1280×800 раскладка
+        отдавала место итогу под таблицей, а самой таблице не оставалось
+        ни одной видимой строки — журнал сделок был, а сделок в нём не было.
+        """
+        hint = super().minimumSizeHint()
+        rows = self.verticalHeader().defaultSectionSize() * self.MIN_ROWS
+        height = (
+            self.horizontalHeader().sizeHint().height() + rows
+            + self.horizontalScrollBar().sizeHint().height() + 2 * self.frameWidth()
+        )
+        return QSize(hint.width(), max(hint.height(), height))
 
 
 def trades_view(
@@ -453,28 +561,56 @@ def trades_view(
     model.set_rows(rows)
     view = _Table(model, stretch_column=_TRADE_WIDE, parent=parent)
     model.setParent(view)
-    header = view.horizontalHeader()
-    header.setSectionResizeMode(_TRADE_WIDE, QHeaderView.ResizeMode.Interactive)
-    view.setColumnWidth(_TRADE_WIDE, REASON_WIDTH)
+    _hold_reason_width(view)
     return view
 
 
+def _hold_reason_width(view: QTableView) -> None:
+    """Колонка причины выхода — постоянной ширины, лишнее — под полосу прокрутки.
+
+    Тянущаяся колонка берёт **остаток** ширины, и там, где остатка нет,
+    Qt ужимает её до обрезков («ина вы»). В отчёте о прогоне так было
+    с 06.09.2026 (см. `trades_view`); в журнале под графиком — с шрифтом
+    ×1,2 на экране 1280×800 (снимок 05.10.2026). Свободную ширину на широком
+    экране забирает последняя колонка.
+    """
+    header = view.horizontalHeader()
+    header.setSectionResizeMode(_TRADE_WIDE, QHeaderView.ResizeMode.Interactive)
+    metrics = view.fontMetrics()
+    view.setColumnWidth(_TRADE_WIDE, metrics.horizontalAdvance(LONGEST_REASON) + metrics.height())
+    header.setStretchLastSection(True)
+
+
 def _assumptions_label() -> QLabel:
-    """Ярлык оговорки под итогом: перенос строк, шрифт на пункт меньше.
+    """Ярлык оговорки под итогом: перенос строк, основной шрифт.
 
     Несколько строк подряд («это расчёт, а не выписка со счёта» и три факта
     с числами) в одну строку не помещаются ни на каком окне, поэтому перенос
-    обязателен. Шрифт меньше основного на пункт, но не «мелкий»: это
-    единственное место, где сказано, чего в показанной прибыли нет.
+    обязателен. Шрифт основной: это единственное место, где сказано, чего
+    в показанной прибыли нет, а «на пункт меньше» (до 05.10.2026) владелец
+    счёта назвал «очень плохо видно».
     """
     label = QLabel()
     label.setWordWrap(True)
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     label.setContentsMargins(6, 0, 6, 6)
-    font = label.font()
-    font.setPointSizeF(max(font.pointSizeF() - 1.0, 7.0))
-    label.setFont(font)
     return label
+
+
+def _below_table(*labels: QLabel) -> FitScrollArea:
+    """Итог и оговорка под таблицей сделок — в прокрутке (`ui/fit_scroll.py`).
+
+    На тесном экране они сжимаются до двух строк с полосой прокрутки,
+    а не оставляют таблицу без единой видимой сделки (снимок 1280×800,
+    05.10.2026, шрифт ×1,2).
+    """
+    below = QWidget()
+    layout = QVBoxLayout(below)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)
+    for label in labels:
+        layout.addWidget(label)
+    return FitScrollArea(below, min_lines=2)
 
 
 class JournalTabs(QWidget):
@@ -485,6 +621,7 @@ class JournalTabs(QWidget):
     """
 
     export_requested = Signal()
+    reports_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -496,10 +633,15 @@ class JournalTabs(QWidget):
         # Тянущаяся колонка берётся из описания колонок, а не числом:
         # у сделок это «Причина выхода», у решений — «Причина».
         self.trades_table = _Table(self.trades_model, stretch_column=_TRADE_WIDE)
+        _hold_reason_width(self.trades_table)
         self.decisions_table = _Table(self.decisions_model, stretch_column=_DECISION_WIDE)
         self.decisions_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
 
         self.summary_label = QLabel()
+        # Перенос строк — не косметика: без него строка итога (≈1400 точек
+        # при шрифте ×1,2) задавала **наименьшую ширину главного окна**,
+        # и на экране 1280×800 окно вылезало за край (снимок 05.10.2026).
+        self.summary_label.setWordWrap(True)
         self.summary_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.summary_label.setContentsMargins(6, 4, 6, 4)
 
@@ -513,8 +655,7 @@ class JournalTabs(QWidget):
         trades_layout.setContentsMargins(0, 0, 0, 0)
         trades_layout.setSpacing(0)
         trades_layout.addWidget(self.trades_table, 1)
-        trades_layout.addWidget(self.summary_label)
-        trades_layout.addWidget(self.assumptions_label)
+        trades_layout.addWidget(_below_table(self.summary_label, self.assumptions_label))
 
         decisions_tab = QWidget()
         decisions_layout = QVBoxLayout(decisions_tab)
@@ -532,13 +673,32 @@ class JournalTabs(QWidget):
             "Сохранить обе вкладки в файлы CSV — открываются в Excel двойным щелчком."
         )
         self.export_button.clicked.connect(self.export_requested)
-        self.tabs.setCornerWidget(self.export_button)
+        self.tabs.setCornerWidget(self._corner())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.tabs)
 
         self.set_summary(None)
+
+    def _corner(self) -> QWidget:
+        """Полка в углу вкладок: «Отчёты…» и выгрузка.
+
+        Угол вкладок держит один виджет — обе кнопки едут в общей полке.
+        Окно «Отчёты» (Н5): итог за период и разбор каждой сделки.
+        """
+        self.reports_button = QPushButton("Отчёты…")
+        self.reports_button.setToolTip(
+            "Финансовый результат за выбранный период и разбор каждой сделки: "
+            "почему вошёл, почему вышел, сколько вышло."
+        )
+        self.reports_button.clicked.connect(self.reports_requested)
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.addWidget(self.reports_button)
+        corner_layout.addWidget(self.export_button)
+        return corner
 
     # ------------------------------------------------------------------ данные
 

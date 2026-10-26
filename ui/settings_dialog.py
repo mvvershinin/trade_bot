@@ -17,10 +17,12 @@
 
 Про умолчания
 -------------
-Числа в полях — отправные точки, а не рекомендации. Тейк 0,5% и окно 10:05–11:00
-подобраны на том же отрезке истории, на котором проверялись (DOMAIN.md §4).
-Это сказано владельцу счёта прямо в окне, а не спрятано в документации: иначе
-он примет подобранные цифры за проверенные.
+Числа в полях — отправные точки, а не рекомендации. Это сказано владельцу
+счёта прямо в окне, а не спрятано в документации: иначе он примет подобранные
+цифры за проверенные. Шапка над вкладками нарочно **без чисел**: до 11.10.2026
+она называла тейк и окно литералом, и у владельца в поле стояло другое окно,
+чем в шапке (`B-059`, `B-066`). Откуда взялось каждое умолчание — в докстринге
+`ui/models.py::Settings`.
 
 Три правила, из-за которых поля устроены не самым коротким способом
 -------------------------------------------------------------------
@@ -39,10 +41,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import fields
 from typing import cast
 
-from PySide6.QtCore import QEvent, QSignalBlocker, QTime, Qt, Signal
+from PySide6.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTime, QTimer, Signal
+from PySide6.QtGui import QStandardItemModel
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -51,8 +58,11 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QTabWidget,
@@ -62,18 +72,88 @@ from PySide6.QtWidgets import (
 )
 
 from market import warmup_bars
+from ui.algorithm_dialog import AlgorithmDialog
 from ui.confirm_changes import confirm_changes
 from ui.models import (
+    EXPIRY_HALT_DAYS_LIMITS,
+    MAX_TIME_EXIT_WAIT_BARS,
+    STEP_WAIT,
     AfterTakeProfit,
+    AlgorithmOption,
     AverageKind,
-    OnPriceEqualsAverage,
+    ContractNotice,
+    MinuteBarLimit,
+    MinutePriceOrder,
     ReversalMoment,
     Settings,
+    TimeExitKind,
 )
 from ui.theme import current as current_theme
+from ui.theme import resize_within_screen
 from ui.wheel_guard import guard_wheel
 
+#: Что стоит в поле шага цены, пока биржа его не сообщила. Не «не задан»:
+#: задавать шаг человеку нечем и незачем — он придёт от биржи сам.
+STEP_UNKNOWN = "биржа ещё не сообщила"
+
 TIMEFRAMES = ("1 минута", "5 минут", "15 минут", "30 минут", "1 час", "4 часа", "День")
+
+#: Что написано вместо названия алгоритма, пока каталог не пришёл.
+#:
+#: ⚠️ Молчание здесь запрещено правилом 13 `CLAUDE.md`: пустая строка на месте
+#: названия читается как «алгоритма нет». Каталог приходит от торговой части
+#: (`app/convert.py::algorithms`), и окно, открытое без неё — снимок экрана,
+#: разбор журнала, — обязано сказать об этом, а не показать пустое место.
+#:
+#: ⚠️ И сказать, **что делать**. Прежняя редакция кончалась на «выбранное имя
+#: показано как есть»: владелец счёта 09.09.2026 читал её, жал «Выбрать
+#: алгоритм…», получал пустое окно с требованием выбрать из списка — и упирался
+#: в тупик. Кнопка теперь выключена (`_show_algorithm`), и здесь сказано
+#: и почему она выключена, и как список получить.
+CATALOGUE_NOT_ARRIVED = (
+    "Список алгоритмов сюда не пришёл: окно открыто без торговой части либо "
+    "программа не ответила. Поэтому вместо названия стоит имя алгоритма как "
+    "есть, а кнопка выбора выключена — выбирать не из чего. Сама настройка "
+    "не тронута: в ней осталось то, что было. Чтобы программа спросила "
+    "список заново, закройте настройки и откройте их снова; если список "
+    "не появился — перезапустите программу."
+)
+
+#: Подсказка кнопки, ведущей в окно выбора алгоритма.
+CHOOSE_HINT = (
+    "Открыть список торговых алгоритмов. Там же кнопка «Подробнее» — "
+    "она показывает словами, как алгоритм принимает решения."
+)
+
+#: Она же, когда кнопка выключена. Qt показывает подсказку и на выключенной
+#: кнопке — на это и расчёт: причина отказа достаётся человеку до нажатия,
+#: а не после (правило §6 брифа окна).
+CHOOSE_IMPOSSIBLE = (
+    "Кнопка выключена: список торговых алгоритмов сюда не пришёл, "
+    "и выбирать не из чего. Что делать — сказано строкой ниже."
+)
+
+#: Что окно говорит на месте трёх предохранителей по деньгам.
+#:
+#: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Потолок объёма, дневной лимит
+#: убытка и запас свободных средств убраны на этапе разработки решением
+#: заказчика 15.09.2026 (решение 0060 §4). Молчать об этом нельзя (правило 13
+#: `CLAUDE.md`): человек, открывший вкладку «Деньги» и не нашедший там защиты,
+#: обязан прочитать, что её нет **намеренно**, а не решить, что он её потерял.
+#:
+#: ⚠️ Тот же смысл говорит журнал решений при каждом запуске
+#: (`app/port.py::NO_GUARDS`). Два текста, а не один общий: `ui/` не имеет
+#: права импортировать `app/` (ARCHITECTURE.md §2). Что они не разойдутся
+#: молча, стережёт тест, а не обещание.
+GUARDS_OFF_NOTE = (
+    "⚠️ ПРЕДОХРАНИТЕЛЕЙ ПО ДЕНЬГАМ НЕТ НИ ОДНОГО. Потолок объёма, дневной "
+    "лимит убытка и запас свободных средств убраны на этапе разработки "
+    "вашим решением и вернутся перед боевым запуском. Пока их нет: робот "
+    "не остановится ни при каком убытке за день, не проверит, хватает ли "
+    "свободных средств, и подаст заявку тем объёмом, который стоит выше, "
+    "каким бы он ни был. Остановить его можно концом торгового окна "
+    "или переключением режима. К боевой торговле программа не допущена."
+)
 
 #: Раскладка окна по вкладкам: заголовок и строители групп на нём.
 #:
@@ -82,7 +162,12 @@ TIMEFRAMES = ("1 минута", "5 минут", "15 минут", "30 минут"
 #: и в конце настройки самой программы.
 _TAB_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Инструмент и данные", ("_instrument_group", "_point_group")),
-    ("Сигнал", ("_signal_group", "_filter_group")),
+    # ⚠️ Выбранный алгоритм назван **первым** на вкладке, до полей: поля
+    # средней настраивают его, и читать их, не зная, чей они, бессмысленно.
+    # Это **строка и кнопка**, а не абзац: описание правила занимает 391–459
+    # точек и вытесняло бы поля под прокрутку — замер 08.09.2026. Полное
+    # описание живёт в отдельном окне (`ui/algorithm_dialog.py`).
+    ("Сигнал", ("_algorithm_group", "_signal_group")),
     ("Вход и выход", ("_entry_group", "_take_group")),
     ("Торговое окно", ("_time_group",)),
     ("Деньги", ("_volume_group", "_risk_group", "_commission_group")),
@@ -114,20 +199,22 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("instrument", "Инструмент и данные", "instrument"),
     ("timeframe", "Инструмент и данные", "timeframe"),
     ("history_depth_days", "Инструмент и данные", "history_depth_days"),
+    ("expiry_halt_days", "Инструмент и данные", "expiry_halt_days"),
     ("depth_days", "Инструмент и данные", "depth_days"),
     ("price_step", "Инструмент и данные", "price_step"),
     ("ruble_per_point", "Инструмент и данные", "ruble_per_point"),
     ("ruble_per_point_source", "Инструмент и данные", "point_note"),
+    ("strategy_id", "Сигнал", "algorithm_name"),
     ("average_period", "Сигнал", "average_period"),
     ("average_kind", "Сигнал", "average_kind"),
-    ("on_price_equals_average", "Сигнал", "on_price_equals_average"),
-    ("filter_enabled", "Сигнал", "filter_enabled"),
-    ("threshold_percent", "Сигнал", "threshold_percent"),
-    ("confirm_bars", "Сигнал", "confirm_bars"),
     ("reversal_moment", "Вход и выход", "reversal_moment"),
     ("after_take_profit", "Вход и выход", "after_take_profit"),
     ("take_profit_enabled", "Вход и выход", "take_profit_enabled"),
     ("take_profit_pct", "Вход и выход", "take_profit"),
+    # ⚠️ Поле показывается ПАРОЙ переключателей — «неподвижная цель»
+    # и «скользящий уровень», — потому что это выбор одного способа из двух,
+    # а не галочка (решение 0060). Таблица называет тот из пары, который
+    # означает «включено»; второй лежит рядом, на той же вкладке.
     ("trailing_enabled", "Вход и выход", "trailing_enabled"),
     ("trailing_start_pct", "Вход и выход", "trailing_start"),
     ("trailing_offset_pct", "Вход и выход", "trailing_offset"),
@@ -135,17 +222,31 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("window_start", "Торговое окно", "window_start"),
     ("window_end", "Торговое окно", "window_end"),
     ("close_on_time_end", "Торговое окно", "close_on_time_end"),
+    ("time_exit_order", "Торговое окно", "time_exit_order"),
+    ("time_exit_limit_steps", "Торговое окно", "time_exit_limit_steps"),
+    ("time_exit_wait_bars", "Торговое окно", "time_exit_wait_bars"),
     ("calendar", "Торговое окно", "calendar_note"),
     ("volume", "Деньги", "volume"),
-    ("volume_cap_enabled", "Деньги", "volume_cap_enabled"),
-    ("volume_cap", "Деньги", "volume_cap"),
-    ("daily_loss_limit_enabled", "Деньги", "daily_loss_limit_enabled"),
-    ("daily_loss_limit_pct", "Деньги", "daily_loss_limit"),
-    ("free_funds_reserve_enabled", "Деньги", "free_funds_reserve_enabled"),
-    ("free_funds_reserve_pct", "Деньги", "free_funds_reserve"),
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # ("volume_cap_enabled", "Деньги", "volume_cap_enabled"),
+    # ("volume_cap", "Деньги", "volume_cap"),
+    # ("daily_loss_limit_enabled", "Деньги", "daily_loss_limit_enabled"),
+    # ("daily_loss_limit_pct", "Деньги", "daily_loss_limit"),
+    # ("free_funds_reserve_enabled", "Деньги", "free_funds_reserve_enabled"),
+    # ("free_funds_reserve_pct", "Деньги", "free_funds_reserve"),
     ("commission_per_side_rub", "Деньги", "commission"),
     ("slippage_steps", "Деньги", "slippage_steps"),
+    ("minute_order", "Деньги", "minute_order"),
+    ("minute_bar_limit", "Деньги", "minute_bar_limit"),
     ("log_directory", "Программа", "log_directory"),
+)
+
+#: Поля-списки: имя поля `Settings` равно имени списка в окне. Одна таблица
+#: на показ (`_show_choices`) и на сбор (`values`).
+_CHOICES: tuple[str, ...] = (
+    "average_kind", "reversal_moment", "after_take_profit",
+    "minute_order", "minute_bar_limit",
+    "time_exit_order",
 )
 
 
@@ -159,6 +260,14 @@ def _choice(enumeration) -> QComboBox:
     box = QComboBox()
     for item in enumeration:
         box.addItem(item.label, item)
+        # Вариант, которого робот не умеет, виден, но не выбирается, и
+        # подсказка говорит почему (`B-050`): выбранный, он был бы отвергнут
+        # при «Применить», а из файла настроек — подменён при запуске.
+        why = getattr(item, "unavailable", "")
+        if why:
+            index = box.count() - 1
+            cast(QStandardItemModel, box.model()).item(index).setEnabled(False)
+            box.setItemData(index, why, Qt.ItemDataRole.ToolTipRole)
     return box
 
 
@@ -247,8 +356,8 @@ def _paint_hint(label: QLabel) -> None:
     теме случайно выходило 5,1:1, поэтому глазами дефект видели только те,
     у кого система светлая.
 
-    `Theme.text_dim` — цвет, заведённый ровно для этого: `#6b7280` в светлой
-    (4,9:1) и `#9aa4b2` в тёмной (8,2:1).
+    `Theme.text_dim` — цвет, заведённый ровно для этого. С 05.10.2026 —
+    `#4b5563` в светлой и `#c5ccd6` в тёмной (числа — `ui/theme.py`).
     """
     label.setProperty(HINT_ROLE, True)
     label.setStyleSheet(f"color: {current_theme().text_dim};")
@@ -318,15 +427,51 @@ def _steps(count: float) -> str:
 
 
 def _hint(text: str) -> QLabel:
-    """Подсказка под полем: серым, некрупно, с переносом строк."""
+    """Подсказка под полем: приглушённым цветом, с переносом строк.
+
+    ⚠️ Шрифт — основной, а не «на пункт мельче», как было до 05.10.2026:
+    владелец счёта назвал подсказки «очень плохо видно». Отличие от
+    подписи поля держится на цвете (`Theme.text_dim`), а не на размере.
+    """
     label = QLabel(text)
     label.setWordWrap(True)
     label.setTextFormat(Qt.TextFormat.PlainText)
-    font = label.font()
-    font.setPointSizeF(max(font.pointSizeF() - 1.0, 7.0))
-    label.setFont(font)
     _paint_hint(label)
     return label
+
+
+#: Ширины для сброса отметки Qt «высоты строк посчитаны» — см. `_Form`.
+#: Две, а не одна: одна из них может совпасть с желаемой шириной формы,
+#: а запрос на желаемой ширине отметку не сбрасывает.
+_STALE_WIDTHS = (1, 2)
+
+
+class _Form(QFormLayout):
+    """Форма группы, строки которой стоят по высотам **своей** ширины.
+
+    ⚠️ Обход дефекта Qt (6.11.1; в ветке dev код тот же). `QFormLayout`
+    держит высоты строк одной таблицей на две запомненные ширины: последнюю
+    запрошенную и желаемую (`sizeHint`). Запрос высоты на желаемой ширине —
+    его делает расчёт подсказки размера страницы (`QLayout::totalSizeHint`) —
+    переписывает таблицу, а отметка «посчитано для настоящей ширины»
+    остаётся. Следующая раскладка ставит строки по чужой ширине. Желаемая
+    ширина шире настоящей — у подсказки в таблице меньше строк, чем у текста,
+    и `QLabel`, центрирующий текст, срезает верхнюю и нижнюю. Снимок
+    владельца счёта 09.10.2026: шрифт 12 пт, желаемая ширина формы 798 точек
+    при настоящих 730, подсказка «Скользящий уровень» — 74 точки вместо 92.
+
+    Запрос на соседних ширинах перед раскладкой снимает отметку, и Qt
+    пересчитывает таблицу для той ширины, на которую раскладывает. Остаток:
+    настоящая ширина ровно равна желаемой — Qt берёт таблицу на две точки
+    уже, то есть строк не меньше нужного. Сторож —
+    `tests/test_ui_settings.py::test_no_hint_is_cut_and_no_row_overlaps_another_on_any_tab`.
+    """
+
+    def setGeometry(self, rect: QRect) -> None:  # имя задано Qt
+        """Раскладка — после сброса отметки «таблица посчитана для этой ширины»."""
+        for narrower in _STALE_WIDTHS:
+            super().heightForWidth(rect.width() - narrower)
+        super().setGeometry(rect)
 
 
 class SettingsDialog(QDialog):
@@ -339,8 +484,20 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Настройки робота")
         self.setModal(True)
-        self.resize(560, 720)
+        # Шире прежних 560: подсказки под полями переносились через слово,
+        # а с крупным шрифтом (`FONT_SCALE`) — тем более. Просьба владельца
+        # счёта 05.10.2026 (`ROADMAP.md`, Н1): «окно настроек сделать шире».
+        resize_within_screen(self, 820, 800)
 
+        #: Строки у полей: требование алгоритма и отказ «Применить». Ключ —
+        #: имя поля `Settings` и вид строки. Создаются по первому требованию
+        #: (`_field_note`): заранее неизвестно, какое поле назовёт алгоритм
+        #: или отказ.
+        self._field_notes: dict[tuple[str, str], QLabel] = {}
+        #: Идёт отправка настроек из этого окна и был ли на неё отказ —
+        #: см. `take_refusal`.
+        self._emitting = False
+        self._refused = False
         self._build_fields()
         self.tabs = self._build_tabs()
 
@@ -362,6 +519,21 @@ class SettingsDialog(QDialog):
         # внутри одной из них: она относится ко всем числам окна сразу,
         # а спрятанная на вкладку читалась бы как оговорка к этой вкладке.
         layout.addWidget(self._notice())
+        #: Отказ «Применить» — крупно над вкладками, а не в строке состояния
+        #: главного окна за этим (дефект 29.09.2026: 15 секунд за модальным
+        #: окном и обрезано на 1440 точках). Спрятан, пока отказа нет.
+        self.refusal_note = _alert("")
+        font = self.refusal_note.font()
+        font.setPointSizeF(font.pointSizeF() + 2.0)
+        self.refusal_note.setFont(font)
+        self.refusal_note.setVisible(False)
+        layout.addWidget(self.refusal_note)
+        #: Программа сама сменила настройки, пока окно открыто (суточный
+        #: переход на действующий контракт): поле обновлено, и это сказано
+        #: словами, а не тихой подменой под рукой человека. См. `take_echo`.
+        self.echo_note = _alert("")
+        self.echo_note.setVisible(False)
+        layout.addWidget(self.echo_note)
         layout.addWidget(self.tabs, 1)
         layout.addWidget(self.buttons)
 
@@ -409,7 +581,8 @@ class SettingsDialog(QDialog):
             # и `guards_note` красятся не через `_alert`, а по состоянию —
             # включён предохранитель или нет, подтверждена величина или нет.
             self._sync_costs()
-            self._sync_volume_cap()
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+            # self._sync_volume_cap()
             self._sync_guards()
         super().changeEvent(event)
 
@@ -433,11 +606,13 @@ class SettingsDialog(QDialog):
         self._build_cost_fields()
         self._build_time_fields()
         self._build_risk_fields()
+        self._build_algorithm_row()
 
     def _build_instrument_fields(self) -> None:
         """Инструмент, размер свечи и две глубины — загрузки и показа."""
         self.instrument = QLineEdit()
-        self.instrument.setPlaceholderText("Например, MXU6")
+        self.instrument.setPlaceholderText("Например, MXZ6")
+        self._build_contract_row()
 
         self.timeframe = QComboBox()
         self.timeframe.addItems(TIMEFRAMES)
@@ -460,6 +635,10 @@ class SettingsDialog(QDialog):
         # «вся история»; десять лет сверху взяты как заведомо больший предел,
         # чем есть данных у любого фьючерса.
         self.depth_days = _whole(0, 3650)
+        # Остановка перед экспирацией: ноль — встать в сам последний день
+        # обращения; тридцать сверху — дольше месяца до экспирации стоять
+        # квартальному контракту незачем, это уже не «перед экспирацией».
+        self.expiry_halt_days = _whole(*EXPIRY_HALT_DAYS_LIMITS, " дн.")
         self.depth_days.setSpecialValueText("0 — вся история")
         self.depth_days.valueChanged.connect(self._sync_depth)
 
@@ -473,34 +652,29 @@ class SettingsDialog(QDialog):
         self.average_kind = _choice(AverageKind)
         self.reversal_moment = _choice(ReversalMoment)
         self.after_take_profit = _choice(AfterTakeProfit)
-        self.on_price_equals_average = _choice(OnPriceEqualsAverage)
 
-        # Фильтр против пилы. Выключен умолчанием — и выключен всеми тремя
-        # элементами сразу: галочка снята, порог ноль, подтверждение одна
-        # свеча. Это в точности поведение прототипа, и на нём стоит сверка
-        # 127 сделок из 127.
-        #
-        # ⚠️ Галочка отдельно от чисел не для красоты. «0 % и 1 свеча» —
-        # верное выражение выключенности, но с экрана оно не читается:
-        # состояние приходится выводить из двух чисел в разных строках.
-        # Числа при снятой галочке сохраняются, чтобы включение вернуло
-        # подобранное, а не умолчание; до движка они при этом не доходят
-        # (`app/convert.py::_FILTER_OFF`).
-        self.filter_enabled = QCheckBox("Включить фильтр против пилы")
-        self.filter_enabled.toggled.connect(self._sync_filter)
-
-        self.threshold_percent = _decimal(0.0, 5.0, 0.05, " %")
-        self.threshold_percent.setSpecialValueText("0,00 % — полосы нет")
-        self.threshold_percent.valueChanged.connect(self._sync_filter)
-
-        self.confirm_bars = _whole(1, 20)
-        self.confirm_bars.setSpecialValueText("1 — подтверждения нет")
-        self.confirm_bars.valueChanged.connect(self._sync_filter)
 
     def _build_take_fields(self) -> None:
-        """Фиксация прибыли: обычная цель и скользящий уровень."""
-        # Выключатель тейка — ТЗ §4.4 В.
-        self.take_profit_enabled = QCheckBox("Фиксировать прибыль по цели")
+        """Фиксация прибыли: включена ли она и **каким из двух способов**.
+
+        ⚠️ Способ — это выбор ОДНОГО из двух, а не две независимые галочки.
+        Слова заказчика 15.09.2026: «это 2 разных способа фиксировать прибыль —
+        надо выбирать что мы применяем один или другой», «не И а ИЛИ мы
+        выбираем способ» (решение 0060). У позиции один уровень выхода, и вид
+        у него один.
+
+        Двумя галочками это не выражается, и дело не в красоте: обе включённые
+        означали бы два уровня, которых не бывает, — и вид приходилось бы
+        выбирать за человека. Программа так и делала, молча в пользу
+        скользящего (`EngineSettings.plan`), и ни строки об этом не говорила.
+        Группа переключателей убирает сам вопрос: состояния «выбраны оба»
+        в окне не существует.
+        """
+        # Выключатель фиксации — ТЗ §4.4 В. Он отвечает на первый вопрос,
+        # «фиксируем ли прибыль вообще»; переключатели ниже — на второй,
+        # «каким способом». Подпись стала без «по цели»: цель — это один
+        # из двух способов, а не синоним фиксации.
+        self.take_profit_enabled = QCheckBox("Фиксировать прибыль")
         self.take_profit_enabled.toggled.connect(self._sync_take)
 
         # ⚠️ Нижняя граница — ноль, а не 0,1. Ноль здесь не вырожденный
@@ -512,10 +686,26 @@ class SettingsDialog(QDialog):
         self.take_profit.setSpecialValueText("0,00 % — тейка нет")
         self.take_profit.valueChanged.connect(self._sync_take)
 
-        # Скользящий тейк. Перенесён в первый этап решением 0009 по требованию
-        # владельца счёта; движок его принимает, окно обязано отдавать.
-        self.trailing_enabled = QCheckBox("Включить скользящий тейк")
-        self.trailing_enabled.toggled.connect(self._sync_take)
+        # Два способа, из которых применяется ровно один. Скользящий перенесён
+        # в первый этап решением 0009 по требованию владельца счёта; выбор
+        # между ним и неподвижной целью — требование заказчика 15.09.2026
+        # (решение 0060).
+        #
+        # ⚠️ Взаимное гашение держит сама Qt, а не наш код: у группы
+        # переключателей выбранным бывает только один. Это не то же самое,
+        # что «две галочки и проверка на сочетание»: проверку можно забыть
+        # позвать, а состояния, которого у группы нет, не бывает вовсе.
+        self.take_fixed = QRadioButton("Неподвижная цель — стоит от цены входа")
+        self.trailing_enabled = QRadioButton("Скользящий уровень — едет за ценой")
+        self.take_method = QButtonGroup(self)
+        self.take_method.addButton(self.take_fixed)
+        self.take_method.addButton(self.trailing_enabled)
+        # Умолчание — неподвижная цель: на ней стоят все замеры проекта,
+        # по скользящему уровню их нет ни одного. Ставится ДО подключения
+        # сигнала: иначе построение окна дёрнуло бы согласование полей,
+        # которых ещё нет.
+        self.take_fixed.setChecked(True)
+        self.take_method.buttonToggled.connect(self._sync_take)
 
         # ⚠️ Нижняя граница обоих полей — ноль, хотя ноль отступа негоден.
         # Границей поля это правило не выражается: Qt подрезал бы пришедшее
@@ -550,8 +740,18 @@ class SettingsDialog(QDialog):
         # Шаг цены инструмента и проскальзывание в шагах (ТЗ §4.4 Ж).
         # Четыре знака после запятой: у фьючерса на индекс шаг целый, у акций
         # он копеечный, и округление до сотых сделало бы поле негодным для них.
-        self.price_step = _decimal(0.0, 1_000_000.0, 1.0, " ₽", decimals=4)
-        self.price_step.setSpecialValueText("не задан")
+        # Единица — пункты цены, а не рубли: шаг умножается на число шагов
+        # и прибавляется к цене (`backtest.Costs.slippage`, предел заявки
+        # движка). Рубли за пункт — соседнее поле.
+        # ⚠️ Только показ: шаг сообщает биржа, человек его не вписывает
+        # (решение владельца счёта 05.10.2026). Что пришло в поле с «ОК»,
+        # порт не берёт (`HistoryPort.apply_settings`).
+        self.price_step = _decimal(
+            0.0, 1_000_000.0, 1.0, " пункт., по данным биржи", decimals=4
+        )
+        self.price_step.setReadOnly(True)
+        self.price_step.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.price_step.setSpecialValueText(STEP_UNKNOWN)
         self.price_step.valueChanged.connect(self._sync_costs)
 
         # ⚠️ Нижняя граница — ноль, и ноль здесь рабочая конфигурация: ровно
@@ -561,6 +761,13 @@ class SettingsDialog(QDialog):
         self.slippage_steps = _decimal(0.0, 20.0, 0.5, "")
         self.slippage_steps.setSpecialValueText("0 — не учитывать")
         self.slippage_steps.valueChanged.connect(self._sync_costs)
+
+        # Порядок цен минутки — допущение прогона по истории, рядом
+        # с проскальзыванием: оба говорят, насколько прогон похож на счёт.
+        self.minute_order = _choice(MinutePriceOrder)
+        # Наибольшая свеча для проверки по минуткам — тоже допущение прогона
+        # (`B-058`): выше порога уровень в прогоне двигается на закрытии свечи.
+        self.minute_bar_limit = _choice(MinuteBarLimit)
 
         # Рублей в пункте цены. Пять знаков после запятой не с потолка:
         # у фьючерса на РТС величина 1,73774, и два знака округлили бы её
@@ -609,6 +816,23 @@ class SettingsDialog(QDialog):
         self.close_on_time_end.toggled.connect(self._sync_window_close)
         self.window_close_note = _alert()
 
+        # Заявка на выход по концу окна и два её числа (решение 0060 §3).
+        # Числа гаснут при рыночной заявке: они читаются только предельной.
+        self.time_exit_order = _choice(TimeExitKind)
+        self.time_exit_order.currentIndexChanged.connect(self._sync_window_close)
+        # Верхняя граница поля — не правило, а предел ввода: у движка отступ
+        # сверху не ограничен. Тысяча шагов — 25 000 пунктов на фьючерсе
+        # на индекс, дальше любой предел уже не предел.
+        self.time_exit_limit_steps = _whole(0, 1000, " × шаг цены")
+        self.time_exit_wait_bars = _whole(1, MAX_TIME_EXIT_WAIT_BARS, " св.")
+        # Шаг цены живёт на другой вкладке, а нужен предельной цене здесь:
+        # его правка обязана перерисовать строку и здесь.
+        self.price_step.valueChanged.connect(self._sync_window_close)
+        self.time_exit_note = _alert()
+        # Та же строка — под полем шага цены: пока биржа шаг не сообщила,
+        # человек видит это и там, где шаг показан, и там, где он нужен.
+        self.step_note = _alert()
+
         # Календарь нерабочих дней своего поля здесь не имеет: его правят
         # в отдельном окне из меню «Настройки». Но указатель на вкладке
         # обязателен — настройка, которую негде найти, для владельца счёта
@@ -624,49 +848,56 @@ class SettingsDialog(QDialog):
 
     def _build_risk_fields(self) -> None:
         """Объём сделки, три предохранителя по деньгам и каталог лога."""
+        # ⚠️ Верхняя граница поля — своя собственная и больше ничем не зажата:
+        # потолок объёма выключен на этапе (D-113), а до того он сужал
+        # и расширял её из `_sync_volume_cap`. Число то же самое, что стояло
+        # у поля всегда, — «потолка нет» именно так и выражалось.
         self.volume = _whole(1, 1_000_000, " контрактов")
-        # ⚠️ Объём подписан на тот же пересчёт, что и потолок, и это не
-        # симметрия ради симметрии: строка под потолком **читает объём**
-        # («⚠️ Объём 50 выше потолка 5: заявка подаваться НЕ БУДЕТ»). Без этой
-        # связи она пересчитывалась только при правке потолка — владелец счёта
-        # уменьшал объём до разрешённого, а красная строка оставалась и
-        # продолжала утверждать, что заявка не пойдёт. Красное предупреждение
-        # про деньги, которое врёт, хуже его отсутствия: рядом ещё три таких,
-        # и перестают верить всем сразу.
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # # ⚠️ Объём подписан на тот же пересчёт, что и потолок, и это не
+        # # симметрия ради симметрии: строка под потолком **читает объём**
+        # # («⚠️ Объём 50 выше потолка 5: заявка подаваться НЕ БУДЕТ»). Без этой
+        # # связи она пересчитывалась только при правке потолка — владелец счёта
+        # # уменьшал объём до разрешённого, а красная строка оставалась и
+        # # продолжала утверждать, что заявка не пойдёт. Красное предупреждение
+        # # про деньги, которое врёт, хуже его отсутствия: рядом ещё три таких,
+        # # и перестают верить всем сразу.
+        # #
+        # # Правило общее: **поле, чья подсказка зависит от другого поля,
+        # # пересчитывается при изменении обоих.**
+        # self.volume.valueChanged.connect(self._sync_volume_cap)
         #
-        # Правило общее: **поле, чья подсказка зависит от другого поля,
-        # пересчитывается при изменении обоих.**
-        self.volume.valueChanged.connect(self._sync_volume_cap)
+        # # ⚠️ У каждого из трёх предохранителей — **своя галочка**, и все три
+        # # сняты умолчанием. Число без галочки ничего не ограничивает: 5
+        # # контрактов и 2 % стоят в полях как предложение, а включённые сами
+        # # собой они означали бы остановку торговли, которой владелец счёта
+        # # не просил. Цифры предохранителей называет он (`CLAUDE.md`).
+        # self.volume_cap_enabled = QCheckBox("Ограничить объём заявки")
+        # self.volume_cap_enabled.toggled.connect(self._sync_volume_cap)
+        # self.volume_cap = _whole(1, 1_000_000, " контрактов")
+        # self.volume_cap.valueChanged.connect(self._sync_volume_cap)
 
-        # ⚠️ У каждого из трёх предохранителей — **своя галочка**, и все три
-        # сняты умолчанием. Число без галочки ничего не ограничивает: 5
-        # контрактов и 2 % стоят в полях как предложение, а включённые сами
-        # собой они означали бы остановку торговли, которой владелец счёта
-        # не просил. Цифры предохранителей называет он (`CLAUDE.md`).
-        self.volume_cap_enabled = QCheckBox("Ограничить объём заявки")
-        self.volume_cap_enabled.toggled.connect(self._sync_volume_cap)
-        self.volume_cap = _whole(1, 1_000_000, " контрактов")
-        self.volume_cap.valueChanged.connect(self._sync_volume_cap)
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # self.daily_loss_limit_enabled = QCheckBox(
+        #     "Останавливать робота при убытке за день"
+        # )
+        # self.daily_loss_limit_enabled.toggled.connect(self._sync_guards)
+        # # Нижняя граница — ноль, а не 0,1: пришедший снаружи ноль Qt подрезал бы
+        # # молча, и окно отдало бы на «ОК» лимит, которого владелец счёта
+        # # не ставил. Ноль означает «лимита нет» и так и подписан.
+        # self.daily_loss_limit = _decimal(0.0, 100.0, 0.1, " % от счёта")
+        # self.daily_loss_limit.setSpecialValueText("0,00 % — лимита нет")
+        # self.daily_loss_limit.valueChanged.connect(self._sync_guards)
 
-        self.daily_loss_limit_enabled = QCheckBox(
-            "Останавливать робота при убытке за день"
-        )
-        self.daily_loss_limit_enabled.toggled.connect(self._sync_guards)
-        # Нижняя граница — ноль, а не 0,1: пришедший снаружи ноль Qt подрезал бы
-        # молча, и окно отдало бы на «ОК» лимит, которого владелец счёта
-        # не ставил. Ноль означает «лимита нет» и так и подписан.
-        self.daily_loss_limit = _decimal(0.0, 100.0, 0.1, " % от счёта")
-        self.daily_loss_limit.setSpecialValueText("0,00 % — лимита нет")
-        self.daily_loss_limit.valueChanged.connect(self._sync_guards)
-
-        self.free_funds_reserve_enabled = QCheckBox(
-            "Беречь часть свободных средств"
-        )
-        self.free_funds_reserve_enabled.toggled.connect(self._sync_guards)
-        self.free_funds_reserve = _decimal(
-            0.0, 90.0, 1.0, " % свободных средств", decimals=1
-        )
-        self.free_funds_reserve.valueChanged.connect(self._sync_guards)
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # self.free_funds_reserve_enabled = QCheckBox(
+        #     "Беречь часть свободных средств"
+        # )
+        # self.free_funds_reserve_enabled.toggled.connect(self._sync_guards)
+        # self.free_funds_reserve = _decimal(
+        #     0.0, 90.0, 1.0, " % свободных средств", decimals=1
+        # )
+        # self.free_funds_reserve.valueChanged.connect(self._sync_guards)
 
         # Каталог технического лога. Пустое поле означает умолчание программы,
         # и так и написано в подсказке поля: пустота, про которую не сказано,
@@ -677,23 +908,75 @@ class SettingsDialog(QDialog):
         )
 
         self.depth_note = _hint("")
-        self.filter_note = _alert()
 
         # Обе строки говорят о состоянии предохранителя: включён он или нет
         # и что будет, когда сработает. Тревожное оформление — не всегда:
         # красным горит только то, что требует внимания сейчас. Красное,
         # которое горит всегда, перестают читать через день.
-        self.cap_note = QLabel()
-        self.cap_note.setWordWrap(True)
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # self.cap_note = QLabel()
+        # self.cap_note.setWordWrap(True)
         self.guards_note = QLabel()
         self.guards_note.setWordWrap(True)
 
+    def _build_algorithm_row(self) -> None:
+        """Строка «какой алгоритм выбран» и кнопка в окно выбора.
+
+        ⚠️ Строка, а не абзац. До 08.09.2026 здесь стояло полное описание
+        правила: 391 точка при умолчаниях, 459 при включённом фильтре против
+        пилы — половина вкладки, поля средней уходили под прокрутку. Описание
+        переехало в отдельное окно, где его читают целиком и с прокруткой.
+
+        ⚠️ Название приходит **готовым** из каталога (`AlgorithmOption.title`),
+        а не пишется здесь: окно торговых слоёв не импортирует
+        (ARCHITECTURE.md §2), и второй список названий разошёлся бы с первым
+        молча — в окне одно, в журнале другое.
+        """
+        #: Имя выбранного алгоритма латиницей. Держится отдельно от каталога:
+        #: `values()` обязан вернуть его даже тогда, когда каталог не приехал,
+        #: иначе «Применить» молча сменил бы алгоритм на умолчание.
+        self._strategy_id = Settings().strategy_id
+        #: Каталог, пришедший от торговой части. Пустой — окно об этом скажет.
+        self._algorithms: tuple[AlgorithmOption, ...] = ()
+
+        self.algorithm_name = QLabel()
+        self.algorithm_name.setWordWrap(True)
+        # Простой текст, а не разметка: название приходит снаружи, а угадывание
+        # разметки съело бы «<» и всё, что за ним, не сказав об этом.
+        self.algorithm_name.setTextFormat(Qt.TextFormat.PlainText)
+        self.algorithm_name.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        font = self.algorithm_name.font()
+        font.setBold(True)
+        self.algorithm_name.setFont(font)
+
+        self.algorithm_button = QPushButton("Выбрать алгоритм…")
+        # ⚠️ Не кнопка по умолчанию: Enter в окне настроек означает «ОК».
+        self.algorithm_button.setAutoDefault(False)
+        self.algorithm_button.setDefault(False)
+        self.algorithm_button.setToolTip(CHOOSE_HINT)
+        self.algorithm_button.clicked.connect(self.choose_algorithm)
+
+        #: Строка про **беду**: каталог не приехал либо выбранного алгоритма
+        #: в сборке нет. В обычном случае пустая и спрятанная — вкладка обязана
+        #: остаться строкой, а не абзацем, ради чего задача и делалась.
+        self.algorithm_note = _hint("")
+        #: Строка про поля, которые выбранный алгоритм **не читает** (`D-107`).
+        #: Спрятана, пока таких нет. Не тревога: поля не сломаны, просто
+        #: у этого алгоритма ни на что не влияют.
+        self.unused_note = _hint("")
+        self.unused_note.setVisible(False)
+        self._show_algorithm()
+
     def _notice(self) -> QLabel:
+        # ⚠️ Ни одной цифры (`B-059`, `B-066`): шапка относится к значениям
+        # в полях, а значения у владельца свои. Число, зашитое сюда, разойдётся
+        # с полем при первой же его правке — и шапка начнёт врать.
         label = QLabel(
-            "Значения в полях — отправная точка, а не рекомендация. Тейк 0,5% "
-            "и окно 10:05–11:00 подобраны на том же отрезке истории, на котором "
-            "потом проверялись. Прежде чем ставить их в бой, прогоните проверку "
-            "на другом периоде."
+            "Значения в полях — отправная точка, а не рекомендация. Прежде чем "
+            "ставить настройки в бой, прогоните проверку на периоде, на котором "
+            "их не подбирали."
         )
         label.setWordWrap(True)
         label.setProperty(HINT_ROLE, True)
@@ -704,7 +987,7 @@ class SettingsDialog(QDialog):
 
     def _group(self, title: str, rows: list[tuple[str, QWidget, str]]) -> QGroupBox:
         box = QGroupBox(title)
-        form = QFormLayout(box)
+        form = _Form(box)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for caption, widget, hint in rows:
@@ -716,16 +999,80 @@ class SettingsDialog(QDialog):
                 form.addRow(_hint(hint))
         return box
 
+    def _build_contract_row(self) -> None:
+        """Действующий контракт по таблице биржи и кнопка «Подставить».
+
+        Решение 0061: какой контракт брать сейчас, решает программа по
+        дневным объёмам биржи. Решение 0016: переход ручной — поэтому
+        кнопка только ставит код в поле, а применяется он «ОК» с
+        подтверждением, как любая правка.
+        """
+        self.contract_note = QLabel()
+        self.contract_note.setWordWrap(True)
+        self.contract_use = QPushButton()
+        self.contract_use.setVisible(False)
+        self.contract_use.clicked.connect(self._use_contract)
+        self.contract_row = QWidget()
+        row = QHBoxLayout(self.contract_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.contract_note, 1)
+        row.addWidget(self.contract_use)
+        self._contract = ContractNotice()
+        self.set_contract(self._contract)
+
+    def set_contract(self, notice: ContractNotice) -> None:
+        """Показать действующий контракт по таблице. Поле не меняется само."""
+        self._contract = notice
+        since = (
+            f" с {notice.current_since:%d.%m.%Y}" if notice.current_since else ""
+        )
+        if notice.current:
+            same = notice.current == self.instrument.text().strip()
+            self.contract_note.setText(
+                f"{notice.current}{since}"
+                + (" — совпадает с полем выше." if same else
+                   " — в поле выше стоит другой код.")
+            )
+            self.contract_use.setText(f"Подставить {notice.current}")
+            self.contract_use.setVisible(not same)
+        else:
+            self.contract_note.setText(
+                notice.trouble or "Не проверен: таблица контрактов заполнится "
+                "при загрузке истории."
+            )
+            self.contract_use.setVisible(False)
+
+    def _use_contract(self) -> None:
+        if self._contract.current:
+            self.instrument.setText(self._contract.current)
+            self.set_contract(self._contract)
+
     def _instrument_group(self) -> QGroupBox:
         box = self._group("Инструмент и свечи", [
             ("Инструмент", self.instrument,
-             "Чем торгуем. Один инструмент за раз — так задумано."),
+             "Чем торгуем. Один инструмент за раз — так задумано. Новый код "
+             "действует со следующей сделки. Пока робот запущен или на счёте "
+             "открыта позиция, код не меняется: программа откажет вслух."),
+            ("Действующий контракт", self.contract_row,
+             "Какой фьючерс сейчас ближний по дневным объёмам биржи. Программа "
+             "сама код не меняет: «Подставить» ставит его в поле выше, а "
+             "применяется он кнопкой «ОК» с подтверждением."),
+            ("Остановка перед экспирацией, за дней", self.expiry_halt_days,
+             "За сколько дней до последнего дня обращения контракта робот "
+             "встаёт сам. Ноль — встать в сам последний день. Срок берётся "
+             "из таблицы контрактов биржи для кода в поле «Инструмент». "
+             "На новый контракт робот не переходит: переключите инструмент "
+             "и снимите остановку кнопкой «Возобновить работу…»."),
             ("Размер свечи", self.timeframe,
              "На каких свечах работает робот. Решение он принимает только "
              "на закрытии свечи: на пятиминутке — раз в пять минут."),
             ("Скачивать историю за, дней", self.history_depth_days,
              "Сколько последних дней качать с биржи, когда вы нажимаете "
-             "«Загрузить историю…» в меню «Программа». Это про добычу данных, "
+             "«Загрузить историю…» в меню «Программа». Для квартального "
+             "фьючерса (MXZ6 и подобных) это число не действует: история "
+             "качается с рубежа контракта и прогрев средней перед ним, а минуты "
+             "до рубежа не качаются — тогда ближним был другой контракт. "
+             "Это про добычу данных, "
              "а не про показ: ниже стоит второе поле — сколько из добытого "
              "показывать. Девяносто дней — примерно вся жизнь одного "
              "фьючерсного контракта в ближней позиции, дальше по нему идут "
@@ -760,10 +1107,14 @@ class SettingsDialog(QDialog):
         """
         box = self._group("Свойства инструмента", [
             ("Шаг цены инструмента", self.price_step,
-             "Наименьшее движение цены этого инструмента — из карточки "
-             "инструмента на сайте биржи. Нужен для поправки на "
-             "проскальзывание на вкладке «Деньги»: она задаётся в шагах, "
-             "потому что «полшага» на фьючерсе и на акции — разные деньги."),
+             "Наименьшее движение цены этого инструмента, в пунктах цены. "
+             "Программа берёт его у биржи сама — вписывать не нужно, и поле "
+             "только показывает, что сообщила биржа. Нужен в двух местах: "
+             "поправке на проскальзывание на вкладке «Деньги» (она задаётся "
+             "в шагах) и предельной цене заявки на выход по концу окна "
+             "на вкладке «Торговое окно» (отступ тоже в шагах). Пока биржа "
+             "шаг не сообщила, выход по концу окна идёт по рынку, "
+             "а проскальзывание не учитывается."),
             ("Рублей в пункте цены", self.ruble_per_point,
              "На сколько рублей меняется ваш результат, когда цена проходит "
              "один пункт. Программа спрашивает это число у биржи и подставляет "
@@ -775,7 +1126,33 @@ class SettingsDialog(QDialog):
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
+            row = cast("tuple[int, object]", layout.getWidgetPosition(self.price_step))
+            layout.insertRow(row[0] + 1, self.step_note)
             layout.addRow(self.point_note)
+        return box
+
+    def _algorithm_group(self) -> QGroupBox:
+        """Какой алгоритм выбран — строкой, и кнопка, открывающая выбор.
+
+        Окно показывает «Период средней» и «Порог пересечения» и само по себе
+        не говорит, **что** программа с ними делает: узнать это можно было
+        только прочитав исходник. Владелец счёта не программист, а решения
+        по этим полям — решения о деньгах. Ответ живёт за кнопкой ниже,
+        в окне «Торговый алгоритм» → «Подробнее».
+        """
+        box = QGroupBox("Торговый алгоритм")
+        body = QVBoxLayout(box)
+        row = QHBoxLayout()
+        row.addWidget(self.algorithm_name, 1)
+        row.addWidget(self.algorithm_button)
+        body.addLayout(row)
+        body.addWidget(self.algorithm_note)
+        body.addWidget(self.unused_note)
+        body.addWidget(_hint(
+            "Алгоритм решает только направление: лонг, шорт или ничего. "
+            "Поля ниже — его настройки. Правило одной фразой — во всплывающей "
+            "подсказке у названия алгоритма."
+        ))
         return box
 
     def _signal_group(self) -> QGroupBox:
@@ -788,48 +1165,7 @@ class SettingsDialog(QDialog):
              "Экспоненциальная сильнее реагирует на последние свечи, простая "
              "считает все свечи одинаково. Все известные результаты получены "
              "на экспоненциальной. Простая удваивает время проверки на истории."),
-            ("Цена закрылась ровно на средней", self.on_price_equals_average,
-             "Редкий случай: закрытие свечи совпало со средней до копейки. Ваш "
-             "нынешний робот в этот момент не делает ничего — и остаётся вне рынка. "
-             "На проверенном отрезке истории случай не встретился ни разу."),
         ])
-        return box
-
-    def _filter_group(self) -> QGroupBox:
-        box = self._group("Фильтр против пилы", [
-            ("Фильтр против пилы", self.filter_enabled,
-             "Против того случая, когда цена ходит вплотную к средней: робот "
-             "переворачивается на каждой свече и платит комиссию за каждый "
-             "переворот. Замер 05.09.2026 на ваших данных, 79 дней, окно "
-             "10:05–11:00: выключено — 111 сделок, чистая +2 151 ₽, просадка "
-             "8 718 ₽; порог 0,04 % — 93 сделки, +8 327 ₽, просадка 7 950 ₽; "
-             "подтверждение 3 свечами — 71 сделка, +10 340 ₽, просадка 6 362 ₽. "
-             "На дне 03.09, где вы поймали четыре переворота подряд, "
-             "подтверждение оставило одну сделку и −103 ₽ вместо шести "
-             "и −1 268 ₽. ⚠️ И вторая половина того же замера: ни один "
-             "из вариантов статистически от нуля не отличается — стандартная "
-             "ошибка итога 6–8,5 тыс. ₽ при самом итоге 2–10 тыс. ₽. Это "
-             "означает «79 дней мало», а не «фильтр работает»."),
-            ("Порог пересечения", self.threshold_percent,
-             "Полоса вокруг средней, внутри которой цена сигналом не считается: "
-             "чтобы перевернуться, цена обязана уйти за среднюю на эту величину. "
-             "Ноль означает «полосы нет» — так работает ваш нынешний робот, "
-             "и сверка с ним сделана на нуле. ⚠️ Лучшая на подборе цифра "
-             "провалилась на проверке: порог 0,20 % дал +7 048 ₽ на первой "
-             "половине отрезка и −3 497 ₽ на второй. Обе половины пережил "
-             "только порог 0,04 %."),
-            ("Подтверждение сигнала, свечей подряд", self.confirm_bars,
-             "Сколько свечей подряд цена должна закрываться по одну сторону "
-             "средней, прежде чем робот войдёт. Одна свеча означает «без "
-             "подтверждения», как сейчас. Больше — входов меньше и они позже. "
-             "⚠️ Соседние значения скачут: 3 свечи дали +10 340 ₽, 4 свечи "
-             "−889 ₽, 5 свечей +7 656 ₽. Соседи так вести себя не должны — это "
-             "мера шума на 79 днях, а не свойство рынка. Обе половины отрезка "
-             "пережили только 3 и 6."),
-        ])
-        layout = box.layout()
-        if isinstance(layout, QFormLayout):
-            layout.addRow(self.filter_note)
         return box
 
     def _entry_group(self) -> QGroupBox:
@@ -849,40 +1185,61 @@ class SettingsDialog(QDialog):
             ("После сработавшего тейка", self.after_take_profit,
              "Что делать остаток дня, когда прибыль уже зафиксирована. «Не входить» — "
              "как сейчас. «Сразу восстановить» — это ваше «всегда должна быть позиция» "
-             "в чистом виде, но и самый дорогой вариант по комиссии."),
+             "в чистом виде, но и самый дорогой вариант по комиссии. В роботе он "
+             "пока не сделан, поэтому в списке виден, но не выбирается."),
         ])
         return box
 
     def _take_group(self) -> QGroupBox:
+        """Один выключатель, выбор одного способа из двух и числа обоих.
+
+        ⚠️ Переключатели стоят рядом, а числа — под ними, и это не вкусовая
+        раскладка. Рядом они читаются как один вопрос с двумя ответами;
+        разведённые числами, они снова выглядят как две независимые галочки —
+        то самое, чего в окне больше не должно быть (решение 0060).
+        """
         box = self._group("Фиксация прибыли", [
-            ("Тейк-профит", self.take_profit_enabled,
-             "Снятая галочка означает, что цели по прибыли нет вовсе: позицию "
-             "держит только переворот по средней. Так сделаны две проверочные "
-             "конфигурации, на которых сверяется расчёт свечи. ⚠️ Без цели "
+            # ⚠️ Подпись строки не повторяет текст галочки: в форме они стоят
+            # рядом, и «Фиксировать прибыль ☑ Фиксировать прибыль» читается
+            # как сбой программы.
+            ("Уровень выхода", self.take_profit_enabled,
+             "Снятая галочка означает, что уровня выхода у позиции нет вовсе: "
+             "её держит только переворот по средней. Так сделаны две проверочные "
+             "конфигурации, на которых сверяется расчёт свечи. ⚠️ Без фиксации "
              "прибыли стратегия убыточна на любом торговом окне — на замеренном "
              "отрезке от −3 038 до −108 366 ₽. Выключать осознанно."),
-            ("Цель прибыли", self.take_profit,
-             "Насколько цена должна уйти в плюс от цены входа, чтобы позиция "
-             "закрылась. Ноль означает то же, что снятая галочка выше: цели нет. "
-             "Уровень выставляется заявкой у брокера и живёт всё время позиции — "
-             "он сработает, даже если программа закрыта."),
-            ("Скользящий тейк", self.trailing_enabled,
-             "Обычная цель стоит на месте: дошли — закрылись. Скользящая едет "
-             "за ценой вслед и забирает больше, если движение продолжилось. "
-             "⚠️ Замеров по ней у проекта нет ни одного: она не воспроизводит "
+            ("Способ фиксации", self.take_fixed,
+             "Способа два, и работает всегда ОДИН — тот, что выбран здесь. "
+             "Неподвижная цель: уровень считается от цены входа и больше "
+             "не двигается, дошла цена — позиция закрылась. Уровень выставляется "
+             "заявкой у брокера и живёт всё время позиции: он сработает, даже "
+             "если программа закрыта. Так работает ваш нынешний робот, и все "
+             "замеры проекта сделаны на нём."),
+            ("", self.trailing_enabled,
+             "Скользящий уровень: появляется не сразу, а когда прибыль дойдёт "
+             "до порога, и дальше едет за ценой вслед — забирает больше, если "
+             "движение продолжилось. ⚠️ Выбрали его — неподвижная цель "
+             "не сторожится вовсе, число ниже не читается. ⚠️ Замеров по "
+             "скользящему уровню у проекта нет ни одного: он не воспроизводит "
              "поведение вашего нынешнего робота, а добавляет новое."),
+            ("Цель прибыли", self.take_profit,
+             "Число способа «неподвижная цель». Насколько цена должна уйти "
+             "в плюс от цены входа, чтобы позиция закрылась. Ноль означает "
+             "то же, что снятая галочка выше: уровня нет."),
             ("Порог включения", self.trailing_start,
-             "Насколько прибыль должна вырасти, прежде чем скользящий уровень "
-             "вообще появится. Пока порог не пройден, позицию держит переворот "
-             "по средней, а уровня выхода нет."),
+             "Число способа «скользящий уровень». Насколько прибыль должна "
+             "вырасти, прежде чем уровень вообще появится. Пока порог "
+             "не пройден, позицию держит переворот по средней, а уровня "
+             "выхода нет."),
             ("Отступ", self.trailing_offset,
-             "Насколько уровень выхода отстаёт от лучшей достигнутой цены. "
-             "Цена откатилась на эту величину — позиция закрывается. Назад "
-             "уровень не едет никогда."),
+             "Число способа «скользящий уровень». Насколько уровень выхода "
+             "отстаёт от лучшей достигнутой цены. Цена откатилась на эту "
+             "величину — позиция закрывается. Назад уровень не едет никогда."),
             ("Шаг подтяжки", self.trailing_step,
-             "Насколько цена должна пройти, чтобы уровень сдвинулся. Не "
-             "украшение: без шага каждая свеча с новой лучшей ценой — это "
-             "отдельное обращение к брокеру, до двенадцати за час позиции."),
+             "Число способа «скользящий уровень». Насколько цена должна "
+             "пройти, чтобы уровень сдвинулся. Не украшение: без шага каждая "
+             "свеча с новой лучшей ценой — это отдельное обращение к брокеру, "
+             "до двенадцати за час позиции."),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
@@ -906,6 +1263,31 @@ class SettingsDialog(QDialog):
              "дают +9 908 ₽, один шаг +4 394 ₽, два шага −153 ₽. Умолчание "
              "ноль: так считает ваш нынешний робот, и только на нуле сходится "
              "сверка с ним."),
+            ("Порядок цен внутри минуты", self.minute_order,
+             "Только для прогона по истории, живого робота не касается. "
+             "Минутная свеча помнит четыре цены — открытие, максимум, минимум "
+             "и закрытие, — но не помнит, в каком порядке они были, и прогон "
+             "вынужден это предположить. Для неподвижной цели прибыли порядок "
+             "неважен, для скользящего уровня важен. Пример с покупкой: если "
+             "цена сначала выросла, уровень подтянулся вверх, и следующее "
+             "падение его задело; если сначала упала — уровень ещё стоял ниже "
+             "и задет не был.\n"
+             "• «Сначала цена, ближняя к открытию» — первой считается та из "
+             "двух крайних цен минуты, что ближе к её открытию.\n"
+             "• «Сначала худшая для позиции цена» — первой считается худшая "
+             "для открытой позиции: при покупке минимум, при продаже "
+             "максимум.\n"
+             "⚠️ Умолчание временное: вопрос задан заказчику, ответа пока нет."),
+            ("Наибольшая свеча для проверки по минуткам", self.minute_bar_limit,
+             "Только для прогона по истории и только при включённом "
+             "скользящем уровне. Если свеча не крупнее выбранного размера, "
+             "прогон проверяет уровень по минуткам внутри свечи — ближе "
+             "к тому, как он двигался бы на счёте. Если свеча крупнее, прогон идёт без "
+             "минуток: скользящий уровень в нём двигается только на закрытии "
+             "свечи, и это написано в допущениях прогона.\n"
+             "Крупнее 15 минут выбрать нельзя намеренно: на таких свечах "
+             "проверка по минуткам слишком тяжела, и прогон может "
+             "остановиться, не дойдя до конца."),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
@@ -927,11 +1309,38 @@ class SettingsDialog(QDialog):
              "на графике. Галочка снята — держим до сигнала средней, тейка или "
              "переворота, и позиция может остаться открытой на ночь и на "
              "выходные. ⚠️ Все замеры проекта и сверка с вашим нынешним "
-             "роботом сделаны с поставленной галочкой."),
+             "роботом сделаны с поставленной галочкой. При заявке «с предельной "
+             "ценой» ниже галочка не действует: позиция закрывается всегда."),
+            ("Заявка на выход по концу окна", self.time_exit_order,
+             "Какой заявкой робот закрывает позицию по концу окна и перед "
+             "нерабочим днём. «По рынку» — по любой цене, сразу; так работает "
+             "ваш нынешний робот, и на этом стоят все замеры. «С предельной "
+             "ценой» — робот назначает цену, хуже которой не закроет: от "
+             "закрытия последней свечи на несколько шагов цены в вашу сторону. "
+             "Позиция при этом закрывается всегда, галочка выше не действует. "
+             "Выход по сигналу средней остаётся рыночным в обоих случаях."),
+            ("Отступ предельной цены", self.time_exit_limit_steps,
+             "На сколько шагов цены предельная цена отстоит от закрытия "
+             "последней свечи — в сторону, худшую для вас: при закрытии лонга "
+             "ниже, при закрытии шорта выше. Больше отступ — заявка "
+             "исполняется надёжнее, но может исполниться хуже. Шаг цены "
+             "берётся из поля «Шаг цены инструмента» на вкладке «Инструмент "
+             "и данные». Действует только при заявке «с предельной ценой»."),
+            ("Ждать исполнения", self.time_exit_wait_bars,
+             "Сколько закрытых свечей ждать, пока заявка с предельной ценой "
+             "исполнится. Не исполнилась — робот останавливается, заявку "
+             "оставляет и зовёт вас: её надо снять или дождаться, прежде чем "
+             "закрывать позицию руками. Действует только при заявке "
+             "«с предельной ценой»."),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
             layout.addRow(self.window_close_note)
+            # Отказ «предельная цена без шага» — сразу под выбором заявки,
+            # а не в хвосте вкладки: в хвосте он уходит под прокрутку,
+            # и человек видит погасшие кнопки без причины (снимок 04.10).
+            row = cast("tuple[int, object]", layout.getWidgetPosition(self.time_exit_order))
+            layout.insertRow(row[0] + 1, self.time_exit_note)
             layout.addRow(self.calendar_note)
         return box
 
@@ -957,56 +1366,59 @@ class SettingsDialog(QDialog):
              "Сколько контрактов покупаем или продаём за раз. Новое значение "
              "действует со следующей сделки — уже открытую позицию оно не трогает: "
              "робот не будет ни доливать, ни отрезать."),
-            ("Потолок объёма", self.volume_cap_enabled,
-             "Галочка снята — потолка нет, робот подаёт заявку любого объёма, "
-             "какой стоит выше. Галочка стоит — заявка на вход объёмом больше "
-             "потолка НЕ ПОДАЁТСЯ ВОВСЕ: робот пропускает сигнал и пишет "
-             "причину в журнал решений. Он не подаёт «поменьше» — это была бы "
-             "догадка за вас. Заведено против опечатки в один знак: она меняет "
-             "последствия в десять раз. Выход из позиции потолок не проверяет "
-             "никогда — иначе позиция крупнее потолка осталась бы в рынке "
-             "навсегда."),
-            ("Потолок объёма, контрактов", self.volume_cap,
-             "Сколько контрактов в одной заявке на вход — предел, а не цель. "
-             "Объём, равный потолку, проходит: потолок — это «не больше чем». "
-             "Число 5 в поле ничем не подкреплено, это предложение; цифру "
-             "называете вы."),
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+            # ("Потолок объёма", self.volume_cap_enabled,
+            #  "Галочка снята — потолка нет, робот подаёт заявку любого объёма, "
+            #  "какой стоит выше. Галочка стоит — заявка на вход объёмом больше "
+            #  "потолка НЕ ПОДАЁТСЯ ВОВСЕ: робот пропускает сигнал и пишет "
+            #  "причину в журнал решений. Он не подаёт «поменьше» — это была бы "
+            #  "догадка за вас. Заведено против опечатки в один знак: она меняет "
+            #  "последствия в десять раз. Выход из позиции потолок не проверяет "
+            #  "никогда — иначе позиция крупнее потолка осталась бы в рынке "
+            #  "навсегда."),
+            # ("Потолок объёма, контрактов", self.volume_cap,
+            #  "Сколько контрактов в одной заявке на вход — предел, а не цель. "
+            #  "Объём, равный потолку, проходит: потолок — это «не больше чем». "
+            #  "Число 5 в поле ничем не подкреплено, это предложение; цифру "
+            #  "называете вы."),
         ])
-        layout = box.layout()
-        if isinstance(layout, QFormLayout):
-            layout.addRow(self.cap_note)
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # layout = box.layout()
+        # if isinstance(layout, QFormLayout):
+        #     layout.addRow(self.cap_note)
         return box
 
     def _risk_group(self) -> QGroupBox:
         box = self._group("Ограничение убытка", [
-            ("Дневной лимит убытка", self.daily_loss_limit_enabled,
-             "Галочка снята — робот за дневным убытком не следит и сам "
-             "не остановится. Галочка стоит — дойдя до лимита, он закрывает "
-             "позицию и прекращает торговать до конца дня; включить его снова "
-             "можно только руками, само не возобновится. В убыток считается "
-             "и бумажная переоценка открытой позиции, а не только "
-             "зафиксированное: иначе лимит молчал бы ровно тогда, когда "
-             "убыток самый большой. Решение принимается на закрытии свечи — "
-             "убыток, сходивший за лимит и вернувшийся внутри пятиминутки, "
-             "робота не остановит."),
-            ("Дневной лимит убытка, % от счёта", self.daily_loss_limit,
-             "Сколько процентов счёта вы готовы потерять за день. Считается "
-             "от размера счёта на первый снимок этой даты, без пересчёта "
-             "внутри дня: иначе просадка сама уменьшала бы порог и остановка "
-             "наступала бы всё раньше. Цифру называете вы — это ответ "
-             "на вопрос «сколько я готов потерять», а не расчётная величина."),
-            ("Минимальный запас средств", self.free_funds_reserve_enabled,
-             "Галочка снята — робот занимает под обеспечение все свободные "
-             "деньги. Галочка стоит — эту долю денег он под обеспечение "
-             "не берёт, и если на полный объём с запасом не хватает, входит "
-             "УМЕНЬШЕННЫМ объёмом, а не пропускает сигнал; не хватает даже "
-             "на один контракт — вход пропускается. Запас нужен на случай, "
-             "когда биржа поднимает требования к обеспечению прямо внутри дня: "
-             "без него позицию закроет брокер — по своей цене и в свой момент."),
-            ("Минимальный запас средств, %", self.free_funds_reserve,
-             "Какую долю свободных денег не трогать. Вычитается до расчёта "
-             "числа контрактов, а не после: запас, занятый под последний "
-             "рубль, запасом не является."),
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+            # ("Дневной лимит убытка", self.daily_loss_limit_enabled,
+            #  "Галочка снята — робот за дневным убытком не следит и сам "
+            #  "не остановится. Галочка стоит — дойдя до лимита, он закрывает "
+            #  "позицию и прекращает торговать до конца дня; включить его снова "
+            #  "можно только руками, само не возобновится. В убыток считается "
+            #  "и бумажная переоценка открытой позиции, а не только "
+            #  "зафиксированное: иначе лимит молчал бы ровно тогда, когда "
+            #  "убыток самый большой. Решение принимается на закрытии свечи — "
+            #  "убыток, сходивший за лимит и вернувшийся внутри пятиминутки, "
+            #  "робота не остановит."),
+            # ("Дневной лимит убытка, % от счёта", self.daily_loss_limit,
+            #  "Сколько процентов счёта вы готовы потерять за день. Считается "
+            #  "от размера счёта на первый снимок этой даты, без пересчёта "
+            #  "внутри дня: иначе просадка сама уменьшала бы порог и остановка "
+            #  "наступала бы всё раньше. Цифру называете вы — это ответ "
+            #  "на вопрос «сколько я готов потерять», а не расчётная величина."),
+            # ("Минимальный запас средств", self.free_funds_reserve_enabled,
+            #  "Галочка снята — робот занимает под обеспечение все свободные "
+            #  "деньги. Галочка стоит — эту долю денег он под обеспечение "
+            #  "не берёт, и если на полный объём с запасом не хватает, входит "
+            #  "УМЕНЬШЕННЫМ объёмом, а не пропускает сигнал; не хватает даже "
+            #  "на один контракт — вход пропускается. Запас нужен на случай, "
+            #  "когда биржа поднимает требования к обеспечению прямо внутри дня: "
+            #  "без него позицию закроет брокер — по своей цене и в свой момент."),
+            # ("Минимальный запас средств, %", self.free_funds_reserve,
+            #  "Какую долю свободных денег не трогать. Вычитается до расчёта "
+            #  "числа контрактов, а не после: запас, занятый под последний "
+            #  "рубль, запасом не является."),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
@@ -1043,6 +1455,407 @@ class SettingsDialog(QDialog):
             tabs.addTab(scroll, title)
         return tabs
 
+    def set_algorithms(self, options: Sequence[AlgorithmOption]) -> None:
+        """Показать каталог алгоритмов. Пустой — сказать, что он не приехал.
+
+        Каталог приходит от торговой части и обновляется на каждом применении
+        настроек: описание выбранного алгоритма считается по **применённым**
+        числам, а не по тому, что стоит в полях сию секунду.
+
+        ⚠️ Выбор в `Settings` этот вызов **не меняет**. Каталог — это то, из
+        чего выбирают; выбранное имя держится отдельно и меняется только
+        мышкой человека либо приходом настроек (`set_values`).
+        """
+        self._algorithms = tuple(options)
+        self._show_algorithm()
+
+    def choose_algorithm(self) -> None:
+        """Открыть окно выбора алгоритма и запомнить выбранное.
+
+        Ничего не применяет: имя ложится в поля окна и уходит движку обычным
+        путём, по «Применить» или «ОК», вместе с остальными настройками.
+        Отдельная дорога к движку означала бы смену торгового правила
+        в обход подтверждения «было → стало».
+        """
+        dialog = AlgorithmDialog(self._algorithms, self, captions=self.field_captions())
+        dialog.set_chosen(self._strategy_id)
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            chosen = dialog.chosen_id()
+        finally:
+            # Без этого окно живёт до конца работы программы: родителем ему
+            # назначено окно настроек, а `exec()` его не удаляет.
+            dialog.deleteLater()
+        if chosen:
+            self.pick_algorithm(chosen)
+
+    def pick_algorithm(self, strategy_id: str) -> None:
+        """Выбрать алгоритм в окне — то же, что выбор в списке и «Выбрать».
+
+        Ничего не применяет: имя ложится в поля окна, а требования алгоритма
+        к общим настройкам — в свои поля (`_sync_demands`).
+        """
+        self._strategy_id = strategy_id
+        self._show_algorithm()
+
+    def _show_algorithm(self) -> None:
+        """Название выбранного алгоритма и оговорка, если что-то не так.
+
+        Три случая, и каждый говорится вслух.
+
+        * Всё в порядке — **только название**, строка беды спрятана. Правило
+          словами живёт в окне выбора: абзац на вкладке занимал 391–459 точек
+          и вытеснял поля средней под прокрутку (замер 08.09.2026), ради чего
+          задача и делалась.
+        * Каталог не приехал — показано имя латиницей и сказано почему.
+          Окно, открытое без торговой части, обязано назвать себя таким.
+        * Каталог есть, а выбранного в нём нет — это сборка постарше, чем
+          файл настроек, и молчать нельзя: робот таким алгоритмом работать
+          не сможет.
+
+        ⚠️ Доступность кнопки выбора считается **здесь и на всех трёх путях**,
+        а не в одном из них. Пустой каталог означает, что окно выбора покажет
+        пустой список: кнопка, ведущая туда, обязана быть выключена вместе
+        с объяснением, а не отказывать после нажатия (правило §6 брифа окна —
+        то же, что у «Старта» на токене «только чтение»). До 09.09.2026 она
+        жалась при пустом каталоге и вела в тупик.
+        """
+        # Порядок важен: сперва доступность, потом тексты. Каталог пуст —
+        # выбирать не из чего, и это верно независимо от того, нашлось имя
+        # в нём или нет.
+        self.algorithm_button.setEnabled(bool(self._algorithms))
+        # Алгоритм один (решение 0063) — выбирать не из чего, кнопка и окно
+        # выбора спрятаны; название остаётся видно строкой. Пустой каталог
+        # кнопку не прячет: там она выключена с объяснением, почему.
+        self.algorithm_button.setVisible(len(self._algorithms) != 1)
+        # Подсказка на выключенной кнопке Qt показывает — на неё и рассчитано:
+        # человек ведёт мышью туда, куда собирался нажать.
+        self.algorithm_button.setToolTip(
+            CHOOSE_HINT if self._algorithms else CHOOSE_IMPOSSIBLE
+        )
+        self._sync_unused()
+        self._sync_demands()
+        # Требование могло закрыть выбор заявки, не сменив его: строка про
+        # шаг цены тогда перестаёт советовать «по рынку» только здесь.
+        self._sync_window_close()
+        found = self._chosen_option()
+        if found is not None:
+            self.algorithm_name.setText(found.title)
+            # Правило одной фразой — во всплывающей подсказке: тому, кто ведёт
+            # мышью, оно достаётся без нажатий, а вкладка остаётся строкой.
+            self.algorithm_name.setToolTip(found.summary)
+            self._say_about_the_algorithm("", alarming=False)
+            return
+        self.algorithm_name.setText(self._strategy_id or "не выбран")
+        self.algorithm_name.setToolTip("")
+        if not self._algorithms:
+            self._say_about_the_algorithm(CATALOGUE_NOT_ARRIVED, alarming=False)
+            return
+        # Кнопка выбора спрятана, когда алгоритм один (решение 0063): тогда
+        # советовать «выберите кнопкой справа» нельзя — кнопки нет.
+        way = (
+            "Выберите алгоритм из списка кнопкой справа либо обновите "
+            "программу целиком."
+            if self.algorithm_button.isVisibleTo(self) else
+            "Обновите программу целиком."
+        )
+        self._say_about_the_algorithm(
+            f"⚠️ Алгоритма «{self._strategy_id}» в этой сборке нет — робот "
+            "работать им не сможет. Скорее всего настройки или шаблон сделаны "
+            f"более новой сборкой программы. {way}",
+            alarming=True,
+        )
+
+    def _chosen_option(self) -> AlgorithmOption | None:
+        """Выбранный алгоритм в каталоге. `None` — каталога нет или имени в нём."""
+        return next(
+            (item for item in self._algorithms if item.id == self._strategy_id),
+            None,
+        )
+
+    def _unused_now(self) -> frozenset[str]:
+        """Поля, которые выбранный алгоритм не читает. Не знаем алгоритма — пусто.
+
+        Пусто, а не «всё»: гасить поля по догадке нельзя, а о незнакомом
+        алгоритме окно и так говорит вслух (`_show_algorithm`).
+        """
+        found = self._chosen_option()
+        return frozenset() if found is None else found.unused
+
+    def _sync_unused(self) -> None:
+        """Погасить поля, которые выбранный алгоритм не читает, и сказать почему.
+
+        Какие поля он читает, объявляет сам алгоритм (`StrategyEntry.fields`),
+        `app/` переводит это в имена полей окна (`AlgorithmOption.unused`),
+        здесь только имя → виджет по `PLACEMENT`. Поле гаснет, а не прячется
+        и не обнуляется: человек видит, что настройка есть, и подобранное
+        вернётся при выборе алгоритма, который её читает.
+
+        Гасятся только поля, которые хоть один алгоритм каталога не читает:
+        остальными — «Период средней» и прочими — ведают свои правила.
+        """
+        unused = self._unused_now()
+        candidates = frozenset().union(*(item.unused for item in self._algorithms))
+        captions = []
+        for name, _tab, attr in PLACEMENT:
+            if name not in candidates:
+                continue
+            widget = getattr(self, attr)
+            widget.setEnabled(name not in unused)
+            if name in unused:
+                captions.append(f"«{self._caption_of(widget) or name}»")
+        found = self._chosen_option()
+        if captions and found is not None:
+            self.unused_note.setText(
+                f"Алгоритм «{found.title}» не читает поля: "
+                + ", ".join(captions)
+                + ". Они погашены: робот при этом алгоритме их не видит, "
+                "и менять их бесполезно. Значения сохранены и снова заработают, "
+                "если выбрать алгоритм, который их читает."
+            )
+        else:
+            self.unused_note.setText("")
+        self.unused_note.setVisible(bool(captions))
+
+    @staticmethod
+    def _caption_of(widget: QWidget) -> str:
+        """Подпись поля так, как её видит человек, — из строки формы."""
+        parent = widget.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if isinstance(layout, QFormLayout):
+            label = layout.labelForField(widget)
+            if isinstance(label, QLabel):
+                return label.text()
+        return ""
+
+    def _say_about_the_algorithm(self, text: str, *, alarming: bool) -> None:
+        """Строка беды под названием. Пустая — спрятать, а не оставить пробел.
+
+        ⚠️ Спрятать, а не очистить: пустой ярлык с переносом строк держит
+        высоту строки и раздвигает группу на пустом месте — ровно то, против
+        чего эта вкладка и перестраивалась.
+        """
+        self._paint_note(self.algorithm_note, alarming=alarming)
+        self.algorithm_note.setText(text)
+        self.algorithm_note.setVisible(bool(text))
+
+    def _widget_of(self, field: str) -> QWidget | None:
+        """Виджет поля `Settings` по таблице `PLACEMENT`. `None` — поля в окне нет."""
+        for name, _tab, attr in PLACEMENT:
+            if name == field:
+                found = getattr(self, attr)
+                return found if isinstance(found, QWidget) else None
+        return None
+
+    def _field_note(self, field: str, kind: str) -> QLabel | None:
+        """Строка прямо под полем. Создаётся один раз и прячется, когда пуста.
+
+        Под полем, а не в общем месте: требование и отказ говорят про одно
+        поле, и человек ищет объяснение там, где поле закрыто или где его
+        надо поменять. `None` — поля в окне нет или оно не в форме.
+        """
+        found = self._field_notes.get((field, kind))
+        if found is not None:
+            return found
+        widget = self._widget_of(field)
+        parent = widget.parentWidget() if widget is not None else None
+        form = parent.layout() if parent is not None else None
+        if widget is None or not isinstance(form, QFormLayout):
+            return None
+        # Строка поля ищется обходом, а не `getWidgetPosition`: у той в PySide6
+        # объявлен возврат `object`, и распаковка его — подавление типов.
+        row = next(
+            index for index in range(form.rowCount())
+            if (item := form.itemAt(index, QFormLayout.ItemRole.FieldRole)) is not None
+            and item.widget() is widget
+        )
+        label = _alert("") if kind == "refusal" else _hint("")
+        label.setVisible(False)
+        form.insertRow(row + 1, label)
+        self._field_notes[(field, kind)] = label
+        return label
+
+    def _sync_demands(self) -> None:
+        """Поставить то, чего требует выбранный алгоритм, закрыть поле, сказать почему.
+
+        Требования объявляет сам алгоритм (`StrategyEntry.demands`), `app/`
+        переводит их в поле и значение окна (`AlgorithmOption.demands`),
+        здесь один цикл по данным — ни имени алгоритма, ни значения поля
+        в этом файле нет. Закрытое поле не даёт собрать сочетание, которое
+        порт всё равно отвергнет (`app/convert.py::check_demands`): до
+        29.09.2026 окно его собирало, отказ уходил в строку состояния
+        за окном, а окно запоминало отвергнутый алгоритм.
+
+        Уход на алгоритм без требования поле открывает, но значение
+        не возвращает: что стоит в поле, человек видит, а «было → стало»
+        покажет подтверждение.
+        """
+        found = self._chosen_option()
+        demanded = {one.field: one for one in (found.demands if found else ())}
+        unused = self._unused_now()
+        for name in sorted({one.field for item in self._algorithms for one in item.demands}):
+            widget = self._widget_of(name)
+            note = self._field_note(name, "demand")
+            # Требование сегодня бывает только к выбору из списка: так его
+            # объявляет реестр (`SettingsDemand.value` — элемент перечисления).
+            if not isinstance(widget, QComboBox) or note is None:
+                continue
+            demand = demanded.get(name)
+            index = widget.findData(demand.value) if demand is not None else -1
+            if demand is not None and index >= 0:
+                widget.setCurrentIndex(index)
+            widget.setEnabled(index < 0 and name not in unused)
+            note.setVisible(demand is not None)
+            if demand is None or found is None:
+                continue
+            note.setText(
+                f"Алгоритм «{found.title}» {demand.reason}. Поэтому здесь стоит "
+                f"«{widget.itemText(index)}», и поле закрыто, пока выбран этот "
+                "алгоритм." if index >= 0 else
+                f"Алгоритм «{found.title}» {demand.reason}, а такого значения "
+                "в этом списке нет. Обновите программу целиком."
+            )
+
+    def take_refusal(self, kept: Settings, reason: str, field: str) -> None:
+        """«Применить» из этого окна не принято: принятым остаётся `kept`, правки — в полях.
+
+        Принятым окно считает то, что осталось в силе: с ним сравнивает
+        подтверждение при следующем «Применить» (до 29.09.2026 окно помнило
+        отвергнутый набор как принятый). Поля **не** откатываются: отказ
+        по одному полю стирал бы все правки разом — период, окно, объём —
+        и человек вводил бы их заново (находка ревью 29.09.2026). Отказ —
+        крупно над вкладками и строкой у названного поля; вкладка поля
+        открывается, фокус — на нём.
+
+        Отказ, пришедший не в ответ на отправку из этого окна, не трогает
+        ни полей, ни окна: правки человека, ещё не отправленные, стирать
+        чужим отказом нельзя.
+        """
+        if not self._emitting:
+            return
+        self._refused = True
+        self._applied = kept
+        widget = self._widget_of(field) if field else None
+        caption = self._caption_of(widget) if widget is not None else ""
+        where = next((tab for name, tab, _attr in PLACEMENT if name == field), "")
+        # Причина целиком — у поля, если поле известно; наверху — куда идти.
+        # Одна и та же фраза дважды на одном экране читалась как два отказа.
+        self.refusal_note.setText(
+            f"Настройки не приняты: поменяйте поле «{caption}» на вкладке "
+            f"«{where}» — причина под полем. В силе прежние настройки; ваши "
+            "правки остались в полях и не применены."
+            if caption else
+            f"Настройки не приняты. {reason} Ваши правки остались в полях "
+            "и не применены."
+        )
+        self.refusal_note.setVisible(True)
+        note = self._field_note(field, "refusal") if field else None
+        if note is not None and widget is not None:
+            note.setText(reason)
+            note.setVisible(True)
+            page = self.page_of(where)
+            if page is not None:
+                self.tabs.setCurrentWidget(page)
+            widget.setFocus()
+
+    def take_echo(self, settings: Settings) -> None:
+        """Настройки, действующие у робота, пришли, пока окно открыто.
+
+        Два источника. Ответ на «Применить» из этого окна (`_emitting`) —
+        тогда это просто новое принятое. И сама программа: суточный переход
+        с истёкшего кода на действующий, подсказанные биржей ₽ за пункт.
+        Во втором случае окно обязано узнать об этом: иначе в полях и
+        в «принятом» остался бы прежний код, подтверждение разницы не
+        показало бы ничего, и «ОК» молча вернул бы робота на истёкший
+        контракт (находка ревью 29.09.2026).
+
+        Слияние — одной таблицей полей `Settings`, без ветки на инструмент:
+        поле, которое человек уже поправил (в окне не то, что было принято),
+        остаётся за ним; остальные берут значение программы. Неотправленные
+        правки чужое эхо не стирает — по той же причине, что и отказ
+        (`take_refusal`).
+        """
+        before = self._applied
+        self._applied = settings
+        if self._emitting or settings == before:
+            return
+        shown = self.values()
+        mine = {
+            one.name: getattr(shown, one.name)
+            for one in fields(Settings)
+            if getattr(shown, one.name) != getattr(before, one.name)
+        }
+        self.set_values(settings.replace(**mine))
+        was, now = before.instrument.strip(), settings.instrument.strip()
+        if was == now:
+            return
+        caption = self.field_captions().get("instrument", "Инструмент")
+        kept = self.instrument.text().strip()
+        self.echo_note.setText(
+            f"Программа перешла с {was} на действующий контракт {now}, пока "
+            f"окно было открыто; причина — в журнале решений. "
+            + (
+                f"Поле «{caption}» обновлено."
+                if kept == now else
+                f"В поле «{caption}» оставлено введённое вами {kept}: "
+                "«Применить» сменит инструмент на него."
+            )
+        )
+        self.echo_note.setVisible(True)
+
+    def note_at(self, field: str, kind: str) -> QLabel | None:
+        """Строка у поля, если она заведена: `kind` — `demand` или `refusal`.
+
+        Только чтение: заводит строки `_field_note`, когда есть что сказать.
+        """
+        return self._field_notes.get((field, kind))
+
+    def field_captions(self) -> dict[str, str]:
+        """Подписи полей так, как их видит человек: имя поля `Settings` → подпись."""
+        found = {}
+        for name, _tab, _attr in PLACEMENT:
+            widget = self._widget_of(name)
+            if widget is not None and (caption := self._caption_of(widget)):
+                found[name] = caption
+        return found
+
+    def _clear_refusal(self) -> None:
+        """Снять прежний отказ перед новой отправкой.
+
+        Заодно и строку о переходе программы (`take_echo`): отправленное
+        уже сравнено с принятым, новость прочитана.
+        """
+        self.refusal_note.setVisible(False)
+        self.refusal_note.setText("")
+        self.echo_note.setVisible(False)
+        for (_field, kind), label in self._field_notes.items():
+            if kind == "refusal":
+                label.setVisible(False)
+
+    def show_field(self, field: str) -> None:
+        """Открыть вкладку поля `Settings`, прокрутить к нему и дать фокус.
+
+        Зовёт главное окно, когда настройки из файла при запуске приняты
+        не так, как записаны (`RobotState.settings_field`): человек приходит
+        чинить одно поле, и искать его по вкладкам и под прокруткой — ровно
+        то, на чём отказ терялся (находка 04.10.2026). Пустое или
+        незнакомое имя — ничего не делать.
+
+        Прокрутка — следующим ходом цикла событий: до показа окна у полей
+        ещё нет мест, и прокручивать не к чему.
+        """
+        widget = self._widget_of(field) if field else None
+        where = next((tab for name, tab, _attr in PLACEMENT if name == field), "")
+        page = self.page_of(where)
+        if widget is None or page is None:
+            return
+        self.tabs.setCurrentWidget(page)
+        widget.setFocus()
+        if isinstance(page, QScrollArea):
+            # Запас снизу — под строку причины, которая стоит под полем.
+            QTimer.singleShot(0, page, lambda: page.ensureWidgetVisible(widget, 50, 160))
+
     def page_of(self, tab: str) -> QWidget | None:
         """Страница вкладки по её заголовку. `None` — такой вкладки нет.
 
@@ -1068,25 +1881,36 @@ class SettingsDialog(QDialog):
         """
         order = [
             # «Инструмент и данные»
-            self.instrument, self.timeframe,
+            self.instrument, self.expiry_halt_days, self.timeframe,
             self.history_depth_days, self.depth_days,
             self.price_step, self.ruble_per_point,
             # «Сигнал»
+            self.algorithm_button,
             self.average_period, self.average_kind,
-            self.on_price_equals_average,
-            self.filter_enabled, self.threshold_percent, self.confirm_bars,
             # «Вход и выход»
             self.reversal_moment, self.after_take_profit,
-            self.take_profit_enabled, self.take_profit,
-            self.trailing_enabled, self.trailing_start, self.trailing_offset,
-            self.trailing_step,
+            # Порядок — как на экране: выключатель, выбор способа, числа
+            # обоих способов. Внутри группы переключателей Qt ходит стрелками,
+            # Tab выводит из группы целиком — это её штатное поведение,
+            # а не потеря фокуса.
+            self.take_profit_enabled,
+            self.take_fixed, self.trailing_enabled,
+            self.take_profit,
+            self.trailing_start, self.trailing_offset, self.trailing_step,
             # «Торговое окно»
             self.window_start, self.window_end, self.close_on_time_end,
+            self.time_exit_order, self.time_exit_limit_steps,
+            self.time_exit_wait_bars,
             # «Деньги»
-            self.volume, self.volume_cap_enabled, self.volume_cap,
-            self.daily_loss_limit_enabled, self.daily_loss_limit,
-            self.free_funds_reserve_enabled, self.free_funds_reserve,
-            self.commission, self.slippage_steps,
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): потолка в обходе нет. При
+            # возврате раскомментировать строку ниже и удалить живую замену под ней.
+            # self.volume, self.volume_cap_enabled, self.volume_cap,
+            self.volume,
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+            # self.daily_loss_limit_enabled, self.daily_loss_limit,
+            # self.free_funds_reserve_enabled, self.free_funds_reserve,
+            self.commission, self.slippage_steps, self.minute_order,
+            self.minute_bar_limit,
             # «Программа»
             self.log_directory,
         ]
@@ -1096,46 +1920,42 @@ class SettingsDialog(QDialog):
 
     # ------------------------------------------------------------------ обмен
 
+    def _show_choices(self, settings: Settings) -> None:
+        """Списки выбора — одной таблицей: забытый здесь вернулся бы к первому."""
+        for name in _CHOICES:
+            field = getattr(self, name)
+            field.setCurrentIndex(max(field.findData(getattr(settings, name)), 0))
+
     def set_values(self, settings: Settings) -> None:
         """Показать настройки в полях."""
         self.instrument.setText(settings.instrument)
-        # ⚠️ Неизвестный размер свечи ДОБАВЛЯЕТСЯ в список, а не заменяется
-        # на «5 минут». Прежняя подмена была молчаливой и меняла стратегию
-        # целиком: настройка приходила одна, на «ОК» уходила другая, и в журнале
-        # решений этой правки не было. Правило файла №1 — значение, пришедшее
-        # снаружи, не подменяется молча — не знает исключений для списков.
-        index = self.timeframe.findText(settings.timeframe)
-        if index < 0 and settings.timeframe:
-            self.timeframe.insertItem(0, settings.timeframe)
-            index = 0
-        self.timeframe.setCurrentIndex(max(index, 0))
+        self._show_timeframe(settings.timeframe)
         self.depth_days.setValue(settings.depth_days)
         self.history_depth_days.setValue(max(settings.history_depth_days, 1))
+        self.expiry_halt_days.setValue(settings.expiry_halt_days)
         self.average_period.setValue(settings.average_period)
-        self.threshold_percent.setValue(settings.threshold_percent)
-        self.confirm_bars.setValue(settings.confirm_bars)
-        for field, value in (
-            (self.average_kind, settings.average_kind),
-            (self.reversal_moment, settings.reversal_moment),
-            (self.after_take_profit, settings.after_take_profit),
-            (self.on_price_equals_average, settings.on_price_equals_average),
-        ):
-            field.setCurrentIndex(max(field.findData(value), 0))
+        self._show_choices(settings)
         # Выключатели — одной таблицей, как и списки выше. Не ради длины:
         # выключатель, дописанный в поля и забытый здесь, возвращался бы
         # к умолчанию при каждом «Применить» и молча — ровно так жили
         # «закрывать в конце окна» и фильтр против пилы. Строк стало меньше,
         # а мест, где можно забыть, — одно вместо четырёх.
         for switch, state in (
-            (self.filter_enabled, settings.filter_enabled),
             (self.take_profit_enabled, settings.take_profit_enabled),
-            (self.trailing_enabled, settings.trailing_enabled),
             (self.close_on_time_end, settings.close_on_time_end),
-            (self.volume_cap_enabled, settings.volume_cap_enabled),
-            (self.daily_loss_limit_enabled, settings.daily_loss_limit_enabled),
-            (self.free_funds_reserve_enabled, settings.free_funds_reserve_enabled),
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+            # (self.volume_cap_enabled, settings.volume_cap_enabled),
+            # (self.daily_loss_limit_enabled, settings.daily_loss_limit_enabled),
+            # (self.free_funds_reserve_enabled, settings.free_funds_reserve_enabled),
         ):
             switch.setChecked(state)
+        # ⚠️ Способ фиксации ставится ОДНИМ переключателем из двух, а не
+        # «включить/выключить» вместе с выключателями выше: `setChecked(False)`
+        # у группы оставил бы невыбранными оба. Пришедшее «способ скользящий
+        # при выключенной фиксации» показывается как есть — что оно не работает,
+        # сказано словами под полями (`_take_text`).
+        method = self.trailing_enabled if settings.trailing_enabled else self.take_fixed
+        method.setChecked(True)
         self.take_profit.setValue(settings.take_profit_pct)
         # ⚠️ Порог и отступ ставятся без хитростей и БЕЗ взаимных границ.
         # Соблазн выразить правило «порог больше отступа» границами полей
@@ -1163,6 +1983,8 @@ class SettingsDialog(QDialog):
         # «закрывать в конце окна» и фильтр против пилы.
         self._calendar = settings.calendar
         self.slippage_steps.setValue(settings.slippage_steps)
+        self.time_exit_limit_steps.setValue(settings.time_exit_limit_steps)
+        self.time_exit_wait_bars.setValue(settings.time_exit_wait_bars)
         self.log_directory.setText(settings.log_directory)
         self.window_start.setTime(QTime(settings.window_start.hour, settings.window_start.minute))
         self.window_end.setTime(QTime(settings.window_end.hour, settings.window_end.minute))
@@ -1171,70 +1993,118 @@ class SettingsDialog(QDialog):
         self._sync_commission()
         self._sync_costs()
         self._sync_depth()
-        self._sync_filter()
         self._sync_window_close()
+        self._take_algorithm(settings.strategy_id)
+
+    def _show_timeframe(self, timeframe: str) -> None:
+        """Размер свечи в списке. Незнакомый ДОБАВЛЯЕТСЯ, а не подменяется.
+
+        Прежняя подмена на «5 минут» была молчаливой и меняла стратегию
+        целиком: настройка приходила одна, на «ОК» уходила другая, и в журнале
+        решений этой правки не было. Правило файла №1 — значение, пришедшее
+        снаружи, не подменяется молча — исключений для списков не знает.
+
+        Отдельным шагом от `set_values`, потому что это единственное поле
+        обмена с ветвлением, и объяснение к нему длиннее самого поля.
+        """
+        index = self.timeframe.findText(timeframe)
+        if index < 0 and timeframe:
+            self.timeframe.insertItem(0, timeframe)
+            index = 0
+        self.timeframe.setCurrentIndex(max(index, 0))
+
+    def _take_algorithm(self, strategy_id: str) -> None:
+        """Имя выбранного алгоритма — как пришло, без сверки с каталогом.
+
+        ⚠️ Незнакомое имя показывается как есть, а `_show_algorithm` говорит
+        вслух, что такого алгоритма в этой сборке нет. Подстановка умолчания
+        была бы сменой торгового правила без ведома владельца счёта: на экране
+        всё выглядело бы исправно, а робот работал бы не тем, что записано
+        в настройках.
+
+        ⚠️ В `set_values` зовётся **последним**: списки ставят значения
+        из настроек, а требование выбранного алгоритма (`_sync_demands`)
+        обязано лечь поверх них, а не под них.
+        """
+        self._strategy_id = strategy_id
+        self._show_algorithm()
 
     def _show_volume_and_guards(self, settings: Settings) -> None:
-        """Объём, потолок и два процента предохранителей — отдельным шагом.
+        """Объём и два процента предохранителей — отдельным шагом.
 
-        Отдельно от `set_values` не ради длины, а потому что здесь
-        единственное место окна, где показ значения требует **порядка**
-        и перекрытых сигналов: остальные поля ставятся в любом порядке
-        и ничего друг о друге не знают.
+        ⚠️ Потолка объёма здесь больше нет — ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН
+        НА ЭТАПЕ (D-113). Вместе с ним ушла единственная причина, по которой
+        этот шаг был отдельным: порядок и перекрытые сигналы (разбор ниже,
+        в закомментированном виде). Метод оставлен на месте, чтобы возврат
+        был одним движением, а не переносом кода обратно в `set_values`.
 
-        Объём показывается настоящий, а не подрезанный потолком. Окно,
-        молча уменьшившее объём, отправит на «ОК» изменение параметра
-        по деньгам, которого владелец счёта не делал и которого не будет
-        в журнале решений. Что делать с объёмом выше потолка, решает движок.
+        Объём показывается настоящий, а не подрезанный. Окно, молча
+        уменьшившее объём, отправит на «ОК» изменение параметра по деньгам,
+        которого владелец счёта не делал и которого не будет в журнале
+        решений.
 
-        Сигналы на время загрузки перекрыты намеренно. `volume_cap.setValue()`
-        синхронно дёргает `_sync_volume_cap`, а тот считает максимум по ещё
-        не обновлённому значению объёма — и сужает его до потолка ровно перед
-        тем, как мы поставим настоящее число. Прежняя правка «сначала поднять
-        максимум» этого не спасала: пересчёт по сигналу шёл после неё.
+        # Сигналы на время загрузки перекрыты намеренно. `volume_cap.setValue()`
+        # синхронно дёргает `_sync_volume_cap`, а тот считает максимум по ещё
+        # не обновлённому значению объёма — и сужает его до потолка ровно перед
+        # тем, как мы поставим настоящее число. Прежняя правка «сначала поднять
+        # максимум» этого не спасала: пересчёт по сигналу шёл после неё.
         """
-        blocker_volume = QSignalBlocker(self.volume)
-        blocker_cap = QSignalBlocker(self.volume_cap)
-        self.volume.setMaximum(max(settings.volume, settings.volume_cap, 1))
-        self.volume_cap.setValue(settings.volume_cap)
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # blocker_volume = QSignalBlocker(self.volume)
+        # blocker_cap = QSignalBlocker(self.volume_cap)
+        # self.volume.setMaximum(max(settings.volume, settings.volume_cap, 1))
+        # self.volume_cap.setValue(settings.volume_cap)
         self.volume.setValue(settings.volume)
-        del blocker_volume, blocker_cap
-        self.daily_loss_limit.setValue(settings.daily_loss_limit_pct)
-        self.free_funds_reserve.setValue(settings.free_funds_reserve_pct)
-        self._sync_volume_cap()
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # del blocker_volume, blocker_cap
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # self.daily_loss_limit.setValue(settings.daily_loss_limit_pct)
+        # self.free_funds_reserve.setValue(settings.free_funds_reserve_pct)
+        # self._sync_volume_cap()
         self._sync_guards()
 
     def values(self) -> Settings:
-        """Собрать настройки из полей."""
-        start = self.window_start.time()
-        end = self.window_end.time()
+        """Собрать настройки из полей.
+
+        Списки выбора — по таблице `_CHOICES`, той же, что и показ: шестой
+        список, собранный только в одном из двух мест, при «Применить» молча
+        возвращался бы к умолчанию.
+        """
+        chosen = {name: getattr(self, name).currentData() for name in _CHOICES}
         return Settings(
             instrument=self.instrument.text().strip(),
             timeframe=self.timeframe.currentText(),
             depth_days=self.depth_days.value(),
             history_depth_days=self.history_depth_days.value(),
+            expiry_halt_days=self.expiry_halt_days.value(),
+            # ⚠️ Имя алгоритма отдаётся как есть, даже если каталог не приехал
+            # и названия мы не знаем. Подстановка умолчания на этом месте была
+            # бы сменой торгового правила, которой владелец счёта не делал
+            # и которой не будет в журнале решений.
+            strategy_id=self._strategy_id,
             average_period=self.average_period.value(),
-            # ⚠️ Числа отдаются такими, какие стоят в полях, независимо
-            # от галочки. Выключенный фильтр — это не «нули в окне»,
-            # а подмена на границе с торговым модулем
-            # (`app/convert.py::_FILTER_OFF`). Обнулить их здесь значило бы
-            # потерять подобранное при первом же снятии галочки.
-            filter_enabled=self.filter_enabled.isChecked(),
-            threshold_percent=self.threshold_percent.value(),
-            confirm_bars=self.confirm_bars.value(),
-            average_kind=self.average_kind.currentData(),
-            reversal_moment=self.reversal_moment.currentData(),
-            after_take_profit=self.after_take_profit.currentData(),
-            on_price_equals_average=self.on_price_equals_average.currentData(),
             take_profit_enabled=self.take_profit_enabled.isChecked(),
             take_profit_pct=self.take_profit.value(),
-            trailing_enabled=self.trailing_enabled.isChecked(),
+            # ⚠️ Способ уходит наружу только вместе с включённой фиксацией,
+            # и это не дублирование галочки. «Скользящий выбран, фиксация
+            # выключена» — состояние, которого у позиции не бывает: уровня
+            # в нём нет вовсе (`EngineSettings.plan`), а пару «порог/отступ»
+            # движок при этом всё равно проверяет и вправе отвергнуть
+            # настройки целиком из-за чисел, которых никто не читает
+            # (`EngineSettings._check_trailing_pair`). Поэтому наружу уходит
+            # ровно то, что применяется.
+            trailing_enabled=(
+                self.take_profit_enabled.isChecked()
+                and self.trailing_enabled.isChecked()
+            ),
             trailing_start_pct=self.trailing_start.value(),
             trailing_offset_pct=self.trailing_offset.value(),
             trailing_step_pct=self.trailing_step.value(),
-            window_start=start.toPython(),
-            window_end=end.toPython(),
+            window_start=self.window_start.time().toPython(),
+            window_end=self.window_end.time().toPython(),
             close_on_time_end=self.close_on_time_end.isChecked(),
+            time_exit_limit_steps=self.time_exit_limit_steps.value(),
+            time_exit_wait_bars=self.time_exit_wait_bars.value(),
             price_step=self.price_step.value(),
             ruble_per_point=self.ruble_per_point.value(),
             # ⚠️ Происхождение числа переживает обмен, но **не переживает
@@ -1248,15 +2118,15 @@ class SettingsDialog(QDialog):
             log_directory=self.log_directory.text().strip(),
             volume=self.volume.value(),
             # ⚠️ Числа отдаются как стоят, независимо от галочек. «Выключено»
-            # выражается на границе с движком (`app/convert.py::_GUARDS`),
-            # а не обнулением полей: обнулив, окно потеряло бы цифры, которые
-            # владелец счёта подбирал, при первом же снятии галочки.
-            volume_cap_enabled=self.volume_cap_enabled.isChecked(),
-            volume_cap=self.volume_cap.value(),
-            daily_loss_limit_enabled=self.daily_loss_limit_enabled.isChecked(),
-            daily_loss_limit_pct=self.daily_loss_limit.value(),
-            free_funds_reserve_enabled=self.free_funds_reserve_enabled.isChecked(),
-            free_funds_reserve_pct=self.free_funds_reserve.value(),
+            # выражается на границе с движком (`app/convert.py::_GUARDS`), а не
+            # обнулением полей: обнулив, окно потеряло бы подобранные цифры.
+            # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+            # volume_cap_enabled=self.volume_cap_enabled.isChecked(),
+            # volume_cap=self.volume_cap.value(),
+            # daily_loss_limit_enabled=self.daily_loss_limit_enabled.isChecked(),
+            # daily_loss_limit_pct=self.daily_loss_limit.value(),
+            # free_funds_reserve_enabled=self.free_funds_reserve_enabled.isChecked(),
+            # free_funds_reserve_pct=self.free_funds_reserve.value(),
             # Ноль в поле — это «тариф не задан», а не «комиссии нет».
             # Разница в том, что делает движок: при `None` он пишет, что
             # правило «цель окупает комиссию обеих сторон» НЕ ПРОВЕРЕНО,
@@ -1264,98 +2134,105 @@ class SettingsDialog(QDialog):
             commission_per_side_rub=(
                 None if self.commission.value() <= 0 else self.commission.value()
             ),
-        )
+        ).replace(**chosen)
 
-    def _sync_volume_cap(self, *_: object) -> None:
-        """Состояние потолка объёма: включён или нет и что из этого следует.
-
-        ⚠️ Тексты здесь **в настоящем времени**, и это стало правдой
-        05.09.2026: проверка живёт в `engine/guards.py::entry_size`, а число
-        доезжает до неё через галочку (`app/convert.py::_GUARDS`). До того
-        здесь стояло будущее время и прямая отметка «предохранитель ещё
-        не включён» — обещание в настоящем времени тогда снимало бы
-        настороженность там, где защиты нет.
-
-        ⚠️ Обратное правило остаётся в силе: **снятая галочка обязана
-        говорить, что защиты нет**. Пустая строка на этом месте читалась бы
-        как «всё в порядке».
-        """
-        on = self.volume_cap_enabled.isChecked()
-        cap = self.volume_cap.value()
-        self.volume_cap.setEnabled(on)
-        if not on:
-            # Потолок снят — ввод объёма он не ограничивает. Верхняя граница
-            # поля возвращается к своей собственной, а не остаётся зажатой
-            # числом, которое ничего не значит.
-            self.volume.setMaximum(1_000_000)
-            self._paint_note(self.cap_note, alarming=False)
-            self.cap_note.setText(
-                "Потолка объёма нет: заявка уйдёт тем объёмом, который стоит "
-                "выше, каким бы он ни был. Опечатка в один знак меняет "
-                "последствия в десять раз, и остановить её будет некому."
-            )
-            return
-        # Потолок ограничивает ввод, но НЕ подрезает уже пришедшее значение:
-        # если движок отдал объём выше потолка, окно обязано показать настоящее
-        # число и сказать вслух, что оно выше. Подмена на «ОК» превратилась бы
-        # в изменение параметра по деньгам, которого владелец счёта не делал
-        # и которого нет в журнале решений.
-        self.volume.setMaximum(max(cap, self.volume.value(), 1))
-        if self.volume.value() > cap:
-            self._paint_note(self.cap_note, alarming=True)
-            self.cap_note.setText(
-                f"⚠️ Объём {self.volume.value()} выше потолка {cap}: заявка "
-                "на вход подаваться НЕ БУДЕТ вовсе, робот пропустит сигнал "
-                "и напишет причину в журнал. Уменьшите объём или поднимите "
-                "потолок — сам он «поменьше» не подаст."
-            )
-            return
-        self._paint_note(self.cap_note, alarming=False)
-        self.cap_note.setText(
-            f"Потолок объёма: {cap}. Заявка на вход объёмом больше него "
-            "не подаётся; объём ровно по потолку проходит. Выход из позиции "
-            "через потолок не проверяется никогда."
-        )
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # def _sync_volume_cap(self, *_: object) -> None:
+    #     """Состояние потолка объёма: включён или нет и что из этого следует.
+    #
+    #     ⚠️ Тексты здесь **в настоящем времени**, и это стало правдой
+    #     05.09.2026: проверка живёт в `engine/guards.py::entry_size`, а число
+    #     доезжает до неё через галочку (`app/convert.py::_GUARDS`). До того
+    #     здесь стояло будущее время и прямая отметка «предохранитель ещё
+    #     не включён» — обещание в настоящем времени тогда снимало бы
+    #     настороженность там, где защиты нет.
+    #
+    #     ⚠️ Обратное правило остаётся в силе: **снятая галочка обязана
+    #     говорить, что защиты нет**. Пустая строка на этом месте читалась бы
+    #     как «всё в порядке».
+    #     """
+    #     on = self.volume_cap_enabled.isChecked()
+    #     cap = self.volume_cap.value()
+    #     self.volume_cap.setEnabled(on)
+    #     if not on:
+    #         # Потолок снят — ввод объёма он не ограничивает. Верхняя граница
+    #         # поля возвращается к своей собственной, а не остаётся зажатой
+    #         # числом, которое ничего не значит.
+    #         self.volume.setMaximum(1_000_000)
+    #         self._paint_note(self.cap_note, alarming=False)
+    #         self.cap_note.setText(
+    #             "Потолка объёма нет: заявка уйдёт тем объёмом, который стоит "
+    #             "выше, каким бы он ни был. Опечатка в один знак меняет "
+    #             "последствия в десять раз, и остановить её будет некому."
+    #         )
+    #         return
+    #     # Потолок ограничивает ввод, но НЕ подрезает уже пришедшее значение:
+    #     # если движок отдал объём выше потолка, окно обязано показать настоящее
+    #     # число и сказать вслух, что оно выше. Подмена на «ОК» превратилась бы
+    #     # в изменение параметра по деньгам, которого владелец счёта не делал
+    #     # и которого нет в журнале решений.
+    #     self.volume.setMaximum(max(cap, self.volume.value(), 1))
+    #     if self.volume.value() > cap:
+    #         self._paint_note(self.cap_note, alarming=True)
+    #         self.cap_note.setText(
+    #             f"⚠️ Объём {self.volume.value()} выше потолка {cap}: заявка "
+    #             "на вход подаваться НЕ БУДЕТ вовсе, робот пропустит сигнал "
+    #             "и напишет причину в журнал. Уменьшите объём или поднимите "
+    #             "потолок — сам он «поменьше» не подаст."
+    #         )
+    #         return
+    #     self._paint_note(self.cap_note, alarming=False)
+    #     self.cap_note.setText(
+    #         f"Потолок объёма: {cap}. Заявка на вход объёмом больше него "
+    #         "не подаётся; объём ровно по потолку проходит. Выход из позиции "
+    #         "через потолок не проверяется никогда."
+    #     )
 
     def _sync_guards(self, *_: object) -> None:
-        """Строка про два предохранителя, считающих от размера счёта.
+        """Крупная строка о том, что предохранителей по деньгам НЕТ ни одного.
 
-        ⚠️ **Оба они сегодня слепы, и об этом сказано заранее.** Дневной
-        лимит считается от размера счёта на утро, запас средств — от свободных
-        денег и ГО контракта; ни того, ни другого программе никто не сообщает:
-        портфель у брокера ещё не читается. Включённый предохранитель при
-        этом не молчит — движок пишет «НЕ ПРОВЕРЕНО» в строку входа
-        (`engine/pipeline.py::_blind_note`), — но узнавать об этом из журнала
-        задним числом хуже, чем прочитать в настройках заранее.
+        ⚠️ **Это и есть то самое «сказать вслух».** Все три предохранителя
+        выключены на этапе разработки вашим решением (D-113): потолка объёма,
+        дневного лимита убытка и запаса свободных средств в программе сейчас
+        нет. Группа настроек осталась на месте с одной этой строкой — пустая
+        группа читалась бы как «здесь всё в порядке», а исчезнувшая группа
+        не читалась бы вовсе.
+
+        Строка **всегда тревожная**: выбирать больше не из чего, а красное,
+        которое горит всегда, здесь уместно ровно потому, что состояние
+        и вправду не меняется до возврата.
         """
-        limit_on = self.daily_loss_limit_enabled.isChecked()
-        funds_on = self.free_funds_reserve_enabled.isChecked()
-        self.daily_loss_limit.setEnabled(limit_on)
-        self.free_funds_reserve.setEnabled(funds_on)
-        if not limit_on and not funds_on:
-            self._paint_note(self.guards_note, alarming=False)
-            self.guards_note.setText(
-                "Оба предохранителя выключены: робот не следит ни за убытком "
-                "за день, ни за свободными средствами. Он остановится только "
-                "по концу торгового окна или когда вы переключите режим."
-            )
-            return
-        which = []
-        if limit_on:
-            which.append(f"дневной лимит {_pct(self.daily_loss_limit.value())}")
-        if funds_on:
-            which.append(f"запас {_pct(self.free_funds_reserve.value())}")
+        # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+        # limit_on = self.daily_loss_limit_enabled.isChecked()
+        # funds_on = self.free_funds_reserve_enabled.isChecked()
+        # self.daily_loss_limit.setEnabled(limit_on)
+        # self.free_funds_reserve.setEnabled(funds_on)
+        # if not limit_on and not funds_on:
+        #     self._paint_note(self.guards_note, alarming=False)
+        #     self.guards_note.setText(
+        #         "Оба предохранителя выключены: робот не следит ни за убытком "
+        #         "за день, ни за свободными средствами. Он остановится только "
+        #         "по концу торгового окна или когда вы переключите режим."
+        #     )
+        #     return
+        # which = []
+        # if limit_on:
+        #     which.append(f"дневной лимит {_pct(self.daily_loss_limit.value())}")
+        # if funds_on:
+        #     which.append(f"запас {_pct(self.free_funds_reserve.value())}")
+        # self._paint_note(self.guards_note, alarming=True)
+        # self.guards_note.setText(
+        #     "⚠️ Включено: " + ", ".join(which) + ". Но считать это НЕ ОТ ЧЕГО: "
+        #     "программа не знает размера вашего счёта — портфель у брокера она "
+        #     "пока не читает. Пока так, проверка не выполняется, и робот пишет "
+        #     "об этом «НЕ ПРОВЕРЕНО» в журнал решений при каждом входе. "
+        #     "Заработает сама, без правки настроек, как только счёт станет "
+        #     "известен. Вашим решением от 05.09.2026 в боевом режиме такой "
+        #     "предохранитель вход ЗАПРЕТИТ — в движке этого пока нет; прогона "
+        #     "по истории решение не касается, там счёта нет по определению."
+        # )
         self._paint_note(self.guards_note, alarming=True)
-        self.guards_note.setText(
-            "⚠️ Включено: " + ", ".join(which) + ". Но считать это НЕ ОТ ЧЕГО: "
-            "программа не знает размера вашего счёта — портфель у брокера она "
-            "пока не читает. Пока так, проверка не выполняется, и робот пишет "
-            "об этом «НЕ ПРОВЕРЕНО» в журнал решений при каждом входе. "
-            "Заработает сама, без правки настроек, как только счёт станет "
-            "известен. Вашим решением от 05.09.2026 в боевом режиме такой "
-            "предохранитель вход ЗАПРЕТИТ — в движке этого пока нет; прогона "
-            "по истории решение не касается, там счёта нет по определению."
-        )
+        self.guards_note.setText(GUARDS_OFF_NOTE)
 
     # ------------------------------------------------- согласование полей
 
@@ -1375,14 +2252,24 @@ class SettingsDialog(QDialog):
         при этом едет вперёд честно, он просто начинается в убытке, и
         приёмочное правило «уровень не едет назад» такого не ловит.
 
-        ⚠️ Условие — ровно то же, что у движка: проверка идёт при включённом
-        скользящем тейке **независимо** от выключателя фиксации прибыли.
-        Сузить его до «и то и другое включено» было соблазнительно и неверно:
-        движок отвергает настройки по одному только `trailing_take_profit`,
-        и сочетание «фиксация выключена, скользящий включён, порог ≤ отступа»
-        прошло бы через окно и упало бы уже за ним.
+        ⚠️ Условие — «скользящий уровень применяется сейчас», то есть выбран
+        способ И включена фиксация. Прежняя редакция проверяла один только
+        выбор способа, **независимо** от выключателя фиксации, и была права:
+        окно тогда отдавало наружу `trailing_enabled` как есть, движок получал
+        его при выключенной фиксации и отвергал настройки по одному этому полю
+        (`EngineSettings._check_trailing_pair`). Теперь окно такого не отдаёт
+        вовсе (`values`), проверять движку нечего — и запрет на этом месте стал
+        бы запретом без предмета: кнопки погашены из-за чисел, которые никуда
+        не уходят.
+
+        ⚠️ Отсюда же и отсутствие ловушки «кнопки погашены, а чинить нечем»:
+        запрет и доступность полей считаются от ОДНОГО условия. Пока запрет
+        есть, поля, которыми он чинится, доступны; выходов из него три —
+        поправить числа, выбрать неподвижную цель, снять фиксацию.
         """
-        if not self.trailing_enabled.isChecked():
+        if not (
+            self.take_profit_enabled.isChecked() and self.trailing_enabled.isChecked()
+        ):
             return ""
         start = self.trailing_start.value()
         offset = self.trailing_offset.value()
@@ -1418,19 +2305,12 @@ class SettingsDialog(QDialog):
                 "перевести движение цены в рубли: все деньги отчёта вышли бы "
                 "нулевыми. Для фьючерса на индекс МосБиржи это 1 ₽ за пункт."
             )
-        if self.slippage_steps.value() > 0 and self.price_step.value() <= 0:
-            return (
-                f"Проскальзывание {_steps(self.slippage_steps.value())} "
-                "задано, а шаг цены инструмента не назван. Так поправка "
-                "не сработает вовсе, а отчёт выглядел бы посчитанным с ней. "
-                "Шаг цены есть в карточке инструмента на сайте биржи."
-            )
         return ""
 
     def _sync_buttons(self) -> None:
         """«ОК» и «Применить» гаснут, пока хоть одна проверка не пройдена.
 
-        Проверок теперь две — тейк и издержки, — и решение о кнопках
+        Проверок три — тейк, издержки, выход по концу окна, — и решение о кнопках
         принимается в одном месте. Врозь они гасили бы кнопки по очереди:
         последняя сработавшая включала бы их обратно, отменяя чужой запрет.
 
@@ -1441,14 +2321,19 @@ class SettingsDialog(QDialog):
         buttons = getattr(self, "buttons", None)
         if buttons is None:
             return
-        allowed = not (self.take_error() or self.costs_error())
+        # Первая непройденная проверка — и запрет, и подсказка серой кнопки:
+        # погасшая «ОК» без слова «почему» выглядит сломанной (находка
+        # 04.10.2026 — причина стояла под полем, уехавшим под прокрутку).
+        reason = self.take_error() or self.costs_error()
+        hint = f"Недоступно: {reason}" if reason else ""
         for standard in (
             QDialogButtonBox.StandardButton.Ok,
             QDialogButtonBox.StandardButton.Apply,
         ):
             button = buttons.button(standard)
             if button is not None:
-                button.setEnabled(allowed)
+                button.setEnabled(not reason)
+                button.setToolTip(hint)
 
     @staticmethod
     def _paint_note(label: QLabel, *, alarming: bool) -> None:
@@ -1497,6 +2382,12 @@ class SettingsDialog(QDialog):
             self.costs_note.setText("⚠️ " + error)
             return
         steps = self.slippage_steps.value()
+        if steps > 0 and self.price_step.value() <= 0:
+            self.costs_note.setText(
+                f"⚠️ {STEP_WAIT} — пока проскальзывание в отчёте не учитывается. "
+                "Шаг программа берёт у биржи сама, как только есть связь."
+            )
+            return
         if steps <= 0:
             self.costs_note.setText(
                 "Поправки нет: отчёт считает, что каждая заявка исполнилась "
@@ -1550,58 +2441,39 @@ class SettingsDialog(QDialog):
             "покажется то, что есть в базе."
         )
 
-    def _sync_filter(self, *_: object) -> None:
-        """Поля фильтра пилы и строка под ними. Молчит, пока фильтр выключен.
+    def step_wait(self) -> str:
+        """Что сейчас идёт иначе, потому что биржа не сообщила шаг цены. Пусто — ничего.
 
-        ⚠️ Молчит именно **выключенный**: тревога, которая горит всегда,
-        перестаёт читаться, а этой строкой сказано то, что владелец счёта
-        обязан знать до включения, — фильтр глушит и выход тоже.
-
-        Числа при снятой галочке гасятся, но не обнуляются: подобранное
-        сохраняется до следующего включения. До торгового модуля выключённые
-        числа не доходят — подмену делает `app.convert.strategy_settings`
-        таблицей `_FILTER_OFF`, и делает её одинаково для окна и для любого
-        другого вызывающего.
+        Не запрет: человеку здесь делать нечего, шаг придёт сам, и кнопки
+        не гаснут. Та же правда, что на плашке главного окна
+        (`app/port.py::step_wait`): в поле стоит предельная цена, а прогон
+        идёт «по рынку», и одно без другого читалось бы ложью.
         """
-        on = self.filter_enabled.isChecked()
-        for field in (self.threshold_percent, self.confirm_bars):
-            field.setEnabled(on)
-        threshold = self.threshold_percent.value()
-        bars = self.confirm_bars.value()
-        if not on:
-            self.filter_note.setText("")
-            return
-        if threshold <= 0 and bars <= 1:
-            # Галочка стоит, а обе цифры выключены — фильтр не делает ничего.
-            # Это не ошибка ввода и не повод гасить кнопки: сочетание рабочее
-            # и в точности равно выключенному фильтру. Но выглядит оно как
-            # включённая защита, поэтому названо вслух.
-            self.filter_note.setText(
-                "⚠️ Фильтр включён, но обе его цифры стоят в «выключено»: "
-                "полоса 0 % и подтверждение одной свечой. Робот ведёт себя "
-                "ровно так же, как с снятой галочкой. Задайте порог, "
-                "подтверждение или оба."
-            )
-            return
-        parts = []
-        if threshold > 0:
-            parts.append(f"полоса ±{_pct(threshold)} вокруг средней")
-        if bars > 1:
-            parts.append(f"подтверждение {_bars(bars)}")
-        self.filter_note.setText(
-            "⚠️ Фильтр против пилы включён (" + ", ".join(parts) + "). Он "
-            "убирает часть переворотов и вместе с ними часть комиссии — "
-            "но глушит и выход тоже: слабый обратный сигнал перестаёт быть "
-            "поводом закрыться, и позиция живёт дольше обычного. При снятой "
-            "галочке «Закрывать позицию в конце окна» верхней границы времени "
-            "жизни позиции не остаётся вовсе. Сверка с вашим нынешним роботом "
-            "гоняется с выключенным фильтром: включённый её не воспроизводит "
-            "по построению — у вашего робота фильтра нет."
-        )
+        limit = self.time_exit_order.currentData() is TimeExitKind.LIMIT
+        if not limit or self.price_step.value() > 0:
+            return ""
+        return f"{STEP_WAIT} — пока выход по концу окна идёт по рынку."
 
     def _sync_window_close(self, *_: object) -> None:
-        """Строка про выход по концу окна. Тревожная только когда галочка снята."""
-        if self.close_on_time_end.isChecked():
+        """Строки про выход по концу окна: форма заявки, её числа, галочка.
+
+        ⚠️ При заявке «с предельной ценой» галочка не действует
+        (`engine.TimeExitOrder`): позиция закрывается всегда. Строка
+        «закрытие по времени выключено» под снятой галочкой была бы тогда
+        неправдой, поэтому галочка гаснет, а строка молчит.
+        """
+        limit = self.time_exit_order.currentData() is TimeExitKind.LIMIT
+        self.close_on_time_end.setEnabled(not limit)
+        self.time_exit_limit_steps.setEnabled(limit)
+        self.time_exit_wait_bars.setEnabled(limit)
+        waiting = self.step_wait()
+        self._sync_buttons()
+        # Пустая строка прячется, а не только стирается: иначе на месте
+        # строки оставалась дыра в полвкладки (снимок 04.10.2026).
+        for note in (self.time_exit_note, self.step_note):
+            note.setText("⚠️ " + waiting if waiting else "")
+            note.setVisible(bool(waiting))
+        if limit or self.close_on_time_end.isChecked():
             self.window_close_note.setText("")
             return
         self.window_close_note.setText(
@@ -1613,23 +2485,35 @@ class SettingsDialog(QDialog):
         )
 
     def _sync_take(self, *_: object) -> None:
-        """Поля скользящего тейка, пояснение под ними и запрет негодного ввода.
+        """Доступность чисел выбранного способа, пояснение и запрет негодного.
+
+        ⚠️ Гашение одного переключателя другим здесь не делается и делаться
+        не может: способы лежат в группе, и выбранным у неё бывает только один
+        (решение 0060). Этому методу остаётся сказать, какой уровень
+        сторожится, и не дать выйти наружу негодному.
 
         Негодное сочетание из окна **не выходит**: «ОК» и «Применить» гаснут.
         Подрезать значения молча нельзя по той же причине, что и объём выше
         потолка, — это изменение параметра по деньгам, которого владелец счёта
         не делал и которого не будет в журнале решений.
+
+        ⚠️ Числа гаснут по одному условию с запретом — «этот способ применяется
+        сейчас». Ловушки «кнопки погашены, а чинить нечем» отсюда нет: пока
+        запрет есть, поля скользящего уровня доступны (разбор — в `take_error`).
         """
         take_on = self.take_profit_enabled.isChecked()
-        trailing_on = self.trailing_enabled.isChecked()
+        trailing = take_on and self.trailing_enabled.isChecked()
 
-        self.take_profit.setEnabled(take_on)
-        # ⚠️ Выключатель скользящего тейка и его поля НЕ гасятся вслед
-        # за выключателем фиксации прибыли. Иначе получается ловушка: негодное
-        # сочетание порога и отступа осталось в полях, кнопки погашены, а поля,
-        # которыми это чинится, недоступны. Выйти из такого состояния нечем.
+        # Способ выбирают, только когда прибыль вообще фиксируют: при снятой
+        # галочке уровня нет ни одного, и выбирать не из чего.
+        for switch in (self.take_fixed, self.trailing_enabled):
+            switch.setEnabled(take_on)
+        # Число неподвижной цели при выбранном скользящем уровне НЕ читается
+        # движком вовсе. Оставить его доступным значило бы показывать живым
+        # поле, которое ни на что не влияет.
+        self.take_profit.setEnabled(take_on and not trailing)
         for field in (self.trailing_start, self.trailing_offset, self.trailing_step):
-            field.setEnabled(trailing_on)
+            field.setEnabled(trailing)
 
         error = self.take_error()
         self._sync_buttons()
@@ -1644,41 +2528,56 @@ class SettingsDialog(QDialog):
             )
             return
         self.take_note.setStyleSheet("")
+        self.take_note.setText(self._take_text(take_on, trailing))
+
+    def _take_text(self, take_on: bool, trailing: bool) -> str:
+        """Какой ОДИН уровень сторожит позицию при нынешнем выборе — словами.
+
+        ⚠️ Требование заказчика 15.09.2026 (решение 0060): способов два,
+        применяется один. Пока это не сказано словами, два переключателя
+        на экране читаются как «работают оба», а число неподвижной цели
+        рядом со скользящим уровнем — как «сторожатся оба».
+        """
         if not take_on:
-            # ⚠️ Снятая галочка «Фиксировать прибыль» отменяет и скользящий
-            # тейк: движок включает его только вместе с обычным. Умолчать
-            # об этом — значит показать владельцу счёта включённый переключатель,
-            # который ничего не делает.
+            # ⚠️ Выбранный способ при снятой галочке не применяется, и наружу
+            # уходит «не фиксируем» (`values`). Умолчать об этом — значит
+            # показать владельцу счёта выбранный способ, которого нет
+            # в настройках.
             tail = (
-                " Скользящий тейк при снятой галочке тоже не работает."
-                if trailing_on else ""
+                " Способ «скользящий уровень» выбран, но при снятой галочке "
+                "он тоже не работает: в настройки уходит «прибыль "
+                "не фиксируется»."
+                if self.trailing_enabled.isChecked() else ""
             )
-            self.take_note.setText(
-                "Цели по прибыли нет: позицию держит только переворот по средней. "
-                "На замеренном отрезке истории это от −3 038 до −108 366 ₽ "
-                "за период — тейк держит весь результат." + tail
+            return (
+                "Цели по прибыли нет: уровня выхода у позиции нет вовсе, "
+                "её держит только переворот по средней. На замеренном отрезке "
+                "истории это от −3 038 до −108 366 ₽ за период — фиксация "
+                "прибыли держит весь результат." + tail
             )
-        elif trailing_on:
-            self.take_note.setText(
-                f"Уровень появится, когда прибыль дойдёт до {_pct(self.trailing_start.value())}, "
-                f"и дальше поедет за ценой с отступом {_pct(self.trailing_offset.value())}. "
-                "Назад он не поедет никогда. Обычная цель прибыли при этом "
-                "не используется: уровень целиком задаётся порогом и отступом. "
-                "Замеров по скользящему тейку у проекта нет — сравнивать его "
-                "будет не с чем."
+        if trailing:
+            return (
+                "Сторожится ОДИН уровень — скользящий. Неподвижная цель при "
+                "этом не используется вовсе, её число не читается. Уровень "
+                f"появится, когда прибыль дойдёт до {_pct(self.trailing_start.value())}, "
+                f"и дальше поедет за ценой с отступом {_pct(self.trailing_offset.value())}; "
+                "назад он не поедет никогда. Пока порог не пройден, уровня "
+                "выхода нет совсем. Замеров по скользящему уровню у проекта "
+                "нет — сравнивать его будет не с чем."
             )
-        elif self.take_profit.value() <= 0:
-            self.take_note.setText(
+        if self.take_profit.value() <= 0:
+            return (
                 "Цель прибыли равна нулю — это то же самое, что снятая галочка: "
-                "цели нет, позицию держит только переворот по средней. "
+                "уровня нет, позицию держит только переворот по средней. "
                 "На замеренном отрезке истории это от −3 038 до −108 366 ₽ за период."
             )
-        else:
-            self.take_note.setText(
-                f"Уровень {_pct(self.take_profit.value())} от цены входа "
-                "выставляется заявкой у брокера и не двигается. Он живёт всё "
-                "время позиции и срабатывает без участия программы."
-            )
+        return (
+            "Сторожится ОДИН уровень — неподвижная цель "
+            f"{_pct(self.take_profit.value())} от цены входа. Скользящий "
+            "уровень при этом не применяется. Уровень выставляется заявкой "
+            "у брокера и не двигается: он живёт всё время позиции и срабатывает "
+            "без участия программы."
+        )
 
     def _sync_commission(self, *_: object) -> None:
         """Тариф рядом с полем — и прямая речь о том, чего без него не будет.
@@ -1691,12 +2590,19 @@ class SettingsDialog(QDialog):
         """
         value = self.commission.value()
         if value <= 0:
+            # Умолчание — из `Settings`, а не литералом: литерал «14 ₽» здесь
+            # пережил смену умолчания на 17 ₽ (решение 0060) на месяц.
+            default = Settings().commission_per_side_rub
+            told = (
+                f"Умолчание программы — {_num(default)} ₽ за контракт на "
+                "сторону, но ваш тариф посмотрите у брокера."
+                if default is not None
+                else "Ваш тариф посмотрите у брокера."
+            )
             self.commission_note.setText(
                 "Тариф не задан: проверка «цель прибыли окупает комиссию обеих "
                 "сторон» не выполняется, и в журнале решений на каждой позиции "
-                "будет предупреждение. В замерах проекта использовалось 14 ₽ "
-                "за контракт на сторону — но это не ваш тариф, посмотрите его "
-                "у брокера."
+                f"будет предупреждение. {told}"
             )
             return
         # ⚠️ Здесь намеренно нет арифметики. Издержки сделки «вошли и вышли»
@@ -1724,9 +2630,18 @@ class SettingsDialog(QDialog):
         values = self.values()
         if not self.confirm(values):
             return False
+        self._clear_refusal()
         self._applied = values
-        self.settings_changed.emit(values)
-        return True
+        # ⚠️ Порт живёт в потоке окна и отвечает внутри этого `emit`
+        # (`ui/ports.py`): отказ приходит в `take_refusal` до возврата.
+        # Отвергнутое «ОК» окно не закрывает — иначе отказ закрылся бы
+        # вместе с ним.
+        self._emitting, self._refused = True, False
+        try:
+            self.settings_changed.emit(values)
+        finally:
+            self._emitting = False
+        return not self._refused
 
     def applied(self) -> Settings:
         """Набор, который робот считает действующим: с ним идёт сравнение.

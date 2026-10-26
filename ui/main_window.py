@@ -56,17 +56,24 @@ from ui import backend
 from ui.background import busy_cursor
 from ui.backtest_dialog import BacktestDialog
 from ui.backtest_report import BacktestReportDialog
+from ui.reports_dialog import ReportsDialog, ShownRun
+from ui.trade_story import PaperReport, PaperReportRequest
 from ui.chart_panel import ChartPanel
+from ui.confirm_changes import confirm_changes
+from ui.contract_banner import ContractBar
+from ui.debug_panel import DebugPanel
 from ui.export import decisions_table, trades_table, write_csv
 from ui.formatting import MSK, fmt_time
 from ui.history_dialog import HistoryDialog
 from ui.journals import JournalTabs
 from ui.models import (
+    AlgorithmOption,
     BacktestOptions,
     BacktestReport,
     Candle,
     ChartData,
     Connection,
+    ContractNotice,
     DecisionRow,
     HistoryFacts,
     HistoryLoadOutcome,
@@ -87,13 +94,14 @@ from ui.notices import (
     resume_question,
     unmanaged_note,
 )
-from ui.ports import DetachedPort, Sanitize, TerminalPort
+from ui.ports import DebugSource, DetachedPort, Sanitize, TerminalPort
 from ui.calendar_dialog import CalendarDialog
 from ui.settings_dialog import SettingsDialog
 from ui.status_panel import StatusPanel
 from ui.templates import Library, Template
 from ui.templates_dialog import TemplatesDialog
-from ui.theme import current as current_theme, text_on
+from ui.settings_banner import SettingsTroubleBar, StepWaitBar
+from ui.theme import current as current_theme, scaled, text_on
 from ui.version import version
 
 TITLE = "Терминал"
@@ -277,6 +285,23 @@ def write_failure(error: BaseException) -> str:
     return "программа не смогла собрать файлы отчёта"
 
 
+#: Имя свойства полоски хода, в котором лежит её **собственная** подпись —
+#: та, что была до сообщения о застревании (`B-044`).
+OWN_LABEL = "терминал-своя-подпись"
+
+
+def _own_label(dialog: QProgressDialog, text: str) -> None:
+    """Подпись полоски по её собственному делу — показать и запомнить.
+
+    Запоминается затем, чтобы снятое сообщение «Не отвечает» было чем
+    заменить (`MainWindow.show_stuck`). Все три места, где полоска меняет
+    подпись сама, идут через эту функцию: пропустивший её оставил бы
+    после снятия тревоги устаревшую подпись.
+    """
+    dialog.setProperty(OWN_LABEL, text)
+    dialog.setLabelText(text)
+
+
 class _Banner(QLabel):
     """Крупная строка предупреждения над графиком.
 
@@ -289,7 +314,8 @@ class _Banner(QLabel):
     #: контраста 3:1, а не 4,5:1. Прежние «системный + 2» давали 11–12 пунктов,
     #: то есть обоснование порога в проверке контраста не выдерживалось:
     #: формально требовалось 4,5:1. Число здесь и порог в тесте связаны.
-    LARGE_POINTS = 14.0
+    #: С 05.10.2026 — ×`FONT_SCALE`: шрифт окна вырос, плашка растёт с ним.
+    LARGE_POINTS = scaled(14.0)
 
     def __init__(
         self,
@@ -372,7 +398,7 @@ class _Banner(QLabel):
             # светло-серым — контраст 1,6:1, то есть кнопки на ней не видно.
             self.close_button.setStyleSheet(
                 f"QToolButton {{ color: {text_on(background)}; "
-                "background: transparent; border: none; font-size: 16px; "
+                f"background: transparent; border: none; font-size: {round(scaled(16))}px; "
                 "font-weight: bold; }"
             )
             self.close_button.adjustSize()
@@ -397,6 +423,10 @@ class MainWindow(QMainWindow):
     #: (`tests/test_function_size.py`). Значение неизменяемое, поэтому общий
     #: на класс умолчанник безопасен — у изменяемого так делать нельзя.
     _loading: QProgressDialog | None = None
+    #: Текст плашки «данных нет» (`show_missing_data`). Объявлен у класса
+    #: по тому же доводу, что `_loading`: строка неизменяемая, а сборка окна
+    #: стоит на пределе длины.
+    _missing_data: str = ""
 
     def __init__(
         self,
@@ -405,6 +435,7 @@ class MainWindow(QMainWindow):
         parent: QWidget | None = None,
         *,
         sanitize: Sanitize,
+        debug: DebugSource | None = None,
     ) -> None:
         """:param sanitize: чистка секретов для выгрузки журналов.
 
@@ -418,6 +449,9 @@ class MainWindow(QMainWindow):
         `broker.redaction.scrub`, а `broker/` окну по ARCHITECTURE.md §2
         не положен. Функцию даёт `app/` — тем же вызовом, каким он даёт её
         слою данных и порту.
+
+        :param debug: лента панели «Отладка» (`app/debug_feed.py`). `None` —
+            окно без торговой части: панель есть и говорит, что ленты нет.
         """
         super().__init__(parent)
         self.port = port or DetachedPort(self)
@@ -425,6 +459,14 @@ class MainWindow(QMainWindow):
         self._settings = settings or Settings()
         self._sanitize = sanitize
         self._state = RobotState()
+        #: Каталог торговых алгоритмов и открытое окно настроек — разбор обоих
+        #: в `_on_algorithms` и `open_settings`.
+        self._algorithms: tuple[AlgorithmOption, ...] = ()
+        self._settings_dialog: SettingsDialog | None = None
+        #: Окно «прогон не состоялся». Одно на программу: второй отказ
+        #: подряд меняет текст, а не множит окна.
+        self._backtest_refusal: QMessageBox | None = None
+        self._init_reports()
         #: Окно собрано целиком. Сторож для `changeEvent`: событие палитры
         #: приходит и в середине сборки, а `apply_theme()` трогает график
         #: и журналы — их в этот момент ещё нет.
@@ -434,17 +476,7 @@ class MainWindow(QMainWindow):
         self.resize(1360, 900)
 
         self.status_panel = StatusPanel()
-        # Порядок плашек — порядок срочности. Остановка сверху: пока робот
-        # остановлен, всё остальное вторично.
-        self.halt_banner = _Banner()
-        self.stuck_banner = _Banner()
-        self.token_banner = _Banner()
-        self.mode_banner = _Banner()
-        #: Плашка «показан прогон на истории». Живые свечи на закреплённый
-        #: отрезок не приходят вовсе, и без этой строки застывший график
-        #: неотличим от потерянной связи (`app/port.py::_Span`).
-        self.history_banner = _Banner(on_close=self.show_recent_data,
-                                      close_hint=UNPIN_HINT)
+        self._build_banners()
         #: Полоска идущего прогона. `None` — прогон не запрашивали.
         self._progress: QProgressDialog | None = None
         self.chart = ChartPanel()
@@ -465,19 +497,15 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
         layout.addWidget(self.status_panel)
-        layout.addWidget(self.halt_banner)
-        layout.addWidget(self.stuck_banner)
-        layout.addWidget(self.token_banner)
-        layout.addWidget(self.mode_banner)
-        layout.addWidget(self.history_banner)
+        for bar in self._banner_column:
+            layout.addWidget(bar)
         layout.addWidget(splitter, 1)
         self.setCentralWidget(central)
 
-        self._clock = QLabel()
-        self.statusBar().addPermanentWidget(self._clock)
-        self.statusBar().showMessage(self.chart.renderer_note)
+        self._build_status_bar(debug)
 
         self.journals.export_requested.connect(self.export_journals)
+        self.journals.reports_requested.connect(self.open_reports)
 
         self._connect_port()
         self.apply_theme()
@@ -492,6 +520,56 @@ class MainWindow(QMainWindow):
         self._tick()
         # Последняя строка сборки — и именно её проверяет `changeEvent`.
         self._ready = True
+
+    def _build_status_bar(self, debug: DebugSource | None) -> None:
+        """Строка состояния: кнопка «Отладка ▴/▾», часы МСК; над ней — док ленты.
+
+        Кнопка стоит слева от часов, прямо под доком, который она открывает.
+        Док свёрнут при запуске и живёт мимо разделителя графика и журналов:
+        «Развернуть график» его не трогает, а изоляция графика сохраняется.
+        """
+        self.debug_panel = DebugPanel(debug, sanitize=self._sanitize, theme=self.theme)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self.debug_panel)
+        self.debug_panel.hide()
+        self._clock = QLabel()
+        self.statusBar().addPermanentWidget(self.debug_panel.button)
+        self.statusBar().addPermanentWidget(self._clock)
+        self.statusBar().showMessage(self.chart.renderer_note)
+
+    def _build_banners(self) -> None:
+        """Плашки над графиком и их порядок на экране — `_banner_column`.
+
+        Порядок — по срочности. Остановка сверху: пока робот остановлен,
+        всё остальное вторично. Порядок записан **один раз**, данными:
+        раскладка в `__init__` его только обходит. Прежде объявление шло
+        в одном порядке, а раскладка — в другом, и докстринг уверял, что
+        они совпадают.
+        """
+        self.halt_banner = _Banner()
+        self.stuck_banner = _Banner()
+        #: «Данных нет» (`show_missing_data`, `D-080`). Без крестика: снять
+        #: её нечем — данные возвращает копирование папки, а не окно.
+        self.data_banner = _Banner()
+        self.token_banner = _Banner()
+        self.mode_banner = _Banner()
+        #: Плашка «показан прогон на истории». Живые свечи на закреплённый
+        #: отрезок не приходят вовсе, и без этой строки застывший график
+        #: неотличим от потерянной связи (`app/port.py::_Span`).
+        self.history_banner = _Banner(on_close=self.show_recent_data,
+                                      close_hint=UNPIN_HINT)
+        #: Действующий контракт по таблице биржи и кнопка перехода (0061, 0016).
+        self.contract_bar = ContractBar()
+        self.contract_bar.switch_requested.connect(self._switch_contract)
+        #: Настройки из файла приняты не так, как записаны (`settings_trouble`).
+        self.settings_bar = SettingsTroubleBar()
+        self.settings_bar.open_requested.connect(self.open_settings)
+        #: Биржа ещё не сообщила шаг цены (`step_wait`) — без кнопки.
+        self.step_bar = StepWaitBar()
+        self._banner_column: tuple[QWidget, ...] = (
+            self.halt_banner, self.stuck_banner, self.data_banner,
+            self.settings_bar, self.step_bar, self.token_banner,
+            self.mode_banner, self.history_banner, self.contract_bar,
+        )
 
     # --------------------------------------------------------------- сборка
 
@@ -723,15 +801,20 @@ class MainWindow(QMainWindow):
         port.decisions_replaced.connect(self.journals.set_decisions)
         port.decision_appended.connect(self.journals.append_decision)
         port.settings_applied.connect(self._on_settings_echo)
+        port.algorithms_changed.connect(self._on_algorithms)
         port.failed.connect(self.show_error)
+        port.settings_refused.connect(self._on_settings_refused)
+        port.backtest_refused.connect(self.show_backtest_refusal)
         port.stuck_changed.connect(self.show_stuck)
         port.busy_changed.connect(self._on_busy)
         port.progress_changed.connect(self._on_progress)
         port.backtest_options_ready.connect(self.show_backtest_dialog)
         port.backtest_finished.connect(self.show_backtest_report)
         port.history_facts_ready.connect(self.show_history_dialog)
+        port.contract_checked.connect(self.show_contract)
         port.history_progress.connect(self._on_history_progress)
         port.history_finished.connect(self.show_history_result)
+        port.paper_report_ready.connect(self.show_paper_report)
 
     # ---------------------------------------------------------------- показ
 
@@ -766,12 +849,37 @@ class MainWindow(QMainWindow):
         self.status_panel.set_theme(self.theme)
         self.chart.set_theme(self.theme)
         self.journals.set_theme(self.theme)
+        self.debug_panel.set_theme(self.theme)
         # ⚠️ Плашки перерисовываются пересчётом состояния. Их цвет и цвет
         # надписи на них взяты из темы в момент показа: без этого уже
         # показанное предупреждение остаётся в цветах прежней темы, а надпись
         # на нём может стать нечитаемой — ровно то, ради чего заведён `text_on`.
         self.status_panel.apply_state(self._state)
         self._update_banners(self._state)
+        self._paint_missing_data()
+
+    def show_missing_data(self, text: str) -> None:
+        """Плашка «данных нет» над графиком: текст готовый, окно его не сочиняет.
+
+        Текст и признак — `app/userdata_notice.py` (`D-080`, решение 0064);
+        окно только показывает. Пустая строка — плашки нет. Зовёт сборка
+        программы один раз, до показа окна, и плашка висит весь сеанс:
+        данные, скопированные при открытой программе, она всё равно
+        не подхватит — их читают при запуске.
+
+        Цвет — `warning`, а не `danger`: на новой машине это обычный первый
+        запуск, а не авария. Хранится текст, а не раскрашенная плашка:
+        `apply_theme` перекрашивает её заново (`_paint_missing_data`), иначе
+        она осталась бы в цветах прежней темы.
+        """
+        self._missing_data = text
+        self._paint_missing_data()
+
+    def _paint_missing_data(self) -> None:
+        if self._missing_data:
+            self.data_banner.show_text(self._missing_data, self.theme.warning)
+        else:
+            self.data_banner.hide_text()
 
     def apply_state(self, state: RobotState) -> None:
         """Показать состояние робота. Ничего не вычисляет — только отображает."""
@@ -842,6 +950,7 @@ class MainWindow(QMainWindow):
         self.stream_action.setToolTip(look.tooltip)
 
     def _update_banners(self, state: RobotState) -> None:
+        self.contract_bar.update_state(state)
         # Остановка робота. Строкой в журнале её показывать нельзя: журнал
         # читают после происшествия, а остановленный робот с открытой позицией
         # это происшествие, которое ещё идёт. Причина приходит готовой строкой
@@ -893,6 +1002,8 @@ class MainWindow(QMainWindow):
         # Закреплённый отрезок истории. Плашка не тревожная, а поясняющая:
         # ничего не сломалось, просто показано прошлое. Но сказать это надо
         # крупно — на живом потоке застывший график читается как обрыв связи.
+        self.settings_bar.show_trouble(state.settings_trouble)
+        self.step_bar.show_wait(state.step_wait)
         if state.history_span:
             self.history_banner.show_text(state.history_span, self.theme.warning)
         else:
@@ -901,9 +1012,16 @@ class MainWindow(QMainWindow):
 
     def show_chart(self, data: ChartData) -> None:
         self.chart.show_chart(data)
+        self._chart_instrument = data.instrument
+        self._chart_basis = data.basis
+        self._chart_bounds = (
+            (data.candles[0].opens_at, data.candles[-1].opens_at) if data.candles else None
+        )
 
     def append_candle(self, candle: Candle) -> None:
         self.chart.append_candle(candle)
+        if self._chart_bounds is not None:
+            self._chart_bounds = (self._chart_bounds[0], candle.opens_at)
 
     def update_last_candle(self, candle: Candle) -> None:
         self.chart.update_last_candle(candle)
@@ -926,11 +1044,14 @@ class MainWindow(QMainWindow):
         """
         self.journals.set_trades(trades, summary)
         self.chart.set_trades(trades)
+        self._run_seen = True
+        self._refresh_reports()
 
     def append_trade(self, trade: TradeRow) -> None:
         """Робот закрыл позицию, пока окно открыто: строка идёт туда же, куда все."""
         self.journals.append_trade(trade)
         self.chart.append_trade(trade)
+        self._refresh_reports()
 
     def set_decisions(self, rows: Sequence[DecisionRow]) -> None:
         self.journals.set_decisions(rows)
@@ -938,6 +1059,28 @@ class MainWindow(QMainWindow):
     def show_error(self, text: str) -> None:
         """Сообщение об отказе. Уже человеческим языком: код сюда не доходит."""
         self.statusBar().showMessage(text, 15000)
+
+    def show_contract(self, notice: ContractNotice) -> None:
+        """Действующий контракт по таблице — плашкой над графиком, если расходится."""
+        self.contract_bar.show_notice(notice, self._state)
+
+    def _switch_contract(self, symbol: str) -> None:
+        """Перейти на действующий контракт — обычной правкой настроек.
+
+        Через то же подтверждение, что и правка руками: человек видит
+        прежний и новый код и соглашается сам (решение 0016). Состояние
+        робота проверяется ещё раз — кнопка могла устареть.
+        """
+        if not self.contract_bar.button.isEnabled():
+            return
+        fresh = self._settings.replace(instrument=symbol)
+        if confirm_changes(
+            self, self._settings, fresh,
+            lead=f"Переход на действующий контракт {symbol}. Робот будет "
+                 f"смотреть и торговать {symbol}; прежний код останется "
+                 "в базе с его историей.",
+        ):
+            self._on_settings_changed(fresh)
 
     def show_stuck(self, text: str) -> None:
         """Долгая работа не отвечает: сказать об этом крупно и не убирать.
@@ -969,13 +1112,17 @@ class MainWindow(QMainWindow):
         рвущий соседнюю задачу (`B-026`, `_open_modal`). Плашка и подпись
         полоски вложенного цикла не поднимают.
         """
-        if not text:
+        if text:
+            self.stuck_banner.show_text(text, self.theme.danger)
+        else:
             self.stuck_banner.hide_text()
-            return
-        self.stuck_banner.show_text(text, self.theme.danger)
+        # ⚠️ Снятие сообщения идёт туда же, куда шло само сообщение (`B-044`).
+        # Прежде пустая строка гасила плашку и выходила до полосок: модальная
+        # полоска прогона продолжала говорить «Не отвечает», пока ползла
+        # полоса, — а во время прогона она единственное, что видно.
         for dialog in (self._progress, self._loading):
             if dialog is not None:
-                dialog.setLabelText(text)
+                dialog.setLabelText(text or str(dialog.property(OWN_LABEL) or ""))
 
     def _on_busy(self, busy: bool, what: str) -> None:
         """Длинная операция началась или кончилась.
@@ -988,7 +1135,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(what if busy else "", 0 if busy else 1)
         if busy:
             if self._progress is not None:
-                self._progress.setLabelText(what)
+                _own_label(self._progress, what)
             return
         self._close_progress()
 
@@ -1093,11 +1240,54 @@ class MainWindow(QMainWindow):
         return answer == QMessageBox.StandardButton.Yes
 
     def open_settings(self) -> None:
+        """Окно настроек. Каталог алгоритмов едет в него вместе с полями.
+
+        ⚠️ **Первая строка — просьба к порту, и без неё окно врёт.** Каталог
+        торговых алгоритмов окно посчитать не может (ARCHITECTURE.md §2:
+        `ui/` не импортирует `strategies/`), он приходит готовым от торговой
+        части. До 09.09.2026 приходил он **только** в ответ на «Применить»:
+        `request_settings` был написан ровно под этот случай, снабжён
+        докстрокой и покрыт проверкой — и не вызывался из продуктового кода
+        ни разу. Человек, открывший настройки сразу после запуска, видел
+        `ema_reverse` вместо «Реверс по скользящей средней», пустой список
+        выбора и указание выбрать из него.
+
+        Почему просьба стоит здесь, а не в `__init__`
+        ---------------------------------------------
+        Здесь она отвечает на **действие человека**, и это не вкус. Порт,
+        не подключённый к движку, отвечает на любую команду фразой «команда
+        не выполнена» (`TerminalPort._not_connected`) — она уходит в строку
+        состояния. Сказанная в ответ на «Настройки», она правдива; сказанная
+        при сборке окна, она называет командой то, чего человек не делал,
+        и садится на строку состояния каждого снимка экрана и каждой
+        проверки интерфейса.
+
+        Второй довод — свежесть. Каталог считается по **применённым** числам
+        (`app/convert.py::algorithms`), и спрошенный при каждом открытии он
+        не может отстать от движка. Спрошенный однажды при сборке — может.
+
+        ⚠️ Ссылка на открытое окно держится, пока оно открыто, и не ради
+        удобства: «Применить» уходит движку, движок отвечает новым каталогом
+        с пересчитанным описанием, и обновить его на экране некому, если окно
+        потеряно. Человек поменял бы период, нажал «Применить» и читал бы
+        в «Подробнее» описание прежнего правила — то есть окно врало бы ровно
+        в том месте, ради которого заведено. Эта же ссылка страхует порт,
+        отвечающий не сразу: каталог, приехавший уже после `exec()`, попадёт
+        в открытое окно тем же путём, что и ответ на «Применить».
+        """
+        # ⚠️ До создания окна, а не после: ответ синхронного порта приходит
+        # внутри этого вызова, и `self._algorithms` ниже обязан быть уже им.
+        self.port.request_settings()
         dialog = SettingsDialog(self._settings, self)
+        dialog.set_contract(self.contract_bar.notice)
         dialog.settings_changed.connect(self._on_settings_changed)
+        dialog.set_algorithms(self._algorithms)
+        dialog.show_field(self._state.settings_field)  # подмена при запуске — сразу к полю
+        self._settings_dialog = dialog
         try:
             dialog.exec()
         finally:
+            self._settings_dialog = None
             # ⚠️ Без этого диалог живёт до конца работы программы: родителем
             # ему назначено окно, а окно не закрывается. Каждое открытие
             # настроек оставляло за собой ещё одну копию — вместе с полями,
@@ -1249,7 +1439,10 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
         if request is None:
             return
-        self._settings = request.settings
+        # ⚠️ Настройки прогона здесь НЕ запоминаются как действующие: их
+        # принимает порт, и принятые придут эхом `settings_applied`. До
+        # 29.09.2026 окно запоминало их сразу, и отвергнутый набор жил
+        # в окне как принятый.
         self._start_progress()
         self.port.run_backtest(request)
 
@@ -1279,7 +1472,7 @@ class MainWindow(QMainWindow):
         wrapping = QLabel(dialog)
         wrapping.setWordWrap(True)
         dialog.setLabel(wrapping)  # полоска забирает надпись себе
-        dialog.setLabelText(text)
+        _own_label(dialog, text)
         dialog.setWindowTitle(title)
         dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
         dialog.setMinimumWidth(self.BAR_WIDTH)
@@ -1339,6 +1532,73 @@ class MainWindow(QMainWindow):
         self.report_dialog.finished.connect(self.report_dialog.deleteLater)
         self.report_dialog.show()
         self.report_dialog.raise_()
+
+    def _init_reports(self) -> None:
+        """Окно «Отчёты» (Н5, шаг 1) и что показано на графике.
+
+        Инструмент и первая с последней свечой — по ним заголовок отчёта
+        называет прогон. `_run_seen` — пришёл ли хоть один прогон: до него
+        «Отчёты» говорят «прогона нет», а не «сделок нет».
+        """
+        self.reports_dialog: ReportsDialog | None = None
+        self._chart_instrument = ""
+        self._chart_basis = ""
+        self._chart_bounds: tuple[datetime, datetime] | None = None
+        self._run_seen = False
+
+    def shown_run(self) -> ShownRun | None:
+        """Прогон на экране для «Отчётов»: строки и итог журнала, свечи графика.
+
+        Сделки берутся из журнала, а не заново из порта: одна правда на три
+        места экрана — журнал, разбор по ПКМ и отчёт.
+        """
+        if not self._run_seen:
+            return None
+        first, last = self._chart_bounds or (None, None)
+        return ShownRun(
+            trades=tuple(self.journals.trades_model.rows()),
+            summary=self.journals.summary(),
+            instrument=self._chart_instrument,
+            first=first,
+            last=last,
+            basis=self._chart_basis,
+        )
+
+    def _refresh_reports(self) -> None:
+        """Открытое окно «Отчёты» не должно описывать прежний прогон."""
+        if self.reports_dialog is not None:
+            self.reports_dialog.set_run(self.shown_run())
+
+    def open_reports(self) -> None:
+        """Окно «Отчёты» по прогону на экране. Одно: второй щелчок поднимает его."""
+        if self.reports_dialog is None:
+            self.reports_dialog = ReportsDialog(
+                self.shown_run(), self, jump=self._show_trade_on_chart,
+                ask=self._ask_paper_report,
+            )
+            self.reports_dialog.finished.connect(self._forget_reports)
+        self.reports_dialog.show()
+        self.reports_dialog.raise_()
+        self.reports_dialog.activateWindow()
+
+    def _ask_paper_report(self) -> None:
+        """«Отчёты» просят сделки симуляции — по инструменту на графике (В3)."""
+        self.port.request_paper_report(PaperReportRequest(instrument=self._chart_instrument))
+
+    def show_paper_report(self, report: PaperReport) -> None:
+        """Сделки симуляции из базы — в открытые «Отчёты». Закрыты — некуда."""
+        if self.reports_dialog is not None:
+            self.reports_dialog.set_paper(report)
+
+    def _forget_reports(self, *_: object) -> None:
+        if self.reports_dialog is not None:
+            self.reports_dialog.deleteLater()
+        self.reports_dialog = None
+
+    def _show_trade_on_chart(self, trade: TradeRow) -> bool:
+        """Двойной щелчок в «Отчётах»: график к сделке. `False` — её нет на графике."""
+        until = trade.exit_time if trade.exit_time is not None else trade.entry_time
+        return self.chart.show_moment(trade.entry_time, until)
 
     # ------------------------------------------------ загрузка истории
 
@@ -1433,7 +1693,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Загрузка истории: {what}")
         if self._loading is not None:
             self._loading.setValue(percent)
-            self._loading.setLabelText(what)
+            _own_label(self._loading, what)
 
     def show_history_result(self, outcome: HistoryLoadOutcome) -> None:
         """Чем кончилась загрузка. Окно с ответом — всегда, даже на отказе.
@@ -1499,7 +1759,70 @@ class MainWindow(QMainWindow):
         self.port.apply_settings(settings)
 
     def _on_settings_echo(self, settings: Settings) -> None:
+        """Эхо порта: действующие настройки. Открытое окно настроек узнаёт их тоже.
+
+        Без передачи окну суточный переход на действующий контракт при
+        открытых настройках терялся: в полях оставался истёкший код,
+        и «ОК» молча возвращал на него (`SettingsDialog.take_echo`).
+        """
         self._settings = settings
+        if self._settings_dialog is not None:
+            self._settings_dialog.take_echo(settings)
+
+    def _on_settings_refused(self, kept: Settings, reason: str, field: str) -> None:
+        """«Применить» не принято: окно остаётся на том, что в силе у порта.
+
+        Отказ показывает само окно настроек — у поля, которое надо поменять
+        (`SettingsDialog.take_refusal`). Строка состояния главного окна
+        за модальным окном настроек не видна.
+        """
+        self._settings = kept
+        if self._settings_dialog is not None:
+            self._settings_dialog.take_refusal(kept, reason, field)
+
+    def show_backtest_refusal(self, reason: str) -> None:
+        """Прогон не состоялся: закрыть полоску и сказать это в окне.
+
+        Полоска закрывается здесь, а не только концом работы (`_on_busy`):
+        отвергнутый прогон работы не начинает, и «работа кончилась» не
+        придёт никогда (дефект 29.09.2026 — «0 %» висело вечно).
+
+        Окно сообщения — немодальное: сигнал может прийти изнутри шага
+        корутины, а модальное окно подняло бы вложенный цикл (`B-026`).
+        """
+        self._close_progress()
+        text = (
+            f"Прогон на истории не состоялся. {reason}\n\n"
+            "На графике и в журнале сделок — то, что было до этой попытки: "
+            "прежний прогон или текущие данные, а не результат этого прогона."
+        )
+        self.statusBar().showMessage("Прогон на истории не состоялся — на экране прежний прогон")
+        box = self._backtest_refusal
+        if box is None:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("Прогон на истории")
+            box.setWindowModality(Qt.WindowModality.NonModal)
+            self._backtest_refusal = box
+        box.setText(text)
+        box.show()
+
+    def _on_algorithms(self, options: tuple[AlgorithmOption, ...]) -> None:
+        """Каталог торговых алгоритмов — от торговой части через порт.
+
+        Хранится здесь, потому что порт отвечает **событием**, а не возвратом
+        значения: просьба уходит из `open_settings`, ответ приходит сюда,
+        и держать его между этими двумя моментами больше некому. Приходит он
+        и сам собой — после каждого «Применить», с описанием, пересчитанным
+        по новым числам.
+
+        Пустой кортеж означает «ещё не приходило», и окно настроек скажет
+        об этом само, а не покажет пустое место
+        (`ui/settings_dialog.py::CATALOGUE_NOT_ARRIVED`).
+        """
+        self._algorithms = tuple(options)
+        if self._settings_dialog is not None:
+            self._settings_dialog.set_algorithms(self._algorithms)
 
     def settings(self) -> Settings:
         return self._settings

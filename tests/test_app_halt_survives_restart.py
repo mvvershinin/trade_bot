@@ -429,3 +429,34 @@ def test_a_missing_base_is_not_created_by_the_startup_read(
     assert not missing.exists(), (
         "чтение остановки завело файл базы там, где его не было"
     )
+
+
+def test_the_halt_is_stamped_by_the_ports_own_clock(loop, live_base) -> None:
+    """D-111: время остановки — по часам порта, и в окне, и в базе.
+
+    Часы порта поставлены на 03.03.2025 09:41 МСК — далеко от часов машины.
+    ⚠️ Мутации: вернуть `datetime.now(MSK)` в `_mark_halt` (время в окне)
+    и убрать `now=self.at` из `_HaltWrite.apply` (время в базе) — каждая
+    роняет свою половину проверки.
+    """
+    moment = datetime(2025, 3, 3, 9, 41, tzinfo=MSK)
+
+    async def go() -> tuple[object, object]:
+        worker = MarketWorker(live_base, sanitize=redact)
+        await worker.open()
+        port = HistoryPort(worker, values=UiSettings(), days=0, sanitize=redact,
+                           clock=lambda: moment)
+        try:
+            port._remember_halt(LIMIT)  # noqa: SLF001 — дверь из движка наружу не открыта
+            await port.wait()
+            shown = port._halt.marks[LIMIT].at  # noqa: SLF001 — отметка наружу не отдаётся
+        finally:
+            await port.aclose()
+            await worker.close()
+        with CandleStore(live_base) as store:
+            (stored,) = store.standing_halt()
+        return shown, stored.raised_at
+
+    shown, stored = loop.run_until_complete(go())
+    assert shown == moment, f"отметка в окне — не по часам порта: {shown}"
+    assert stored == moment, f"отметка в базе — не по часам порта: {stored}"

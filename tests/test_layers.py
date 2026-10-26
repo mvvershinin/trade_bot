@@ -24,6 +24,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import time
 import tomllib
 from typing import Final
 
@@ -110,6 +111,40 @@ TOKENISH_BODY = re.compile(
 # и .git/info/exclude, которых нет в репозитории. Без изоляции тест зеленеет
 # у того, у кого секрет лежит, и молчит там, где файл попадёт в историю.
 GIT_ISOLATED = ["git", "-c", "core.excludesFile=/dev/null", "-c", "core.quotePath=false"]
+
+#: Сколько раз звать `git check-ignore`, если он отказал сам (код не 0 и не 1).
+#: В одном дереве работают несколько исполнителей, и чужой `git` в ту же
+#: секунду переписывает индекс (B-036: падение раз в сто прогонов). Повтор
+#: снимает только отказ самого git — ответ «готов закоммитить» не повторяется
+#: и не прощается, проверка остаётся той же.
+GIT_ATTEMPTS: Final[int] = 3
+
+
+def _git_check_ignore(relative: list[str]) -> subprocess.CompletedProcess[str]:
+    """`git check-ignore` по списку путей, устойчивый к соседнему `git`.
+
+    `GIT_OPTIONAL_LOCKS=0` — чтобы и сама проверка не брала необязательную
+    блокировку индекса и не мешала соседу. Отказ самого git (не 0 и не 1)
+    повторяется до `GIT_ATTEMPTS` раз; последний ответ возвращается как есть.
+    """
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    result: subprocess.CompletedProcess[str] | None = None
+    for attempt in range(GIT_ATTEMPTS):
+        if attempt:
+            time.sleep(0.2 * attempt)
+        result = subprocess.run(
+            [*GIT_ISOLATED, "check-ignore", "-z", "--stdin"],
+            cwd=REPO_ROOT,
+            env=env,
+            input="\0".join(relative),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode in (0, 1):
+            break
+    assert result is not None
+    return result
 
 
 @pytest.mark.parametrize("layer", LAYERS)
@@ -470,14 +505,7 @@ def test_secret_looking_files_are_not_committable() -> None:
     # (`core.quotePath` по умолчанию включён), и совпадение строк не срабатывает —
     # тест падал бы ложно именно на «токен.txt», ради которого паттерн и написан.
     relative = [str(path.relative_to(REPO_ROOT).as_posix()) for path in candidates]
-    result = subprocess.run(
-        [*GIT_ISOLATED, "check-ignore", "-z", "--stdin"],
-        cwd=REPO_ROOT,
-        input="\0".join(relative),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    result = _git_check_ignore(relative)
     # 0 — что-то проигнорировано, 1 — ничего, всё остальное — отказ самого git.
     assert result.returncode in (0, 1), (
         f"git check-ignore не отработал (код {result.returncode}): "

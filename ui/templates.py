@@ -107,6 +107,7 @@ __all__ = [
     "export_templates",
     "merge_templates",
     "read_for_import",
+    "with_current_contract",
 ]
 
 #: Имя файла библиотеки внутри `userdata/`.
@@ -126,12 +127,35 @@ _KEY_NAME: Final[str] = "name"
 _KEY_SAVED: Final[str] = "saved_at"
 _KEY_VALUES: Final[str] = "settings"
 _KEY_ORIGIN: Final[str] = "origin"
+#: Ключи записи, которые эта сборка понимает. Остальные бережёт `record_extras`.
+_RECORD_KEYS: Final[frozenset[str]] = frozenset(
+    (_KEY_NAME, _KEY_SAVED, _KEY_VALUES, _KEY_ORIGIN)
+)
 
 #: Имя встроенного шаблона. Он не хранится в файле и не удаляется: это
 #: умолчания продукта, за которыми стоят замеры и сверка с прототипом
 #: 127 сделок из 127. Он показывается первым — за пользовательскими наборами
 #: пока не стоит ничего.
 BUILTIN_NAME: Final[str] = "Умолчания проекта"
+
+#: Настройки, которых шаблон **не несёт**. Решение 0061, п. 7 — слова
+#: владельца счёта 27.09.2026: «для шаблона неважно должно быть что за
+#: контракт». Инструмент — это «какой контракт брать сейчас», его решает
+#: программа по таблице контрактов, а не набор, сохранённый полгода назад.
+#: Шаблон, несущий `MXU6`, вернул бы истёкший контракт тем же нажатием,
+#: которым возвращают проверенный набор.
+#:
+#: Остановка перед экспирацией — туда же: это предохранитель живого хода
+#: (его читает только вердикт срока контракта), а не настройка торговли.
+#: Сделок прогона она не меняет, и шаблон, применённый поверх, молча
+#: переставил бы число дней, которое владелец счёта выбрал сам.
+#:
+#: В файл не пишется, при чтении старого файла **выбрасывается молча**: это
+#: не «незнакомая настройка» (её бы вечно возвращало в файл и называло
+#: в подтверждении) и не «пропущенная» (её бы подставляло умолчанием
+#: программы и тем самым меняло значение владельца). При применении берётся
+#: из текущих настроек — `with_current_contract`.
+NOT_IN_TEMPLATE: Final[tuple[str, ...]] = ("instrument", "expiry_halt_days")
 
 #: Сколько знаков имени шаблона показывается и хранится. Ограничение
 #: не от жадности: имя уходит в заголовок строки таблицы и в фразу отказа.
@@ -165,6 +189,13 @@ class Template:
     #: Незнакомые настройки целиком — чтобы записать их обратно нетронутыми.
     #: Не участвует в сравнении: два шаблона равны по имени и значениям.
     extras: dict[str, object] = field(default_factory=dict, compare=False, repr=False)
+    #: Незнакомые ключи **самой записи** — рядом с именем, временем и
+    #: происхождением, а не внутри настроек (`D-074`). Отдельно от `extras`
+    #: и от `unknown` намеренно: это не настройки, применять из них нечего,
+    #: и шаблон из-за них не становится «применимым с оговорками».
+    record_extras: dict[str, object] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
     @property
     def complete(self) -> bool:
@@ -184,6 +215,20 @@ class LoadedTemplates:
 
     templates: tuple[Template, ...] = ()
     troubles: tuple[str, ...] = ()
+
+
+def with_current_contract(template: Template, current: Settings) -> Settings:
+    """Значения шаблона с тем, чего шаблон не несёт, — из текущих настроек.
+
+    Применение шаблона меняет настройки стратегии, а не торгуемый контракт
+    (`NOT_IN_TEMPLATE`). Встроенный набор тоже: его `Settings()` несёт
+    умолчание инструмента, и без этой подстановки «Умолчания проекта»
+    переключали бы робота на контракт из сборки.
+    """
+    return replace(
+        template.values,
+        **{name: getattr(current, name) for name in NOT_IN_TEMPLATE},
+    )
 
 
 def builtin_template() -> Template:
@@ -287,6 +332,10 @@ def _body_of(templates: Sequence[Template]) -> str:
         _KEY_VERSION: FORMAT_VERSION,
         _KEY_TEMPLATES: [
             {
+                # ⚠️ Незнакомые ключи записи — первыми, по той же причине,
+                # что и незнакомые настройки ниже: перебить известное они
+                # не могут.
+                **one.record_extras,
                 _KEY_NAME: one.name,
                 _KEY_SAVED: (
                     one.saved_at.isoformat() if one.saved_at is not None else ""
@@ -295,7 +344,13 @@ def _body_of(templates: Sequence[Template]) -> str:
                 # ⚠️ Незнакомые ключи кладутся ПЕРВЫМИ и потому не могут
                 # перебить своими значениями то, что программа понимает.
                 # Порядок здесь — правило безопасности, а не оформление.
-                _KEY_VALUES: {**one.extras, **encode_fields(one.values)},
+                _KEY_VALUES: {
+                    key: value
+                    for key, value in {
+                        **one.extras, **encode_fields(one.values)
+                    }.items()
+                    if key not in NOT_IN_TEMPLATE
+                },
             }
             for one in templates
         ],
@@ -539,7 +594,11 @@ def _template_of(item: object, number: int) -> tuple[Template | None, str]:
             f"Шаблон «{name}» пропущен: в нём нет настроек. Остальные шаблоны "
             "прочитаны."
         )
-    table = field_codecs()
+    table = {
+        name: codec for name, codec in field_codecs().items()
+        if name not in NOT_IN_TEMPLATE
+    }
+    raw = {key: value for key, value in raw.items() if key not in NOT_IN_TEMPLATE}
     values = Settings()
     changes: dict[str, object] = {}
     for field_name, codec in table.items():
@@ -560,17 +619,47 @@ def _template_of(item: object, number: int) -> tuple[Template | None, str]:
     missing = tuple(sorted(set(table) - set(raw)))
     extras = {key: value for key, value in raw.items() if key not in table}
     saved_at = _moment_of(item.get(_KEY_SAVED))
+    values, both_ways = _one_way_to_take_profit(name, values.replace(**changes))
     return (
         Template(
             name=name,
-            values=values.replace(**changes),
+            values=values,
             saved_at=saved_at,
             origin=_origin_of(item.get(_KEY_ORIGIN)),
             missing=missing,
             unknown=tuple(sorted(extras)),
             extras=extras,
+            record_extras={
+                key: value for key, value in item.items() if key not in _RECORD_KEYS
+            },
         ),
-        "",
+        both_ways,
+    )
+
+
+def _one_way_to_take_profit(name: str, values: Settings) -> tuple[Settings, str]:
+    """«Скользящий уровень при выключенной фиксации» — снять, но вслух (`B-052`).
+
+    Сочетания у позиции не бывает: уровня в нём нет вовсе, а пару «порог/
+    отступ» движок всё равно проверяет и вправе отвергнуть набор из-за чисел,
+    которых никто не читает. Окно настроек его не отдаёт
+    (`SettingsDialog.values`), файл настроек чинит при чтении
+    (`app/settings_store.py::_one_way_to_take_profit`), а шаблон, сохранённый
+    прежней сборкой, приносил бы его обратно при «Применить».
+
+    ⚠️ Подмена не меняет поведения робота — уровня не было и не будет. Но снят
+    переключатель, который ставили руками, и молчать об этом нельзя
+    (правило 13 `CLAUDE.md`): строка идёт в `troubles` и доходит до окна.
+    """
+    if not values.trailing_enabled or values.take_profit_enabled:
+        return values, ""
+    return values.replace(trailing_enabled=False), (
+        f"В шаблоне «{name}» выбран скользящий уровень фиксации прибыли, "
+        "а сама фиксация выключена. Такого сочетания не бывает: уровня выхода "
+        "у позиции в нём нет. Шаблон показан как «прибыль не фиксируется» — "
+        "так он и работал бы. Если нужен скользящий уровень, примените шаблон, "
+        "откройте «Настройки» → «Вход и выход», поставьте галочку «Фиксировать "
+        "прибыль» и выберите способ «Скользящий уровень»."
     )
 
 

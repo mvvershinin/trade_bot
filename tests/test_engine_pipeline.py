@@ -23,6 +23,7 @@ from engine import (
     ExitReason,
     Fill,
     JournalLevel,
+    LevelTouch,
     Mode,
     OrderAction,
     OrderRequest,
@@ -37,7 +38,8 @@ from engine import (
     exit_signal,
     process_closed_candle,
 )
-from strategies import Intent
+from strategies import FactKind, Intent, MaReverseAlwaysSettings
+from strategies.ma_reverse_always import describe
 from tests.engine_helpers import MSK, bar, decision, position
 
 WINDOW = TradingWindow(time(10, 5), time(11, 0))
@@ -206,6 +208,53 @@ def test_a_repeated_bar_is_skipped_although_the_warmup_is_long_past() -> None:
     assert "повторно" in outcome.journal[0].reason
 
 
+def test_the_warmup_bar_carries_its_reason_into_the_journal() -> None:
+    """Свеча прогрева не обрабатывается — но причина доезжает до человека.
+
+    Стережёт **молчание**, а не отказ (`CLAUDE.md` №13). Прогрев — законное
+    исключение из «в торговое время всегда есть позиция»
+    (`E5-module-2-specification.md` §3.4), и каждое такое исключение обязано
+    называться человеку строкой. Сказать это может только движок: торговый
+    модуль в журнал не пишет, он лишь возвращает причину решением.
+
+    ⚠️ Заведено 14.09.2026 после мутации. Проверка была **только** на свече
+    повторной подачи (выше), а шаг 2 пишет обе строки одним вызовом. Замена
+    этого вызова на молчание в ветке прогрева — при сохранённой строке про
+    повтор — не роняла во всём наборе ни одного теста: 3961 прошло. Сторожа
+    на непустую причину в самом модуле такую подмену не видят по построению,
+    они смотрят на решение, а не на журнал.
+
+    ⚠️ Причина подаётся сюда **извне**, решением модуля, и проверяется, что
+    в журнал доехала именно она. Требовать от движка слова «Прогрев» было бы
+    проверкой его собственной формулировки: она зеленела бы и тогда, когда
+    причина модуля потеряна по дороге.
+    """
+    said = "Прогрев EMA(15): накоплено свечей 3 из 16 — сигналов нет"
+    outcome = run(skip_bar=True, warmed_up=False, reason=said)
+    assert outcome.journal, (
+        "свеча прогрева прошла без единой строки журнала: человек видит "
+        "график без меток и ниоткуда не узнаёт, почему робот молчит"
+    )
+    assert any(said in entry.reason for entry in outcome.journal), (
+        "причина, названная торговым модулем, до журнала не доехала: "
+        f"{[entry.reason for entry in outcome.journal]}"
+    )
+    # ⚠️ Вторая половина той же обязанности — **ключ** гашения. `_Journal.quiet`
+    # молчит на повторе ключа, и ключ переезжает между свечами через
+    # `EngineState.quiet_note`: без него пятнадцать свечей прогрева дали бы
+    # пятнадцать одинаковых строк. Общий ключ у прогрева и у повторной свечи
+    # означал бы обратное — вторая причина молча съедена первой, и человек,
+    # у которого свеча пришла дважды сразу после прогрева, об этом не узнаёт.
+    repeated = run(
+        skip_bar=True, warmed_up=True, reason="Свеча подана повторно — уже учтена"
+    )
+    assert outcome.state.quiet_note != repeated.state.quiet_note, (
+        "прогрев и повторная свеча гасятся одним ключом журнала "
+        f"(«{outcome.state.quiet_note}»): вторая причина не будет напечатана "
+        "вовсе, если придёт следом за первой"
+    )
+
+
 def test_a_bar_with_no_intent_is_processed_to_the_end() -> None:
     """`Intent.NONE` — это не `skip_bar`: обработка свечи продолжается.
 
@@ -312,6 +361,44 @@ def test_outside_the_window_the_position_is_closed_to_cash() -> None:
     outcome = run(state, intent=Intent.LONG, when=OUTSIDE)
     assert [order.exit_reason for order in outcome.orders] == [ExitReason.WINDOW_END]
     assert outcome.last_step is Step.WINDOW
+
+
+def test_the_engine_cancels_an_intent_as_the_module_promises() -> None:
+    """Оговорка модуля «общие настройки могут отменить намерение» — исполняется.
+
+    Описание торгового модуля кончается фразой про то, что войдёт ли робот
+    на самом деле, решают общие настройки. Это утверждение про **движок**,
+    и сам модуль исполнить его не может: слой стратегий про `engine/` не знает
+    (ARCHITECTURE.md §2). Поэтому факт объявлен модулем
+    (`FactKind.ENGINE_MAY_OVERRIDE`), а исполняется здесь — передача записана
+    в `tests/test_strategies_description.py::DELEGATED_FACTS` и сверяется
+    списком.
+
+    Исполняется буквально: движку подаётся намерение «лонг» из пустой позиции,
+    и ровно одна общая настройка — торговое окно — отменяет его. Ни одной
+    рыночной заявки не подаётся.
+
+    Мутация, обязанная ронять проверку: убрать из описания фразу «может
+    отменить любое намерение» (`_BOUNDARY_NOTE` → «ни одна общая настройка
+    намерение не отменит»). 09.09.2026 такая подмена проходила молча
+    (`B-041`).
+    """
+    outcome = run(intent=Intent.LONG, when=OUTSIDE)
+    assert market_orders(outcome) == [], (
+        "намерение «лонг» вне торгового окна дошло до заявки — тогда фраза "
+        "описания про общие настройки была бы неправдой"
+    )
+    assert outcome.last_step is Step.WINDOW
+
+    fact = describe(MaReverseAlwaysSettings()).fact(FactKind.ENGINE_MAY_OVERRIDE)
+    assert fact is not None, (
+        "модуль перестал объявлять факт про общие настройки — описание "
+        "правила читалось бы как полное правило поведения робота"
+    )
+    assert fact.answer in fact.text, (
+        f"факт про общие настройки отвечает «{fact.answer}», а в его тексте "
+        f"этого нет: «{fact.text}»"
+    )
 
 
 def test_with_closing_at_the_window_end_switched_off_only_the_signal_closes() -> None:
@@ -938,7 +1025,8 @@ def test_a_deal_on_the_armed_level_is_a_take_profit_because_the_order_says_so() 
     order = OrderRequest(
         action=OrderAction.ARM_TAKE_PROFIT, side=Side.LONG, volume=1.0,
         submitted_at=bar(*INSIDE).closes_at, reason="сторожим уровень",
-        order_id="take:long:тест", price=100.5,
+        order_id="take:long:тест", price=100.5, touch=LevelTouch.RISE,
+        exit_reason=ExitReason.TAKE_PROFIT,
     )
     state = EngineState(position=armed, pending=(order,))
     result = apply_fill(state, Fill(
@@ -1015,7 +1103,8 @@ def test_the_orders_of_one_candle_are_a_known_short_list() -> None:
                                     when=when,
                                 )
                                 _check_order_shape(outcome, settings, state, intent)
-    assert seen == 1440, f"перебор выродился: разобрано {seen} случаев"
+    # 288 случаев на режим; режимов шесть с «один вход в день» (29.09.2026).
+    assert seen == 1728, f"перебор выродился: разобрано {seen} случаев"
 
 
 def _check_order_shape(outcome, settings, state, intent) -> None:

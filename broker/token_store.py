@@ -43,7 +43,7 @@ from typing import Any, Final
 from broker.errors import TokenFileError
 from broker.redaction import log
 from broker.secret import Secret
-from broker.tokens import RefreshToken, TokenScope, now_utc
+from broker.tokens import RefreshToken, TokenScope, issued_for, now_utc, printable_client
 
 #: Имя каталога рантайм-данных. Решение 0003.
 USERDATA_DIR_NAME: Final[str] = "userdata"
@@ -126,6 +126,41 @@ class StoredToken:
     permissions_were_loose: bool = False
     #: На этой системе права файла средствами Python не сужаются (Windows).
     permissions_enforced: bool = True
+    #: Тип взят из самого токена (поле `azp`), а не из поля `scope` файла.
+    scope_from_token: bool = False
+    #: Что указано в поле `scope` файла; `None` — поля нет или оно незнакомо.
+    scope_in_file: TokenScope | None = None
+
+    @property
+    def scope_disagrees(self) -> bool:
+        """Тип в файле не тот, для которого токен выпущен (или не указан)."""
+        return self.scope_from_token and self.scope_in_file is not self.token.scope
+
+    @property
+    def scope_notice(self) -> str | None:
+        """Строка владельцу счёта о расхождении типа; `None` — расхождения нет.
+
+        Правило 13: молча подменить тип нельзя — человек сам выбирал его,
+        и должен узнать, что программа пошла по токену, а не по его выбору.
+        """
+        if not self.scope_disagrees:
+            return None
+        used = self.token.scope.human
+        said = (
+            f"указан тип «{self.scope_in_file.human}»"
+            if self.scope_in_file is not None
+            else "тип не указан"
+        )
+        tail = (
+            " Работе это не мешает: тип берётся из самого токена."
+            if self.token.scope.can_trade
+            else " Подавать заявки с таким токеном нельзя: боевой режим не включится."
+        )
+        return (
+            f"В файле с токеном {said}, а сам токен выпущен «{used}» — "
+            f"программа работает по токену, «{used}». Файл программа "
+            f"не переписывает.{tail}"
+        )
 
 
 def windows() -> bool:
@@ -502,7 +537,13 @@ class TokenStore:
         value = payload.pop(LEGACY_KEYS[_KEY_TOKEN], None)
         value = payload.pop(_KEY_TOKEN, value)
         present = value is not None
+        # Клиент, для которого выпущен токен, читается из сырого значения здесь,
+        # до затирания: иначе понадобился бы ещё один `reveal()`, а их места
+        # перечислены (`test_reveal_lives_where_declared`). Наружу — одна строка
+        # `azp`, разобранная нагрузка из `issued_for` не выходит.
+        azp: str | None = None
         try:
+            azp = issued_for(value) if isinstance(value, str) else None
             secret = Secret(value) if isinstance(value, str) else None
         except ValueError:
             secret = None
@@ -521,13 +562,17 @@ class TokenStore:
 
         raw_scope = _read(payload, _KEY_SCOPE)
         try:
-            scope = TokenScope(raw_scope)
+            in_file: TokenScope | None = TokenScope(raw_scope)
         except ValueError:
-            raise TokenFileError(
-                "В файле настроек не указан тип токена — «только для чтения» "
-                "или «для торговли и чтения». Укажите его в настройках.",
-                technical=f"{self._path}: неизвестный тип прав {raw_scope!r}",
-            ) from None
+            in_file = None
+        by_token = TokenScope.of_client(azp)
+        if azp is not None and by_token is None:
+            log().warning(
+                "токен выпущен для незнакомого клиента %s; тип взят из файла: %s",
+                printable_client(azp),
+                self._path,
+            )
+        scope = self._settle_scope(by_token, in_file, raw_scope)
 
         issued_raw = _read(payload, _KEY_ISSUED)
         try:
@@ -547,7 +592,42 @@ class TokenStore:
             account=account if isinstance(account, str) else None,
             permissions_were_loose=loose,
             permissions_enforced=enforced,
+            scope_from_token=by_token is not None,
+            scope_in_file=in_file,
         )
+
+    def _settle_scope(
+        self, by_token: TokenScope | None, in_file: TokenScope | None, raw_scope: object
+    ) -> TokenScope:
+        """Тип токена: по самому токену, а поле файла — запасной путь.
+
+        Брокер обменивает токен только с `client_id`, для которого тот выпущен
+        (показ 05.10.2026). Поэтому известный `azp` главнее поля файла: оно
+        лишь повторяет то, что уже записано в токене, и ошибка в нём ломала
+        подключение. Поля нет или оно незнакомо при известном `azp` — тоже
+        не повод отказаться от файла: решение то же, расхождение то же.
+        Файл не переписывается: правка чужого файла на чтении умеет отказать
+        (`_note_previous_format`). ⚠️ `save` пишет тип, переданный ему, а не `azp`:
+        записи токена из окна сейчас нет, и расхождение в файле держится до
+        ручной правки — строка человеку повторяется на каждом подключении.
+        """
+        if by_token is not None:
+            if in_file is not by_token:
+                log().warning(
+                    "тип токена в файле (%s) не совпадает с типом, для которого "
+                    "токен выпущен (%s); используется тип из токена: %s",
+                    in_file.value if in_file is not None else "не указан",
+                    by_token.value,
+                    self._path,
+                )
+            return by_token
+        if in_file is None:
+            raise TokenFileError(
+                "В файле настроек не указан тип токена — «только для чтения» "
+                "или «для торговли и чтения». Укажите его в настройках.",
+                technical=f"{self._path}: неизвестный тип прав {raw_scope!r}",
+            )
+        return in_file
 
     def _note_previous_format(self, payload: dict[str, Any]) -> None:
         """Сказать в журнал, что файл записан в формате до 06.09.2026.

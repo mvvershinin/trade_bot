@@ -22,18 +22,17 @@ import subprocess
 import sys
 from dataclasses import dataclass, fields
 from datetime import date, datetime, time, timedelta
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 os.environ.setdefault("QT_API", "pyside6")  # до первого импорта qasync
 
-from app import convert
+from app import convert, runs
 from app.port import HistoryPort
 from app.runs import (
     _COSTS_TITLES,
     _ENGINE_TITLES,
-    _STRATEGY_TITLES,
     RUNS_KEPT,
     RUNS_SHOWN,
     RunConditions,
@@ -41,9 +40,18 @@ from app.runs import (
     result_note,
     settings_text,
     show_runs,
+    snapshot_marks,
 )
 from backtest import Costs
-from engine import DayMarks, EngineSettings, Mode, PartialCandles, Reversal, TradingWindow
+from engine import (
+    DayMarks,
+    EngineSettings,
+    Mode,
+    PartialCandles,
+    Reversal,
+    TimeExitOrder,
+    TradingWindow,
+)
 from market import (
     BACKTEST_SESSIONS_KEPT,
     MSK,
@@ -57,9 +65,21 @@ from market import (
     build_bars,
 )
 from market.journal import SECRET_MASK, redact
-from strategies import AverageKind, EmaReverse, EmaReverseSettings, OnPriceEqualsAverage
+from strategies import (
+    AverageKind,
+    MaReverseAlways,
+    MaReverseAlwaysSettings,
+    registry,
+)
+from ui.models import Mode as WindowMode
+from ui.models import ReversalMoment, Settings, TimeExitKind
 from ui.models import RunOrigin as WindowOrigin
-from ui.models import Settings
+
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
 
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)  # пятница, до открытия окна
 
@@ -81,7 +101,7 @@ def _minutes(count: int = 300, start: datetime = DAY) -> list[Candle]:
 def database(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(), Source.ISS)
     return path
 
 
@@ -93,11 +113,11 @@ def _conditions(*, days: int = 30, until: datetime | None = None) -> RunConditio
     """Условия прогона для проверок записи. Меняются только отбор и правый край."""
     return RunConditions(
         origin=RunOrigin.BACKTEST,
-        symbol="MXU6",
+        symbol=SYMBOL,
         timeframe="5 минут",
         engine=EngineSettings(mode=Mode.REVERSE, commission_per_side=14.0),
-        strategy=EmaReverseSettings(),
-        strategy_title=EmaReverse.title,
+        strategy=MaReverseAlwaysSettings(),
+        algorithm=registry.default_entry(),
         app_version="1.2.3",
         days=days,
         until=until,
@@ -158,9 +178,9 @@ def test_a_pass_of_the_engine_leaves_a_finished_row_with_conditions_and_result(
     session = sessions[0]
     assert session.origin is RunOrigin.BACKTEST, "происхождение прогона не то"
     assert session.finished_at is not None, "прогон закрылся, но остался незакрытым"
-    assert session.symbol == "MXU6"
+    assert session.symbol == SYMBOL
     assert session.timeframe == "5 минут"
-    assert session.strategy == EmaReverse.title
+    assert session.strategy == MaReverseAlways.title
     assert session.app_version, "версия программы не записана"
     assert "Настройки движка" in session.settings, "снимка настроек в записи нет"
     assert "свечей" in session.note, "на чём гнали — не записано"
@@ -184,29 +204,65 @@ def test_each_new_pass_makes_its_own_row(loop, database) -> None:
     assert any("Период средней: 15" in text for text in snapshots)
 
 
-def test_the_port_writes_no_decisions_and_no_trades_and_that_holds_the_limit(
+def test_a_pass_over_history_writes_no_rows_and_that_holds_the_limit(
     loop, database
 ) -> None:
-    """Стережёт опору под `RUNS_KEPT`: порт кладёт строку прогона и больше ничего.
+    """Стережёт опору под `RUNS_KEPT`: проход по истории кладёт строку прогона и всё.
 
     Двести прогонов помещаются в базу только потому, что прогон стоит около
-    двух килобайт. Начни порт писать журнал решений и сделок — та же двести
-    станет сотней мегабайт, и число обязано вернуться к порядку
-    `BACKTEST_SESSIONS_KEPT`. Тест падает ровно в тот день, когда это случится.
+    двух килобайт. Начни проход по истории писать решения, сделки, заявки или
+    отметку о строках — те же двести станут сотней мегабайт, и число обязано
+    вернуться к порядку `BACKTEST_SESSIONS_KEPT`. Тест падает ровно в тот
+    день, когда это случится. Строки пишет только живой ход симуляции —
+    его стережёт соседний тест.
     """
     _passes(loop, database, Settings())
 
     with CandleStore(database) as store:
         stats = store.journal_stats()
     assert stats.sessions == 1
-    assert stats.decisions == 0 and stats.trades == 0, (
-        "порт начал писать строки журналов — пересмотрите RUNS_KEPT: "
-        f"{RUNS_KEPT} прогонов со строками это уже не мегабайты"
+    rows = (stats.decisions, stats.trades, stats.orders, stats.run_rows)
+    assert rows == (0, 0, 0, 0), (
+        "проход по истории начал писать строки (решения, сделки, заявки, "
+        f"отметки: {rows}) — пересмотрите RUNS_KEPT: {RUNS_KEPT} прогонов "
+        "со строками это уже не мегабайты"
     )
     assert RUNS_KEPT > BACKTEST_SESSIONS_KEPT, (
         "своё число хранения потеряло смысл: оно и заведено ради того, "
         "что строка прогона здесь дешевле полного прогона"
     )
+
+
+def test_a_live_simulation_writes_its_rows(loop, database) -> None:
+    """Стережёт: живой ход симуляции пишет свои строки — решения и отметку.
+
+    Пара к тесту выше. Без неё сторож «проход по истории строк не пишет»
+    зеленел бы и тогда, когда строки не пишет никто, — то есть ровно в том
+    состоянии, из которого задача выводила владельца счёта: сделку
+    симуляции после перезапуска не открыть.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        port.attach_stream(lambda on: None)  # подключение «удалось»
+        try:
+            port.stream(True)
+            await port.wait()
+            port.refresh("закрылся бар")
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+    with CandleStore(database) as store:
+        stats = store.journal_stats()
+        paper = store.paper_runs([SYMBOL])
+    assert len(paper) == 1, "живой ход не записан прогоном симуляции"
+    assert paper[0].mark is not None, "строки живого хода не записаны: отметки нет"
+    assert stats.decisions > 0, "решения живого хода не легли в базу"
 
 
 # ------------------------------------------------------------ полнота полей
@@ -215,7 +271,12 @@ def test_the_port_writes_no_decisions_and_no_trades_and_that_holds_the_limit(
     ("titles", "kind"),
     [
         (_ENGINE_TITLES, EngineSettings),
-        (_STRATEGY_TITLES, EmaReverseSettings),
+        # ⚠️ Подписи полей торгового алгоритма живут не в `app/runs.py`,
+        # а в записи реестра: свой список в сборке был бы второй правдой
+        # и разошёлся бы с алгоритмом молча (`D-100`). Проверка от этого
+        # не ослабла — она берёт таблицу оттуда, где та теперь лежит,
+        # и точно так же падает на поле, заведённом завтра и не подписанном.
+        (registry.default_entry().titles(), MaReverseAlwaysSettings),
         (_COSTS_TITLES, Costs),
     ],
     ids=["движок", "торговый модуль", "издержки"],
@@ -253,7 +314,9 @@ def test_a_setting_added_tomorrow_lands_in_the_snapshot_by_itself() -> None:
     # Подставной класс завтрашних настроек — не `EngineSettings`, и приведение
     # здесь именно про это: снимок обязан сниматься с любого набора полей.
     tomorrow = cast(EngineSettings, SettingsOfTomorrow())
-    text = settings_text(tomorrow, EmaReverseSettings(), strategy_title="проба")
+    text = settings_text(
+        tomorrow, MaReverseAlwaysSettings(), algorithm=registry.default_entry()
+    )
     assert "daily_loss_limit_rub: 25000" in text, (
         "поле, у которого нет подписи, выпало из снимка целиком — "
         "значит снимок собирается списком, а не обходом полей"
@@ -278,30 +341,35 @@ _ANOTHER_ENGINE: dict[str, object] = {
     "trailing_offset_percent": 0.3,
     "trailing_step_percent": 0.07,
     "stop_after_take_profit": False,
+    "min_exit_profit_sides": 2.0,
     "partial_candles": PartialCandles.SKIP,
     "commission_per_side": 7.0,
     "ruble_per_point": 2.0,
     "close_wait_bars": 5,
-    "volume_cap": 9.0,
-    "daily_loss_limit_percent": 3.5,
-    "free_funds_reserve_percent": 25.0,
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+    # "volume_cap": 9.0,
+    # "daily_loss_limit_percent": 3.5,
+    # "free_funds_reserve_percent": 25.0,
     "calendar": DayMarks.of({date(2026, 6, 12): False}),
     "exchange_days": DayMarks.of({date(2026, 6, 12): False}),
+    # Предельная форма законна только при известном шаге — шаг стоит
+    # в основе (см. следующий тест), как тариф для порога выхода.
+    "time_exit_order": TimeExitOrder.LIMIT,
+    "time_exit_limit_steps": 3,
+    "time_exit_wait_bars": 2,
+    "price_step": 10.0,
 }
 
 _ANOTHER_STRATEGY: dict[str, object] = {
     "period": 20,
     "kind": AverageKind.SMA,
-    "on_equal": OnPriceEqualsAverage.TREAT_AS_LONG,
-    "threshold_percent": 0.2,
-    "confirm_bars": 2,
 }
 
 
 def test_the_table_of_other_values_covers_every_field() -> None:
     """Стережёт сам следующий тест: неполная таблица делала бы его слепым."""
     assert set(_ANOTHER_ENGINE) == {field.name for field in fields(EngineSettings)}
-    assert set(_ANOTHER_STRATEGY) == {field.name for field in fields(EmaReverseSettings)}
+    assert set(_ANOTHER_STRATEGY) == {field.name for field in fields(MaReverseAlwaysSettings)}
 
 
 @pytest.mark.parametrize("name", sorted(_ANOTHER_ENGINE))
@@ -311,23 +379,90 @@ def test_changing_any_engine_setting_changes_the_snapshot(name: str) -> None:
     Это и есть повторимость, выраженная проверяемо. Поле, выпавшее из снимка,
     делает две разные настройки неотличимыми в базе — ровно тот случай,
     когда числа владельца счёта не воспроизводятся, а объяснить это нечем.
+
+    ⚠️ Тариф комиссии стоит **в основе**, а не только в изменении: порог
+    выхода по обратному сигналу без тарифа настройки отвергают, и без этой
+    строки поле нельзя было бы поменять поодиночке. На остальные поля
+    основа с тарифом не влияет — сравниваются два снимка, и тариф в обоих
+    одинаков.
     """
-    base = EngineSettings()
+    base = EngineSettings(commission_per_side=14.0, price_step=5.0)
     other = base.replace(**{name: _ANOTHER_ENGINE[name]})
-    assert settings_text(base, EmaReverseSettings(), strategy_title="x") != settings_text(
-        other, EmaReverseSettings(), strategy_title="x"
+    assert settings_text(
+        base, MaReverseAlwaysSettings(), algorithm=registry.default_entry()
+    ) != settings_text(
+        other, MaReverseAlwaysSettings(), algorithm=registry.default_entry()
     ), f"настройка `{name}` не видна в снимке: два разных прогона запишутся одинаково"
 
 
 @pytest.mark.parametrize("name", sorted(_ANOTHER_STRATEGY))
 def test_changing_any_strategy_setting_changes_the_snapshot(name: str) -> None:
     """Стережёт то же самое для настроек торгового модуля."""
-    base = EmaReverseSettings()
+    base = MaReverseAlwaysSettings()
     other = base.replace(**{name: _ANOTHER_STRATEGY[name]})
     engine = EngineSettings()
-    assert settings_text(engine, base, strategy_title="x") != settings_text(
-        engine, other, strategy_title="x"
+    assert settings_text(
+        engine, base, algorithm=registry.default_entry()
+    ) != settings_text(
+        engine, other, algorithm=registry.default_entry()
     ), f"настройка модуля `{name}` не видна в снимке"
+
+
+def test_the_snapshot_says_what_the_robot_did_with_those_numbers() -> None:
+    """Снимок прогона несёт не только значения полей, но и **правило словами**.
+
+    Список значений отвечает на вопрос «чем гнали» наполовину: «период 15,
+    порог 0» не говорит, что робот с ними делал. Разбирают прогон через месяц
+    и разбирают именно правило.
+
+    Мутация, обязанная ронять проверку: убрать сборку правила
+    из `app/runs.py::settings_text`.
+    """
+    text = settings_text(
+        EngineSettings(), MaReverseAlwaysSettings(), algorithm=registry.default_entry()
+    )
+    assert "Правило робота словами:" in text, "снимок не называет правило вовсе"
+    assert "Закрытие выше EMA(15) — робот хочет быть в лонге." in text, (
+        "правило записано без утверждений — читать в нём нечего"
+    )
+    assert "EMA(20)" not in text, "в снимке чужие числа"
+
+
+def test_the_rule_in_the_snapshot_follows_the_settings() -> None:
+    """Правило в снимке пересчитывается, а не написано один раз навсегда.
+
+    Записанное однажды и не следящее за настройками, оно было бы хуже
+    отсутствующего: разбор прогона опирался бы на правило чужого прогона.
+    """
+    engine = EngineSettings()
+    twenty = settings_text(
+        engine, MaReverseAlwaysSettings(period=20), algorithm=registry.default_entry()
+    )
+    assert "Закрытие выше EMA(20) — робот хочет быть в лонге." in twenty
+    assert "EMA(15)" not in twenty
+
+
+def test_the_rule_does_not_leak_into_the_marks_of_the_snapshot() -> None:
+    """Абзацы правила — не поля снимка, и читатель их полем не считает.
+
+    `snapshot_marks` считает подписью поля всё, что начинается с отступа
+    и содержит «: ». Отступ в абзаце описания превратил бы предложение
+    в поле — и сверка набора с прогоном (`_made_with`) искала бы это «поле»
+    в чужих записях, то есть перестала бы узнавать свои прогоны.
+    """
+    text = settings_text(
+        EngineSettings(), MaReverseAlwaysSettings(), algorithm=registry.default_entry()
+    )
+    marks = snapshot_marks(text)
+    assert set(marks) == (
+        {title for title in marks if not title.startswith("•")}
+    ), "строка описания попала в подписи полей снимка"
+    assert len(marks) == len(fields(EngineSettings)) + len(
+        fields(MaReverseAlwaysSettings)
+    ), (
+        "число подписей снимка изменилось: описание правила перестало быть "
+        f"текстом и стало полем. Подписи: {sorted(marks)}"
+    )
 
 
 def test_the_costs_the_money_was_counted_on_are_written_next_to_it() -> None:
@@ -548,7 +683,7 @@ def test_the_runs_key_prints_the_conditions_next_to_the_result(loop, database) -
     assert "Прогон 1 — прогон по истории" in text
     assert "Тейк-профит, %: 0,5" in text, "настроек в выдаче нет"
     assert "Период средней: 15" in text, "настроек торгового модуля в выдаче нет"
-    assert "MXU6, 5 минут: свечей" in text, "отрезка в выдаче нет"
+    assert f"{SYMBOL}, 5 минут: свечей" in text, "отрезка в выдаче нет"
     assert "Сделок" in text and "чистая" in text, "итога в выдаче нет"
 
 
@@ -568,7 +703,15 @@ def test_the_runs_key_tells_an_empty_base_from_a_missing_one(tmp_path) -> None:
 
 
 def test_an_unfinished_run_is_printed_as_interrupted(loop, database) -> None:
-    """Стережёт: незакрытый прогон в выдаче назван словами, а не пустым местом."""
+    """Стережёт: незакрытый прогон в выдаче назван словами, и причин названо две.
+
+    `D-066`: прогон, снятый кнопкой «Отменить», и прогон, оборванный закрытием
+    программы, в базе неотличимы — оба без времени конца. Фраза, называющая
+    одну причину, говорит неправду тому, у кого была другая.
+
+    Мутация, обязанная ронять проверку: вернуть прежнюю фразу «не закрыт —
+    программу закрыли на середине прогона».
+    """
 
     async def go():
         worker = MarketWorker(database)
@@ -582,7 +725,10 @@ def test_an_unfinished_run_is_printed_as_interrupted(loop, database) -> None:
 
     out = io.StringIO()
     show_runs(database, out=out)
-    assert "не закрыт — программу закрыли на середине прогона" in out.getvalue()
+    (ended,) = [line for line in out.getvalue().splitlines() if "Окончен:" in line]
+    assert "не закрыт" in ended, f"незакрытый прогон не назван незакрытым: {ended!r}"
+    for cause in ("кнопкой «Отменить»", "закрытием программы"):
+        assert cause in ended, f"в строке конца не названа причина «{cause}»: {ended!r}"
 
 
 def test_the_runs_key_answers_on_a_machine_where_qt_cannot_start(database) -> None:
@@ -596,7 +742,7 @@ def test_the_runs_key_answers_on_a_machine_where_qt_cannot_start(database) -> No
     """
     with CandleStore(database) as store:
         session = store.open_journal_session(
-            SessionRecord(RunOrigin.BACKTEST, symbol="MXU6", settings="Настройки движка")
+            SessionRecord(RunOrigin.BACKTEST, symbol=SYMBOL, settings="Настройки движка")
         )
         store.finish_journal_session(session.id, note="Сделок 3")
 
@@ -670,3 +816,310 @@ def test_a_field_of_the_record_is_never_left_empty() -> None:
     for field in dataclasses.fields(SessionRecord):
         value = getattr(record, field.name)
         assert value not in ("", None), f"колонка `{field.name}` осталась пустой"
+
+
+# ---------------------------------------------------------------------------
+# Выбранный алгоритм в снимке прогона
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", registry.entries(), ids=lambda entry: entry.id)
+def test_the_snapshot_names_the_algorithm_that_was_chosen(entry) -> None:
+    """Снимок называет **выбранный** алгоритм, а не тот, который был первым.
+
+    Через месяц разбирают по снимку, чем гнали прогон. Название, вписанное
+    константой на месте вызова, осталось бы прежним после смены алгоритма —
+    и снимок называл бы не то, чем считали.
+
+    ⚠️ Проверка идёт по **каждому** алгоритму реестра, и это `D-099`: пока
+    проверялось одно умолчание, константа на месте названия проходила её
+    зелёной. Переворот в одной свече ставится ради второго алгоритма — без
+    него его запись отказывает (`convert.check_demands`), а первому всё равно.
+
+    Мутации, обязанные ронять проверку: `snapshot_of` отдаёт в `settings_text`
+    `registry.default_entry()` вместо `convert.chosen_algorithm(values)`;
+    `settings_text` пишет в заголовок `registry.default_entry().title`.
+    """
+    values = Settings(strategy_id=entry.id, reversal_moment=ReversalMoment.SAME_BAR)
+    text = runs.snapshot_of(values)
+    assert f"Торговый алгоритм: {entry.title}" in text, (
+        f"снимок не называет выбранный алгоритм «{entry.title}»"
+    )
+    for other in registry.entries():
+        if other.id != entry.id:
+            assert f"Торговый алгоритм: {other.title}" not in text, (
+                f"выбран «{entry.title}», а снимок называет «{other.title}»"
+            )
+
+
+def test_the_snapshot_title_comes_from_the_registry_by_the_chosen_name() -> None:
+    """Название берётся у реестра по имени из настроек, а не пишется в `app/`.
+
+    ⚠️ Незнакомое имя показывается как есть — и это не мягкость: снимок пишут
+    в базу, и запись, упавшая из-за незнакомого имени, унесла бы с собой
+    условия прогона целиком.
+    """
+    assert convert.strategy_title(Settings()) == registry.default_entry().title
+    assert convert.strategy_title(
+        Settings().replace(strategy_id="atr_channel")
+    ) == "atr_channel"
+
+
+# ---------------------------------------------------------------------------
+# Числа программы в снимке прогона (D-117)
+# ---------------------------------------------------------------------------
+
+
+def test_the_program_numbers_reach_the_record_of_a_run() -> None:
+    """Стережёт: остановка перед экспирацией и глубина загрузки — в записи прогона.
+
+    `D-117`: снимок собирался только из движка и алгоритма. Два прогона
+    с разной остановкой перед экспирацией дают разные сделки у края
+    контракта, а по записи были бы неразличимы.
+
+    Мутация, обязанная ронять проверку: `RunConditions.record` не передаёт
+    `program` в `settings_text`.
+    """
+    conditions = dataclasses.replace(
+        _conditions(),
+        program=runs.ProgramFields(expiry_halt_days=4, history_depth_days=45),
+    )
+    marks = snapshot_marks(conditions.record(_bars()).settings)
+    assert marks.get("Остановка перед экспирацией, дней") == "4", marks
+    assert marks.get("Глубина загрузки истории, дней") == "45", marks
+
+
+def test_the_window_snapshot_carries_the_program_numbers_of_the_set() -> None:
+    """Стережёт: снимок набора окна берёт числа программы из самого набора.
+
+    Мутация, обязанная ронять проверку: `snapshot_of` не передаёт `program`.
+    """
+    marks = snapshot_marks(
+        runs.snapshot_of(Settings(expiry_halt_days=3, history_depth_days=60))
+    )
+    assert marks.get("Остановка перед экспирацией, дней") == "3", marks
+    assert marks.get("Глубина загрузки истории, дней") == "60", marks
+
+
+def test_every_program_number_has_a_title_for_a_person() -> None:
+    """Стережёт: у каждого поля `ProgramFields` есть подпись, а не имя латиницей."""
+    text = settings_text(
+        EngineSettings(), MaReverseAlwaysSettings(), algorithm=registry.default_entry(),
+        program=runs.ProgramFields(expiry_halt_days=1, history_depth_days=90),
+    )
+    for field in dataclasses.fields(runs.ProgramFields):
+        assert f"{field.name}:" not in text, f"поле `{field.name}` осталось без подписи"
+
+
+def test_a_run_recorded_without_program_numbers_still_belongs_to_its_set(
+    tmp_path,
+) -> None:
+    """Стережёт: числа программы не отнимают у шаблона его прежние прогоны.
+
+    Прогоны, записанные до `D-117`, и места вызова, ещё не передающие числа
+    программы, этих подписей не несут. `_made_with` читает отсутствие
+    подписи как «не тот набор» — если бы числа программы сличались,
+    статистика шаблонов пропала бы у всех прежних прогонов разом.
+
+    Мутация, обязанная ронять проверку: убрать любое из двух чисел
+    программы из `_UNCONTROLLED_TITLES`.
+
+    Порядок цен минутки в записи **есть**: с З9 Ф5 он сделки меняет
+    и сличается (`test_a_run_with_another_minute_order_is_not_credited…`),
+    так что прогон без него своим набору не засчитывается — и это верно.
+    """
+    database = tmp_path / "candles.sqlite3"
+    values = Settings()
+    engine = convert.engine_settings(values, WindowMode.REVERSE)
+    whole = settings_text(
+        engine, convert.strategy_settings(values),
+        algorithm=convert.chosen_algorithm(values),
+        program=runs.ProgramFields.of(values),
+    )
+    dropped = (
+        "Остановка перед экспирацией, дней:", "Глубина загрузки истории, дней:",
+    )
+    older = "\n".join(
+        line for line in whole.splitlines() if not line.strip().startswith(dropped)
+    )
+    assert older != whole, "чисел программы в снимке не нашлось — вырезать было нечего"
+    with CandleStore(database) as store:
+        store.open_journal_session(SessionRecord(
+            origin=RunOrigin.BACKTEST, symbol=convert.instrument_of(values.instrument),
+            timeframe=values.timeframe, strategy="EMA-разворот",
+            settings=older, note="прогон прерван",
+        ))
+    found = runs.matching_runs(database, [values])
+    assert len(found.runs[0]) == 1, (
+        f"прогон без чисел программы не узнан своим набором: {found.trouble!r}"
+    )
+
+
+def test_a_run_with_another_expiry_halt_is_credited_to_the_set(tmp_path) -> None:
+    """Стережёт: остановка перед экспирацией не различает прогоны тестера.
+
+    Её читает только вердикт срока живого хода; тестер, перебор и склейка
+    её не знают, и сделки прогона от неё не зависят. Прогон, записанный
+    при остановке за три дня, — прогон того же набора, в окне которого
+    стоит остановка за день. Иначе поменял предохранитель — и шаблон
+    «не гонялся ни разу».
+
+    Мутация, обязанная ронять проверку: убрать `expiry_halt_days`
+    из `_UNCONTROLLED_TITLES`.
+    """
+    database = tmp_path / "candles.sqlite3"
+    values = Settings(expiry_halt_days=1)
+    with CandleStore(database) as store:
+        store.open_journal_session(SessionRecord(
+            origin=RunOrigin.BACKTEST, symbol=convert.instrument_of(values.instrument),
+            timeframe=values.timeframe, strategy="EMA-разворот",
+            settings=runs.snapshot_of(values.replace(expiry_halt_days=3)),
+            note="прогон прерван",
+        ))
+    found = runs.matching_runs(database, [values])
+    assert len(found.runs[0]) == 1, (
+        "прогон с остановкой за три дня не засчитан набору с остановкой "
+        f"за день, хотя сделки у них одни: {found.trouble!r}"
+    )
+
+
+def test_the_run_snapshot_names_the_minute_order() -> None:
+    """Стережёт: порядок цен минутки записан в снимок прогона — подписью окна.
+
+    Два прогона со скользящим уровнем при разном порядке дадут разные
+    сделки (с Ф5 З9), и по записи они обязаны различаться. Что старый снимок
+    без этой строки набору **не** засчитывается (он сделан по размаху бара),
+    стережёт `test_a_run_with_another_minute_order_is_not_credited_to_the_set`.
+    """
+    from ui.models import MinutePriceOrder
+
+    marks = snapshot_marks(
+        runs.snapshot_of(Settings(minute_order=MinutePriceOrder.ADVERSE_FIRST))
+    )
+    assert marks.get("Порядок цен внутри минуты") == (
+        MinutePriceOrder.ADVERSE_FIRST.label
+    ), marks
+
+
+def test_a_run_with_another_minute_order_is_not_credited_to_the_set(tmp_path) -> None:
+    """Стережёт: прогон при другом порядке цен минутки — не прогон этого набора.
+
+    С З9 Ф5 прогон окна идёт по минуткам, и скользящий уровень внутри бара
+    от порядка зависит: при одном порядке вершина подтянула уровень раньше
+    провала, при другом — нет. Засчитать шаблону прогон с чужим порядком
+    значит приписать ему чужие деньги. Прогон без строки порядка (записан
+    до минуток, по размаху бара) тоже не его.
+
+    Мутация, обязанная ронять проверку: вернуть `minute_order`
+    в `_UNCONTROLLED_TITLES`.
+    """
+    from ui.models import MinutePriceOrder
+
+    database = tmp_path / "candles.sqlite3"
+    values = Settings(minute_order=MinutePriceOrder.NEAR_FIRST)
+    other = values.replace(minute_order=MinutePriceOrder.ADVERSE_FIRST)
+    with CandleStore(database) as store:
+        for made in (values, other):
+            store.open_journal_session(SessionRecord(
+                origin=RunOrigin.BACKTEST,
+                symbol=convert.instrument_of(values.instrument),
+                timeframe=values.timeframe, strategy="EMA-разворот",
+                settings=runs.snapshot_of(made), note="прогон прерван",
+            ))
+    found = runs.matching_runs(database, [values, other])
+    assert [len(one) for one in found.runs] == [1, 1], (
+        "прогон при другом порядке цен минутки засчитан набору, хотя сделки "
+        f"у них разные: {[len(one) for one in found.runs]} {found.trouble!r}"
+    )
+
+
+#: Выход по концу окна с предельной ценой (З8): набор и его сосед, отличающийся
+#: ровно одним полем. Шаг цены стоит в обоих — предел без шага не собрать.
+_TIME_EXIT_PAIRS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
+    "time_exit_order": (
+        {"time_exit_order": TimeExitKind.LIMIT}, {"time_exit_order": TimeExitKind.MARKET},
+    ),
+    "time_exit_limit_steps": (
+        {"time_exit_limit_steps": 10}, {"time_exit_limit_steps": 3},
+    ),
+    "time_exit_wait_bars": ({"time_exit_wait_bars": 1}, {"time_exit_wait_bars": 2}),
+    "price_step": ({"price_step": 25.0}, {"price_step": 10.0}),
+}
+
+
+@pytest.mark.parametrize("field", list(_TIME_EXIT_PAIRS))
+def test_a_run_with_another_time_exit_is_not_credited_to_the_set(
+    tmp_path, field: str
+) -> None:
+    """Стережёт: прогон с другой формой, отступом, ожиданием или шагом — не этого набора.
+
+    Все четыре меняют сделки: форма — рынок или предел, отступ и шаг —
+    сам предел, ожидание — когда робот встанет. Засчитать шаблону прогон
+    с чужим числом — приписать ему чужие деньги.
+
+    Мутация, обязанная ронять проверку: внести любое из четырёх полей
+    в `_UNCONTROLLED_TITLES`.
+    """
+    database = tmp_path / "candles.sqlite3"
+    base = Settings(time_exit_order=TimeExitKind.LIMIT, price_step=25.0)
+    mine, theirs = _TIME_EXIT_PAIRS[field]
+    values, other = base.replace(**mine), base.replace(**theirs)
+    with CandleStore(database) as store:
+        for made in (values, other):
+            store.open_journal_session(SessionRecord(
+                origin=RunOrigin.BACKTEST,
+                symbol=convert.instrument_of(values.instrument),
+                timeframe=values.timeframe, strategy="EMA-разворот",
+                settings=runs.snapshot_of(made), note="прогон прерван",
+            ))
+    found = runs.matching_runs(database, [values, other])
+    assert [len(one) for one in found.runs] == [1, 1], (
+        f"прогон с другим «{field}» засчитан набору, хотя сделки у них разные: "
+        f"{[len(one) for one in found.runs]} {found.trouble!r}"
+    )
+
+
+def test_the_run_snapshot_names_the_minute_bar_limit() -> None:
+    """Стережёт: порог «наибольшая свеча для проверки по минуткам» записан в снимок.
+
+    Подписью окна и значением окна: два прогона при разном пороге на одной
+    свече дают разные сделки (`B-058`) и по записи обязаны различаться.
+    """
+    from ui.models import MinuteBarLimit
+
+    marks = snapshot_marks(
+        runs.snapshot_of(Settings(minute_bar_limit=MinuteBarLimit.FIFTEEN))
+    )
+    assert marks.get("Наибольшая свеча для проверки по минуткам") == "15 минут", marks
+
+
+def test_a_run_with_another_minute_bar_limit_is_not_credited_to_the_set(
+    tmp_path,
+) -> None:
+    """Стережёт: прогон при другом пороге минуток — не прогон этого набора.
+
+    Выше порога скользящий уровень в прогоне двигается только на закрытии
+    свечи, ниже — по минуткам; сделки разные. Засчитать шаблону прогон
+    с чужим порогом — приписать ему чужие деньги.
+
+    Мутация, обязанная ронять проверку: внести `minute_bar_limit`
+    в `_UNCONTROLLED_TITLES`.
+    """
+    from ui.models import MinuteBarLimit
+
+    database = tmp_path / "candles.sqlite3"
+    values = Settings(minute_bar_limit=MinuteBarLimit.FIVE)
+    other = values.replace(minute_bar_limit=MinuteBarLimit.FIFTEEN)
+    with CandleStore(database) as store:
+        for made in (values, other):
+            store.open_journal_session(SessionRecord(
+                origin=RunOrigin.BACKTEST,
+                symbol=convert.instrument_of(values.instrument),
+                timeframe=values.timeframe, strategy="EMA-разворот",
+                settings=runs.snapshot_of(made), note="прогон прерван",
+            ))
+    found = runs.matching_runs(database, [values, other])
+    assert [len(one) for one in found.runs] == [1, 1], (
+        "прогон при другом пороге минуток засчитан набору, хотя сделки "
+        f"у них разные: {[len(one) for one in found.runs]} {found.trouble!r}"
+    )

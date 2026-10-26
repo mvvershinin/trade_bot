@@ -10,7 +10,7 @@
 2. **Сети в окне нет.** Сетевой вызов в слоте замораживает интерфейс, и обрыв
    связи выглядит как зависшая программа (ARCHITECTURE.md §5).
 3. **График изолирован.** Имя библиотеки отрисовки не встречается за пределами
-   `ui/chart/`, иначе запасной вариант по ТЗ §6 перестаёт быть заменой одного
+   `ui/chart/`, иначе замена отрисовки по ТЗ §6 перестаёт быть заменой одного
    блока (ARCHITECTURE.md §4).
 
 Проверка статическая: она ловит время, когда правило нарушено, а не когда
@@ -38,10 +38,8 @@ SOURCES = sorted(path for path in UI.rglob("*.py") if "__pycache__" not in path.
 # проходил молча все эти дни. Что список состоит из имён, а не из переводов,
 # стережёт `test_the_forbidden_lists_name_modules_not_russian_words`.
 #
-# Чего здесь намеренно нет: `QtWebEngine` — им нарисован график, и его место
-# ограничено каталогом `ui/chart/` отдельной проверкой (`RENDERERS` ниже);
-# `select`/`selectors` — блокируют поток, но сами по себе не сеть, и в окне
-# ловятся проверкой на ожидание.
+# Чего здесь намеренно нет: `select`/`selectors` — блокируют поток, но сами
+# по себе не сеть, и в окне ловятся проверкой на ожидание.
 NETWORK = {
     # клиенты HTTP: свои и чужие
     "requests", "httpx", "aiohttp", "urllib", "urllib3", "http",
@@ -61,6 +59,14 @@ NETWORK = {
 CALCULATION = {"pandas", "numpy", "scipy", "statistics", "ta", "talib"}
 
 # Имена библиотек отрисовки. Живут только в `ui/chart/`.
+#
+# ⚠️ С 09.09.2026 ни одного из них в дереве нет: веб-график удалён (решение
+# 0056), а отрисовка на Qt не библиотека — она рисует `QPainter`'ом, который
+# и так везде. Список от этого не устарел, а сменил роль: он **запрещает
+# будущее**, а не описывает настоящее. Первый же `import pyqtgraph` в окне
+# настроек или в журнале обязан упасть здесь, а не выясниться через месяц.
+# Проверка на то, что список ещё что-то ловит, стоит отдельно и работает
+# на подсунутом файле, а не на дереве: `test_isolation_check_is_not_blind`.
 RENDERERS = ("QtWebEngine", "pyqtgraph", "LightweightCharts", "lightweight-charts", "QtCharts")
 
 
@@ -218,18 +224,30 @@ def test_ui_does_not_sleep(parsed) -> None:
     assert not guilty, "ожидание в потоке интерфейса подвешивает окно: " + ", ".join(guilty)
 
 
-def test_chart_library_is_named_only_inside_ui_chart(parsed) -> None:
-    """Замена отрисовщика обязана стоить один блок, а не всю программу."""
+def _named_renderers(sources: list[tuple[pathlib.Path, ast.AST, str]]) -> list[str]:
+    """Файлы вне `ui/chart/`, в которых названа библиотека отрисовки.
+
+    Вынесено функцией, чтобы канарейка ниже била **в этот же разбор**,
+    а не в свою копию: проверка и её проверка, разойдясь, обе останутся
+    зелёными, и узнать об этом будет не по чему.
+    """
     guilty = []
-    for path, _, text in parsed:
+    for path, _, text in sources:
         if path.parent.name == "chart":
             continue
         found = [name for name in RENDERERS if name in text]
         if found:
-            guilty.append(f"{path.relative_to(UI.parent)}: {found}")
+            guilty.append(f"{path}: {found}")
+    return guilty
+
+
+def test_chart_library_is_named_only_inside_ui_chart(parsed) -> None:
+    """Замена отрисовщика обязана стоить один блок, а не всю программу."""
+    named = [(path.relative_to(UI.parent), tree, text) for path, tree, text in parsed]
+    guilty = _named_renderers(named)
     assert not guilty, (
-        "имя библиотеки отрисовки вышло за пределы ui/chart/ — запасной вариант "
-        "по ТЗ §6 перестал быть заменой одного блока:\n  " + "\n  ".join(guilty)
+        "имя библиотеки отрисовки вышло за пределы ui/chart/ — замена отрисовки "
+        "по ТЗ §6 перестала быть заменой одного блока:\n  " + "\n  ".join(guilty)
     )
 
 
@@ -238,14 +256,27 @@ def test_isolation_check_is_not_blind() -> None:
 
     Без неё опечатка в списке имён превратила бы предыдущий тест в вечно
     зелёный — ровно тот случай, когда предохранитель есть, а защиты нет.
+
+    ⚠️ Проверяется на **подсунутом** файле, а не на дереве. До 09.09.2026
+    канарейка искала имя отрисовщика внутри `ui/chart/` и зеленела оттого,
+    что там лежал веб-график. Веб-график удалён (решение 0056), чужих
+    библиотек отрисовки в дереве не осталось ни одной — и канарейка в прежнем
+    виде упала бы, хотя запрет исправен. Она проверяла наличие нарушителя,
+    а должна была проверять зоркость проверки.
     """
-    chart_sources = [path for path in SOURCES if path.parent.name == "chart"]
-    assert chart_sources, "каталог ui/chart/ пуст"
-    joined = "\n".join(path.read_text(encoding="utf-8") for path in chart_sources)
-    assert any(name in joined for name in RENDERERS), (
-        "внутри ui/chart/ не найдено ни одного имени отрисовщика — список RENDERERS "
-        "устарел, и проверка изоляции ничего не проверяет"
+    caught = _named_renderers(_planted("import pyqtgraph as pg\n"))
+    assert caught, (
+        "подсунутый в ui/ импорт отрисовщика прошёл мимо проверки изоляции: "
+        "список RENDERERS или сам разбор перестали работать"
     )
+
+    inside = [(pathlib.Path("ui/chart/planted_probe.py"), ast.parse(""), "import pyqtgraph\n")]
+    assert not _named_renderers(inside), (
+        "проверка ловит имя отрисовщика внутри ui/chart/ — там ему и место"
+    )
+
+    clean = _named_renderers(_planted("from PySide6.QtWidgets import QLabel\n"))
+    assert not clean, "проверка изоляции ловит обычный виджет окна"
 
 
 def test_every_code_directory_in_ui_is_a_package() -> None:
@@ -261,13 +292,28 @@ def test_every_code_directory_in_ui_is_a_package() -> None:
 
 
 def test_chart_factory_reports_why_it_chose_what_it_chose() -> None:
-    """Переход на запасной отрисовщик обязан быть видимым, а не молчаливым."""
+    """Выбор отрисовщика обязан быть видимым, а не молчаливым.
+
+    ⚠️ Отрисовщик с 09.09.2026 один (решение 0056), и «>= 2» здесь стояло
+    ровно до этого дня. Проверка осталась не ради счёта, а ради двух вещей,
+    которые от числа не зависят: у отрисовщика есть **человеческое имя**
+    (оно уезжает в подпись окна, в «О программе» и в журнал при старте —
+    с него начинается разбор жалобы «график пустой»), и отказ, если он
+    случился, назван **словами**, а не пустой строкой.
+    """
     from ui.chart import available_surfaces
 
     surfaces = available_surfaces()
-    assert len(surfaces) >= 2, "запасного варианта отрисовки нет"
+    assert surfaces, "фабрика не знает ни одного отрисовщика — графика не будет вовсе"
+    assert any(ok for _, ok, _ in surfaces), (
+        "ни один отрисовщик не доступен: окно откроется без графика"
+    )
     for name, ok, reason in surfaces:
         assert name, "у отрисовщика нет человеческого имени"
+        assert name != "неизвестный отрисовщик", (
+            "отрисовщик не назвал себя — в журнале и в окне будет умолчание "
+            "из ChartSurface.name"
+        )
         if not ok:
             assert len(reason) > 20, f"отказ {name} без внятной причины: {reason!r}"
 

@@ -21,10 +21,18 @@
 1. **Рыночная заявка, поданная на закрытии свечи, исполняется по `open`
    следующей свечи**; временем сделки записывается **начало** свечи исполнения
    (PROTOTYPE.md §2).
-2. **Сторожимый уровень проверяется внутри бара** — по `high` для лонга и `low`
-   для шорта, достижение считается по касанию. Это **единственное событие
-   прототипа, происходящее не на закрытии свечи** (PROTOTYPE.md §5); без него
-   сделки разойдутся по причине, не связанной с торговой логикой.
+2. **Сторожимый уровень проверяется внутри бара**, достижение считается
+   по касанию. Поданы минутки (`use_minutes`) — касание ищется по отрезкам
+   между точками минуток под баром, и между отрезками движку отдаётся
+   наблюдение цены (`fills_at`, решение 0059 §3); иначе — по размаху бара.
+   По какому экстремуму — сказано **в заявке**
+   (`OrderRequest.touch`), а не выведено здесь: `RISE` это `high >= уровень`,
+   `FALL` — `low <= уровень`. Это **единственное событие прототипа,
+   происходящее не на закрытии свечи** (PROTOTYPE.md §5); без него сделки
+   разойдутся по причине, не связанной с торговой логикой.
+   ⚠️ До 10.09.2026 здесь стояло «по `high` для лонга и `low` для шорта» —
+   вывод из стороны позиции. Для неподвижного тейка он верен, для
+   скользящего неверен: тот стоит позади рынка (`B-046`).
 3. **Заявка не участвует в свече, интервал которой начался раньше момента
    её подачи.** Один интервал показывается исполнителю несколько раз — круг
    обмена внутри свечи, повтор после переподключения, незакрытый бар на каждом
@@ -40,6 +48,21 @@
    из «за один вызов отдаётся всё накопленное», и относится оно к обеим
    реализациям. Читать его только здесь нельзя — боевой адаптер пишут
    по тексту порта.
+5. **Заявка на выход с предельной ценой** (`OrderRequest.limit_price`,
+   выход по времени при `TimeExitOrder.LIMIT`) — не рыночная, и по `open`
+   как рыночная не исполняется. На открытии каждой свечи, пока заявка ждёт:
+   `open` не хуже предела (продажа — `open >= предел`, покупка — `open <=
+   предел`, равенство — «не хуже») → сделка по `open`, проскальзывание
+   не выносит цену за предел. Иначе — следующим кругом, наравне со сторожем
+   уровня и тем же путём (`_fire`: размах бара либо отрезки минуток), касание
+   предела → сделка ровно по пределу; не задет — заявка ждёт следующей свечи.
+   Разрыв между минутками внутри свечи — сделка **по пределу**: в непрерывных
+   торгах стоящая заявка исполнилась бы раньше, чем цена её перепрыгнула.
+   Разрыв между свечами, пока заявка ждёт, — сделка **по `open`**: так
+   правильно после перерыва торгов (аукцион), а в непрерывных торгах это
+   ошибка **в нашу пользу**, и потому такие исполнения считаются отдельно
+   (`LimitExits.at_later_open`). Прототипом лимитные заявки
+   не воспроизводились: сверка с ним на этой форме не обещается.
 
 Уровень **движущийся**, а не только неподвижный
 ------------------------------------------------
@@ -57,7 +80,10 @@
   свечи, — и потому сторожится уже на ней самой.
 
 Ни одной проверки «скользящий это или нет» здесь нет и быть не должно: модель
-исполнения знает про уровень ровно то, что ей назвал движок.
+исполнения знает про уровень ровно то, что ей назвал движок. Сторона касания —
+часть названного (пункт 2 выше), а не признак «это трейлинг»: движок объявляет,
+**с какой стороны** до уровня доходят, и модель исполнения по-прежнему не знает,
+неподвижный уровень перед ней или едущий.
 
 Издержки: комиссия и проскальзывание
 -------------------------------------
@@ -84,19 +110,24 @@
 
 from __future__ import annotations
 
+import bisect
+import enum
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from engine import (
     ExecutionRefused,
     Fill,
+    LevelTouch,
     MarketCandle,
     OrderAction,
     OrderRequest,
+    PriceSeen,
     Refusal,
     Side,
+    close_time,
 )
 
 __all__ = [
@@ -104,9 +135,14 @@ __all__ = [
     "Costs",
     "ExecutionModel",
     "Guard",
+    "LevelGaps",
+    "LimitExits",
+    "MinuteOrder",
+    "Minutes",
     "OpenLeg",
     "Tariff",
     "commissions_disagree",
+    "minute_points",
     "selling",
 ]
 
@@ -416,6 +452,182 @@ class Guard:
         return leg is not None and self.leg is leg
 
 
+@dataclass(slots=True)
+class LevelGaps:
+    """Сколько уровней сработало **на разрыве** — раздельно по стороне касания.
+
+    Разрыв через уровень — это свеча, открывшаяся уже за ним: на прошлом баре
+    цена была по эту сторону, а торги начались по ту. Модель исполнения
+    записывает такую сделку **ровно по уровню** — так считал прототип, — и это
+    не бесплатно. Ошибка есть, у неё есть знак, и знак **противоположен**
+    по сторонам касания:
+
+    * `RISE` — уровень впереди рынка (неподвижный тейк). Рынок открылся
+      за целью, запись по уровню **занижает** прибыль: ошибка в пользу
+      осторожности;
+    * `FALL` — уровень позади рынка (скользящий стоп лонга). Рынок открылся
+      за стопом, запись по уровню **завышает** результат: это подаренные
+      деньги, того же сорта, что дефект `B-046`.
+
+    Поэтому счётчик раздельный. Один общий сложил бы два разных знака в одно
+    число и спрятал вторую половину — ту, которая врёт в нашу пользу.
+
+    `fall_points` — сумма `(уровень − открытие) × объём` по срабатываниям
+    `FALL`. В деньги её переводит тот, кто знает цену пункта
+    (`HistoryExecutor.fall_gap_rubles`): базовая модель курса пункта не знает.
+
+    ⚠️ Знак `fall_points` читается как «приписано себе» только для стопа
+    лонга — того случая, ради которого счётчик и заведён. У неподвижного тейка
+    **шорта** касание тоже `FALL`, и там та же разница означает обратное:
+    выход ниже уровня для шорта выгоднее. Число сырое, толкует его человек.
+    """
+
+    #: Срабатываний на разрыве вверх — уровень был впереди рынка.
+    rise: int = 0
+    #: Срабатываний на разрыве вниз — уровень был позади рынка.
+    fall: int = 0
+    #: `(уровень − открытие) × объём`, накопленное по срабатываниям `FALL`.
+    fall_points: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class LimitExits:
+    """Судьба заявок на выход с предельной ценой за прогон (правило 5 шапки).
+
+    Четыре исхода и ни одного общего числа: «исполнилась» по открытию первой
+    свечи, по открытию более поздней свечи и по касанию предела — три разные
+    цены, а неисполненная заявка останавливает робота. Сумма исходов равна
+    `submitted`; неисполненные дописывает прогон (`backtest.history.replay`)
+    — это заявки, оставшиеся в ожидании, когда ряд кончился или робот встал.
+    """
+
+    #: Подано заявок на выход с предельной ценой.
+    submitted: int = 0
+    #: Исполнено по `open` первой свечи после подачи.
+    at_open: int = 0
+    #: Исполнено по `open` более поздней свечи — разрыв через предел, пока
+    #: заявка ждала. Ошибка модели в нашу пользу (правило 5 шапки).
+    at_later_open: int = 0
+    #: Исполнено ровно по пределу — касание внутри свечи.
+    at_touch: int = 0
+    #: Не исполнено к концу прогона.
+    unfilled: int = 0
+
+    def __add__(self, other: LimitExits) -> LimitExits:
+        """Сумма по кускам склейки: потерянный здесь счёт — молчание (правило 13)."""
+        return LimitExits(
+            submitted=self.submitted + other.submitted,
+            at_open=self.at_open + other.at_open,
+            at_later_open=self.at_later_open + other.at_later_open,
+            at_touch=self.at_touch + other.at_touch,
+            unfilled=self.unfilled + other.unfilled,
+        )
+
+
+class MinuteOrder(enum.Enum):
+    """В каком порядке цены минутки считаются пройденными — **допущение прогона**.
+
+    Минутка хранит четыре цены и не хранит, в каком порядке они случились.
+    Для неподвижного тейка это безразлично, для скользящего уровня — нет:
+    вершина, пройденная до провала, сдвигает уровень, и провал его задевает;
+    после провала — не задевает. Порядок не следует из данных, поэтому он
+    назван вслух и меняется в настройках прогона, а не зашит в обход.
+
+    ⚠️ Это **не** настройка движка (`EngineSettings`): минутки есть только
+    у истории, в бою цены идут тиками в настоящем порядке.
+
+    * `NEAR_FIRST` — открытие → ближний к открытию экстремум → дальний →
+      закрытие; при равном удалении первым идёт неблагоприятный для позиции.
+      Временное значение (вопрос заказчику в `OPEN-QUESTIONS.md`);
+    * `ADVERSE_FIRST` — открытие → неблагоприятный для позиции экстремум →
+      благоприятный → закрытие. Самое осторожное прочтение минутки.
+    """
+
+    NEAR_FIRST = "near_first"
+    ADVERSE_FIRST = "adverse_first"
+
+
+@dataclass(frozen=True, slots=True)
+class Minutes:
+    """Минутки под пятиминутками прогона и порядок обхода их цен.
+
+    Отдаются **только исполнителю** (`ExecutionModel.use_minutes`): источник
+    свечей и движок их не видят (решение 0059 §3). Порядок входа значения
+    не имеет — исполнитель сортирует по времени сам.
+    """
+
+    candles: Sequence[MarketCandle]
+    order: MinuteOrder = MinuteOrder.NEAR_FIRST
+
+
+@dataclass(frozen=True, slots=True)
+class CoarseBar:
+    """Скользящий уровень включён, а минутки прогону не поданы: свеча крупнее порога.
+
+    B-058: на крупной свече исполнитель отдаёт движку наблюдение на каждую
+    точку минуток, и прогон упирается в предел кругов одного бара. Порог —
+    из настроек окна; что свеча его превысила, решает `app/minutes.py`.
+    Здесь — только факт для допущения прогона: уровень на такой свече
+    двигается лишь на её закрытии, и отчёт обязан сказать это вслух.
+    """
+
+    bar_minutes: int
+    limit_minutes: int
+
+
+def minute_points(
+    minute: MarketCandle, order: MinuteOrder, side: Side
+) -> tuple[float, ...]:
+    """Цены минутки в порядке обхода. Подряд равные схлопываются в одну точку.
+
+    Плоская минутка — одна точка. Сторона позиции нужна, чтобы назвать
+    неблагоприятный экстремум: для лонга это минимум, для шорта — максимум.
+    """
+    adverse, favourable = (
+        (minute.low, minute.high) if side is Side.LONG else (minute.high, minute.low)
+    )
+    first, second = adverse, favourable
+    if order is MinuteOrder.NEAR_FIRST:
+        up = minute.high - minute.open
+        down = minute.open - minute.low
+        if up < down:
+            first, second = minute.high, minute.low
+        elif down < up:
+            first, second = minute.low, minute.high
+    points: list[float] = []
+    for price in (minute.open, first, second, minute.close):
+        if not points or points[-1] != price:
+            points.append(price)
+    return tuple(points)
+
+
+@dataclass(frozen=True, slots=True)
+class _Step:
+    """Один шаг обхода: отрезок от прошлой точки до этой и минутка, где он лежит.
+
+    `start` у первой точки бара — она сама: переход от прошлого бара к открытию
+    этого — разрыв, и судит о нём `_reachable` по закрытию прошлого бара,
+    а не касание. `previous` — цена до отрезка для сторожа `_reachable`.
+    """
+
+    minute: MarketCandle
+    start: float
+    end: float
+    previous: float | None
+
+
+@dataclass(slots=True)
+class _Walk:
+    """Обход точек минуток под одной пятиминуткой и курсор в нём."""
+
+    bar: datetime
+    steps: tuple[_Step, ...]
+    at: int = 0
+    #: Под баром минуток нет — он сторожится по размаху. Запомнен, чтобы
+    #: следующие круги обмена того же бара не считали его заново.
+    bare: bool = False
+
+
 class ExecutionModel:
     """Исполнитель заявок для прогона по истории. Правила — в шапке модуля.
 
@@ -467,7 +679,68 @@ class ExecutionModel:
         #: но факт записывает: молча проглотить его значило бы спрятать самую
         #: дорогую ошибку контракта.
         self.orphans: list[Fill] = []
+        #: Срабатывания на разрыве через уровень — раздельно по стороне
+        #: касания (`LevelGaps`). Это не статистика ради статистики: запись
+        #: сделки по уровню, которого в свече не было, — единственный законный
+        #: случай, когда сторож `_reachable` молчит, и число таких случаев
+        #: обязано быть видно.
+        self.gaps = LevelGaps()
+        #: Исходы заявок на выход с предельной ценой (`LimitExits`).
+        self.limits = LimitExits()
+        #: Заявки с пределом, чьё первое открытие уже было хуже предела:
+        #: исполнение по `open` для них — разрыв через предел, а не первая свеча.
+        self._limit_waited: set[str] = set()
         self._open: OpenLeg | None = None
+        #: Закрытие **предыдущего** интервала и время текущего. Вход сторожа
+        #: `_reachable`, взятый ВНЕ условия срабатывания: проверка, собранная
+        #: из тех же величин, что и проверяемое правило, зеленеет вместе с ним.
+        #: Разбор этой ошибки — в миниплане `B-046`, раздел 7.
+        self._previous_close: float | None = None
+        self._current: tuple[datetime, float] | None = None
+        #: Начала незакрытых свечей, показанных после последнего закрытого
+        #: интервала (решение 0065), и признак «прошлый интервал показан только
+        #: незакрытым»: тогда закрытие прошлого бара неизвестно, и сторож
+        #: разрыва судить не может (`_gapped`). Набор, а не одно последнее
+        #: время: незакрытая T+1, показанная до закрытой T+1, затёрла бы
+        #: память о незакрытой T, чья закрытая так и не пришла (`_remember`).
+        self._partials: set[datetime] = set()
+        self._blind = False
+        #: Минутки, отсортированные по времени, и их времена для поиска
+        #: по интервалу бара. Пусто — внутрибарные события по размаху бара,
+        #: ровно как до минуток.
+        self._minutes: tuple[MarketCandle, ...] = ()
+        self._minute_times: list[datetime] = []
+        #: Минутки поданы — пусть даже пустым набором. Отдельно от «непусто»:
+        #: пустые минутки за весь отрезок — это каждый бар без минуток,
+        #: и счёт `bars_without_minutes` обязан это сказать, а не промолчать.
+        self.minutes_given = False
+        self.minute_order = MinuteOrder.NEAR_FIRST
+        self._walk: _Walk | None = None
+        #: Бары, под которыми минуток не нашлось, хотя минутки поданы. Такой
+        #: бар сторожится по своему размаху, и наблюдений цены в нём нет —
+        #: скользящий уровень внутри него не едет. Число обязано быть видно.
+        self.bars_without_minutes = 0
+
+    def use_minutes(self, minutes: Minutes) -> None:
+        """Искать внутрибарные события по минуткам, а не по размаху бара.
+
+        Подаётся до первой свечи. Минутка — свеча таймфрейма в одну минуту:
+        пятиминутка, поданная минуткой, дала бы обход по четырём ценам бара,
+        то есть тот же накопленный размах под видом отрезков.
+
+        :raises ValueError: среди минуток есть свеча другого таймфрейма.
+        """
+        for minute in minutes.candles:
+            if minute.timeframe.minutes != 1:
+                raise ValueError(
+                    f"минуткой подана свеча {minute.timeframe.minutes} мин за "
+                    f"{minute.time:%d.%m.%Y %H:%M}: обход по её ценам был бы "
+                    "обходом по размаху бара, а не по минуткам"
+                )
+        self._minutes = tuple(sorted(minutes.candles, key=lambda one: one.time))
+        self._minute_times = [one.time for one in self._minutes]
+        self.minute_order = minutes.order
+        self.minutes_given = True
 
     # -- порт ---------------------------------------------------------------
 
@@ -496,10 +769,12 @@ class ExecutionModel:
             # а не «текущей позиции, какой бы она ни была» (`Guard`).
             self.armed[order.order_id] = Guard(order=order, leg=self._open)
             return
+        if order.limit_price is not None:
+            self.limits = replace(self.limits, submitted=self.limits.submitted + 1)
         self.submitted_market.append(order)
         self.pending.append(order)
 
-    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill]:
+    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen]:
         """Сделки, случившиеся к моменту закрытия этой свечи и ещё не отданные.
 
         Порядок внутри круга однозначен: сначала исполнения по **открытию**
@@ -508,12 +783,148 @@ class ExecutionModel:
         раньше, чем движок успел его назвать. Требование записано в контракте
         порта (`engine/ports.py`), а не изобретено здесь: боевой адаптер обязан
         придержать внутрибарное событие точно так же.
+
+        С минутками (`use_minutes`) внутрибарные события ищутся обходом точек
+        минуток под этим баром (`_walked`); без них — по размаху бара, как
+        до минуток. Выбор — по наличию минуток **под этим баром**, а не по
+        тому, что вернул обход: исчерпанный обход, свалившийся в размах бара,
+        проверил бы сдвинутый уровень по накопленному размаху.
+
+        **Незакрытая свеча** (`unsettled`, решение 0065) — только исполнения
+        по открытию: её `open` уже известен и закрытым баром не изменится.
+        Ни закрытие прошлого интервала (`_remember`), ни обход минуток, ни
+        сторожа уровней по ней не трогаются: размах огрызка неполон, а время
+        закрытия лежит в будущем. Всё это делает закрытая свеча того же
+        интервала, и сделки выходят те же, что без незакрытых показов
+        (`tests/test_forming_bar_equivalence.py`).
         """
+        if getattr(candle, "unsettled", False):
+            self._partials.add(candle.time)
+            opened = self._market_fills(candle)
+            self.fills.extend(opened)
+            return opened
+        self._remember(candle)
         fills = self._market_fills(candle)
         if not fills:
+            walk = self._walk_of(candle)
+            if walk is not None:
+                return self._walked(walk, candle)
             fills = self._level_fills(candle)
         self.fills.extend(fills)
         return fills
+
+    def _walk_of(self, candle: MarketCandle) -> _Walk | None:
+        """Обход этого бара — начатый или новый. `None` — бар идёт по размаху.
+
+        Минутки берутся **строго из интервала бара** — от начала до закрытия,
+        не включая закрытие. Минутка соседнего бара в обходе дала бы
+        наблюдения цен, которых в этом баре не было, и лишние круги обмена.
+
+        Бар старше начатого обхода (повтор после переподключения) — пустой
+        обход: его цены уже пройдены.
+        """
+        if not self.minutes_given:
+            return None
+        walk = self._walk
+        if walk is not None and candle.time <= walk.bar:
+            if candle.time < walk.bar:
+                return _Walk(candle.time, ())
+            return None if walk.bare else walk
+        first = bisect.bisect_left(self._minute_times, candle.time)
+        last = bisect.bisect_left(self._minute_times, close_time(candle))
+        if first == last:
+            self.bars_without_minutes += 1
+            self._walk = _Walk(candle.time, (), bare=True)
+            return None
+        side = Side.LONG if self._open is None else self._open.side
+        steps: list[_Step] = []
+        previous = self._previous_close
+        start: float | None = None
+        for minute in self._minutes[first:last]:
+            for price in minute_points(minute, self.minute_order, side):
+                steps.append(_Step(
+                    minute=minute,
+                    start=price if start is None else start,
+                    end=price,
+                    previous=previous if start is None else start,
+                ))
+                start = price
+        self._walk = _Walk(candle.time, tuple(steps))
+        return self._walk
+
+    def _walked(self, walk: _Walk, candle: MarketCandle) -> list[Fill | PriceSeen]:
+        """Следующее внутрибарное событие обхода: сделки по уровню или наблюдение.
+
+        Шаг обхода — отрезок между соседними точками. Сначала сторожа
+        проверяются по отрезку; задет хоть один — ответ из сделок, и курсор
+        за этой точкой. Не задет, а нога открыта — ответ из **одного**
+        наблюдения цены этой точки (контракт порта): движок пересчитает
+        уровень и подаст вооружение раньше, чем следующий отрезок будет
+        проверен. Наблюдение шлётся при любой открытой ноге, в том числе
+        до вооружения уровня: фильтрует движок, а не исполнитель.
+
+        Наблюдение в `fills` не попадает — это не сделка. Обход кончился —
+        пустой ответ, и обмен по этому бару закончен.
+        """
+        while walk.at < len(walk.steps):
+            step = walk.steps[walk.at]
+            walk.at += 1
+            fills = self._fire(
+                candle,
+                span=step.minute,
+                reach=(min(step.start, step.end), max(step.start, step.end)),
+                ready_at=step.minute.time,
+                previous=step.previous,
+            )
+            if fills:
+                self.fills.extend(fills)
+                return list(fills)
+            if self._open is not None:
+                return [PriceSeen(at=step.minute.time, price=step.end)]
+        return []
+
+    def _remember(self, candle: MarketCandle) -> None:
+        """Запомнить закрытие предыдущего интервала. Вход сторожа `_reachable`.
+
+        ⚠️ **Предыдущий интервал, а не предыдущий вызов.** Один и тот же
+        интервал показывается исполнителю несколько раз — круг обмена внутри
+        свечи, повтор после переподключения, незакрытый бар на каждом тике
+        потока (контракт порта), — и «прошлым баром» ни один из повторов
+        не становится. Отсюда сравнение по времени начала свечи, а не счётчик
+        вызовов: со счётчиком второй круг той же свечи объявил бы её саму
+        своим прошлым баром, и сторож судил бы о разрыве по цене, которой
+        на прошлом баре не было.
+
+        Свеча из прошлого (источник отдал ряд не по порядку) прошлым баром
+        тоже не становится — она уже позади.
+
+        ⚠️ **Прошлый интервал показан только незакрытым** (решение 0065):
+        живой ход исполнил заявку по открытию частичной T, а закрытая T так
+        и не пришла — порт выбросил её как неполную (`HistoryPort._trusted`).
+        Закрытие T неизвестно, а закрытие T-1 прошлым не является: уровень
+        от `T.open` им не судится. Прошлое тогда пусто, и сторож разрыва
+        считает уровень вне размаха разрывом, а не дефектом (`_blind`).
+
+        Признак — «между прошлым закрытым интервалом и этим показан хоть один
+        незакрытый», а не «последний показ раньше этого». Конец T порт
+        замечает на первой минуте T+1 и тем же проходом показывает T+1
+        незакрытой: по последнему показу закрытая T+1 судилась бы
+        по закрытию T-1. Показы до этого интервала включительно здесь же
+        и забываются: дальше они ничего не решают.
+        """
+        now = candle.close
+        if self._current is None or candle.time > self._current[0]:
+            after = None if self._current is None else self._current[0]
+            self._blind = any(
+                (after is None or after < shown) and shown < candle.time
+                for shown in self._partials
+            )
+            self._partials = {shown for shown in self._partials if shown > candle.time}
+            known = None if self._current is None else self._current[1]
+            self._previous_close = None if self._blind else known
+        elif candle.time < self._current[0]:
+            return
+        self._current = (candle.time, now)
 
     # -- правила исполнения -------------------------------------------------
 
@@ -528,6 +939,13 @@ class ExecutionModel:
         for order in self.pending:
             if not self._ready(order, candle):
                 waiting.append(order)
+                continue
+            if order.limit_price is not None:
+                limit_fill = self._limit_at_open(order, candle)
+                if limit_fill is None:
+                    waiting.append(order)
+                else:
+                    fills.append(limit_fill)
                 continue
             at = candle.time
             price = self.costs.fill_price(candle.open, order.action, order.side)
@@ -557,30 +975,79 @@ class ExecutionModel:
     def _level_fills(self, candle: MarketCandle) -> list[Fill]:
         """Сторожимые уровни внутри бара.
 
-        Достижение считается **по касанию**: `high >= уровень` для лонга,
-        `low <= уровень` для шорта. ⚠️ Касание против пересечения эталонным
-        датасетом не проверяется — свечи, у которой экстремум ровно равен
-        уровню, на отрезке нет ни одной, и строгое неравенство даёт те же
-        127 сделок. Выбрано по смыслу стоп-заявки, а не по данным.
+        Достижение считается **по касанию**, и сторона касания приходит
+        в заявке (`OrderRequest.touch`), а не выводится здесь из стороны
+        позиции:
+
+        * `RISE` — `high >= уровень`: цена доросла до уровня снизу;
+        * `FALL` — `low <= уровень`: цена откатилась до уровня сверху.
+
+        ⚠️ **До 10.09.2026 сторона выводилась здесь, из стороны позиции**,
+        и для неподвижного тейка догадка была верна. Для скользящего — нет:
+        он стоит позади рынка, и условие «дотянулись снизу» для уровня ниже
+        рынка истинно всегда. Замер 17.06–04.09.2026: 28 вооружений,
+        0 подтяжек, жизнь уровня 0 свечей у всех 28 (`B-046`). Правило
+        «модель исполнения знает про уровень ровно то, что ей назвал движок»
+        осталось прежним — просто движок теперь называет его целиком.
+
+        ⚠️ Касание против пересечения эталонным датасетом не проверяется —
+        свечи, у которой экстремум ровно равен уровню, на отрезке нет ни одной,
+        и строгое неравенство даёт те же 127 сделок. Выбрано по смыслу
+        стоп-заявки, а не по данным.
 
         Цена срабатывания — сам уровень; цена сделки — уровень, сдвинутый
         проскальзыванием. При нулевом проскальзывании это одно и то же число,
         и ровно так считал прототип: «исполнение ровно по уровню».
         """
+        return self._fire(
+            candle,
+            span=candle,
+            reach=(candle.low, candle.high),
+            ready_at=candle.time,
+            previous=self._previous_close,
+        )
+
+    def _fire(
+        self,
+        candle: MarketCandle,
+        *,
+        span: MarketCandle,
+        reach: tuple[float, float],
+        ready_at: datetime,
+        previous: float | None,
+    ) -> list[Fill]:
+        """Сторожа, задетые в размахе `reach`. Общее для бара и отрезка минуток.
+
+        * `candle` — бар: его начало — время сделки (`Fill.at`), его закрытие —
+          время расчёта (`_level_hit`). Внутри бара у сделки то же время,
+          что без минуток: путь Б «стопа после тейка» берёт дату отсюда;
+        * `span` — свеча, в размахе которой обязан лежать уровень (`_reachable`):
+          бар без минуток, минутка с ними;
+        * `reach` — `(низ, верх)` проверяемых цен: размах бара либо отрезок
+          между соседними точками обхода — **не** накопленный размах минутки;
+        * `ready_at` — сторож проверяется, если подан не позже этого момента
+          (правило 3). Для бара это его начало, для отрезка — начало минутки:
+          уровень, переподанный по наблюдению внутри бара, сторожится
+          со следующего отрезка, а не со следующего бара;
+        * `previous` — цена до проверяемого участка, вход сторожа разрыва.
+        """
+        low, high = reach
         fills: list[Fill] = []
         for order_id, guard in list(self.armed.items()):
             order = guard.order
-            if not self._ready(order, candle):
+            if order.submitted_at > ready_at:
                 continue
             level = order.price
             assert level is not None, "вооружение без уровня — дефект движка"
-            hit = (
-                candle.high >= level
-                if order.side is Side.LONG
-                else candle.low <= level
+            touch = order.touch
+            assert touch is not None, (
+                "вооружение без стороны касания — дефект движка: догадываться "
+                "о ней здесь запрещено, из этой догадки вырос B-046"
             )
+            hit = high >= level if touch is LevelTouch.RISE else low <= level
             if not hit:
                 continue
+            self._reachable(order, level, touch, span, previous)
             del self.armed[order_id]
             at = candle.time
             price = self.costs.fill_price(level, OrderAction.CLOSE, order.side)
@@ -610,7 +1077,178 @@ class ExecutionModel:
             self._level_hit(order, level, candle)
             self._closed(price, at, order, order_id)
             fills.append(fill)
+        return fills + self._limit_touches(candle, span, reach, ready_at, previous)
+
+    def _limit_at_open(self, order: OrderRequest, candle: MarketCandle) -> Fill | None:
+        """Заявка с пределом на открытии свечи: сделка по `open` или `None` — ждёт.
+
+        Сделка — только если `open` не хуже предела; проскальзывание сдвигает
+        цену против позиции, но не за предел: лимитная заявка хуже своей цены
+        не исполняется. Касание внутри свечи здесь не ищется — оно идёт
+        следующим кругом (`_limit_touches`), после ответа движка.
+        """
+        limit = order.limit_price
+        assert limit is not None, "заявка без предела — путь рыночной"
+        sell = selling(order.action, order.side)
+        if not (candle.open >= limit if sell else candle.open <= limit):
+            self._limit_waited.add(order.order_id)
+            return None
+        moved = self.costs.fill_price(candle.open, order.action, order.side)
+        price = max(moved, limit) if sell else min(moved, limit)
+        if order.order_id in self._limit_waited:
+            self.limits = replace(
+                self.limits, at_later_open=self.limits.at_later_open + 1
+            )
+        else:
+            self.limits = replace(self.limits, at_open=self.limits.at_open + 1)
+        return self._limit_filled(order, price, candle)
+
+    def _limit_touches(
+        self,
+        candle: MarketCandle,
+        span: MarketCandle,
+        reach: tuple[float, float],
+        ready_at: datetime,
+        previous: float | None,
+    ) -> list[Fill]:
+        """Заявки с пределом, чей предел задет в размахе `reach`: сделка по пределу.
+
+        Тот же вход, что у сторожа уровня (`_fire`), и потому одинаково
+        с минутками и без: без минуток `reach` — размах бара, с ними — отрезок
+        обхода. Сторона касания выводится из направления сделки: продаже
+        предел достаётся снизу вверх (`RISE`), покупке — сверху вниз (`FALL`).
+        Сторож «цены, которой не было» тот же (`_gapped`), но разрыв
+        в `LevelGaps` не пишется: это счётчик уровней тейка.
+
+        Заявка, ещё не прошедшая проверку открытия этой свечи, сюда
+        не попадает: её `submitted_at` позже `ready_at` (правило 3).
+        """
+        low, high = reach
+        fills: list[Fill] = []
+        waiting: list[OrderRequest] = []
+        for order in self.pending:
+            limit = order.limit_price
+            if limit is None or order.submitted_at > ready_at:
+                waiting.append(order)
+                continue
+            sell = selling(order.action, order.side)
+            if not (high >= limit if sell else low <= limit):
+                waiting.append(order)
+                continue
+            touch = LevelTouch.RISE if sell else LevelTouch.FALL
+            self._gapped(order, limit, touch, span, previous)
+            self.limits = replace(self.limits, at_touch=self.limits.at_touch + 1)
+            fills.append(self._limit_filled(order, limit, candle))
+        self.pending = waiting
         return fills
+
+    def _limit_filled(
+        self, order: OrderRequest, price: float, candle: MarketCandle
+    ) -> Fill:
+        """Сделка по заявке с пределом: позиция закрыта, сделка для движка."""
+        self._limit_waited.discard(order.order_id)
+        self._closed(price, candle.time, order, order.order_id)
+        return Fill(
+            action=order.action, side=order.side, volume=order.volume,
+            price=price, at=candle.time, order_id=order.order_id,
+            commission=self.costs.commission(order.volume),
+        )
+
+    def _reachable(
+        self,
+        order: OrderRequest,
+        level: float,
+        touch: LevelTouch,
+        candle: MarketCandle,
+        previous: float | None,
+    ) -> None:
+        """Сторож «цена, которой не было» — плюс счётчик разрывов.
+
+        `candle` — свеча, в размахе которой обязан лежать уровень: бар,
+        а при обходе минуток — минутка. `previous` — цена перед ней: закрытие
+        прошлого бара либо прошлая точка обхода. Разрыв между минутками
+        внутри бара тоже разрыв и считается так же.
+
+        Правило, названное владельцем счёта: **цена сделки обязана лежать
+        внутри размаха своей свечи**. Исключение ровно одно — настоящий
+        разрыв: на предыдущем баре цена была по эту сторону уровня, а эта
+        свеча открылась уже за ним. Тогда запись по уровню законна (так
+        исполнял прототип), но она не бесплатна, и потому считается
+        (`LevelGaps`). Всё прочее — дефект модели исполнения.
+
+        ::
+
+            RISE:  разрыв ⟺ prev_close < уровень ∧ open > уровень
+            FALL:  разрыв ⟺ prev_close > уровень ∧ open < уровень
+
+        ⚠️ **Вход берётся ВНЕ условия срабатывания, и это главное свойство
+        сторожа.** Первая редакция правила («уровень внутри размаха ЛИБО свеча
+        открылась за ним по ходу касания») была тождественна условию
+        срабатывания: для `RISE` она сводится к `high >= уровень` посимвольно,
+        то есть не могла упасть никогда. Различает случаи только цена
+        на **прошлом** баре — величина, которой в условии срабатывания нет.
+        Второй конъюнкт (`open` по ту сторону) из условия срабатывания
+        следует и оставлен ради читаемости правила целиком.
+
+        ⚠️ Сторож стоит на **уровне срабатывания**, а не на цене сделки:
+        проскальзывание законно выносит цену за размах свечи.
+
+        ⚠️ Прошлого бара нет — сторож молчит: судить не о чем. Это самая
+        первая свеча, показанная исполнителю, и слепое пятно названо вслух,
+        а не закрыто догадкой.
+
+        :raises AssertionError: сделка записана по цене, которой в свече
+            не было, и разрывом это не объясняется.
+        """
+        if not self._gapped(order, level, touch, candle, previous):
+            return
+        opened = candle.open
+        if touch is LevelTouch.RISE:
+            self.gaps.rise += 1
+        else:
+            self.gaps.fall += 1
+            self.gaps.fall_points += (level - opened) * order.volume
+
+    def _gapped(
+        self,
+        order: OrderRequest,
+        level: float,
+        touch: LevelTouch,
+        candle: MarketCandle,
+        previous: float | None,
+    ) -> bool:
+        """Уровень вне размаха свечи и объяснён разрывом? Иначе — падение.
+
+        Общая часть сторожа `_reachable` для уровня тейка и предела заявки
+        на выход; что считать разрывом, решает вызывающий.
+
+        ⚠️ Прошлое пусто, потому что прошлый интервал показан только
+        незакрытым (`_blind`, решение 0065), — уровень вне размаха считается
+        разрывом без проверки: закрытие прошлого бара неизвестно, и судить
+        по закрытию позапрошлого значило бы остановить робота «ошибкой
+        исполнителя» на цене, которая была. Разрыв идёт в `LevelGaps`,
+        то есть виден в допущениях прогона, а не проглочен.
+
+        :raises AssertionError: уровень вне размаха, и разрыва не было.
+        """
+        if candle.low <= level <= candle.high:
+            return False
+        if previous is None:
+            return self._blind
+        opened = candle.open
+        gap = (
+            previous < level < opened
+            if touch is LevelTouch.RISE
+            else previous > level > opened
+        )
+        assert gap, (
+            f"сделка по цене, которой в свече не было: уровень {level} "
+            f"вне размаха [{candle.low}, {candle.high}] свечи {candle.time}, "
+            f"а разрыва не было — на прошлом баре {previous}, открытие "
+            f"{opened}. Касание {touch.value}, заявка {order.order_id}. "
+            "Это дефект модели исполнения, а не рынка"
+        )
+        return True
 
     # -- что делают наследники ----------------------------------------------
 

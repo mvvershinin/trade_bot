@@ -224,9 +224,13 @@ def test_a_losing_run_does_not_claim_a_reserve_it_does_not_have() -> None:
 # Остальные допущения
 # ---------------------------------------------------------------------------
 
-def test_the_take_caveat_appears_only_when_the_run_has_take_exits() -> None:
-    """Выходы по уровню названы отдельно: их цена — самая оптимистичная в прогоне."""
-    with_take = _run([_deal(reason=ExitReason.TAKE_PROFIT)])
+@pytest.mark.parametrize("why", [ExitReason.TAKE_PROFIT, ExitReason.TRAILING_TAKE])
+def test_the_take_caveat_appears_only_when_the_run_has_take_exits(why: ExitReason) -> None:
+    """Выходы по уровню названы отдельно: их цена — самая оптимистичная в прогоне.
+
+    Скользящий уровень — тоже уровень: исполнен по касанию так же.
+    """
+    with_take = _run([_deal(reason=why)])
     assert "Тейк исполнен по касанию" in _names(with_take)
     without = _run([_deal(reason=ExitReason.SIGNAL)])
     assert "Тейк исполнен по касанию" not in _names(without)

@@ -13,8 +13,9 @@
 которое потом наблюдает. Ложной была бы обратная схема — тест, который сам
 ставит подмену и сам же её видит; такой ничего не доказывает про соседей.
 
-Чего эти проверки не доказывают, названо прямо: сторож сети живёт в подмене
-`socket` **этого** процесса и до отдельного процесса не доезжает.
+Отдельный процесс (`B-047`) стережётся своими проверками ниже: ребёнку
+отдаются своя папка данных и запрет сети через окружение, и это проверяется
+настоящим подпроцессом, а не чтением обвязки.
 """
 
 from __future__ import annotations
@@ -31,10 +32,13 @@ import threading
 import pytest
 from conftest import (
     INTERNET_ALLOWED,
+    OFFLINE_REPORT_ENV,
     SCREENLESS_PLATFORMS,
     USERDATA_BOUND_IN,
+    ChildPlace,
     OpenedAWindow,
     WentOutside,
+    children_stayed_offline,
     named_in,
 )
 
@@ -640,3 +644,92 @@ def test_the_harness_carries_out_the_deletions_a_test_left_behind(
         "виджеты не пережили `processEvents()` — тесту нечего оставлять "
         "за собой, и проверка на разборе стала бы вакуумной"
     )
+
+
+# ------------------------------------ отдельный процесс (`B-047`)
+
+def _child(source: str, **extra: str) -> subprocess.CompletedProcess[str]:
+    """Ребёнок так же, как его запускают тесты программы: своё окружение."""
+    environment = {**os.environ, "PYTHONPATH": str(REPO), **extra}
+    return subprocess.run(
+        [sys.executable, "-c", source], cwd=REPO, env=environment,
+        capture_output=True, text=True, encoding="utf-8", timeout=120, check=False,
+    )
+
+
+def test_a_child_writes_its_log_outside_the_owners_folder() -> None:
+    """Копия программы в прогоне не пишет в `userdata/logs/` рабочей копии.
+
+    Так было 10.09.2026: строки `/tmp/pytest-…` и запросы к бирже лежали
+    в `terminal.log` владельца счёта. Проверяется то, куда ребёнок **сам**
+    откроет лог, — его собственным `default_log_dir()`, без подсказок.
+    """
+    done = _child(
+        "from app.logs import default_log_dir, setup_logging\n"
+        "from market.paths import userdata_dir\n"
+        "setup_logging()\n"
+        "print(userdata_dir())\n"
+        "print(default_log_dir())\n"
+    )
+    assert done.returncode == 0, done.stderr
+    userdata, logs = (pathlib.Path(line) for line in done.stdout.split())
+    owner = (REPO / "userdata").resolve()
+    assert userdata != owner and owner not in userdata.parents, (
+        f"ребёнок взял папку данных владельца счёта: {userdata}"
+    )
+    assert owner not in logs.parents, f"ребёнок пишет лог владельцу счёта: {logs}"
+    assert (logs / "terminal.log").exists(), "лог ребёнка не открылся там, куда указан"
+
+
+def test_a_child_going_outside_is_refused_and_written_down() -> None:
+    """Ребёнок, полезший на биржу, получает отказ, а попытка попадает в отчёт.
+
+    Отчёт этого теста вычищается в конце вручную: иначе его же и уронит
+    `children_stayed_offline` — что и есть громкость, проверяемая следующим.
+    """
+    done = _child(
+        "import os, socket\n"
+        f"print(os.environ[{OFFLINE_REPORT_ENV!r}])\n"
+        "try:\n"
+        f"    socket.create_connection({OUTSIDE!r}, timeout=1)\n"
+        "except OSError as error:\n"
+        "    print('отказ', error)\n"
+    )
+    report = pathlib.Path(done.stdout.splitlines()[0])
+    try:
+        assert "отказ" in done.stdout and "B-047" in done.stdout, done.stdout + done.stderr
+        assert "iss.moex.com" in report.read_text(encoding="utf-8"), "попытка не записана"
+    finally:
+        report.unlink(missing_ok=True)
+
+
+def test_a_written_down_attempt_fails_the_test(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Непустой отчёт роняет тест — отказ в ребёнке не остаётся молчаливым.
+
+    Программа встречает отказ как лежащую сеть и живёт дальше; без этого
+    шага тест, сходивший на биржу, оставался бы зелёным (правило 13).
+    """
+    place = ChildPlace(tmp_path_factory)
+    children_stayed_offline("пустой", place)  # детей не было — не падает
+    (place.ensure() / "offline-report.txt").write_text("iss.moex.com\n", encoding="utf-8")
+    with pytest.raises(AssertionError, match="пошла в сеть без заглушки"):
+        children_stayed_offline("виноватый", place)
+
+
+def test_the_exchange_stub_answers_without_a_socket() -> None:
+    """Заглушка биржи отвечает отказом транспорта, в сеть не ходя.
+
+    Ею тесты окна и снимка закрывают догрузку истории при старте копии
+    программы; сломается — они упадут отчётом о сети, а не тихо.
+    """
+    done = _child(
+        "from market.iss import HttpxTransport, IssTransportError\n"
+        "try:\n"
+        "    HttpxTransport().get('https://iss.moex.com/x.json', timeout=1)\n"
+        "except IssTransportError as error:\n"
+        "    print('заглушка', error)\n",
+        TERMINAL_TEST_ISS_STUB="1",
+    )
+    assert "заглушка прогона тестов" in done.stdout, done.stdout + done.stderr

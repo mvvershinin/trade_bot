@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import random
-from decimal import Decimal, getcontext
+from decimal import Decimal, getcontext, localcontext
 from math import fsum
 
 import pytest
@@ -178,24 +178,39 @@ def test_ema_stays_within_a_few_ulp_of_exact_arithmetic() -> None:
         price += rng.uniform(-300, 300)
         closes.append(round(price, 1))
 
-    getcontext().prec = 60
-    alpha = Decimal(2) / Decimal(16)
     exact: Decimal | None = None
     worst = Decimal(0)
     average = MovingAverage(15, AverageKind.EMA)
 
-    for index, close in enumerate(closes):
-        if exact is None:
-            if index >= 14:
-                exact = sum(Decimal(str(x)) for x in closes[:15]) / 15
-        else:
-            exact = exact + alpha * (Decimal(str(close)) - exact)
-        ours = average.push(close)
-        if exact is not None and ours is not None:
-            worst = max(worst, abs(Decimal(ours) - exact) / abs(exact))
+    # Точность — только на этот замер (D-084): `getcontext().prec = 60`
+    # меняла бы её на весь процесс, и соседний тест считал бы в 60 знаков.
+    with localcontext() as context:
+        context.prec = 60
+        alpha = Decimal(2) / Decimal(16)
+        for index, close in enumerate(closes):
+            if exact is None:
+                if index >= 14:
+                    exact = sum(Decimal(str(x)) for x in closes[:15]) / 15
+            else:
+                exact = exact + alpha * (Decimal(str(close)) - exact)
+            ours = average.push(close)
+            if exact is not None and ours is not None:
+                worst = max(worst, abs(Decimal(ours) - exact) / abs(exact))
 
     assert worst > 0, "расхождения нет вовсе — замер выродился"
     assert worst < Decimal("1e-14"), f"дрейф двоичной средней вырос до {worst}"
+
+
+def test_drift_measurement_leaves_process_decimal_precision_untouched() -> None:
+    """Замер дрейфа не меняет точность `Decimal` для остального процесса (D-084).
+
+    Точность — состояние, выбираемое на поток; тест, меняющий её насовсем,
+    делает соседей зелёными или красными по порядку запуска.
+    """
+    with localcontext() as context:
+        context.prec = 17  # заведомо не умолчание и не 60
+        test_ema_stays_within_a_few_ulp_of_exact_arithmetic()
+        assert getcontext().prec == 17, "замер дрейфа оставил свою точность процессу"
 
 
 def test_replay_recomputes_the_whole_history() -> None:

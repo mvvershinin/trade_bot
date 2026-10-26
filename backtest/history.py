@@ -43,8 +43,12 @@ from datetime import date, datetime
 
 from backtest.assumptions import Assumption, assumptions, headline
 from backtest.execution import (
+    CoarseBar,
     Costs,
     ExecutionModel,
+    LimitExits,
+    MinuteOrder,
+    Minutes,
     OpenLeg,
     commissions_disagree,
     selling,
@@ -323,6 +327,30 @@ class HistoryRun:
     halted: str = ""
     bars: int = 0
     costs: Costs = Costs()
+    #: Порядок обхода цен минутки, если минутки поданы. `None` — не поданы,
+    #: и уровни сторожились по размаху бара (сверка, перебор, подбор лидеров).
+    minute_order: MinuteOrder | None = None
+    #: Бары, под которыми при поданных минутках их не нашлось: такой бар
+    #: сторожится по размаху, скользящий уровень внутри него не едет.
+    #: Число идёт в допущения прогона (`backtest/assumptions.py`) — молча
+    #: посчитанный по размаху бар неотличим в отчёте от посчитанного по минуткам.
+    bars_without_minutes: int = 0
+    #: Скользящий уровень включён, но минутки не поданы — свеча крупнее
+    #: порога (B-058). Ставит тот, кто решал не подавать (`app/minutes.py`);
+    #: `None` — минутки поданы либо скользящего уровня нет.
+    coarse_bar: CoarseBar | None = None
+    #: Судьба заявок на выход с предельной ценой (`TimeExitOrder.LIMIT`):
+    #: по открытию, по касанию предела, не исполнено. Идёт в допущения
+    #: прогона — неисполненный выход останавливает робота, и молча
+    #: посчитанный итог такого прогона неотличим от полного.
+    limit_exits: LimitExits = LimitExits()
+    #: Имена рыночных заявок (и заявок с пределом), принятых исполнителем
+    #: и не исполненных к концу прогона (`ExecutionModel.pending`). По ним
+    #: окно отличает «заявка ждёт открытия бара» от «решения без исполнения»
+    #: (решение 0065). ⚠️ Заполняет каждый, кто собирает `HistoryRun` руками:
+    #: `replay`, `LiveObserver.run`, `app/stitched_view.as_history`. Забытое
+    #: поле молча даёт умолчание `()`, и ждущая заявка рисуется как ⊗.
+    waiting: tuple[str, ...] = ()
 
     @property
     def assumptions(self) -> tuple[Assumption, ...]:
@@ -468,6 +496,21 @@ class HistoryExecutor(ExecutionModel):
         """Комиссия одной стороны за контракт. `None` — тариф не задан, а не ноль."""
         return self.costs.per_side
 
+    @property
+    def fall_gap_rubles(self) -> float:
+        """Сколько рублей отчёт приписал себе на разрывах вниз через уровень.
+
+        Пункты считает базовая модель (`LevelGaps.fall_points`), цену пункта
+        знает только этот класс — отсюда и деление обязанностей. Разрыв
+        **вниз** через уровень, стоящий позади рынка, записывается по уровню,
+        а не по открытию: результат выходит лучше, чем был бы на счёте.
+
+        ⚠️ Знак читается как «приписано себе» для стопа лонга — случая,
+        ради которого счётчик заведён. У неподвижного тейка шорта касание
+        тоже `FALL`, и там та же разница означает обратное. Число сырое.
+        """
+        return self.gaps.fall_points * self.ruble_per_point
+
     # -- запись результата --------------------------------------------------
 
     def _record(
@@ -488,11 +531,7 @@ class HistoryExecutor(ExecutionModel):
         Комиссия сделки — **обе стороны**: вход и выход. `None` не превращается
         в ноль ни на одном шаге.
         """
-        reason = (
-            ExitReason.TAKE_PROFIT
-            if order.action is OrderAction.ARM_TAKE_PROFIT
-            else order.exit_reason or ExitReason.SIGNAL
-        )
+        reason = order.exit_reason or ExitReason.SIGNAL
         one_side = self.costs.commission(leg.volume)
         self.deals.append(Deal(
             side=leg.side, volume=leg.volume,
@@ -521,7 +560,8 @@ class HistoryExecutor(ExecutionModel):
         self.level_plans.append(Plan(
             order_id=order.order_id, decided_at=close_time(candle), price=level,
             side=order.side, action=OrderAction.CLOSE,
-            exit_reason=ExitReason.TAKE_PROFIT,
+            # Вид уровня назвал движок в заявке вооружения — не додумывать.
+            exit_reason=order.exit_reason,
         ))
 
 
@@ -789,12 +829,13 @@ def _tariff(value: float | None) -> str:
     return "тарифа нет" if value is None else f"{value} ₽ за контракт на сторону"
 
 
-async def replay(  # noqa: PLR0913 — шестой параметр это издержки, и убрать их некуда: настройки движка проскальзывания не знают, а живость окна задают два оставшихся
+async def replay(  # noqa: PLR0913 — сверх пяти идут издержки и минутки, обе величины только исполнителя: настройки движка их не знают, а живость окна задают два оставшихся
     candles: Sequence[object],
     strategy: Strategy,
     settings: EngineSettings,
     *,
     costs: Costs | None = None,
+    minutes: Minutes | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     breathe_every: int = BREATHE_EVERY,
 ) -> HistoryRun:
@@ -812,14 +853,40 @@ async def replay(  # noqa: PLR0913 — шестой параметр это из
     сверка с ним сходится по построению: проскальзывание больше нуля меняет
     цену каждой сделки и, значит, все деньги прогона.
 
-    ⚠️ Издержки на **список** сделок не влияют — ни комиссия, ни
-    проскальзывание в решения движка не входят (PROTOTYPE.md §6). Поэтому два
-    прогона с разными издержками дают одни и те же сделки и разные деньги,
-    и различить их можно только по `HistoryRun.costs`.
+    ⚠️ **Проскальзывание меняет не только деньги, но и список сделок**
+    (`D-061`). `Costs.fill_price` сдвигает цену исполнения входа, движок
+    записывает её ценой входа позиции и от неё же строит уровень тейка
+    (`engine.pipeline`, вооружение плана). Сдвинутый уровень задевается
+    на другой свече или не задевается вовсе — и дальше расходятся выход,
+    «стоп после тейка» и все следующие входы. Замер 05.09.2026 на `@MX`,
+    настройки владельца счёта: 0/1/2 шага дают 1219 / 1223 / 1232 сделки;
+    на умолчаниях (тейк 0,5 %) список совпал — расхождение зависит от того,
+    насколько тесен уровень, а не от принципа.
+
+    Второй путь тех же издержек в решения — **порог выхода по обратному
+    сигналу** (`min_exit_profit_sides` больше нуля): выход откладывается,
+    пока прибыль от цены входа не окупит заданную долю комиссии. Здесь
+    решения двигают обе издержки — проскальзывание через цену входа,
+    комиссия через сам порог.
+
+    Одни и те же сделки при разных издержках гарантированы только так:
+    порог выхода нулевой (умолчание), и различается **только комиссия** —
+    с ней движок сверяет цель тейка (`covers_commission`) лишь ради строки
+    в журнале. ⚠️ И это верно, пока выключен дневной лимит убытка (`D-113`):
+    он считает день за вычетом издержек, и после возвращения обе начнут
+    сдвигать момент остановки торговли.
 
     ⚠️ **Комиссия отчёта и комиссия движка обязаны совпадать**, иначе прогон
     отвергается вслух (`_one_commission`). Проскальзывание — величина только
     отчёта, у движка её нет вовсе, и сверять её не с чем.
+
+    `minutes` — минутки под барами ряда и порядок обхода их цен. Получает
+    их **только исполнитель** (`ExecutionModel.use_minutes`): источник свечей
+    и движок их не видят, и решения по-прежнему принимаются на закрытии бара.
+    По минуткам исполнитель сторожит уровень по отрезкам между точками
+    и сообщает движку наблюдённые цены — по ним скользящий уровень едет
+    внутри бара (решение 0059 §3). Не заданы — сторож по размаху бара,
+    как до минуток.
 
     :raises ValueError: издержки называют одну комиссию, настройки движка —
         другую.
@@ -834,6 +901,8 @@ async def replay(  # noqa: PLR0913 — шестой параметр это из
         costs=costs,
         ruble_per_point=settings.ruble_per_point,
     )
+    if minutes is not None:
+        executor.use_minutes(minutes)
     source = HistorySource(
         candles, on_progress=on_progress, breathe_every=breathe_every
     )
@@ -881,4 +950,10 @@ async def replay(  # noqa: PLR0913 — шестой параметр это из
         halted=engine.halted,
         bars=seen,
         costs=costs,
+        minute_order=executor.minute_order if executor.minutes_given else None,
+        bars_without_minutes=executor.bars_without_minutes,
+        limit_exits=replace(executor.limits, unfilled=sum(
+            1 for order in executor.pending if order.limit_price is not None
+        )),
+        waiting=tuple(order.order_id for order in executor.pending),
     )

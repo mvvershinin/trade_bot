@@ -29,16 +29,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Protocol
 
 from PySide6.QtCore import QObject, Signal
 
 from ui.models import (
     BacktestRequest,
     ChartData,
+    DebugBatch,
     HistoryLoadRequest,
     Mode,
     Settings,
 )
+from ui.trade_story import PaperReport, PaperReportRequest
 
 #: Чистка секретов: текст на входе, текст без токена на выходе.
 #:
@@ -53,6 +56,22 @@ from ui.models import (
 #: быть **одна** на запись в базу, на отправку в окно и на выгрузку в файл.
 #: Две разных разошлись бы, и разошлись бы молча.
 Sanitize = Callable[[str], str]
+
+
+class DebugSource(Protocol):
+    """Откуда панель «Отладка» берёт строки. Реализация — `app/debug_feed.py`.
+
+    Протокол, а не сигнал порта, и не по вкусу. Строки пишутся из любого
+    потока и десятками в секунду при прогреве; сигнал на каждую строку
+    заваливал бы очередь Qt, пока панель свёрнута и на неё никто не смотрит.
+    Поэтому окно **само** забирает новое по таймеру и только пока панель
+    открыта (`ui/debug_panel.py`). Реализацию окно не импортирует: она
+    приходит параметром с границы `app/`, как и чистка секретов.
+    """
+
+    def since(self, after: int, limit: int) -> DebugBatch:
+        """Строки с номером больше `after`, не больше `limit`, старшие первыми."""
+        ...
 
 
 class TerminalPort(QObject):
@@ -81,15 +100,33 @@ class TerminalPort(QObject):
     decisions_replaced = Signal(object)   # tuple[DecisionRow, ...]
     decision_appended = Signal(object)    # DecisionRow
     settings_applied = Signal(object)     # Settings — эхо движка, а не наше
+    algorithms_changed = Signal(object)   # tuple[AlgorithmOption, ...] — каталог
     busy_changed = Signal(bool, str)      # идёт длинная операция, что именно
     progress_changed = Signal(int, str)   # 0…100, подпись
     failed = Signal(str)                  # человеческая фраза, не код ошибки
+    settings_refused = Signal(object, str, str)  # Settings в силе, причина, поле
+    backtest_refused = Signal(str)        # прогон не состоится — почему
     stuck_changed = Signal(str)           # работа не отвечает; «» — снять сообщение
     backtest_options_ready = Signal(object)  # BacktestOptions — из чего выбирать
     backtest_finished = Signal(object)    # BacktestReport — что вышло из прогона
     history_facts_ready = Signal(object)  # HistoryFacts — что уже есть в базе
     history_progress = Signal(int, str)   # 0…100, подпись — ход загрузки истории
     history_finished = Signal(object)     # HistoryLoadOutcome — чем кончилась
+    contract_checked = Signal(object)     # ContractNotice — действующий контракт по таблице
+    paper_report_ready = Signal(object)   # PaperReport — сделки симуляции из базы
+
+    # ⚠️ Два отказа — своими сигналами, а не одним `failed`, и это правило
+    # 13 `CLAUDE.md`. `failed` — фраза в строку состояния на 15 секунд; окно
+    # не может понять по ней, ЧЕМУ отказано. Отсюда два дефекта 29.09.2026:
+    # окно настроек, запомнившее непринятый алгоритм, и полоска прогона,
+    # висевшая вечно после отказа, — прогона нет, закрыть её нечему.
+    #
+    # * `settings_refused` — «Применить» не принято: настройки, которые
+    #   остались в силе, причина и имя поля `Settings`, которое надо
+    #   поменять (пусто — поле не одно). Окно откатывается к первому
+    #   и показывает второе у третьего.
+    # * `backtest_refused` — просьба о прогоне кончилась ничем: не начат
+    #   или оборван. Полоска закрывается, отказ показывается в окне.
 
     # ⚠️ `stuck_changed` — не отказ и не ошибка, поэтому сигнал свой, а не
     # `failed`. Отказ отвечает на нажатие и живёт в строке состояния секунды;
@@ -163,7 +200,20 @@ class TerminalPort(QObject):
         self._not_connected("Применение настроек")
 
     def request_settings(self) -> None:
-        """Попросить текущие настройки. Ответ придёт сигналом `settings_applied`."""
+        """Попросить текущие настройки.
+
+        Ответ приходит **двумя** сигналами: `settings_applied` — значения
+        полей, `algorithms_changed` — каталог торговых алгоритмов: название,
+        правило одной фразой и правило абзацами. Второй нужен потому, что
+        правило считает сам алгоритм, а окно торговых слоёв не импортирует
+        (ARCHITECTURE.md §2): текст принадлежит тому, кто его посчитал,
+        окно его только показывает.
+
+        ⚠️ Каталог, а не одна строка правила. Кнопка «Подробнее» в окне
+        выбора обязана показать описание **любого** алгоритма из списка,
+        в том числе ещё не выбранного, — иначе прочитать, что он делает,
+        можно было бы только выбрав его, то есть уже поменяв настройку.
+        """
         self._not_connected("Чтение настроек")
 
     def request_chart(self, instrument: str, timeframe: str) -> None:
@@ -236,6 +286,21 @@ class TerminalPort(QObject):
     def cancel_history_load(self) -> None:
         """Остановить идущую загрузку. Скачанное к этому моменту остаётся в базе."""
         self._not_connected("Отмена загрузки истории")
+
+    def request_paper_report(self, request: PaperReportRequest) -> None:
+        """Попросить сделки симуляции из базы для окна «Отчёты».
+
+        Ответ — сигналом `paper_report_ready`, а не возвратом: чтение базы —
+        работа потока данных. Ответ приходит **всегда**, отказ тоже —
+        полем `trouble`: окно, ждущее ответа, иначе ждало бы вечно, и пустая
+        таблица читалась бы как «сделок не было».
+        """
+        self._not_connected("Чтение сделок симуляции")
+        self.paper_report_ready.emit(PaperReport(
+            instrument=request.instrument,
+            trouble="Сделки симуляции не прочитаны: окно открыто без торговой "
+                    "части, базы у него нет.",
+        ))
 
     def show_recent(self) -> None:
         """Вернуться к обычному показу последних дней вместо закреплённого отрезка.

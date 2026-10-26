@@ -46,10 +46,12 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import pathlib
+import sqlite3
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from typing import TextIO
 
@@ -59,28 +61,37 @@ from market import (
     MARKETS,
     MSK,
     CandleStore,
+    ContractError,
     FetchResult,
     HistoryOutcome,
     HistoryRequest,
     Inventory,
     IssClient,
     IssError,
+    IssUnknownInstrument,
     Leg,
     StitchReport,
+    adopt_chain,
     daily_volume,
+    default_db_path,
     ensure_userdata_dir,
     is_synthetic,
     legs_of_chain,
     load_history,
+    refresh_contracts,
     stitch,
     take_inventory,
     userdata_dir,
 )
+from market.paths import say_ignored_override
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "CHAIN_DB_FILE_NAME",
     "STITCH_DEPTH_DAYS",
     "ChainRequest",
+    "adopt_into_working_base",
     "build_chain",
     "chain_lines",
     "fetch_history",
@@ -225,14 +236,20 @@ def fetch_history(
     и отмечено (`market.sync`). Трассировка на экране сказала бы человеку,
     что всё пропало, тогда как повторный запуск продолжит с места обрыва.
     """
+    iss = client or IssClient()
+    try:
+        # `D-128`: дальше идёт код биржи, а не набранный — `sber` лёг бы
+        # в базу отдельным инструментом, которого окно не найдёт.
+        request = replace(request, symbol=iss.secid(request.symbol))
+    except IssError as error:
+        out.write(f"Загрузка не начата: {error}\n")
+        return 1
     ticker = Ticker(out, request.symbol)
     out.write(f"Загрузка истории {request.symbol} с МосБиржи…\n")
     out.flush()
     try:
         with CandleStore(database) as store:
-            outcome = load_history(
-                store, client or IssClient(), request, progress=ticker
-            )
+            outcome = load_history(store, iss, request, progress=ticker)
     except IssError as error:
         ticker.close()
         out.write(
@@ -275,6 +292,12 @@ def run_from_arguments(
     `tests/test_app_boundaries.py`, и число прогрева живёт в `market.history`
     (`WARMUP_PERIOD`), а связь с модулем стратегии держит тест.
     """
+    # `D-124`: переменная папки данных, выставленная вне теста, не действует,
+    # и человек, её выставивший, искал бы свечи не там. Технический лог
+    # к этой минуте уже поднят (`app/main.py`), строка уходит и в него.
+    said = say_ignored_override(database)
+    if said:
+        log.warning("%s", said)
     today = datetime.now(MSK).date()
     since: date | None = None
     if args.fetch_since is not None:
@@ -287,7 +310,7 @@ def run_from_arguments(
         out.write(f"{error}\n")
         return 1
     request = HistoryRequest(
-        symbol=args.fetch.strip().upper(),
+        symbol=args.fetch.strip(),
         market=MARKETS[args.fetch_market],
         until=today,
         since=since,
@@ -347,20 +370,75 @@ def inventory_lines(inventory: Inventory, database: pathlib.Path) -> list[str]:
     return lines
 
 
-def show_inventory(database: pathlib.Path, symbol: str, *, out: TextIO) -> int:
+def _stored_key(symbols: list[str], symbol: str) -> list[str]:
+    """Ключи базы, под которыми может лежать `symbol`.
+
+    Точное совпадение — оно одно. Нет точного — все ключи, равные коду
+    без учёта регистра: Si, загруженный до `D-128`, лежит под `SIZ6`,
+    а биржа называет его `SiZ6`. Пустой список — в базе такого нет.
+    """
+    if symbol in symbols:
+        return [symbol]
+    folded = symbol.casefold()
+    return [key for key in symbols if key.casefold() == folded]
+
+
+def show_inventory(
+    database: pathlib.Path,
+    symbol: str,
+    *,
+    out: TextIO,
+    client: IssClient | None = None,
+) -> int:
     """Напечатать опись базы. Только чтение: ни одной записи не делается.
 
     База не найдена — это отказ с фразой, а не пустая опись: «минуток нет»
     и «файла нет» человек лечит по-разному.
+
+    Код, набранный человеком, сначала приводится к коду биржи (`D-128`):
+    `mxu6` ищет минуты `MXU6`. Сшитый ряд (`@MX`) бирже не известен
+    и ищется как набран. Биржа недоступна — код ищется как набран, с фразой,
+    что он не сверен: опись только читает базу, сеть ей не обязательна.
+    Нет ключа точно — ищется без учёта регистра (Si до `D-128` лежит под
+    `SIZ6`): одно совпадение показывается с пометкой, несколько — перечисляются.
     """
+    symbol = symbol.strip()
     if not database.exists():
         out.write(
             f"Базы свечей нет: {database}\n"
             f"Она появится сама при первой загрузке. {how_to_fetch(symbol)}\n"
         )
         return 1
+    checked = True
+    if not is_synthetic(symbol):
+        try:
+            symbol = (client or IssClient()).secid(symbol)
+        except IssUnknownInstrument as error:
+            out.write(f"Опись не составлена: {error}\n")
+            return 1
+        except IssError as error:
+            # Опись только читает базу: без биржи она ищет код как набран.
+            checked = False
+            out.write(
+                f"Биржа недоступна ({error}), код {symbol!r} не сверен "
+                "с кодом биржи — ищу в базе как набран.\n"
+            )
     with CandleStore(database) as store:
-        inventory = take_inventory(store, symbol.strip().upper())
+        stored = _stored_key(store.symbols(), symbol)
+        if len(stored) > 1:
+            out.write(
+                f"В базе несколько ключей для {symbol!r} без учёта регистра: "
+                f"{', '.join(stored)}. Наберите нужный точно.\n"
+            )
+            return 1
+        if stored and stored[0] != symbol:
+            out.write(
+                f"В базе ключ в другом регистре: {stored[0]}"
+                + (f" (код биржи {symbol})" if checked else "")
+                + ". Показываю его; база не переименована.\n"
+            )
+            symbol = stored[0]
+        inventory = take_inventory(store, symbol)
     out.write("\n".join(inventory_lines(inventory, database)) + "\n")
     return 0 if inventory.days else 1
 
@@ -457,6 +535,12 @@ def build_chain(
     today = datetime.now(MSK).date()
     market = MARKETS["futures"]
     if request.fetch:
+        iss = client or IssClient()
+        try:
+            legs = [iss.secid(leg) for leg in legs]  # `D-128`: коды биржи
+        except IssError as error:
+            out.write(f"Ряд не собран: {error}\n")
+            return 1
         for leg in legs:
             ticker = Ticker(out, leg)
             out.write(f"Загрузка {leg} с МосБиржи…\n")
@@ -465,7 +549,7 @@ def build_chain(
                 with CandleStore(database) as store:
                     load_history(
                         store,
-                        client or IssClient(),
+                        iss,
                         HistoryRequest(
                             symbol=leg,
                             market=market,
@@ -503,6 +587,81 @@ def build_chain(
     return 0
 
 
+def _exchange_code(client: IssClient, leg: str) -> str:
+    """Код биржи для контракта `--legs`; незнакомый бирже остаётся как набран.
+
+    Незнакомый код здесь не отказ: `refresh_contracts` называет его строкой
+    человеку и решает сам — дальний выпадает, код посреди цепочки
+    останавливает перенос (`B-054`). Обрыв связи — отказ, как и был.
+    """
+    try:
+        return client.secid(leg)
+    except IssUnknownInstrument:
+        return leg.strip()
+
+
+def adopt_into_working_base(
+    source: pathlib.Path,
+    target: pathlib.Path,
+    legs: Sequence[str],
+    *,
+    out: TextIO,
+    client: IssClient | None = None,
+) -> int:
+    """Перенести контракты цепочки в рабочую базу и уточнить периоды у биржи.
+
+    Два шага, и второй не обязателен. Перенос не ходит в сеть: минуты
+    и отметки дней берутся из `source` только на чтение, периоды считаются
+    по перенесённым минутам (`market.contracts.adopt_chain`). Уточнение
+    у биржи (`client` не `None`) добавляет последний день обращения и рубеж
+    контракта, которого в источнике нет, — без него действующим останется
+    последний перенесённый, даже если он истёк.
+    """
+    try:
+        if client is not None:
+            # `D-128`: перенос идёт по имени, и `mxu6` в базе цепочки не найдётся.
+            legs = [_exchange_code(client, leg) for leg in legs]
+        with CandleStore(target) as store:
+            report = adopt_chain(source, store, legs)
+            for leg in legs:
+                out.write(
+                    f"{leg}: минут {report.minutes.get(leg, 0)}, "
+                    f"записано {report.written.get(leg, 0)}, "
+                    f"дней отмечено {report.days.get(leg, 0)}\n"
+                )
+            rows = report.contracts
+            if client is not None:
+                refreshed = refresh_contracts(store, client, legs, market=MARKETS["futures"])
+                for text in refreshed.said:
+                    out.write(f"{text}\n")
+                rows = refreshed
+    except (ContractError, IssError, sqlite3.Error) as error:
+        out.write(f"Перенос не выполнен: {error}\n")
+        return 1
+    for row in rows:
+        period = (
+            f"{row.active_from or '?'} … {row.active_to or 'сейчас'}"
+            if row.active_from or row.active_to
+            else "период не установлен"
+        )
+        mark = (
+            "архивный" if row.archived
+            else "срок не проверен у биржи" if row.last_trade_day is None
+            else "действующий" if row.current
+            else ""
+        )
+        out.write(f"{row.symbol}: {period} {mark}".rstrip() + "\n")
+        if row.current and row.last_trade_day is None:
+            # `D-130`: действующий без срока — тот самый код, которым пойдёт
+            # робот, и остановка перед экспирацией на нём не сработает.
+            how = ", запустив --adopt без --no-fetch" if client is None else ""
+            out.write(
+                f"  Срок обращения {row.symbol} не проверен у биржи: возможно, "
+                f"контракт уже истёк — уточните срок у биржи{how}.\n"
+            )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """`python3 -m app.fetch --stitch @MX --legs MXM5,MXU5,…` — сборка ряда.
 
@@ -530,16 +689,32 @@ def main(argv: list[str] | None = None) -> int:
                         help="сколько последних дней качать по каждому контракту")
     parser.add_argument("--no-fetch", action="store_true",
                         help="не ходить на биржу: собрать из того, что уже в базе")
+    parser.add_argument("--adopt", action="store_true",
+                        help="не сшивать, а перенести контракты --legs из базы цепочки "
+                             "в рабочую базу и заполнить периоды (решение 0061)")
+    parser.add_argument("--target", metavar="PATH", default=None,
+                        help="рабочая база для --adopt, по умолчанию userdata/candles.sqlite3")
     args = parser.parse_args(argv)
     database = (
         pathlib.Path(args.db) if args.db else userdata_dir() / CHAIN_DB_FILE_NAME
     )
+    say_ignored_override(database)  # `D-124`: молча переменную не игнорируем
     try:
         ensure_userdata_dir(database.parent)
     except OSError as error:
         sys.stdout.write(f"{error}\n")
         return 1
-    legs = [leg.strip().upper() for leg in args.legs.split(",") if leg.strip()]
+    # Регистр не поднимается (`D-128`): у биржи `SiZ6`, и `SIZ6` лёг бы
+    # в базу отдельным инструментом. Код биржи спрашивается у ISS там,
+    # где идут в сеть (`build_chain`, `adopt_into_working_base`); с `--no-fetch`
+    # контракты ищутся в базе как набраны.
+    legs = [leg.strip() for leg in args.legs.split(",") if leg.strip()]
+    if args.adopt:
+        target = pathlib.Path(args.target) if args.target else default_db_path()
+        return adopt_into_working_base(
+            database, target, legs, out=sys.stdout,
+            client=None if args.no_fetch else IssClient(),
+        )
     return build_chain(
         database,
         ChainRequest(

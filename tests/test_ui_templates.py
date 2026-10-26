@@ -28,11 +28,12 @@ from PySide6.QtWidgets import QAbstractSpinBox, QComboBox, QTableWidget
 import ui.templates_dialog
 from app import convert, runs
 from market import CandleStore, RunOrigin, SessionRecord
+from strategies import registry
 from ui import backend
 from ui.backend import Backend, RunStats, TemplateRun
-from ui.models import Settings
+from ui.models import AfterTakeProfit, Settings
 from ui.settings_dialog import SettingsDialog
-from ui.templates import BUILTIN_NAME, Library, Template
+from ui.templates import BUILTIN_NAME, NOT_IN_TEMPLATE, Library, Template
 from ui.templates_dialog import NEVER_RUN, TemplatesDialog
 from ui.wheel_guard import GUARDED_TYPES, guard_wheel
 
@@ -88,10 +89,11 @@ def test_a_saved_template_returns_every_field_unchanged(library) -> None:
     Мутация, которую тест обязан ловить: укладка, забывшая поле, — тогда
     человек применяет шаблон и получает умолчание вместо того, что сохранял.
     """
+    # Инструмент в шаблоне не хранится (решение 0061) — здесь он не задан.
     values = Settings(
-        instrument="RIU6", timeframe="15 минут", average_period=21,
+        timeframe="15 минут", average_period=21,
         take_profit_pct=0.9, volume=4, window_start=time(10, 30),
-        commission_per_side_rub=None, threshold_percent=0.4, confirm_bars=3,
+        commission_per_side_rub=None,
     )
     assert library.write((Template(name="Проба", values=values),)) == ""
 
@@ -112,7 +114,9 @@ def test_the_field_list_of_a_template_is_the_field_list_of_settings(library) -> 
     library.write((Template(name="Проба", values=Settings()),))
     payload = json.loads(library.path.read_text(encoding="utf-8"))
     stored = set(payload["templates"][0]["settings"])
-    assert stored == {field.name for field in dataclasses.fields(Settings)}
+    assert stored == {
+        field.name for field in dataclasses.fields(Settings)
+    } - set(NOT_IN_TEMPLATE)
 
 
 def test_a_template_with_one_bad_value_is_refused_whole(library) -> None:
@@ -298,6 +302,145 @@ def test_applying_a_template_sends_the_whole_set_at_once(
     assert asked and asked[0][1] == values, "подтверждение спрашивали не про тот набор"
 
 
+def test_an_old_template_with_an_instrument_opens_and_keeps_the_current_contract(
+    qapp, library, real_backend, monkeypatch
+) -> None:
+    """Стережёт: шаблон не меняет торгуемый контракт (решение 0061, п. 7).
+
+    Старый файл несёт `"instrument": "MXU6"` — истёкший контракт. Шаблон
+    открывается без оговорок (поле не «незнакомое» и не «пропущенное»),
+    а применение оставляет инструмент тем, что стоит сейчас. Мутации, которые
+    тест ловит: чтение, берущее `instrument` из файла; применение, отдающее
+    `template.values` как есть (тогда встанет MXU6 или умолчание сборки).
+    """
+    asked = _accepting(monkeypatch)
+    library.write((Template(name="Старый", values=Settings(volume=3)),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["settings"]["instrument"] = "MXU6"
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = library.read()
+    assert loaded.troubles == (), "старый шаблон с инструментом открылся с отказом"
+    old = [one for one in loaded.templates if not one.builtin]
+    assert len(old) == 1
+    assert old[0].complete, "поле инструмента названо незнакомым или пропущенным"
+
+    current = Settings(instrument="RIZ6")
+    got: list[Settings] = []
+    dialog = TemplatesDialog(library, current)
+    dialog.applied.connect(got.append)
+    try:
+        dialog.table.selectRow(1)
+        dialog.apply_selected()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+    assert len(got) == 1
+    assert got[0].instrument == "RIZ6", "шаблон сменил торгуемый контракт"
+    assert got[0].volume == 3, "остальные значения шаблона не применились"
+    assert asked[0][1].instrument == "RIZ6", "подтверждение спрашивало о смене контракта"
+
+
+def test_applying_a_template_keeps_the_owners_expiry_halt(
+    qapp, library, real_backend, monkeypatch
+) -> None:
+    """Стережёт: шаблон не меняет остановку перед экспирацией.
+
+    Это предохранитель живого хода, а не настройка торговли: сделок прогона
+    он не меняет, и число дней выбирает владелец счёта, а не набор.
+    Старый файл (и пример поставки до 28.09.2026) несёт `expiry_halt_days`;
+    шаблон открывается без оговорок, а применение оставляет текущие 3 дня —
+    ни 5 из файла, ни умолчание программы (1).
+
+    Мутации, которые тест ловит: убрать `expiry_halt_days`
+    из `NOT_IN_TEMPLATE` (встанет 5 из файла); применение, отдающее
+    `template.values` как есть (встанет умолчание 1).
+    """
+    asked = _accepting(monkeypatch)
+    library.write((Template(name="Старый", values=Settings(volume=3)),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["settings"]["expiry_halt_days"] = 5
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = library.read()
+    assert loaded.troubles == (), "старый шаблон с остановкой открылся с отказом"
+    old = [one for one in loaded.templates if not one.builtin]
+    assert len(old) == 1
+    assert old[0].complete, "поле остановки названо незнакомым или пропущенным"
+
+    current = Settings(expiry_halt_days=3)
+    got: list[Settings] = []
+    dialog = TemplatesDialog(library, current)
+    dialog.applied.connect(got.append)
+    try:
+        dialog.table.selectRow(1)
+        dialog.apply_selected()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+    assert len(got) == 1
+    assert got[0].expiry_halt_days == 3, (
+        f"шаблон переставил остановку перед экспирацией на {got[0].expiry_halt_days}"
+    )
+    assert got[0].volume == 3, "остальные значения шаблона не применились"
+    assert asked[0][1].expiry_halt_days == 3, (
+        "подтверждение спрашивало о смене остановки перед экспирацией"
+    )
+
+
+def test_the_builtin_template_keeps_the_current_contract(
+    qapp, library, real_backend, monkeypatch
+) -> None:
+    """Стережёт: «Умолчания проекта» не переключают робота на контракт из сборки."""
+    _accepting(monkeypatch)
+    got: list[Settings] = []
+    dialog = TemplatesDialog(library, Settings(instrument="RIZ6", volume=7))
+    dialog.applied.connect(got.append)
+    try:
+        dialog.table.selectRow(0)
+        dialog.apply_selected()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+
+    assert [one.instrument for one in got] == ["RIZ6"]
+    assert got[0].volume == Settings().volume
+
+
+def test_a_template_file_does_not_carry_the_instrument(library) -> None:
+    """Стережёт: сохранённый шаблон ключа `instrument` в файле не несёт.
+
+    Старый ключ, прочитанный из файла, обратно тоже не пишется.
+    """
+    library.write((Template(name="Проба", values=Settings(instrument="RIU6")),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["settings"]["instrument"] = "MXU6"
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    library.write(library.read().templates)
+    stored = json.loads(library.path.read_text(encoding="utf-8"))
+    assert "instrument" not in stored["templates"][0]["settings"]
+
+
+def test_the_shipped_examples_do_not_carry_the_instrument() -> None:
+    """Стережёт: примеры в поставке не несут полей вне шаблона (решение 0061).
+
+    Ни контракта, ни остановки перед экспирацией (`NOT_IN_TEMPLATE`): при
+    чтении они выбросились бы молча, но лежащий в файле ключ читается
+    человеком как значение, которое пример поставит.
+    """
+    from ui.templates import example_files
+
+    files = example_files()
+    assert files, "примеры не найдены — проверять нечего"
+    for path in files:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for one in payload["templates"]:
+            carried = set(NOT_IN_TEMPLATE) & set(one["settings"])
+            assert not carried, f"{path.name}: {one['name']} несёт {sorted(carried)}"
+
+
 def test_a_refused_confirmation_applies_nothing_at_all(
     qapp, library, real_backend, monkeypatch
 ) -> None:
@@ -390,9 +533,9 @@ def test_the_money_half_and_the_rest_add_up_to_the_whole_list() -> None:
     """
     before = Settings()
     after = Settings(
-        volume=3, volume_cap_enabled=True, commission_per_side_rub=20.0,
+        volume=3, commission_per_side_rub=20.0,
         average_period=25, take_profit_pct=1.0, instrument="RIU6",
-        daily_loss_limit_enabled=True, free_funds_reserve_pct=40.0,
+        after_take_profit=AfterTakeProfit.WAIT_FOR_SIGNAL,
     )
     diff = convert.settings_diff(before, after)
     whole, trouble = convert.all_changes(before, after)
@@ -401,6 +544,73 @@ def test_the_money_half_and_the_rest_add_up_to_the_whole_list() -> None:
         "половины перечня не сходятся с полным перечнем"
     )
     assert not set(diff.money) & set(diff.other), "строка попала в оба списка"
+
+
+def test_the_list_of_changes_survives_a_change_of_the_algorithm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Смена алгоритма даёт перечень изменений, а не падение.
+
+    ⚠️ Был строгий `xfail` — сторож-долг на `B-051`. Пометка снята 14.09.2026
+    вместе с правкой; в этом и был её смысл: долг, записанный только словами
+    в документе, исчезает при первом же обновлении документа, а строгий `xfail`
+    после починки краснеет сам и требует себя снять.
+
+    Что было сломано. `convert.all_changes` звал `changes_from` у настроек
+    **нового** алгоритма, передавая ему настройки **старого**: классы разные,
+    поля разные, разбор падал `AttributeError`, а он в `except` там не входит.
+    Путь «Настройки» → выбрать другой алгоритм → «Применить» проходит через
+    подтверждение изменений (`ui/settings_dialog.py::confirm` →
+    `ui/confirm_changes.py::diff_of` → `convert.settings_diff`) **до** того,
+    как настройки уйдут наружу: второй торговый алгоритм из окна не выбирался
+    вовсе, а ни применение, ни отказ на несовместимой паре до этого места
+    не доходили.
+
+    Что стережётся теперь — три утверждения, падающие порознь:
+
+    * разбор не падает и причина пуста;
+    * перечень **не пуст**: молчание здесь читается как «ничего не меняется»
+      и стоит дороже падения (правило 13 `CLAUDE.md`);
+    * замена названа строкой с **обоими** именами. Одного нового названия
+      мало — оно стоит и в строке «правило теперь читается так», и проверка
+      «где-то есть название» зеленела бы при пропавшей строке замены.
+
+    Проверяются **обе** стороны: переход на второй алгоритм и возврат
+    на первый. Падали обе, и правка одной без другой оставила бы половину.
+
+    ⚠️ Соседняя проверка выше перечисляет изменяемые поля руками — потому
+    `strategy_id` в неё и не попал ни разу. Полем в поле все настройки окна
+    теперь проходит `tests/test_app_port.py::
+    test_a_change_of_any_settings_field_reaches_the_confirmation`.
+    """
+    # Алгоритм в сборке один (решение 0063): второй — подставной, своё имя
+    # и название при том же расчёте. Настоящая таблица не трогается (`D-078`).
+    real = registry.default_entry()
+    double = dataclasses.replace(real, id="twin", title="Двойник")
+    monkeypatch.setattr(registry, "_ENTRIES", (real, double))
+    first = Settings()
+    other = next(
+        one.id for one in registry.entries() if one.id != first.strategy_id
+    )
+    second = first.replace(strategy_id=other)
+    for previous, now in ((first, second), (second, first)):
+        diff = convert.settings_diff(previous, now)
+        assert not diff.trouble, (
+            f"перечень изменений не собран: {diff.trouble}"
+        )
+        assert diff.other, (
+            "перечень изменений пуст при смене торгового алгоритма — человек "
+            "подтвердит замену правила, которой ему не показали"
+        )
+        was_title = registry.find(previous.strategy_id).title
+        now_title = registry.find(now.strategy_id).title
+        assert any(
+            "→" in line and was_title in line and now_title in line
+            for line in diff.other
+        ), (
+            f"замена «{was_title}» → «{now_title}» в перечне изменений "
+            f"не названа одной строкой с обоими именами: {diff.other}"
+        )
 
 
 def test_money_changes_are_told_apart_from_the_rest() -> None:
@@ -427,8 +637,6 @@ def test_unreadable_settings_are_a_loud_trouble_not_an_empty_list() -> None:
     Пустой перечень читался бы как «ничего не меняется» ровно там, где
     настройки применить нельзя вовсе.
     """
-    from ui.models import AfterTakeProfit
-
     diff = convert.settings_diff(
         Settings(), Settings(after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
     )
@@ -690,7 +898,13 @@ def test_the_mode_does_not_break_the_match(tmp_path) -> None:
         session = store.open_journal_session(SessionRecord(
             origin=RunOrigin.BACKTEST, symbol=values.instrument,
             timeframe=values.timeframe, strategy="EMA-разворот",
-            settings=runs.settings_text(engine, module, strategy_title="EMA-разворот"),
+            # Числа программы — как пишет их прогон окна (`app/port.py`):
+            # порядок цен минутки с З9 Ф5 сличается, и снимок без него
+            # набору не засчитывается.
+            settings=runs.settings_text(
+                engine, module, algorithm=convert.chosen_algorithm(values),
+                program=runs.ProgramFields.of(values),
+            ),
             note="MXU6, 5 минут: свечей 10, с 01.08.2026 10:05 по 02.08.2026 18:45 МСК.",
         ))
         store.finish_journal_session(session.id, note="Сделок 3, переворотов 1, свечей 10.")
@@ -831,7 +1045,7 @@ def test_an_exported_set_reads_back_as_the_same_set(tmp_path) -> None:
     """
     from ui.templates import export_templates, read_for_import
 
-    values = Settings(instrument="RIU6", average_period=21, take_profit_pct=0.9, volume=4)
+    values = Settings(average_period=21, take_profit_pct=0.9, volume=4)
     one = Template(name="Перенос", values=values, origin="RIU6, июль 2026")
     path = tmp_path / "перенос.json"
     assert export_templates(path, (one,)) == ""
@@ -1077,7 +1291,7 @@ def test_the_examples_folder_travels_with_the_build() -> None:
     """
     from tools import build
 
-    argv = build.command(with_web=False, jobs=1)
+    argv = build.command(jobs=1)
     assert f"--include-data-dir={build.EXAMPLES}={build.EXAMPLES}" in argv, (
         "папка примеров не едет в поставку"
     )
@@ -1101,6 +1315,86 @@ def test_every_shipped_example_says_where_it_came_from() -> None:
         assert not mute, (
             f"в {path.name} нет происхождения у наборов: {mute}. Пример без "
             "отрезка и инструмента читается как совет"
+        )
+
+
+def test_every_shipped_example_carries_the_program_default_tariff() -> None:
+    """Стережёт: каждый пример из поставки несёт комиссию, равную умолчанию.
+
+    Применение примера переписывает комиссию целиком. Пример с прежними
+    14 ₽ вернул бы их поверх ответа заказчика (17 ₽, решение 0060) — молча,
+    одной кнопкой. Ключ обязан стоять в файле: комиссия, взятая умолчанием
+    за отсутствием ключа, совпала бы и здесь, а в окне читалась бы оговоркой.
+    """
+    from ui.templates import example_files, examples_dir, read_for_import
+
+    default = Settings().commission_per_side_rub
+    files = example_files(examples_dir())
+    assert files, "в поставке нет ни одного файла примеров"
+    for path in files:
+        loaded = read_for_import(path)
+        assert loaded.templates, f"файл примеров {path.name} не прочитался"
+        # Пропавший ключ назван словами: значение у такого примера — то самое
+        # умолчание, и одно число в тексте отказа читалось бы как «равно».
+        wrong = {
+            one.name: (
+                "ключа нет в файле"
+                if "commission_per_side_rub" in one.missing
+                else one.values.commission_per_side_rub
+            )
+            for one in loaded.templates
+            if "commission_per_side_rub" in one.missing
+            or one.values.commission_per_side_rub != default
+        }
+        assert not wrong, (
+            f"в {path.name} комиссия примеров не равна умолчанию программы "
+            f"({default} ₽): {wrong}"
+        )
+
+
+def test_every_shipped_example_applies_without_a_caveat() -> None:
+    """Стережёт: каждый пример из поставки применяется целиком, без оговорки.
+
+    Оговорок две половины (`Template.complete`), и обе окно говорит вслух:
+    незнакомые ключи — «не применятся», недостающие поля — «возьмутся
+    умолчанием программы». Собственный пример программы, применённый
+    «с оговоркой», читается как испорченный.
+
+    До 28.09.2026 у всех пятнадцати примеров не было `strategy_id`
+    (`B-055`): поле появилось в настройках позже, чем примеры были
+    отобраны. Алгоритм проставлен `ema_reverse` не по полям, а по
+    происхождению: примеры отобраны 05.09.2026 перебором первого
+    алгоритма, второй появился в сборке 27.09.2026. `expiry_halt_days`
+    шаблон не несёт вовсе (`NOT_IN_TEMPLATE`) — это предохранитель живого
+    хода, и в примерах его нет.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Шесть ключей трёх
+    предохранителей убраны из примеров вместе с полями окна; при возврате
+    `D-113` ключи возвращаются в примеры тем же движением — иначе этот тест
+    покраснеет на недостающих полях.
+    """
+    from ui.templates import example_files, examples_dir, read_for_import
+
+    known = {entry.id for entry in registry.entries()}
+    files = example_files(examples_dir())
+    assert files, "в поставке нет ни одного файла примеров"
+    for path in files:
+        loaded = read_for_import(path)
+        assert loaded.templates, f"файл примеров {path.name} не прочитался"
+        caveats = {
+            one.name: (one.missing, one.unknown)
+            for one in loaded.templates if not one.complete
+        }
+        assert not caveats, (
+            f"в {path.name} примеры применяются с оговоркой — (нет полей, "
+            f"незнакомые ключи): {caveats}"
+        )
+        strangers = {
+            one.name: one.values.strategy_id
+            for one in loaded.templates if one.values.strategy_id not in known
+        }
+        assert not strangers, (
+            f"в {path.name} у примеров алгоритм, которого нет в сборке: {strangers}"
         )
 
 
@@ -1470,3 +1764,134 @@ def test_closing_the_clash_question_keeps_my_set_untouched(
     assert answer is NameClash.SKIP, (
         "закрытое без ответа окно решило судьбу набора само"
     )
+
+
+def _snippet_of(qapp, library, current: Settings, monkeypatch) -> str:
+    """Что окно сохранения показывает над полем имени — через кнопку, а не мимо."""
+    from PySide6.QtWidgets import QInputDialog
+
+    shown: list[str] = []
+
+    def ask(_parent, _title, label, *args, **kwargs):
+        shown.append(label)
+        return "", False
+
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(ask))
+    dialog = TemplatesDialog(library, current)
+    try:
+        dialog.save_current()
+    finally:
+        dialog.deleteLater()
+        qapp.processEvents()
+    assert shown, "окно сохранения не открылось"
+    return shown[0]
+
+
+def test_the_save_snippet_names_the_trailing_level_and_not_the_fixed_target(
+    qapp, library, monkeypatch
+) -> None:
+    """Стережёт `B-052`: выжимка называет тот способ фиксации, который работает.
+
+    При скользящем уровне число неподвижной цели движок не читает вовсе;
+    подпись «тейк 0,77%» называла бы параметр, которого в наборе нет.
+
+    Мутация: вернуть в `_snippet` выбор по одному `take_profit_enabled` —
+    в подписи снова появится «0,77%».
+    """
+    said = _snippet_of(
+        qapp,
+        library,
+        Settings(
+            take_profit_enabled=True, take_profit_pct=0.77, trailing_enabled=True,
+            trailing_start_pct=0.6, trailing_offset_pct=0.3,
+        ),
+        monkeypatch,
+    )
+    assert "0,77" not in said, f"выжимка назвала цель, которую движок не читает: {said!r}"
+    assert "скользящий" in said and "0,6" in said and "0,3" in said, (
+        f"выжимка не назвала скользящий уровень и его числа: {said!r}"
+    )
+
+
+def test_the_save_snippet_says_off_when_fixing_is_off_whatever_the_method(
+    qapp, library, monkeypatch
+) -> None:
+    """Стережёт `B-052`: выключенная фиксация выключает и скользящий уровень.
+
+    Мутация: проверить `trailing_enabled` раньше `take_profit_enabled` —
+    выжимка назовёт скользящий уровень, которого у позиции нет.
+    """
+    said = _snippet_of(
+        qapp,
+        library,
+        Settings(take_profit_enabled=False, trailing_enabled=True),
+        monkeypatch,
+    )
+    assert "тейк выключен" in said, f"выжимка не сказала «выключен»: {said!r}"
+    assert "скользящ" not in said, f"выжимка назвала уровень, которого нет: {said!r}"
+
+
+def test_an_old_template_with_trailing_but_no_fixing_is_normalised_out_loud(
+    tmp_path,
+) -> None:
+    """Стережёт `B-052`: шаблон прежней сборки не приносит невозможное сочетание.
+
+    «Скользящий уровень выбран, фиксация выключена» — уровня в нём нет,
+    а пару «порог/отступ» движок проверяет и вправе отвергнуть набор из-за
+    чисел, которых никто не читает. Снимается при чтении — и вслух.
+
+    Мутации: убрать подмену в `ui/templates.py::_one_way_to_take_profit` —
+    красная первая проверка; оставить подмену, но вернуть пустую строку
+    вместо фразы (молчание) — красная вторая.
+    """
+    from ui.templates import export_templates, read_for_import
+
+    path = tmp_path / "old.json"
+    export_templates(
+        path,
+        [Template(
+            name="Старый",
+            values=Settings(take_profit_enabled=False, trailing_enabled=True),
+        )],
+    )
+    loaded = read_for_import(path)
+    (one,) = loaded.templates
+    assert not one.values.trailing_enabled, (
+        "шаблон принёс скользящий уровень при выключенной фиксации"
+    )
+    said = [line for line in loaded.troubles if "«Старый»" in line]
+    assert said and "скользящий уровень" in said[0], (
+        f"подмена сделана молча: {loaded.troubles!r}"
+    )
+
+
+def test_unknown_keys_of_the_record_survive_a_rewrite(library) -> None:
+    """D-074: ключ записи от более новой сборки переживает перезапись библиотеки.
+
+    Поведение: незнакомый ключ **рядом** с `name` и `saved_at` (не внутри
+    `settings`) при чтении запоминается, а при записи ложится обратно
+    нетронутым. Знакомые ключи записи он перебить не может.
+
+    ⚠️ Мутации: убрать `**one.record_extras` из `_body_of` — ключ пропадает;
+    не заполнять `record_extras` при чтении — то же самое; сложить ключи
+    записи в `unknown` — шаблон перестаёт быть «полным».
+    """
+    library.write((Template(name="Проба", values=Settings(average_period=21)),))
+    payload = json.loads(library.path.read_text(encoding="utf-8"))
+    payload["templates"][0]["rating"] = {"stars": 4, "by": "новая сборка"}
+    library.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    loaded = [one for one in library.read().templates if not one.builtin]
+    assert [one.name for one in loaded] == ["Проба"]
+    assert loaded[0].complete, (
+        "незнакомый ключ записи сделал шаблон «применимым с оговорками», "
+        "а к настройкам он отношения не имеет"
+    )
+    assert library.write(library.read().templates) == ""
+
+    stored = json.loads(library.path.read_text(encoding="utf-8"))["templates"][0]
+    assert stored.get("rating") == {"stars": 4, "by": "новая сборка"}, (
+        f"ключ записи от более новой сборки потерян при перезаписи: {stored}"
+    )
+    assert stored["name"] == "Проба"
+    assert stored["settings"]["average_period"] == 21

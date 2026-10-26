@@ -49,6 +49,9 @@ def folder(tmp_path: pathlib.Path) -> pathlib.Path:
 def _launch(source: str, *arguments: str) -> subprocess.Popen[str]:
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(REPO)
+    # Биржа ребёнку не нужна, а при старте он сам догружает историю (B-047):
+    # заглушка отвечает отказом сети (`tests/child_guard/offline_iss.py`).
+    environment["TERMINAL_TEST_ISS_STUB"] = "1"
     # Свой же интерпретатор и свой же текст программы — не пользовательский ввод.
     return subprocess.Popen(
         [sys.executable, "-c", textwrap.dedent(source), *arguments],
@@ -382,6 +385,14 @@ def test_inspect_reads_while_the_program_is_open(
 ) -> None:
     """Стережёт `--inspect`: тоже только чтение, тоже без замка."""
     _no_logging(monkeypatch)
+
+    class KnowsEveryCode:
+        """Биржа подставная: `--inspect` спрашивает у неё код (`D-128`)."""
+
+        def secid(self, code: str) -> str:
+            return code
+
+    monkeypatch.setattr("app.fetch.IssClient", KnowsEveryCode)
     database = _empty_database(folder)
     held = OneCopy(folder)
     assert held.take().taken
@@ -459,6 +470,9 @@ def _program(source: str | None, *arguments: str) -> subprocess.CompletedProcess
     """
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(REPO)
+    # Биржа ребёнку не нужна, а при старте он сам догружает историю (B-047):
+    # заглушка отвечает отказом сети (`tests/child_guard/offline_iss.py`).
+    environment["TERMINAL_TEST_ISS_STUB"] = "1"
     # ⚠️ Негодный плагин вместо `pop` — тот же довод, что в
     # `tests/test_app_main.py::_launch`. Присвоение `offscreen` в ветке
     # `--shot` обязано перебить то, что было в окружении; `pop` этого
@@ -517,6 +531,9 @@ def test_the_refusal_survives_a_qt_that_cannot_start(folder: pathlib.Path) -> No
     try:
         environment = dict(os.environ)
         environment["PYTHONPATH"] = str(REPO)
+        # Биржа ребёнку не нужна, а при старте он сам догружает историю (B-047):
+        # заглушка отвечает отказом сети (`tests/child_guard/offline_iss.py`).
+        environment["TERMINAL_TEST_ISS_STUB"] = "1"
         environment["QT_QPA_PLATFORM"] = "there-is-no-such-plugin"
         outcome = subprocess.run(
             [sys.executable, "-m", "app.main", "--db", str(database)],

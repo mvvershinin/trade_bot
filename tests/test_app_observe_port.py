@@ -35,6 +35,12 @@ from ui.models import ChartData
 from ui.models import RunOrigin as WindowOrigin
 from ui.models import Settings as UiSettings
 
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = UiSettings().instrument
+
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)  # пятница, до открытия окна
 
 
@@ -66,7 +72,7 @@ def live_database(tmp_path: pathlib.Path) -> pathlib.Path:
         for bar in bars(600, step=1)
     ]
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", minutes, Source.ISS)
+        store.put_minutes(SYMBOL, minutes, Source.ISS)
     return path
 
 

@@ -75,13 +75,15 @@ def period_lines(report: BacktestReport) -> list[str]:
         if report.first_bar is not None and report.last_bar is not None
         else "свечей на этот отрезок в базе не нашлось"
     )
-    return [
+    lines = [
         f"Просили: {asked} МСК",
         f"Посчитано: {found} МСК",
         f"Свечей в прогоне: {fmt_number(report.bars, 0)}. "
         f"Торговых дней: {report.trading_days} "
         "(дней, в которые были торги, — не календарных)",
     ]
+    # Склейка: на каких контрактах и днях посчитано — готовой строкой (B-069).
+    return [*lines, report.basis] if report.basis else lines
 
 
 class BacktestReportDialog(QDialog):
@@ -106,8 +108,16 @@ class BacktestReportDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
+        # Первой строкой: «Сделок: 0» без причины читается как поломка
+        # (правило 13 `CLAUDE.md`). Причину называет `app/`, окно показывает.
+        self.no_trades = QLabel(report.no_trades)
+        self.no_trades.setWordWrap(True)
+        self.no_trades.setStyleSheet(f"color: {self._theme.warning}; font-weight: 600;")
+        self.no_trades.setVisible(bool(report.no_trades))
+        layout.addWidget(self.no_trades)
         layout.addWidget(self._head())
         layout.addWidget(self._money())
+        layout.addWidget(self._contracts())
         layout.addWidget(self._headline())
         layout.addWidget(self._tabs(), 1)
         layout.addWidget(self._close_button())
@@ -162,6 +172,25 @@ class BacktestReportDialog(QDialog):
                 colour = self._theme.success if value >= 0 else self._theme.danger
                 cell.setStyleSheet(f"color: {colour}; font-weight: 600;")
             form.addRow(f"{field.label}:", cell)
+        return box
+
+    def _contracts(self) -> QWidget:
+        """Прогон по склейке: итог по каждому контракту и стыки (решение 0061).
+
+        Строки приходят готовыми из `backtest.stitched.stitched_lines`: окно
+        их не считает. Комиссия в каждой — отдельной колонкой. Прогон одним
+        контрактом группу не показывает.
+        """
+        box = QGroupBox("По контрактам")
+        rows = QVBoxLayout(box)
+        for line in self._report.contracts:
+            label = QLabel(line)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            if line.startswith("⚠"):
+                label.setStyleSheet(f"color: {self._theme.warning};")
+            rows.addWidget(label)
+        box.setVisible(bool(self._report.contracts))
         return box
 
     def _headline(self) -> QWidget:

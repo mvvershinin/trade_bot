@@ -62,13 +62,15 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+from strategies import registry
 from ui.models import Settings
-from ui.settings_codec import encode_fields, field_codecs, read_fields
+from ui.settings_codec import caption_of, encode_fields, field_codecs, read_fields
 from ui.userdata_file import write_atomically
 
 __all__ = [
@@ -110,6 +112,257 @@ class Loaded:
     values: Settings
     notes: tuple[str, ...] = ()
     troubles: tuple[str, ...] = ()
+    #: Строки `troubles` про требования алгоритма — с полем, о котором каждая.
+    #: Сборка не печатает такую строку, если порт при запуске снял это поле
+    #: снова (`HistoryPort.startup_substituted`): строка называла бы
+    #: действующим то, что уже не действует, — вторая правда рядом с первой.
+    demanded: tuple[tuple[str, str], ...] = ()
+
+
+def _known_algorithm(values: Settings) -> tuple[Settings, tuple[str, ...]]:
+    """Выбранный алгоритм есть в этой сборке — или берётся умолчание, но вслух.
+
+    ⚠️ Отдельная проверка, потому что укладка её не делает и делать не может:
+    `strategy_id` — обычная строка, и файл более новой сборки пройдёт разбор
+    целиком, а сломается позже — на первой же попытке собрать настройки
+    алгоритма, то есть при запуске робота.
+
+    Почему **умолчание с оговоркой**, а не отказ читать файл. Отказ здесь
+    не на что опереть: прежних настроек в этот момент не существует, программа
+    только открывается. Отказ означал бы «программа не запускается, потому что
+    в файле новое имя алгоритма» — а в файле рядом лежит всё, что человек
+    подбирал руками.
+
+    ⚠️ Молчаливой подменой это быть не имеет права (правило 13 `CLAUDE.md`):
+    подменён **не размер поля, а правило принятия решений**. Строка идёт
+    в `troubles`, то есть доходит до журнала решений предупреждением.
+    """
+    if values.strategy_id in registry.known_ids():
+        return values, ()
+    fallback = registry.default_entry()
+    gone = registry.retired_title(values.strategy_id)
+    if gone is not None:
+        # Алгоритм убран владельцем счёта (решение 0063): не беда, а факт.
+        # Строка уходит в журнал; файл переписывается только по «ОК».
+        return values.replace(strategy_id=fallback.id), (
+            f"Алгоритм «{gone}» убран, работает «{fallback.title}».",
+        )
+    return values.replace(strategy_id=fallback.id), (
+        f"Торгового алгоритма «{values.strategy_id}» в этой сборке нет — "
+        f"взят «{fallback.title}». Робот работает НЕ ТЕМ правилом, которое "
+        "вы выбирали: обновите программу целиком либо откройте «Настройки» "
+        "и нажмите «Применить», чтобы записать взятый. ⚠️ Остальные "
+        "настройки остались прежними, а подбирались они под другой алгоритм — "
+        "проверьте их тоже.",
+    )
+
+
+def _demanded_settings(
+    values: Settings, absent: frozenset[str] = frozenset()
+) -> tuple[Settings, dict[str, str]]:
+    """Настройки, которых требует выбранный алгоритм: подмена, но вслух.
+
+    Требования объявлены записью реестра (`strategies/registry.py`,
+    `SettingsDemand`): без них название алгоритма становится ложью — «Реверс
+    с постоянной позицией» при перевороте через свечу покидает рынок на каждом
+    перевороте.
+
+    ⚠️ **Здесь подмена, а при «Применить» — отказ, и это не разнобой.** Довод
+    тот же, что у `_known_algorithm` строкой выше: отказ здесь не на что
+    опереть — прежних настроек в этот момент не существует, программа только
+    открывается. Отказ означал бы «программа не запускается, потому что в файле
+    стоит момент переворота», а рядом в файле лежит всё, что человек подбирал
+    руками. При «Применить» прежние настройки есть, и там отказ законен:
+    владельцу счёта возвращают то, что работало.
+
+    ⚠️ Молчаливой подменой это быть не имеет права (правило 13 `CLAUDE.md`):
+    подменено **поведение робота на каждом перевороте**, а не оформление.
+    Строка идёт в `troubles`, то есть доходит до журнала решений
+    предупреждением.
+
+    ⚠️ Зовётся **после** `_known_algorithm`: требования принадлежат алгоритму,
+    и спрашивать их у имени, которого в сборке нет, нечего.
+
+    Несогласованность самой записи реестра (поля с таким именем у настроек
+    нет, элемента с таким именем нет у перечисления) здесь **не лечится
+    и не замалчивается**: она одинакова при любом файле и от чтения не зависит.
+    Громко о ней говорит первый же пересчёт, и цепочка проверена, а не
+    предположена: `app/main.py` зовёт `refresh("запуск программы")` сразу
+    после чтения настроек → `_replay` → `convert.strategy_settings` →
+    `chosen_algorithm` → `_demand_gap` → отказ и в окно, и в журнал решений
+    (`tests/test_app_algorithm_demands.py::
+    test_a_typo_in_the_declaration_does_not_stay_silent_at_start_up`).
+    Чтение файла в этом случае оставляет значение как есть.
+    """
+    try:
+        entry = registry.find(values.strategy_id)
+    except registry.UnknownStrategy:
+        return values, {}
+    changes: dict[str, object] = {}
+    said: dict[str, str] = {}
+    for demand in entry.demands:
+        current = getattr(values, demand.outer, None)
+        if current is None:
+            continue
+        # Элемент берётся у класса нынешнего значения: перечисление названо
+        # не строкой в реестре, а тем, что в поле уже лежит.
+        wanted = getattr(type(current), demand.value, None)
+        if wanted is None or current is wanted:
+            continue
+        changes[demand.outer] = wanted
+        # Поля могло не быть в файле вовсе (файл прежней сборки): тогда
+        # «в файле стояло» — неправда, стояло умолчание программы (`absent`).
+        was = (
+            "этой настройки не было (файл записан прежней сборкой)"
+            if demand.outer in absent else f"стояло «{_choice(current)}»"
+        )
+        said[demand.outer] = (
+            f"Алгоритм «{entry.title}» {demand.reason}. В файле настроек "
+            f"{was} — взято «{_choice(wanted)}». "
+            "Робот работает НЕ С ТОЙ настройкой, которая была записана: "
+            "откройте «Настройки» и проверьте, что выбрано, — поле закрыто "
+            "и подписано требованием алгоритма."
+        )
+    if not changes:
+        return values, {}
+    return values.replace(**changes), said
+
+
+def _one_way_to_take_profit(values: Settings) -> tuple[Settings, tuple[str, ...]]:
+    """Способ фиксации прибыли один — или берётся «не фиксируем», но вслух.
+
+    Способов два, применяется **один**: неподвижная цель или скользящий
+    уровень (решение 0060, слова заказчика «не И а ИЛИ мы выбираем способ»).
+    В настройках выбор лежит парой полей, и три сочетания из четырёх осмысленны:
+
+    * `take_profit_enabled=False` — прибыль не фиксируется, уровня нет;
+    * `True` без `trailing_enabled` — неподвижная цель от цены входа;
+    * `True` вместе с `trailing_enabled` — скользящий уровень.
+
+    Четвёртого — «способ скользящий, а фиксация выключена» — у позиции
+    не бывает: уровня в нём нет вовсе (`EngineSettings.plan`: `trailing =
+    take_profit and trailing_take_profit`), а пару «порог/отступ» движок при
+    этом всё равно проверяет и вправе отвергнуть настройки целиком из-за чисел,
+    которых никто не читает. Окно такого больше не отдаёт
+    (`ui/settings_dialog.py::SettingsDialog.values`), а в файле прежней сборки
+    оно осталось лежать.
+
+    Почему **умолчание с оговоркой**, а не отказ читать файл — довод тот же,
+    что у `_known_algorithm` выше: отказ здесь не на что опереть, прежних
+    настроек в этот момент не существует, программа только открывается.
+
+    ⚠️ Подмена **не меняет поведения робота**: уровня не было и не будет,
+    выбор направлен в ту сторону, в которую программа и работала. Молчаливой
+    она быть не имеет права (правило 13 `CLAUDE.md`) — снят переключатель,
+    который человек ставил руками, и строка идёт в `troubles`, то есть
+    доходит до журнала решений предупреждением.
+    """
+    if not values.trailing_enabled or values.take_profit_enabled:
+        return values, ()
+    return values.replace(trailing_enabled=False), (
+        "В файле настроек выбран скользящий уровень фиксации прибыли, а сама "
+        "фиксация выключена. Такого сочетания не бывает: уровня выхода "
+        "у позиции в нём нет вовсе — её держит только переворот по средней, "
+        "и ровно так программа и работала. Записано «прибыль не фиксируется». "
+        "⚠️ Если вы хотели скользящий уровень, откройте «Настройки» → «Вход "
+        "и выход», поставьте галочку «Фиксировать прибыль» и выберите способ "
+        "«Скользящий уровень».",
+    )
+
+
+#: Три предохранителя по деньгам: выключатель, число и как они называются
+#: человеку. ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113) — полей с такими именами
+#: в `ui.models.Settings` сейчас нет, а в файлах на дисках они остались.
+#:
+#: Таблицей, а не тремя ветками: четвёртый предохранитель, заведённый завтра,
+#: попадёт сюда строкой, а не новым `if` (`CLAUDE.md`, правило 9).
+#: Поля «Реверса по скользящей средней», убранного 05.10.2026 вместе с ним
+#: (решение 0063). Старый файл настроек их содержит; читать их некому.
+RETIRED_KEYS: Final[frozenset[str]] = frozenset({
+    "filter_enabled", "threshold_percent", "confirm_bars",
+    "on_price_equals_average",
+})
+
+_GUARDS_OFF: Final[tuple[tuple[str, str, str], ...]] = (
+    ("volume_cap_enabled", "volume_cap", "потолок объёма"),
+    ("daily_loss_limit_enabled", "daily_loss_limit_pct", "дневной лимит убытка"),
+    (
+        "free_funds_reserve_enabled",
+        "free_funds_reserve_pct",
+        "запас свободных средств",
+    ),
+)
+
+
+def _guards_off_in_the_file(
+    raw: dict[str, object], table: Mapping[str, object]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Выключенные на этапе предохранители, найденные в файле: сказать вслух.
+
+    Возвращает обычные оговорки и тревожные — в том же порядке, в каком их
+    ждёт `Loaded`.
+
+    ⚠️ Отдельная проверка, потому что общая («ключей этой сборке не знакомых»)
+    объяснила бы их **неправдой**: она говорит «скорее всего файл сделан более
+    новой сборкой программы», а сборка здесь не новее — предохранители выключены
+    у нас, решением заказчика 15.09.2026 (решение 0060 §4). Человек, прочитавший
+    эту строку, пошёл бы искать несуществующее обновление.
+
+    ⚠️ **Промолчать нельзя** (правило 13 `CLAUDE.md`), и это разный по силе
+    случай. Галочка в файле стояла — у владельца счёта **перестала работать
+    защита, которую он включал руками**: строка идёт в `troubles`, то есть
+    доходит до журнала решений предупреждением. Галочка снята — не изменилось
+    ничего, и строка идёт обычной оговоркой: кричать тут значит приучить
+    не читать предупреждения.
+
+    ⚠️ Список считается **от самой сборки**, а не записан руками: предохранитель
+    попадает сюда, только если поля с его именем в `field_codecs()` нет. Отсюда
+    два следствия. На этапе, где выключен ещё не весь список, о живых полях
+    не говорится ни слова. А когда `D-113` вернёт поля в окно, проверка
+    замолчит сама — без правки, о которой некому будет вспомнить.
+
+    Значения из файла при этом **не трогаются**: они лежат в `self._unknown`
+    и уходят обратно при записи. Подобранные руками цифры переживут выключение
+    предохранителя и вернутся вместе с ним.
+    """
+    gone = [
+        (switch, title)
+        for switch, number, title in _GUARDS_OFF
+        if switch not in table and number not in table and (switch in raw or number in raw)
+    ]
+    if not gone:
+        return (), ()
+    armed = sorted({title for switch, title in gone if raw.get(switch) is True})
+    quiet = sorted({title for switch, title in gone} - set(armed))
+    troubles: list[str] = []
+    notes: list[str] = []
+    if armed:
+        many = len(armed) > 1
+        troubles.append(
+            ("В файле настроек включены предохранители: " if many else
+             "В файле настроек включён предохранитель: ")
+            + ", ".join(armed)
+            + (". В этой сборке их НЕТ: " if many else ". В этой сборке его НЕТ: ")
+            + "предохранители по деньгам выключены на этапе разработки "
+            "по решению владельца счёта, и робот за этим НЕ СЛЕДИТ. "
+            "⚠️ Значения из файла сохранены нетронутыми и вернутся вместе "
+            "с предохранителями; к боевой торговле программа в таком виде "
+            "не допущена."
+        )
+    if quiet:
+        notes.append(
+            "Настройки выключенных на этапе предохранителей оставлены в файле "
+            "нетронутыми: " + ", ".join(quiet) + ". В этой сборке их нет, "
+            "и галочки в файле сняты — поведение робота от этого не изменилось."
+        )
+    return tuple(notes), tuple(troubles)
+
+
+def _choice(value: object) -> str:
+    """Значение выбора из списка так, как его видит человек в окне."""
+    said = getattr(value, "label", "")
+    return said if isinstance(said, str) and said else str(value)
+
 
 # ---------------------------------------------------------------------------
 # Сам файл
@@ -171,11 +424,25 @@ class SettingsStore:
             ))
         notes: list[str] = []
         table = field_codecs()
-        self._unknown = {key: item for key, item in raw.items() if key not in table}
-        if self._unknown:
+        # Поля убранного алгоритма (решение 0063) в «незнакомые» не идут
+        # и обратно в файл не пишутся: им больше некому принадлежать.
+        self._unknown = {
+            key: item for key, item in raw.items()
+            if key not in table and key not in RETIRED_KEYS
+        }
+        # Выключенные на этапе предохранители объясняются **своими словами**,
+        # а не общим «файл новее»: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113).
+        # В файле они при этом остаются — `self._unknown` их держит.
+        guards_notes, guards_troubles = _guards_off_in_the_file(raw, table)
+        notes.extend(guards_notes)
+        troubles.extend(guards_troubles)
+        strangers = sorted(
+            set(self._unknown) - {name for row in _GUARDS_OFF for name in row[:2]}
+        )
+        if strangers:
             notes.append(
                 "Настройки, которых эта сборка не знает, оставлены в файле "
-                "нетронутыми: " + ", ".join(sorted(self._unknown)) + ". Скорее "
+                "нетронутыми: " + ", ".join(strangers) + ". Скорее "
                 "всего файл сделан более новой сборкой программы."
             )
         changes, refused, missing = read_fields(raw, table, start)
@@ -183,10 +450,26 @@ class SettingsStore:
         if missing:
             notes.append(
                 "Настройки, которых в файле нет, взяты по умолчанию: "
-                + ", ".join(missing)
-                + ". Так бывает после обновления программы."
+                + ", ".join(f"«{caption_of(name)}»" for name in missing)
+                + ". Так бывает после обновления программы. Что выбрано, видно "
+                "в окне «Настройки»; в файл они запишутся, когда вы сами "
+                "примените настройки."
             )
-        return Loaded(start.replace(**changes), tuple(notes), tuple(troubles))
+        values = start.replace(**changes)
+        values, unknown_algorithm = _known_algorithm(values)
+        troubles.extend(unknown_algorithm)
+        # Порядок значим: требования принадлежат алгоритму, а какой он —
+        # решает строка выше.
+        values, unmet_demands = _demanded_settings(values, frozenset(missing))
+        troubles.extend(unmet_demands.values())
+        # Порядок с двумя проверками выше безразличен: ни одна из них не трогает
+        # полей фиксации прибыли. Стоит последней, потому что читается как
+        # продолжение — «а теперь то же самое про способ фиксации».
+        values, both_ways = _one_way_to_take_profit(values)
+        troubles.extend(both_ways)
+        return Loaded(
+            values, tuple(notes), tuple(troubles), tuple(unmet_demands.items())
+        )
 
     def _quarantine(self, error: Exception) -> tuple[str, ...]:
         """Отложить испорченный файл в сторону и сказать, куда именно.
@@ -242,6 +525,59 @@ class SettingsStore:
                 "прежние. Проверьте, что папка существует и в неё можно писать."
             )
         return ""
+
+    def patch(self, values: Settings, names: tuple[str, ...]) -> str:
+        """Переписать в файле только поля `names`, остальное — байт в байт как было.
+
+        Для единственной записи без «ОК» — перехода с истёкшего контракта
+        (`HistoryPort._switch_to_current`). `save` записал бы всё прочитанное:
+        с подменами при чтении и с ключами, которых в файле не было, — а это
+        и есть правка файла владельца без его ведома (`B-050`). Здесь
+        меняются только названные ключи, отсутствующие и незнакомые остаются
+        как есть.
+
+        Файла нет или он не читается — не пишется ничего, и это фраза:
+        первый «ОК» человека создаст файл сам, а до него смена живёт только
+        в памяти — молчать об этом при строке «записан в файл» нельзя.
+        """
+        if not self._path.exists():
+            return (
+                f"Файла настроек {self._path} ещё нет: смена действует до "
+                "закрытия программы, файл появится с первым «ОК» в настройках."
+            )
+        # Не читается — тоже фраза, а не «успех» (аудит /risk 06.10.2026):
+        # прежде здесь стояло `return ""`, и переход с истёкшего контракта
+        # сообщал «записан в файл», хотя не записано ничего. Файл при этом
+        # не перезаписывается умолчаниями: он чужой, его чинит человек.
+        kept = "смена действует до закрытия программы, файл оставлен как есть."
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            return f"Файл настроек {self._path} не читается ({_why(error)}): {kept}"
+        stored = payload.get(_KEY_VALUES) if isinstance(payload, dict) else None
+        if not isinstance(stored, dict):
+            return f"В файле настроек {self._path} нет раздела настроек: {kept}"
+        encoded = encode_fields(values)
+        stored.update({name: encoded[name] for name in names})
+        body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        try:
+            write_atomically(self._path, body)
+        except OSError as error:
+            return (
+                f"Настройки не сохранены в {self._path}: {error}. В этом сеансе "
+                "они действуют, но при следующем запуске программа возьмёт прежние."
+            )
+        return ""
+
+    @staticmethod
+    def patched(values: Settings, names: tuple[str, ...]) -> str:
+        """Что записала `patch`, словами для журнала: подписи окна и значения."""
+        return (
+            "В файле настроек изменено только: "
+            + ", ".join(f"«{caption_of(name)}» — {getattr(values, name)}" for name in names)
+            + ". Остальное в файле не тронуто."
+        )
+
 
 def _why(error: Exception) -> str:
     """Почему файл не прочёлся — по-русски и без кода библиотеки.

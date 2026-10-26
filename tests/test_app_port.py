@@ -26,6 +26,8 @@ from PySide6.QtCore import Qt
 
 os.environ.setdefault("QT_API", "pyside6")  # до первого импорта qasync
 
+from app import convert
+from app.port import NO_GUARDS, HistoryPort, _Frame
 from backtest import BREATHE_EVERY, Deal, HistoryRun
 from engine import ExitReason, Side
 from market import (
@@ -38,20 +40,29 @@ from market import (
     Timeframe,
 )
 from market.journal import SECRET_MASK, redact
+from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     CalendarDay,
-    Candle as WindowCandle,
     ChartData,
     Connection,
     DecisionLevel,
     HistoryLoadRequest,
     Layer,
     Mode,
+    ReversalMoment,
     Settings,
+    TimeExitKind,
+)
+from ui.models import (
+    Candle as WindowCandle,
 )
 
-from app.port import NO_GUARDS, HistoryPort
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
 
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)  # пятница, до открытия окна
 
@@ -79,7 +90,7 @@ def _minutes(count: int = 300, start: datetime = DAY) -> list[Candle]:
 def database(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(), Source.ISS)
     return path
 
 
@@ -95,7 +106,7 @@ def long_database(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "long-candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes((BREATHE_EVERY * 2 + 20) * 5), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes((BREATHE_EVERY * 2 + 20) * 5), Source.ISS)
     return path
 
 
@@ -108,8 +119,8 @@ def two_day_database(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "two-days.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(300, DAY - timedelta(days=1)), Source.ISS)
-        store.put_minutes("MXU6", _minutes(300, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY - timedelta(days=1)), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY), Source.ISS)
     return path
 
 
@@ -124,8 +135,8 @@ def database_with_tails(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "tails.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(298, DAY), Source.ISS)
-        store.put_minutes("MXU6", _minutes(298, DAY + timedelta(days=3)), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(298, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(298, DAY + timedelta(days=3)), Source.ISS)
     return path
 
 
@@ -141,6 +152,8 @@ class Recorded:
         self.busy: list[tuple[bool, str]] = []
         self.progress: list[tuple[int, str]] = []
         self.settings: list[Settings] = []
+        #: Каталог алгоритмов — каждый, что порт отправил в окно.
+        self.catalogues: list[tuple] = []
         #: Строки журнала по одной, как они появлялись. Нужны там, где до
         #: полной публикации журнала дело не доходит: `decisions_replaced`
         #: отправляется в конце прохода, а строка об изменении настройки
@@ -162,6 +175,7 @@ class Recorded:
         port.busy_changed.connect(lambda on, what: self.busy.append((on, what)))
         port.progress_changed.connect(lambda p, what: self.progress.append((p, what)))
         port.settings_applied.connect(self.settings.append)
+        port.algorithms_changed.connect(self.catalogues.append)
 
 
 async def _run(port: HistoryPort, worker: MarketWorker | None = None) -> None:
@@ -189,13 +203,28 @@ def replay_history(loop, database: pathlib.Path, **kwargs):
     return loop.run_until_complete(go())
 
 
+def _close_again(loop, port: HistoryPort) -> None:
+    """Закрыть порт, которым тест пользовался после `replay_history`.
+
+    `replay_history` порт уже закрыл, но новая команда (`apply_settings`)
+    заводит работу заново через `_begin`, а с ней — часы сторожа
+    (`_Stuck.timer`, таймер Qt раз в секунду). Порт, брошенный с идущими
+    часами, уходит в сборку мусора циклом, и сборщик вправе сработать
+    в потоке базы (`MarketWorker`). `~QObject` не в своём потоке таймер
+    не снимает («Timers cannot be stopped from another thread»), запись
+    о нём остаётся в цикле Qt, и следующий тест этого воркера падает
+    SIGSEGV в `QTimerInfoList::activateTimers` (замер 29.09.2026).
+    """
+    loop.run_until_complete(port.aclose())
+
+
 # --------------------------------------------------------------------- норма
 
 def test_candles_and_deals_reach_the_window(loop, database) -> None:
     port, recorded = replay_history(loop, database, values=Settings(), days=0)
 
     chart = recorded.charts[-1]
-    assert chart.instrument == "MXU6"
+    assert chart.instrument == SYMBOL
     assert len(chart.candles) > 50, "свечи из базы не доехали"
     assert chart.average, "линия средней пуста — торговый модуль её не отдал"
     assert chart.average_label.startswith("EMA(15)")
@@ -313,7 +342,7 @@ def test_the_state_is_always_simulation(loop, database) -> None:
     assert state.simulation is True, "боевой режим не подключён и объявляться не должен"
     assert state.running is False
     assert state.connection is Connection.UNKNOWN
-    assert state.instrument == "MXU6"
+    assert state.instrument == SYMBOL
 
 
 @pytest.mark.slow
@@ -340,12 +369,16 @@ def test_progress_and_busy_are_shown(loop, long_database) -> None:
 # --------------------------------------------------------------------- отказы
 
 def test_a_missing_database_is_said_in_plain_words(loop, tmp_path) -> None:
-    """Отсутствие базы — не трассировка, а фраза, называющая файл."""
+    """Отсутствие базы — не трассировка, а фраза, называющая кнопку.
+
+    Показ заказчику 01.10.2026: служебное «автозагрузка (Э1-5) ещё не
+    сделана» и путь к файлу человеку не говорили, что нажать.
+    """
     missing = tmp_path / "no-such.sqlite3"
     _, recorded = replay_history(loop, missing, values=Settings(), days=0)
     assert recorded.failures, "программа промолчала о том, что базы нет"
     message = recorded.failures[-1]
-    assert "no-such.sqlite3" in message
+    assert "«Загрузить историю»" in message
     assert "Traceback" not in message
     assert recorded.charts[-1].candles == ()
 
@@ -355,7 +388,7 @@ def test_a_missing_instrument_names_what_is_there(loop, database) -> None:
         loop, database, values=Settings().replace(instrument="RIU6"), days=0
     )
     message = recorded.failures[-1]
-    assert "RIU6" in message and "MXU6" in message
+    assert "RIU6" in message and SYMBOL in message
 
 
 def test_start_refuses_with_an_explanation(loop, database) -> None:
@@ -428,6 +461,201 @@ def test_changing_the_mode_changes_the_deals(loop, database) -> None:
     assert after == 0, "в режиме «Выключен» сделок быть не может"
 
 
+def test_the_new_rule_in_words_reaches_the_journal(loop, database) -> None:
+    """Сменили период — в журнале и число, и **правило целиком** новыми словами.
+
+    Строка «Период средней: 15 → 20» говорит, что поменяли, и не говорит,
+    каким стало правило. Разбирают через месяц именно правило — «почему
+    в тот день робот повёл себя иначе», — а восстанавливать его из чисел
+    по памяти некому.
+
+    Мутация, обязанная ронять проверку: убрать `changes.append(...)`
+    с `rule_headline_of` в `HistoryPort.apply_settings`.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        recorded = Recorded(port)
+        try:
+            await _run(port)
+            port.apply_settings(Settings().replace(average_period=20))
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return recorded
+
+    recorded = loop.run_until_complete(go())
+    said = [
+        row.reason
+        for row in recorded.appended
+        if getattr(row, "event", "") == "Настройки изменены"
+    ]
+    assert said, "изменение настроек не попало в журнал"
+    told = said[-1]
+    assert "Период средней: 15 → 20" in told, "прежнего и нового значения нет"
+    assert "Правило теперь читается так" in told, (
+        "журнал назвал изменившееся число и не назвал получившееся правило"
+    )
+    assert "EMA(20)" in told, "правило в журнале осталось с прежним периодом"
+    assert "EMA(15)" not in told.split("Правило теперь читается так")[1], (
+        "в новом правиле стоит прежняя средняя"
+    )
+
+
+def test_a_change_that_does_not_touch_the_module_says_nothing_about_the_rule(
+    loop, database
+) -> None:
+    """Объём поменяли — правило не изменилось, и строки про него нет.
+
+    Строка про правило на **каждое** изменение настроек превратила бы журнал
+    в стену повторов, и читать его перестали бы целиком.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        recorded = Recorded(port)
+        try:
+            await _run(port)
+            port.apply_settings(Settings().replace(volume=2))
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return recorded
+
+    recorded = loop.run_until_complete(go())
+    said = [
+        row.reason
+        for row in recorded.appended
+        if getattr(row, "event", "") == "Настройки изменены"
+    ]
+    assert said, "изменение настроек не попало в журнал"
+    assert "Правило теперь читается так" not in said[-1]
+
+
+def test_the_catalogue_of_algorithms_reaches_the_window(loop, database) -> None:
+    """Каталог алгоритмов уезжает в окно вместе с настройками, с новыми числами.
+
+    Окно посчитать его не может: `ui/` не импортирует торговые слои
+    (ARCHITECTURE.md §2). Значит каталог обязан приехать готовым — и приехать
+    **и по запросу настроек, и после их применения**: окно, спросившее
+    настройки при открытии, иначе не знало бы даже названия алгоритма,
+    которым работает робот.
+    """
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        recorded = Recorded(port)
+        try:
+            await _run(port)
+            port.request_settings()
+            asked = list(recorded.catalogues)
+            port.apply_settings(Settings().replace(average_period=20))
+            await port.wait()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return asked, recorded
+
+    asked, recorded = loop.run_until_complete(go())
+    assert asked, "на запрос настроек каталог алгоритмов не пришёл"
+    first = asked[-1]
+    assert first, "каталог приехал пустым — выбирать человеку не из чего"
+    assert first[0].title, "у алгоритма в каталоге нет названия"
+    assert first[0].chosen, "выбранный алгоритм в каталоге не помечен"
+    assert "EMA(15)" in first[0].details, "описание пришло без нынешних чисел"
+    assert first[0].summary and not any(
+        sign.isdigit() for sign in first[0].summary
+    ), "правило одной фразой обязано читаться без чисел"
+
+    latest = recorded.catalogues[-1]
+    assert latest[0].details != first[0].details, (
+        "после «Применить» описание не обновилось"
+    )
+    assert "EMA(20)" in latest[0].details, "в описании остался прежний период"
+    assert "робот хочет быть в лонге" in latest[0].details, (
+        "описание приехало без утверждений — показывать человеку нечего"
+    )
+
+
+def test_the_settings_window_names_the_algorithm_before_any_apply(
+    loop, database, monkeypatch
+) -> None:
+    """Настоящая дорога целиком: порт → сигнал → окно настроек. Без «Применить».
+
+    ⚠️ Это тот путь, которым идёт человек, и именно он не проверялся ничем.
+    Соседняя проверка выше зовёт `port.request_settings()` руками и потому
+    зеленела при полностью отсутствующей проводке: из продуктового кода этот
+    метод не вызывался **ни разу**, каталог уезжал в окно только из
+    `apply_settings`. Владелец счёта 09.09.2026 открыл настройки сразу после
+    запуска и увидел `ema_reverse` вместо названия и пустой список выбора.
+
+    Здесь подменён единственный кусок — `exec()` окна настроек: модальный
+    цикл в прогоне ждал бы человека вечно. Всё остальное настоящее: порт,
+    реестр алгоритмов, сборка каталога, само окно настроек и его вкладка.
+
+    Мутация, обязанная ронять проверку: снять `self.port.request_settings()`
+    из `MainWindow.open_settings`.
+    """
+    from ui.main_window import MainWindow
+    from ui.settings_dialog import SettingsDialog
+
+    seen: dict[str, object] = {}
+
+    def instead_of_exec(dialog: SettingsDialog) -> int:
+        """Снять с окна то, что увидел бы человек, и закрыть его."""
+        seen["name"] = dialog.algorithm_name.text()
+        seen["note"] = dialog.algorithm_note.text()
+        seen["button"] = dialog.algorithm_button.isEnabled()
+        seen["rows"] = len(dialog._algorithms)  # noqa: SLF001 — состав каталога
+        return 0
+
+    monkeypatch.setattr(SettingsDialog, "exec", instead_of_exec)
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        window = MainWindow(port=port, settings=Settings(), sanitize=redact)
+        window._timer.stop()  # noqa: SLF001 — часы в тесте только мешают
+        try:
+            window.open_settings()
+        finally:
+            await port.aclose()
+            await worker.close()
+        return window
+
+    window = loop.run_until_complete(go())
+    try:
+        assert seen, "окно настроек не открылось — проверять нечего"
+        assert seen["rows"] == len(registry.entries()), (
+            "до окна доехал не весь реестр алгоритмов: "
+            f"{seen['rows']} из {len(registry.entries())}"
+        )
+        assert seen["name"] != Settings().strategy_id, (
+            "на вкладке снова стоит имя латиницей вместо названия алгоритма"
+        )
+        assert seen["name"] == registry.default_entry().title, (
+            f"название не то, что в реестре: {seen['name']!r}"
+        )
+        assert not seen["note"], (
+            f"рядом с названием осталась строка беды: {seen['note']!r}"
+        )
+        assert seen["button"], (
+            "кнопка выбора алгоритма выключена при живом каталоге"
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+
+
 def test_a_settings_change_writes_a_line_in_the_journal(loop, database) -> None:
     """Список изменений даёт движок, а не окно и не порт."""
 
@@ -470,9 +698,47 @@ def _something_else(field: str, expected_value):
     Значения не подбираются под ожидаемый текст: тест проверяет, что запись
     об изменении вообще появилась, а не как она сформулирована.
     """
+    if field == "strategy_id":
+        return _another_algorithm(expected_value) or f"{expected_value}/иначе"
     if field in _ANOTHER_VALUE:
         return _ANOTHER_VALUE[field]
     return _another_of_the_same_type(field, expected_value)
+
+
+def _another_algorithm(current: str) -> str | None:
+    """Другой торговый алгоритм реестра. `None` — он в нём один.
+
+    Спрашивается у реестра, а не записывается здесь именем: с 05.10.2026
+    алгоритм в сборке один (решение 0063), и второй ставит фикстура `twin`.
+    """
+    others = [name for name in registry.known_ids() if name != current]
+    return others[0] if others else None
+
+
+#: Подставной второй алгоритм: тот же расчёт, своё имя, **без требований**.
+#: Нужен проверкам смены алгоритма и полей, которых требует настоящий
+#: (момент переворота, форма выхода): при одном алгоритме с требованиями
+#: их изменение выставляется обратно, и журналу нечего записать.
+TWIN_ID = "twin_without_demands"
+
+
+@pytest.fixture
+def twin(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Реестр с подставным вторым алгоритмом; ответ — настройки на нём.
+
+    Настоящая таблица не трогается (`D-078`): подмена живёт одну проверку.
+    """
+    real = registry.default_entry()
+    double = dataclasses.replace(
+        real, id=TWIN_ID, title="Двойник без требований", demands=(),
+    )
+    monkeypatch.setattr(registry, "_ENTRIES", (real, double))
+    # Прежние умолчания программы: у подставного требований нет, и смена
+    # момента переворота и формы выхода на нём доходит до журнала.
+    return Settings(
+        strategy_id=TWIN_ID, reversal_moment=ReversalMoment.NEXT_BAR,
+        time_exit_order=TimeExitKind.MARKET,
+    )
 
 
 def _another_of_the_same_type(field: str, expected_value):
@@ -502,7 +768,45 @@ def _another_of_the_same_type(field: str, expected_value):
     raise AssertionError(f"тест не знает, как изменить поле {field}")
 
 
-def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:
+def _with_demands(values: Settings) -> Settings:
+    """Настройки, отвечающие требованиям выбранного алгоритма.
+
+    ⚠️ Нужно с 14.09.2026: алгоритм вправе требовать от общих настроек
+    программы определённого значения — «Реверс с постоянной позицией»
+    требует переворота в одной свече, — и пара, требованию не отвечающая,
+    **не принимается вовсе** (`app/convert.py::check_demands`). Тест,
+    меняющий одно поле, без этого проверял бы путь отказа вместо пути
+    журнала, и делал бы это молча: строка в журнале была бы, но другая.
+
+    Требования спрашиваются у реестра, а не записываются здесь именем поля:
+    третий алгоритм со своим требованием подхватится сам.
+    """
+    try:
+        entry = registry.find(values.strategy_id)
+    except registry.UnknownStrategy:
+        return _with_step(values)
+    changes = {
+        demand.outer: getattr(type(getattr(values, demand.outer)), demand.value)
+        for demand in entry.demands
+    }
+    return _with_step(values.replace(**changes) if changes else values)
+
+
+def _with_step(values: Settings) -> Settings:
+    """Заявке с предельной ценой — шаг цены: без него настройки отвергаются.
+
+    ⚠️ С Ф3 задачи З8 выход «с предельной ценой» без шага цены — отказ
+    (`app/convert.py::limit_without_step`). Тест на путь журнала проверял бы
+    без этого путь отказа — тот же довод, что у требований выше.
+    """
+    if values.time_exit_order is TimeExitKind.LIMIT and values.price_step <= 0:
+        return values.replace(price_step=25.0)
+    return values
+
+
+def _apply(
+    loop, database: pathlib.Path, updated: Settings, start: Settings | None = None,
+) -> Recorded:
     """Применить настройки и вернуть записи. Прогон не гоняется.
 
     Строка журнала пишется до постановки прогона в очередь, поэтому ждать
@@ -511,7 +815,10 @@ def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:
 
     async def go():
         worker = MarketWorker(database)
-        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        port = HistoryPort(
+            worker, values=Settings() if start is None else start, days=0,
+            sanitize=redact,
+        )
         recorded = Recorded(port)
         port.apply_settings(updated)
         await port.aclose()
@@ -521,8 +828,18 @@ def _apply(loop, database: pathlib.Path, updated: Settings) -> Recorded:
     return loop.run_until_complete(go())
 
 
-@pytest.mark.parametrize("field", [field.name for field in fields(Settings)])
-def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, field) -> None:
+#: Шаг цены человек не меняет: его сообщает биржа (решение 05.10.2026), и то,
+#: что пришло в нём с «Применить», порт не берёт —
+#: `tests/test_step_from_exchange.py`.
+_NOT_SET_BY_PERSON = frozenset({"price_step"})
+
+
+@pytest.mark.parametrize("field", [
+    field.name for field in fields(Settings) if field.name not in _NOT_SET_BY_PERSON
+])
+def test_a_change_of_any_settings_field_reaches_the_journal(
+    loop, database, field, twin,
+) -> None:
     """ТЗ §4.4 А: изменение настройки — строка с прежним и новым значением.
 
     Проверяются **все** поля окна, а не одно. Список изменений раньше
@@ -535,8 +852,24 @@ def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, fiel
     Новое поле в `Settings` без источника строки тоже уронит этот тест —
     список полей берётся у самого класса, а не записан здесь от руки.
     """
-    before = Settings()
-    recorded = _apply(loop, database, before.replace(**{field: _something_else(field, getattr(before, field))}))
+    # ⚠️ Условие до прогона, а не ветка после него, и правка эта от 14.09.2026.
+    # Прежняя редакция при одном алгоритме в реестре **молча** переходила
+    # на слабое утверждение — «незнакомое имя отвергнуто вслух» вместо «строка
+    # было → стало есть в журнале». Переход был тихим: сторож отключал себя
+    # сам, и вместе с ним переставала ловиться подмена выбранного алгоритма
+    # первым. Алгоритмов теперь два; вернётся один — об этом будет сказано
+    # вслух (`CLAUDE.md` №13).
+    if field == "strategy_id":
+        assert _another_algorithm(TWIN_ID) is not None, (
+            "в сборке один торговый алгоритм: строку «было → стало» для имени "
+            "алгоритма нечем получить, и проверка этого поля вакуумна. Пока "
+            "так, изменение правила принятия решений в журнал не стережётся"
+        )
+    # Начало — подставной алгоритм без требований (`twin`): иначе изменение
+    # момента переворота и формы выхода выставлялось бы обратно.
+    before = twin
+    changed = before.replace(**{field: _something_else(field, getattr(before, field))})
+    recorded = _apply(loop, database, _with_demands(changed), start=before)
     reasons = [entry.reason for entry in recorded.appended]
     assert "Значения совпали с прежними" not in reasons, (
         f"поле «{field}» изменено, а в журнале написано, что всё осталось "
@@ -546,38 +879,199 @@ def test_a_change_of_any_settings_field_reaches_the_journal(loop, database, fiel
         f"изменение поля «{field}» не попало в журнал ни одной строкой "
         f"с прежним и новым значением: {reasons}"
     )
+    if field == "strategy_id":
+        # ⚠️ Проверяется **кусок** склеенной строки, а не строка целиком,
+        # и это замер, а не вкус. `apply_settings` склеивает все изменения
+        # в одну строку журнала через «; ». Смена алгоритма приносит с собой
+        # его требование к общим настройкам (`_with_demands`), поэтому
+        # в склейке всегда есть и стрелка — от момента переворота, — и новое
+        # название, от строки «Правило теперь читается так». Утверждение
+        # «в строке есть стрелка и есть название» на такой склейке зеленеет,
+        # даже когда строка про сам алгоритм пропала целиком: проверено
+        # мутацией 14.09.2026, прогон остался зелёным. Разбираем склейку
+        # обратно тем же разделителем (он написан здесь же, в `apply_settings`)
+        # и требуем один кусок, называющий **оба** имени: журнал обязан
+        # сказать, какое правило каким заменили.
+        was_title = registry.find(before.strategy_id).title
+        now_title = registry.find(changed.strategy_id).title
+        assert any(
+            "→" in piece and was_title in piece and now_title in piece
+            for said in reasons
+            for piece in said.split("; ")
+        ), (
+            f"смена торгового алгоритма «{was_title}» → «{now_title}» "
+            f"не попала в журнал одной строкой с обоими именами: {reasons}"
+        )
 
 
-@pytest.mark.parametrize(
-    "field", ["volume_cap", "daily_loss_limit_pct", "free_funds_reserve_pct"]
-)
-def test_changing_a_guard_says_what_it_does_and_what_it_does_not(
-    loop, database, field
-) -> None:
-    """Стережёт: число предохранителя принято не молча, а с оговоркой.
+@pytest.mark.parametrize("field", [field.name for field in fields(Settings)])
+def test_a_change_of_any_settings_field_reaches_the_confirmation(field, twin) -> None:
+    """Перечень перед «Применить» собирается для **любого** поля окна.
 
-    Тихое «принято» читается как «ограничение поставлено». Само по себе
-    число не ограничивает ничего: предохранитель работает от своей галочки,
-    и все три галочки сняты умолчанием. Два из трёх вдобавок считаются
-    от размера счёта, которого программа не знает.
+    ⚠️ Проверка заведена правкой `B-051` и стоит рядом с журнальной нарочно:
+    у них общий список полей и общий подбор «другого значения», а дефект был
+    ровно в том, что второй дороги никто так не проходил. Перечень изменений
+    падал `AttributeError` при смене торгового алгоритма — то есть второй
+    алгоритм из окна **не выбирался вовсе**, — и прогон был зелёным: единственный
+    сторож на разбор изменений перечислял поля руками, и `strategy_id` в него
+    не попал.
 
-    ⚠️ Прежняя редакция этого теста утверждала обратное — «в движке нет
-    ни одного из трёх предохранителей». Это перестало быть правдой
-    05.09.2026, когда их провели из окна (`D-030`), а текст остался
-    и врал владельцу счёта при каждом старте (`D-037`).
+    Стережёт три вещи, и все три — проверяемое следствие, а не текст:
+
+    * разбор **не падает** (падение здесь останавливает путь человека
+      до применения настроек и до отказа на несовместимой паре);
+    * причина пуста — перечень собран, а не заменён объяснением;
+    * перечень **не пуст**. Молчание здесь читается как «ничего не меняется»
+      и стоит дороже падения: человек подтверждает изменение по деньгам,
+      которого ему не показали (правило 13 `CLAUDE.md`).
+
+    * перечень **называет прежнее и новое значение** — строкой со стрелкой.
+      Утверждение добавлено 14.09.2026 по мутации: без него проверка зеленела
+      на перечне из одной постоянной строки «Настройки изменены» для всех
+      тридцати шести полей, а главное — пропускала поле, чьё изменение
+      программа назвать не умеет. Такое поле даёт честную, но пустую по сути
+      оговорку «программа не умеет назвать изменения полей: instrument»,
+      и человек перед «Применить» не видит, на что меняет инструмент.
+      Журнальный близнец (`..._reaches_the_journal`) это ловил, а перечень
+      подтверждения — нет: две дороги расходились на одном и том же дефекте.
+
+    ⚠️ Стрелка требуется у **какой-нибудь** строки перечня, а не у всех:
+    смена алгоритма приносит с собой ещё и строку «Правило теперь читается
+    так — …», в которой стрелки нет и быть не должно. Замер 14.09.2026:
+    все тридцать шесть полей дают сегодня хотя бы одну строку со стрелкой,
+    так что утверждение не вакуумно ни на одном из них.
+
+    Мутации, обязанные ронять проверку: вернуть в `all_changes` сравнение
+    настроек алгоритмов поле в поле; отдать пустой список; отдать список
+    из одной постоянной строки; убрать любое поле из `_WINDOW_TOLD`.
     """
-    before = Settings()
-    recorded = _apply(loop, database, before.replace(**{field: _something_else(field, getattr(before, field))}))
-    warnings_seen = [
-        entry for entry in recorded.appended
-        if entry.level is DecisionLevel.WARNING and NO_GUARDS in entry.reason
-    ]
-    assert warnings_seen, (
-        f"поле «{field}» принято молча — владелец счёта вправе решить, что "
-        "ограничение поставлено. Строки журнала: "
-        f"{[(seen.event, seen.level) for seen in recorded.appended]}"
+    before = twin
+    changed = before.replace(**{field: _something_else(field, getattr(before, field))})
+    lines, trouble = convert.all_changes(before, _with_demands(changed))
+    assert trouble == "", (
+        f"перечень изменений поля «{field}» не собран: {trouble}"
     )
-    assert "→" in warnings_seen[-1].reason
+    assert lines, (
+        f"поле «{field}» изменено, а перечень перед «Применить» пуст — человек "
+        "подтвердит изменение, которого ему не показали"
+    )
+    assert any("→" in line for line in lines), (
+        f"поле «{field}» изменено, а в перечне перед «Применить» нет ни одной "
+        f"строки с прежним и новым значением: {lines}"
+    )
+
+
+def test_a_change_of_the_algorithm_names_both_rules_in_the_confirmation(twin) -> None:
+    """Смена алгоритма названа в перечне дважды: имя и получившееся правило.
+
+    Два утверждения, и они падают порознь — в этом их смысл:
+
+    * строка «было → стало» с **обоими** названиями. Одного нового названия
+      мало: оно стоит и в строке «правило теперь читается так», и проверка
+      «где-то есть название» зеленела бы при пропавшей строке замены;
+    * строка про **получившееся правило**. Поля двух алгоритмов сравнивать
+      не с чем, и она — единственное место, где человек видит, чем
+      обернулась замена: «закрытие выше EMA(15) — робот хочет быть в лонге».
+
+    Мутации, обязанные ронять проверку: убрать `strategy_id` из строк окна;
+    убрать `rule_changes` из `all_changes`.
+    """
+    before = twin
+    other = next(
+        one for one in registry.known_ids() if one != before.strategy_id
+    )
+    after = _with_demands(before.replace(strategy_id=other))
+    was_title = registry.find(before.strategy_id).title
+    now_title = registry.find(other).title
+    lines, trouble = convert.all_changes(before, after)
+    assert trouble == ""
+    assert any(
+        "→" in line and was_title in line and now_title in line for line in lines
+    ), f"замена «{was_title}» → «{now_title}» в перечне не названа: {lines}"
+    assert any(
+        line.startswith("Правило теперь читается так") and now_title in line
+        for line in lines
+    ), f"перечень не говорит, чем обернулась замена алгоритма: {lines}"
+
+
+def test_a_new_period_chosen_together_with_the_algorithm_is_not_lost(twin) -> None:
+    """Период, изменённый заодно со сменой алгоритма, из перечня не пропадает.
+
+    ⚠️ Это сторож на **следствие принятого решения**, а не на его формулировку.
+    Решение: отдельной строки «Период средней: 15 → 20» при одновременной
+    смене алгоритма не будет — поля разных алгоритмов сравнивать не с чем,
+    и `changes_from` их не берёт (`convert.rule_changes`). Значит новое число
+    доезжает до человека **ровно одним** путём — внутри строки «Правило теперь
+    читается так — … EMA(20) …». Путь один, запасного нет, и пропасть он может
+    молча: перечень останется непустым, стрелка в нём останется, оба названия
+    алгоритмов останутся. Человек подтвердит смену правила, не увидев, что
+    поменялся ещё и период, по которому это правило считает.
+
+    Два утверждения, и они падают порознь:
+
+    * новое число названо в перечне;
+    * того же числа **нет** в перечне, собранном на смене одного алгоритма.
+      Это канарейка к первому утверждению: без неё оно зеленело бы на любой
+      строке, где двадцатка стоит сама по себе, — проверено мутацией
+      14.09.2026 (постоянная строка с числом в каждом перечне; первое
+      утверждение прошло, канарейка упала).
+
+    Число берётся из фикстуры, а не считается по тем же настройкам, которые
+    проверяются: посчитанное ожидание уехало бы вместе с ошибкой.
+
+    Мутация, обязанная ронять проверку: убрать строку «Правило теперь читается
+    так» из `rule_changes`; собрать её по прежним настройкам.
+    """
+    before = twin
+    other = next(one for one in registry.known_ids() if one != before.strategy_id)
+    # Период — из фикстуры: 20 нет ни в одном умолчании окна, поэтому
+    # совпадение с посторонней строкой перечня исключено.
+    both = _with_demands(before.replace(strategy_id=other, average_period=20))
+    only = _with_demands(before.replace(strategy_id=other))
+    lines, trouble = convert.all_changes(before, both)
+    assert trouble == "", f"перечень не собран: {trouble}"
+    assert any("20" in line for line in lines), (
+        "период средней изменён заодно со сменой алгоритма, и нового числа "
+        f"в перечне перед «Применить» нет нигде: {lines}"
+    )
+    untouched = convert.all_changes(before, only)[0]
+    assert not any("20" in line for line in untouched), (
+        "двадцатка стоит в перечне и тогда, когда период не трогали — значит "
+        f"утверждение выше зеленеет не от периода: {untouched}"
+    )
+
+
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): полей предохранителей в окне нет.
+# @pytest.mark.parametrize(
+#     "field", ["volume_cap", "daily_loss_limit_pct", "free_funds_reserve_pct"]
+# )
+# def test_changing_a_guard_says_what_it_does_and_what_it_does_not(
+#     loop, database, field
+# ) -> None:
+#     """Стережёт: число предохранителя принято не молча, а с оговоркой.
+#
+#     Тихое «принято» читается как «ограничение поставлено». Само по себе
+#     число не ограничивает ничего: предохранитель работает от своей галочки,
+#     и все три галочки сняты умолчанием. Два из трёх вдобавок считаются
+#     от размера счёта, которого программа не знает.
+#
+#     ⚠️ Прежняя редакция этого теста утверждала обратное — «в движке нет
+#     ни одного из трёх предохранителей». Это перестало быть правдой
+#     05.09.2026, когда их провели из окна (`D-030`), а текст остался
+#     и врал владельцу счёта при каждом старте (`D-037`).
+#     """
+#     before = Settings()
+#     recorded = _apply(loop, database, before.replace(**{field: _something_else(field, getattr(before, field))}))
+#     warnings_seen = [
+#         entry for entry in recorded.appended
+#         if entry.level is DecisionLevel.WARNING and NO_GUARDS in entry.reason
+#     ]
+#     assert warnings_seen, (
+#         f"поле «{field}» принято молча — владелец счёта вправе решить, что "
+#         "ограничение поставлено. Строки журнала: "
+#         f"{[(seen.event, seen.level) for seen in recorded.appended]}"
+#     )
+#     assert "→" in warnings_seen[-1].reason
 
 
 def test_the_journal_opens_with_the_version_line(loop, database) -> None:
@@ -668,9 +1162,12 @@ def test_a_frame_never_mixes_a_run_with_fresher_settings(loop, long_database) ->
     async def go():
         worker = MarketWorker(long_database)
         await worker.open()
-        port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
+        # Окно явно, а не умолчанием: отметка FIRST_WINDOW_SHADE_END считана
+        # с 10:05, а умолчание с 11.10.2026 другое (решение 0060).
+        before = Settings().replace(window_start=time(10, 5), window_end=time(11, 0))
+        port = HistoryPort(worker, values=before, days=0, sanitize=redact)
         recorded = Recorded(port)
-        updated = Settings().replace(
+        updated = before.replace(
             average_period=20, window_start=time(12, 0), window_end=time(13, 0)
         )
         interfered: list[int] = []
@@ -804,9 +1301,8 @@ def test_a_halted_run_is_visible_in_the_window(loop, database, monkeypatch) -> N
     """
     from dataclasses import replace as _replace
 
-    from ui.main_window import MainWindow
-
     from app import port as port_module
+    from ui.main_window import MainWindow
 
     HALT_REASON = "Сделка не сопоставилась ни с одной заявкой в полёте"
     the_real_replay = port_module.replay
@@ -981,6 +1477,35 @@ def test_the_day_of_the_panel_refuses_a_naive_moment() -> None:
     run = HistoryRun(deals=(_utc_deal(datetime(2026, 6, 19, 21, 40, tzinfo=timezone.utc)),))
     with pytest.raises(ValueError):
         _day_summary(run, [naive])
+
+
+@pytest.mark.parametrize(
+    ("pinned", "halted", "expected"),
+    [
+        (False, "", convert.Unfilled.WAITING),
+        (True, "", convert.Unfilled.CUT),
+        (False, "Исход заявки неизвестен", convert.Unfilled.MISSED),
+        (True, "Исход заявки неизвестен", convert.Unfilled.CUT),
+    ],
+    ids=["живой-ход", "отрезок", "остановка-порта", "отрезок-и-остановка-порта"],
+)
+def test_the_port_says_a_pinned_span_before_its_own_halt(
+    pinned: bool, halted: str, expected: convert.Unfilled
+) -> None:
+    """Стережёт: что будет с ждущей заявкой — по порядку «отрезок, остановка порта».
+
+    Закреплённый отрезок главнее остановки порта: показан прогон тестера,
+    а не живой ход, и его заявке помешала граница отрезка — подсказка
+    обязана сказать «прогон кончился», а не «не состоялся». Без отрезка
+    и без остановки — заявка исполнится, часы. Остановку движка поверх
+    этого стережёт `tests/test_app_convert.py`.
+    """
+    from app.port import _pending_of
+
+    got = _pending_of(pinned=pinned, halted=halted)
+    assert got is expected, (
+        f"pinned={pinned}, halted={halted!r}: порт сказал {got.name}, а надо {expected.name}"
+    )
 
 
 # -- чистка секретов доезжает не только до базы -------------------------------
@@ -1260,7 +1785,11 @@ def test_an_accepted_stream_command_does_not_pretend_to_know_the_connection(
     assert len(recorded.failures) == failures, "принятая команда связи объявлена отказом"
     assert len(recorded.states) == states, "ради команды связи переслан снимок состояния"
     assert port.connection is Connection.UNKNOWN, "состояние связи выставляет поток, не команда"
-    said = [row.event for row in recorded.appended[-2:]]
+    # Только строки про ход: при включении порт вправе сказать и про срок
+    # контракта («Срок контракта не известен» — таблицы в этой базе нет).
+    said = [
+        row.event for row in recorded.appended if row.event.startswith("Наблюдение")
+    ][-2:]
     assert said == ["Наблюдение включено", "Наблюдение выключено"], (
         f"о включении и выключении живого хода не сказано: {said}"
     )
@@ -1340,12 +1869,12 @@ class LiveRun:
         добавленных справа, и уточнений последней свечи.
         """
         was = self.counters()
-        await self.worker.put_minutes("MXU6", [_one_minute(moment)], Source.BROKER)
-        self.port.live_candle("MXU6")
+        await self.worker.put_minutes(SYMBOL, [_one_minute(moment)], Source.BROKER)
+        self.port.live_candle(SYMBOL)
         await self.port.wait()
         return tuple(b - a for a, b in zip(was, self.counters(), strict=True))  # type: ignore[return-value]
 
-    async def growing(self, minute: Candle, symbol: str = "MXU6") -> tuple[int, int, int]:
+    async def growing(self, minute: Candle, symbol: str = SYMBOL) -> tuple[int, int, int]:
         """Отдать порту снимок **ещё идущей** минуты — как это делает поток.
 
         В базу при этом не пишется ничего: формирующаяся минута туда
@@ -1676,11 +2205,11 @@ def test_a_growing_minute_is_never_written_to_the_base(loop, database) -> None:
     """
 
     async def body(run: LiveRun):
-        before = await run.worker.minutes("MXU6")
+        before = await run.worker.minutes(SYMBOL)
         for shift, price in enumerate((222_000.0, 333_000.0, 444_000.0)):
             moment = NEXT_MINUTE + timedelta(minutes=shift)
             await run.growing(_running_minute(moment, close=price))
-        return before, await run.worker.minutes("MXU6"), run.recorded.retouched
+        return before, await run.worker.minutes(SYMBOL), run.recorded.retouched
 
     before, after, drawn = live_session(
         loop, database, body, values=Settings(), days=0, redraw_gap=0.0
@@ -1849,7 +2378,7 @@ def _broker_wire(close: float, turnover: float) -> str:
 
     return json.dumps({
         "responseType": "CandleStick",
-        "ticker": "MXU6",
+        "ticker": SYMBOL,
         "classCode": "SPBFUT",
         "timeFrame": "M1",
         "open": close, "high": close, "low": close, "close": close,
@@ -1895,7 +2424,7 @@ def test_a_hanging_growing_candle_does_not_swallow_the_run_at_the_bar_close(
             return await honest(*args, **kwargs)
 
         run.worker.minutes = slow  # type: ignore[method-assign]
-        run.port.growing_minute("MXU6", _running_minute(
+        run.port.growing_minute(SYMBOL, _running_minute(
             NEXT_MINUTE + timedelta(minutes=2), close=222_222.0
         ))
         await asyncio.sleep(0.01)  # дать задаче дойти до чтения базы
@@ -1906,9 +2435,9 @@ def test_a_hanging_growing_candle_does_not_swallow_the_run_at_the_bar_close(
         was = run.counters()
         for shift in range(5):  # 12:00 … 12:04 — бар [12:00, 12:05) закрылся
             await run.worker.put_minutes(
-                "MXU6", [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))], Source.BROKER
+                SYMBOL, [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))], Source.BROKER
             )
-        run.port.live_candle("MXU6")
+        run.port.live_candle(SYMBOL)
         gate.set()
         await run.port.wait()
         return was, run.counters()
@@ -1960,7 +2489,7 @@ def test_a_broker_snapshot_moves_the_painted_candle_all_the_way_to_the_pixels(
                 assert snapshot is not None, "сообщение брокера не разобрано"
                 tally = tally_after(tally, snapshot)
                 assert tally.refusal is None, tally.refusal
-                port.growing_minute("MXU6", to_minute(snapshot, tally.contracts, unsettled=True))
+                port.growing_minute(SYMBOL, to_minute(snapshot, tally.contracts, unsettled=True))
                 await port.wait()
                 qapp.processEvents()
                 shots.append(_painted(surface))
@@ -2017,7 +2546,7 @@ def test_a_bar_the_run_refused_comes_back_once_the_exchange_confirmed_the_gap(
         await run.minute(NEXT_MINUTE + timedelta(minutes=2))     # 12:02, 12:01 нет
         await run.minute(NEXT_MINUTE + timedelta(minutes=4))     # 12:04 — бар закрылся
         refused = run.recorded.charts[-1].candles[-1].opens_at
-        moved = run.port.history_confirmed("MXU6", NEXT_MINUTE + timedelta(minutes=5))
+        moved = run.port.history_confirmed(SYMBOL, NEXT_MINUTE + timedelta(minutes=5))
         run.port.refresh("догрузка пропущенного")
         await run.port.wait()
         return refused, moved, run.recorded.charts[-1].candles[-1].opens_at
@@ -2046,8 +2575,8 @@ def test_the_confirmed_edge_never_moves_back(loop, database) -> None:
         await run.minute(NEXT_MINUTE)
         await run.minute(NEXT_MINUTE + timedelta(minutes=2))
         await run.minute(NEXT_MINUTE + timedelta(minutes=4))
-        forward = run.port.history_confirmed("MXU6", NEXT_MINUTE + timedelta(minutes=5))
-        backward = run.port.history_confirmed("MXU6", NEXT_MINUTE)
+        forward = run.port.history_confirmed(SYMBOL, NEXT_MINUTE + timedelta(minutes=5))
+        backward = run.port.history_confirmed(SYMBOL, NEXT_MINUTE)
         run.port.refresh("после отката")
         await run.port.wait()
         return forward, backward, run.recorded.charts[-1].candles[-1].opens_at
@@ -2124,7 +2653,7 @@ def two_instrument_database(tmp_path: pathlib.Path) -> pathlib.Path:
     """
     path = tmp_path / "two-instruments.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(300, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY), Source.ISS)
         store.put_minutes("SiU6", _holed(LATER_DAY, drop=HOLE), Source.ISS)
     return path
 
@@ -2205,15 +2734,15 @@ def test_a_deeper_instrument_does_not_lend_its_edge_to_the_shallower_one(
             await _run(port)                                        # MXU6
             port.apply_settings(replace(Settings(), instrument="SiU6"))
             await port.wait()                                       # край уехал на 22.06
-            port.apply_settings(replace(Settings(), instrument="MXU6"))
+            port.apply_settings(replace(Settings(), instrument=SYMBOL))
             await port.wait()
             # Живая минута MXU6 с пропуском: бар [12:00, 12:05) из трёх минут.
             for shift in (0, 2, 4):
                 await worker.put_minutes(
-                    "MXU6", [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))],
+                    SYMBOL, [_one_minute(NEXT_MINUTE + timedelta(minutes=shift))],
                     Source.BROKER,
                 )
-                port.live_candle("MXU6")
+                port.live_candle(SYMBOL)
                 await port.wait()
         finally:
             await port.aclose()
@@ -2223,7 +2752,7 @@ def test_a_deeper_instrument_does_not_lend_its_edge_to_the_shallower_one(
     recorded = loop.run_until_complete(go())
 
     shown = recorded.charts[-1]
-    assert shown.instrument == "MXU6", f"на графике не тот инструмент: {shown.instrument}"
+    assert shown.instrument == SYMBOL, f"на графике не тот инструмент: {shown.instrument}"
     starts = {candle.opens_at for candle in shown.candles}
     assert NEXT_MINUTE not in starts, (
         "бар из минут потока с пропуском показан закрытым: границу доверия "
@@ -2261,7 +2790,7 @@ def test_a_base_that_appeared_later_still_gets_its_first_look(
             await _run(port)  # базы ещё нет
             missing = list(recorded.failures)
             with CandleStore(path) as store:
-                store.put_minutes("MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)),
+                store.put_minutes(SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)),
                                   Source.ISS)
             await worker.open()
             port.refresh("база появилась")
@@ -2273,7 +2802,7 @@ def test_a_base_that_appeared_later_still_gets_its_first_look(
 
     missing, recorded = loop.run_until_complete(go())
 
-    assert missing and "Базы свечей нет" in missing[0], (
+    assert missing and "Свечей ещё нет" in missing[0], (
         f"первый проход прошёл не по ветке «базы нет»: {missing}"
     )
     starts = {candle.opens_at for candle in recorded.charts[-1].candles}
@@ -2310,9 +2839,9 @@ def test_minutes_the_stream_wrote_itself_are_never_confirmed_as_history(
             await _run(port)  # базы ещё нет
             await worker.open()  # так делает поток: `LiveFeed._listen`
             await worker.put_minutes(
-                "MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.BROKER
+                SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.BROKER
             )
-            port.live_candle("MXU6")  # поток: минута записана
+            port.live_candle(SYMBOL)  # поток: минута записана
             await port.wait()
             port.refresh("после потока")
             await port.wait()
@@ -2389,7 +2918,7 @@ def test_the_drawing_does_not_argue_with_the_run(loop, database, edge_at, note) 
 
     async def body(run: LiveRun):
         await run.worker.put_minutes(
-            "MXU6",
+            SYMBOL,
             [_one_minute(NEXT_MINUTE + timedelta(minutes=shift)) for shift in range(5)],
             Source.BROKER,
         )
@@ -2399,7 +2928,7 @@ def test_the_drawing_does_not_argue_with_the_run(loop, database, edge_at, note) 
         assert edge is not None, "прогон не оставил правого края — проверять нечего"
         run.port._edge = replace(edge, last=edge_at, forming=None)  # noqa: SLF001
         was = (len(run.recorded.grown), len(run.recorded.retouched))
-        run.port.live_candle("MXU6")
+        run.port.live_candle(SYMBOL)
         await run.port.wait()
         return (len(run.recorded.grown), len(run.recorded.retouched)), was
 
@@ -2501,7 +3030,7 @@ def test_a_bar_that_closed_and_went_into_the_run_is_not_drawn_a_second_time(
     async def body(run: LiveRun):
         drawn = await run.minute(NEXT_MINUTE)  # 12:00 — бар набирается
         await run.worker.put_minutes(
-            "MXU6",
+            SYMBOL,
             [_one_minute(NEXT_MINUTE + timedelta(minutes=shift)) for shift in (1, 2, 3, 4)],
             Source.BROKER,
         )
@@ -2540,10 +3069,13 @@ def test_a_change_of_instrument_reaches_the_quote_stream(loop, database) -> None
     asked: list[str] = []
     port.attach_stream(lambda on: None, retarget=asked.append)
 
-    port.apply_settings(replace(Settings(), instrument="SiU6"))
-    port.apply_settings(replace(Settings(), instrument="SiU6"))
-    port.apply_settings(replace(Settings(), instrument="  MXU6  "))
-    loop.run_until_complete(port.wait())
+    try:
+        port.apply_settings(replace(Settings(), instrument="SiU6"))
+        port.apply_settings(replace(Settings(), instrument="SiU6"))
+        port.apply_settings(replace(Settings(), instrument="  MXU6  "))
+        loop.run_until_complete(port.wait())
+    finally:
+        _close_again(loop, port)
 
     assert asked == ["SiU6", "SiU6", "MXU6"], (
         f"звено узнало о смене инструмента не так: {asked}"
@@ -2574,8 +3106,11 @@ def test_a_port_without_a_retarget_handler_still_applies_settings(loop, database
     """
     port, recorded = replay_history(loop, database)
     port.attach_stream(lambda on: None)
-    port.apply_settings(replace(Settings(), instrument="SiU6"))
-    loop.run_until_complete(port.wait())
+    try:
+        port.apply_settings(replace(Settings(), instrument="SiU6"))
+        loop.run_until_complete(port.wait())
+    finally:
+        _close_again(loop, port)
     assert recorded.settings[-1].instrument == "SiU6"
 
 
@@ -2605,11 +3140,11 @@ def test_the_boundary_of_a_never_seen_instrument_comes_from_the_first_stream_min
             await _run(port)  # базы ещё нет, первый взгляд отложен
             await worker.open()
             await worker.put_minutes(
-                "MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
+                SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
             )
-            port.stream_leads("MXU6", lead)  # поток: подписка открыта с этой минуты
-            await worker.put_minutes("MXU6", _stream_tail(lead), Source.BROKER)
-            port.live_candle("MXU6")
+            port.stream_leads(SYMBOL, lead)  # поток: подписка открыта с этой минуты
+            await worker.put_minutes(SYMBOL, _stream_tail(lead), Source.BROKER)
+            port.live_candle(SYMBOL)
             await port.wait()
             port.refresh("после потока")
             await port.wait()
@@ -2660,12 +3195,12 @@ def test_only_the_first_connection_of_a_session_sets_the_boundary(
             await _run(port)  # базы ещё нет, первый взгляд отложен
             await worker.open()
             await worker.put_minutes(
-                "MXU6", _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
+                SYMBOL, _holed(DAY, drop=DAY + timedelta(minutes=22)), Source.ISS
             )
-            port.stream_leads("MXU6", lead)            # подключение первое
-            await worker.put_minutes("MXU6", _stream_tail(lead), Source.BROKER)
-            port.stream_leads("MXU6", again)           # обрыв и подключение второе
-            port.live_candle("MXU6")
+            port.stream_leads(SYMBOL, lead)            # подключение первое
+            await worker.put_minutes(SYMBOL, _stream_tail(lead), Source.BROKER)
+            port.stream_leads(SYMBOL, again)           # обрыв и подключение второе
+            port.live_candle(SYMBOL)
             await port.wait()
             port.refresh("после переподключения")
             await port.wait()
@@ -2731,14 +3266,14 @@ class _Exchange:
 #: Взят намеренно не единицей — на единице тест не отличил бы подстановку
 #: с биржи от умолчания программы.
 RTS = PointValue(
-    "MXU6", 1.737744, "биржей — карточка RIU6 (RFUD): шаг цены 10, "
+    SYMBOL, 1.737744, "биржей — карточка RIU6 (RFUD): шаг цены 10, "
     "стоимость шага 17,37744 ₽, помечена 2026-09-04 07:00:01"
 )
 
 #: Ответ биржи про фьючерс на индекс: ровно рубль. На нём стоит сверка
 #: с прототипом — 127 сделок из 127.
 INDEX = PointValue(
-    "MXU6", 1.0, "биржей — карточка MXU6 (RFUD): шаг цены 25, "
+    SYMBOL, 1.0, "биржей — карточка MXU6 (RFUD): шаг цены 25, "
     "стоимость шага 25 ₽, помечена 2026-09-04 07:00:01"
 )
 
@@ -2798,7 +3333,7 @@ def test_the_cost_of_a_point_is_asked_from_the_exchange_and_reaches_the_engine(
     port, recorded = replay_with_exchange(
         loop, database, exchange, values=Settings(), days=0
     )
-    assert exchange.asked == ["MXU6"], (
+    assert exchange.asked == [SYMBOL], (
         f"биржу спросили {exchange.asked} раз вместо одного про MXU6"
     )
     assert port._engine_settings.ruble_per_point == pytest.approx(1.737744)  # noqa: SLF001 — настройки движка наружу не отдаются
@@ -2863,7 +3398,7 @@ def test_a_silent_exchange_is_said_out_loud_and_names_what_is_used_instead(
 
 def test_an_answer_without_a_number_is_said_out_loud_too(loop, database) -> None:
     """Стережёт: «биржа не назвала стоимость шага» — тоже событие для журнала."""
-    silent = PointValue("MXU6", None, "у акций колонки STEPPRICE нет вовсе")
+    silent = PointValue(SYMBOL, None, "у акций колонки STEPPRICE нет вовсе")
     _, recorded = replay_with_exchange(
         loop, database, _Exchange(silent), values=Settings(), days=0
     )
@@ -2931,7 +3466,7 @@ def test_the_exchange_is_not_asked_more_often_than_the_gap(loop, database) -> No
         return exchange
 
     exchange = loop.run_until_complete(go())
-    assert exchange.asked == ["MXU6"], (
+    assert exchange.asked == [SYMBOL], (
         f"за три прохода биржу спросили {len(exchange.asked)} раз"
     )
 
@@ -3018,13 +3553,13 @@ def test_an_answer_about_an_instrument_no_longer_shown_is_not_applied(
         recorded = Recorded(port)
 
         def switch(symbol: str) -> None:
-            if symbol == "MXU6":
+            if symbol == SYMBOL:
                 port.apply_settings(values.replace(instrument="SiU6"))
 
         # По MXU6 биржа отвечает «Брентом», по SiU6 — единицей. Применённый
         # ответ про MXU6 виден сразу: 868,872 не спутать ни с чем.
         def answer(symbol: str) -> PointValue:
-            return PointValue(symbol, 868.872 if symbol == "MXU6" else 1.0, f"биржей {symbol}")
+            return PointValue(symbol, 868.872 if symbol == SYMBOL else 1.0, f"биржей {symbol}")
 
         port.attach_exchange(_Exchange(answer, before=switch))
         try:
@@ -3045,58 +3580,147 @@ def test_an_answer_about_an_instrument_no_longer_shown_is_not_applied(
 
 # ------------------------------------ текст про предохранители (`D-037`)
 
-def test_the_journal_line_about_guards_names_every_guard_that_exists() -> None:
-    """Стережёт расхождение текста и состояния: заведут четвёртый — упадёт здесь.
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): три прежних сторожа текста `NO_GUARDS`
+# (редакция 05.09–16.09.2026). Живые сторожа ниже при возврате правят, а не удаляют.
+# def test_the_journal_line_about_guards_names_every_guard_that_exists() -> None:
+#     """Стережёт расхождение текста и состояния: заведут четвёртый — упадёт здесь.
+#
+#     Текст `NO_GUARDS` уходит в журнал уровнем WARNING при каждом старте
+#     и после каждой правки предохранителя. Прежняя редакция говорила «в движке
+#     отсутствуют», и это стало ложью в тот день, когда их провели (`D-037`).
+#     Связь текста с состоянием держалась комментарием, то есть ничем.
+#     """
+#     from app.convert import _GUARDS, _WINDOW_TOLD
+#
+#     # Регистр не сверяется: в окне подпись стоит с большой буквы, а в строке
+#     # журнала — внутри фразы. Требовать совпадения регистра значило бы
+#     # заставлять писать «Дневной лимит убытка» посреди предложения.
+#     said = NO_GUARDS.lower()
+#     for guard in _GUARDS.values():
+#         label = _WINDOW_TOLD[guard.switch].label
+#         assert label.lower() in said, (
+#             f"предохранитель «{label}» заведён в app/convert.py, а строка "
+#             "журнала о нём молчит. Дописать его в NO_GUARDS "
+#             "(app/port.py) — иначе владелец счёта прочтёт неполный список"
+#         )
+#
+#
+# def test_the_journal_line_about_guards_matches_the_defaults() -> None:
+#     """Стережёт вторую половину текста: «все три галочки сняты по умолчанию».
+#
+#     Умолчание, поменянное на «включено», сделало бы строку ложью — и заодно
+#     включило бы остановку торговли, которой владелец счёта не просил.
+#     """
+#     from app.convert import _GUARDS
+#
+#     values = Settings()
+#     armed = [guard.switch for guard in _GUARDS.values() if getattr(values, guard.switch)]
+#     assert not armed, (
+#         f"предохранители {armed} включены умолчанием, а строка журнала обещает "
+#         "обратное. Либо вернуть умолчание, либо переписать NO_GUARDS "
+#         "(app/port.py) — расходиться им нельзя"
+#     )
+#     assert "по умолчанию сняты" in NO_GUARDS
+#
+#
+# def test_the_journal_line_about_guards_no_longer_claims_they_are_absent() -> None:
+#     """Стережёт возврат прежней лжи: «в движке отсутствуют» — это `D-037`.
+#
+#     Проверка на подстроку, а не на смысл, и это осознанно: вернуть текст
+#     целиком проще всего копированием, и ловится это ровно так.
+#     """
+#     for lie in ("отсутствуют", "ничего не ограничивают", "не проверяются"):
+#         assert lie not in NO_GUARDS, (
+#             f"в строке про предохранители снова стоит «{lie}» — они проведены "
+#             "и работают от галочек (D-030)"
+#         )
 
-    Текст `NO_GUARDS` уходит в журнал уровнем WARNING при каждом старте
-    и после каждой правки предохранителя. Прежняя редакция говорила «в движке
-    отсутствуют», и это стало ложью в тот день, когда их провели (`D-037`).
-    Связь текста с состоянием держалась комментарием, то есть ничем.
+
+def test_the_journal_line_about_guards_names_every_guard_that_is_switched_off() -> None:
+    """Стережёт: строка запуска называет все три выключенных предохранителя.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Вместе с кодом замолчали
+    35 сторожей `tests/test_engine_guards.py`; `NO_GUARDS` осталась
+    единственным, что говорит о трёх предохранителях вслух, и потому
+    сторожится отдельно.
+
+    ⚠️ Список берётся **из `app/settings_store._GUARDS_OFF`**, а не пишется
+    здесь: там же он решает, какую строку сказать про старый файл настроек,
+    и разъехаться двум спискам нельзя. Вернут предохранитель — строка реестра
+    уйдёт оттуда, и этот тест потребует переписать `NO_GUARDS` под новое
+    состояние. Ровно так же он потребовал бы этого при заведении четвёртого.
     """
-    from app.convert import _GUARDS, _WINDOW_TOLD
+    from app.settings_store import _GUARDS_OFF
 
-    # Регистр не сверяется: в окне подпись стоит с большой буквы, а в строке
-    # журнала — внутри фразы. Требовать совпадения регистра значило бы
-    # заставлять писать «Дневной лимит убытка» посреди предложения.
     said = NO_GUARDS.lower()
-    for guard in _GUARDS.values():
-        label = _WINDOW_TOLD[guard.switch].label
-        assert label.lower() in said, (
-            f"предохранитель «{label}» заведён в app/convert.py, а строка "
-            "журнала о нём молчит. Дописать его в NO_GUARDS "
-            "(app/port.py) — иначе владелец счёта прочтёт неполный список"
-        )
-
-
-def test_the_journal_line_about_guards_matches_the_defaults() -> None:
-    """Стережёт вторую половину текста: «все три галочки сняты по умолчанию».
-
-    Умолчание, поменянное на «включено», сделало бы строку ложью — и заодно
-    включило бы остановку торговли, которой владелец счёта не просил.
-    """
-    from app.convert import _GUARDS
-
-    values = Settings()
-    armed = [guard.switch for guard in _GUARDS.values() if getattr(values, guard.switch)]
-    assert not armed, (
-        f"предохранители {armed} включены умолчанием, а строка журнала обещает "
-        "обратное. Либо вернуть умолчание, либо переписать NO_GUARDS "
-        "(app/port.py) — расходиться им нельзя"
+    assert _GUARDS_OFF, (
+        "реестр выключенных предохранителей пуст — значит их вернули (D-113), "
+        "и NO_GUARDS обязана перестать утверждать, что их нет"
     )
-    assert "по умолчанию сняты" in NO_GUARDS
-
-
-def test_the_journal_line_about_guards_no_longer_claims_they_are_absent() -> None:
-    """Стережёт возврат прежней лжи: «в движке отсутствуют» — это `D-037`.
-
-    Проверка на подстроку, а не на смысл, и это осознанно: вернуть текст
-    целиком проще всего копированием, и ловится это ровно так.
-    """
-    for lie in ("отсутствуют", "ничего не ограничивают", "не проверяются"):
-        assert lie not in NO_GUARDS, (
-            f"в строке про предохранители снова стоит «{lie}» — они проведены "
-            "и работают от галочек (D-030)"
+    for _switch, _number, title in _GUARDS_OFF:
+        assert title.lower() in said, (
+            f"предохранитель «{title}» выключен на этапе, а строка журнала "
+            "о нём молчит. Дописать его в NO_GUARDS (app/port.py) — иначе "
+            "владелец счёта прочтёт неполный список"
         )
+
+
+def test_the_journal_line_about_guards_says_the_robot_will_not_stop_itself() -> None:
+    """Стережёт вторую половину текста: последствие, а не только перечень.
+
+    Список имён без последствия читается как опись. Владелец счёта обязан
+    прочитать, что именно теперь **не произойдёт**: робот не остановится
+    по убытку, не проверит средства и подаст заявку любым объёмом.
+    """
+    said = NO_GUARDS.lower()
+    for promise in ("не остановится", "не проверит", "не допущена"):
+        assert promise in said, (
+            f"в строке про предохранители нет «{promise}»: перечень имён "
+            "без последствия владельцу счёта ничего не говорит"
+        )
+
+
+def test_the_journal_line_about_guards_no_longer_claims_they_are_armed() -> None:
+    """Стережёт возврат прежней лжи — теперь в обратную сторону.
+
+    Редакция 05.09–16.09.2026 обещала «проведены в движок и работают каждый
+    от своей галочки». Галочек больше нет, и вернуть этот текст проще всего
+    копированием — ловится это ровно проверкой на подстроку.
+    """
+    for lie in ("работают", "от своей галочки", "по умолчанию сняты"):
+        assert lie not in NO_GUARDS, (
+            f"в строке про предохранители снова стоит «{lie}» — а их нет "
+            "ни одного (D-113)"
+        )
+
+
+def test_the_window_and_the_journal_say_the_same_about_the_guards() -> None:
+    """Стережёт: окно и журнал решений не разойдутся молча про предохранители.
+
+    Текстов два, а не один общий: `ui/` не имеет права импортировать `app/`
+    (ARCHITECTURE.md §2). Разойтись им нельзя — человек читает оба, и
+    в настройках «защиты нет», а в журнале «защита работает» это тот же
+    дефект, что `D-037`, только распределённый по двум окнам.
+    """
+    from app.settings_store import _GUARDS_OFF
+    from ui.settings_dialog import GUARDS_OFF_NOTE
+
+    for text, where in ((NO_GUARDS, "журнал"), (GUARDS_OFF_NOTE, "окно")):
+        said = text.lower()
+        assert "предохранителей по деньгам нет ни одного" in said, (
+            f"{where} перестал говорить, что предохранителей нет: {text!r}"
+        )
+        assert "не допущена" in said, (
+            f"{where} не говорит, что к боевой торговле программа не допущена"
+        )
+        # ⚠️ Перечень берётся из **таблицы**, а не из литерала здесь: сверка
+        # текста с текстом зеленеет, если оба текста поправить разом. Оба
+        # конца привязаны к `_GUARDS_OFF`, и вернуть предохранитель, забыв
+        # один из текстов, эта проверка не даст.
+        for _switch, _number, title in _GUARDS_OFF:
+            assert title.lower() in said, (
+                f"{where} не назвал выключенный предохранитель «{title}»"
+            )
 
 
 # ================================================================== B-029
@@ -3179,13 +3803,13 @@ def test_no_developer_speak_reaches_the_window(loop, database) -> None:
     async def go() -> list[str]:
         worker = MarketWorker(database)
         await worker.open()
-        port = HistoryPort(worker, values=Settings(instrument="MXU6"),
+        port = HistoryPort(worker, values=Settings(instrument=SYMBOL),
                            days=0, sanitize=redact)
         said = _everything_said(port)
         await worker.close()  # база закрыта, а окно ещё спрашивает
-        port.request_history_facts("MXU6")
+        port.request_history_facts(SYMBOL)
         port.request_backtest_options()
-        port.load_history(HistoryLoadRequest(symbol="MXU6", days=3))
+        port.load_history(HistoryLoadRequest(symbol=SYMBOL, days=3))
         port.refresh("после закрытия базы")
         for _ in range(200):
             await asyncio.sleep(0.01)
@@ -3201,3 +3825,313 @@ def test_no_developer_speak_reaches_the_window(loop, database) -> None:
             assert mark not in line, (
                 f"в окно уехал текст для разработчика («{mark}»):\n{line}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Живой ход знает, каким алгоритмом он идёт
+# ---------------------------------------------------------------------------
+
+
+def _watch_key_of(loop, database: pathlib.Path, values: Settings) -> tuple:
+    """Ключ живого хода при этих настройках. Прогон не гоняется."""
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        try:
+            frame = _Frame(
+                values=values,
+                engine=convert.engine_settings(values, Mode.OFF),
+            )
+            return port._watch_key(frame, SYMBOL)  # noqa: SLF001 — сторож на ключ
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    # Через переменную, а не возвратом: цикл событий отдаёт `Any`, и `mypy`
+    # считает находкой возврат `Any` из функции с объявленным типом.
+    key: tuple = loop.run_until_complete(go())
+    return key
+
+
+def test_the_live_run_is_keyed_by_the_chosen_algorithm(loop, database, twin) -> None:
+    """Имя алгоритма входит в то, чем задан живой ход.
+
+    Без него окно показывало бы новый алгоритм, а решения считал бы прежний:
+    ход не пересобрался бы, потому что настройки модуля могли совпасть до поля
+    (ловушка 7 миниплана `strategy-modules-switchable.md`).
+
+    Мутация, обязанная ронять проверку: убрать `frame.values.strategy_id`
+    из `HistoryPort._watch_key`.
+    """
+    values = Settings()
+    key = _watch_key_of(loop, database, values)
+    assert values.strategy_id in key, (
+        f"имя алгоритма не входит в ключ живого хода: {key}"
+    )
+    # Второй алгоритм — подставной (`twin`): смена алгоритма обязана давать
+    # другой ключ, то есть новый прогрев с той же границы.
+    other = _another_algorithm(values.strategy_id)
+    if other is not None:
+        assert _watch_key_of(
+            loop, database, values.replace(strategy_id=other)
+        ) != key, "смена алгоритма не пересобирает живой ход"
+
+
+def test_the_start_line_about_guards_carries_the_warning_itself(loop, database) -> None:
+    """Стережёт МОЛЧАНИЕ: в журнал при запуске доезжает сам текст про предохранители.
+
+    ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113). Прочие сторожа проверяют
+    константу `NO_GUARDS` и то, что строка с нужным событием стоит уровнем
+    WARNING. Ни один не смотрел, **что написано в строке, дошедшей до журнала**:
+    заголовок «Предохранители по деньгам» с пустым или успокаивающим текстом
+    проходил их все, а владелец счёта читал журнал, в котором о выключенной
+    защите не сказано ни слова.
+
+    Проверяется строка журнала, а не константа: сказано, что защиты нет,
+    что робот не остановится и что к бою программа не допущена.
+    """
+    _, recorded = replay_history(loop, database, values=Settings(), days=0)
+    lines = [
+        row for row in recorded.decisions[-1]
+        if row.event == "Предохранители по деньгам"
+    ]
+    assert lines, "строки про предохранители при запуске нет вовсе"
+    said = lines[0].reason.lower()
+    for words in (
+        "предохранителей по деньгам нет ни одного",
+        "не остановится",
+        "не допущена",
+    ):
+        assert words in said, (
+            f"строка журнала про предохранители не говорит «{words}»: {said!r}"
+        )
+
+
+def test_the_window_run_goes_over_minutes_in_the_order_set_in_the_window(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт: прогон окна получает минутки под своими барами и порядок из окна.
+
+    Два поведения, обе мутации обязаны ронять:
+
+    * `app/port.py` зовёт `replay` без `minutes` — скользящий уровень внутри
+      бара в окне перестаёт ехать, а тесты движка и исполнителя зелёные;
+    * смена **только** порядка цен минутки в настройках не перезапускает
+      прогон или перезапускает его с прежним порядком — на экране остаётся
+      прогон, сделанный при другом допущении, а снимок в журнале прогонов
+      называет новый.
+
+    Минутки идут только скользящему уровню на свече не крупнее порога
+    (B-058), поэтому прогон здесь — со скользящим уровнем на пятиминутках
+    при пороге по умолчанию (5 мин): иначе `minutes=None` законен и первая
+    мутация не видна.
+
+    Вход подставной: база во временной папке, минутки ровного ряда.
+    """
+    from app import port as port_module
+    from backtest import MinuteOrder, Minutes
+    from ui.models import MinutePriceOrder
+
+    trailing = Settings().replace(trailing_enabled=True)
+    assert convert.timeframe_of(trailing.timeframe).minutes == 5
+    assert convert.minute_bar_limit_of(trailing) >= 5
+
+    the_real_replay = port_module.replay
+    got: list[Minutes | None] = []
+
+    async def watched_replay(*args, **kwargs):
+        got.append(kwargs.get("minutes"))
+        return await the_real_replay(*args, **kwargs)
+
+    monkeypatch.setattr(port_module, "replay", watched_replay)
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=trailing, days=0, sanitize=redact)
+        try:
+            await _run(port)
+            first = port._run  # noqa: SLF001 — показанный прогон, как его видит окно
+            port.apply_settings(
+                trailing.replace(minute_order=MinutePriceOrder.ADVERSE_FIRST)
+            )
+            await port.wait()
+            return first, port._run  # noqa: SLF001 — то же
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    first, second = loop.run_until_complete(go())
+    assert len(got) == 2, f"прогонов {len(got)}: смена порядка цен минутки не перезапустила прогон"
+    minutes = got[0]
+    assert minutes is not None, "прогон окна пошёл без минуток — по размаху бара"
+    assert len(minutes.candles) == len(_minutes()), "минутки под барами прогона не все"
+    assert minutes.order is MinuteOrder.NEAR_FIRST
+    assert got[1] is not None
+    assert got[1].order is MinuteOrder.ADVERSE_FIRST, (
+        "порядок из окна не дошёл до прогона: перезапущен с прежним"
+    )
+    assert first.minute_order is MinuteOrder.NEAR_FIRST
+    assert second.minute_order is MinuteOrder.ADVERSE_FIRST
+    assert first.bars_without_minutes == 0
+    assert first.coarse_bar is None, "минутки поданы, а итог говорит, что нет"
+
+
+def test_a_coarse_bar_with_a_trailing_level_runs_without_minutes_and_says_so(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт (B-058): свеча крупнее порога — прогон окна без минуток, и это сказано.
+
+    Скользящий уровень на 30 минутах при пороге 5: `replay` получает
+    `minutes=None` (иначе прогон упирается в предел кругов бара), а итог,
+    показанный окном, несёт строку допущения «Свеча 30 мин крупнее порога
+    5 мин…». Две мутации обязаны ронять: условие по порогу снято (минутки
+    поданы) и пометка итога потеряна в `port.py` (молчание, правило 13).
+
+    Вход подставной: база во временной папке, минутки ровного ряда.
+    """
+    from app import port as port_module
+    from backtest import CoarseBar
+
+    the_real_replay = port_module.replay
+    got: list[object] = []
+
+    async def watched_replay(*args, **kwargs):
+        got.append(kwargs.get("minutes"))
+        return await the_real_replay(*args, **kwargs)
+
+    monkeypatch.setattr(port_module, "replay", watched_replay)
+    values = Settings().replace(trailing_enabled=True, timeframe="30 минут")
+    assert convert.minute_bar_limit_of(values) == 5
+    port, _ = replay_history(loop, database, values=values, days=0)
+
+    assert got == [None], f"минутки поданы свече крупнее порога: {got!r}"
+    run = port._run  # noqa: SLF001 — показанный прогон, как его видит окно
+    assert run is not None
+    assert run.coarse_bar == CoarseBar(30, 5)
+    said = [item.short for item in run.assumptions]
+    assert any(
+        line.startswith("Свеча 30 мин крупнее порога 5 мин: скользящий уровень")
+        and "только на закрытии свечи" in line
+        for line in said
+    ), f"о не поданных минутках отчёт молчит: {said!r}"
+
+
+def _shown_run(port: HistoryPort) -> HistoryRun | None:
+    """Прогон, показанный окном. Снимок прогона наружу порт не отдаёт."""
+    return port._run  # noqa: SLF001 — снимок прогона наружу порт не отдаёт
+
+
+def test_a_stitched_run_on_a_coarse_bar_also_says_minutes_were_not_given(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт (B-058, правило 13): ветка склейки в `_replay` тоже помечает итог.
+
+    Скользящий уровень на 30 минутах при пороге 5, прогон идёт веткой
+    склейки (`stitch is not None`). Итог, показанный окном, обязан нести
+    `coarse_bar` и строку допущения «Свеча 30 мин крупнее порога 5 мин…»,
+    как и простой прогон. Сторож выше проходит только простую ветку:
+    пометка, потерянная в ветке склейки, молчала бы.
+
+    Вход подставной: нарезка по контрактам и прогон кусков заменены
+    (`_series` отдаёт ряд базы как «склейку», `stitched_view.run` — простой
+    `replay` по нему). Предмет — только пометка итога в ветке склейки.
+    """
+    from types import SimpleNamespace
+
+    from app import port as port_module
+    from backtest import CoarseBar
+
+    # Подмена обёрткой над настоящим чтением ряда: публичного входа у него нет.
+    real_series = port_module.HistoryPort._series  # noqa: SLF001 — подмена в тесте
+    the_real_replay = port_module.replay
+    reached: list[object] = []
+
+    async def stitched_series(self, frame, symbol, timeframe):
+        candles, _ = await real_series(self, frame, symbol, timeframe)
+        return candles, SimpleNamespace(
+            candles=candles, seams=(), symbols="подставная", pieces=(), basis="",
+        )
+
+    async def stitched_run(stitch, values, engine, **_kwargs):
+        reached.append(stitch)
+        return await the_real_replay(
+            stitch.candles,
+            convert.chosen_algorithm(values).build(convert.strategy_settings(values)),
+            engine,
+            costs=convert.run_costs(values),
+        )
+
+    monkeypatch.setattr(port_module.HistoryPort, "_series", stitched_series)
+    monkeypatch.setattr(port_module.stitched_view, "run", stitched_run)
+    monkeypatch.setattr(port_module.stitched_view, "as_history", lambda run, costs: run)
+    values = Settings().replace(trailing_enabled=True, timeframe="30 минут")
+    assert convert.minute_bar_limit_of(values) == 5
+    port, _ = replay_history(loop, database, values=values, days=0)
+
+    assert reached, "сценарий: прогон не пошёл веткой склейки"
+    run = _shown_run(port)
+    assert run is not None
+    assert run.coarse_bar == CoarseBar(30, 5), "склейка потеряла пометку о минутках"
+    said = [item.short for item in run.assumptions]
+    assert any(
+        line.startswith("Свеча 30 мин крупнее порога 5 мин: скользящий уровень")
+        for line in said
+    ), f"о не поданных минутках отчёт склейки молчит: {said!r}"
+
+
+def test_changing_only_the_minute_bar_limit_reruns_the_window_with_the_new_limit(
+    loop, database, monkeypatch
+) -> None:
+    """Стережёт (B-058): порог из окна доезжает до прогона, и смена одного его перезапускает.
+
+    Скользящий уровень на 15 минутах. При пороге 5 свеча крупнее порога:
+    `replay` получает `minutes=None`, итог помечен `CoarseBar(15, 5)`.
+    После `apply_settings`, где изменился **только** порог (15), прогон
+    обязан пройти заново, получить минутки и пометку потерять. Иначе
+    на экране остаётся прогон, сделанный при другом пороге, — или порт
+    берёт порог не из настроек окна, а зашитый: `test_the_limit_comes_from_the_settings`
+    проверяет `minute_plan` отдельно и такую подмену в порту не видит.
+
+    Вход подставной: база во временной папке, минутки ровного ряда.
+    """
+    from app import port as port_module
+    from backtest import CoarseBar
+    from ui.models import MinuteBarLimit
+
+    values = Settings().replace(trailing_enabled=True, timeframe="15 минут")
+    assert convert.timeframe_of(values.timeframe).minutes == 15
+    assert convert.minute_bar_limit_of(values) == 5
+
+    the_real_replay = port_module.replay
+    got: list[object] = []
+
+    async def watched_replay(*args, **kwargs):
+        got.append(kwargs.get("minutes"))
+        return await the_real_replay(*args, **kwargs)
+
+    monkeypatch.setattr(port_module, "replay", watched_replay)
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        try:
+            await _run(port)
+            first = _shown_run(port)
+            port.apply_settings(values.replace(minute_bar_limit=MinuteBarLimit.FIFTEEN))
+            await port.wait()
+            return first, _shown_run(port)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    first, second = loop.run_until_complete(go())
+    assert len(got) == 2, f"прогонов {len(got)}: смена только порога не перезапустила прогон"
+    assert got[0] is None, "при пороге 5 минутки поданы 15-минутной свече"
+    assert got[1] is not None, "порог 15 из окна не дошёл до прогона: минутки не поданы"
+    assert first is not None and second is not None
+    assert first.coarse_bar == CoarseBar(15, 5)
+    assert second.coarse_bar is None, "показан прогон с пометкой прежнего порога"

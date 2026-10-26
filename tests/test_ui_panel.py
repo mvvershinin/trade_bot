@@ -117,7 +117,12 @@ class FakeSurface:
 
         draw_marker(painter, point, kind, layer, style)
 
+    def set_expand_handler(self, handler) -> None:
+        self.expand_handler = handler
+
     def scroll_to_last(self) -> None: ...
+    def show_all(self) -> None: ...
+    def select_all(self) -> None: ...
     def is_following(self) -> bool:
         return True
 

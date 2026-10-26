@@ -32,10 +32,12 @@ Python, показывает график и историю по инструм�
 | Файл | Система | Что нужно на машине |
 |---|---|---|
 | `Terminal-__VERSION__-windows-x86_64.zip` | Windows 10/11, 64-бит | ничего заранее — распаковать и запустить |
-| `Terminal-__VERSION__-linux-x86_64.tar.gz` | Linux, 64-бит, glibc ≥ 2.38 | несколько системных библиотек Qt, см. ниже |
+| `Terminal.AppImage` | Linux, 64-бит, glibc ≥ 2.35 | `chmod +x`, `fuse3` (или запуск с `APPIMAGE_EXTRACT_AND_RUN=1`, если FUSE недоступен), несколько системных библиотек Qt, см. ниже |
 
 Оба собраны из одного и того же исходного кода одним и тем же прогоном —
-`.github/workflows/release.yml`, тег `__VERSION__`.
+`.github/workflows/release.yml`, тег `__VERSION__`. Имя `Terminal.AppImage`
+не меняется от релиза к релизу — так и задумано (решение `0002`): скачивая
+новую версию, замените файл целиком.
 
 ## Windows: что покажет система при первом запуске
 
@@ -57,16 +59,21 @@ Python, показывает график и историю по инструм�
 
 ## Linux: что нужно доустановить
 
-Библиотеки Qt для окна — они не входят в архив. Список измерен 08.09.2026
-на `ubuntu:24.04` (замер на реальном собранном бинаре: сначала offscreen-
-прогон, затем настоящее окно под Xvfb, `ldd` по всем библиотекам поставки;
-подробности — `BUILD.md` в репозитории, раздел «Запустить готовую программу
-на Linux»):
+`Terminal.AppImage` — один файл: `chmod +x Terminal.AppImage`, затем
+`./Terminal.AppImage`. Если система не даёт смонтировать AppImage
+(нет FUSE) — `APPIMAGE_EXTRACT_AND_RUN=1 ./Terminal.AppImage`.
+
+Библиотеки Qt для окна не входят в архив — они уже есть на любом Linux
+с рабочим столом. Список измерен 08.09.2026 на `ubuntu:24.04` (замер
+на реальном собранном бинаре: сначала offscreen-прогон, затем настоящее
+окно под Xvfb, `ldd` по всем библиотекам поставки; подробности —
+`BUILD.md` в репозитории, раздел «Запустить готовую программу на Linux»):
 
 ```
 sudo apt install libgl1 libegl1 libxkbcommon0 libglib2.0-0 libdbus-1-3 \
-                  libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 \
-                  libxcb-keysyms1 libxcb-xkb1 libwayland-cursor0 libwayland-egl1
+                  libfontconfig1 libxcb-cursor0 libxkbcommon-x11-0 \
+                  libxcb-icccm4 libxcb-keysyms1 libxcb-xkb1 \
+                  libwayland-cursor0 libwayland-egl1
 ```
 
 Команды для Fedora/Arch и что покажет программа, если библиотеки не хватает, —

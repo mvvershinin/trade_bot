@@ -38,19 +38,31 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, cast
 
-from PySide6.QtCore import QObject, QTimer, SignalInstance
+from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
+from app import contract_view, convert, debug_feed, paper_report, stitched_view
+from app.minutes import minute_plan, minutes_under
+from app.observe import LiveObserver, RunRecording
+from app.runs import ProgramFields, RunConditions, RunLog, result_note, settings_text
 from backtest import HistoryRun, Summary, pairs, replay, reversal_entries, summarise
-from engine import EngineSettings, MSK, PositionState, close_time, in_moscow
+from engine import MSK, EngineSettings, PositionState, close_time, in_moscow
 from market import (
-    Candle as MarketCandle,
     FUTURES,
+    WARMUP_LOOK_BACK_DAYS,
+    ChainNotQuarterly,
+    ContractError,
+    ContractLoad,
+    ContractRequest,
+    ContractRow,
+    Expiry,
+    ExpiryVerdict,
     FetchResult,
     HaltKind,
     HaltRecord,
@@ -58,23 +70,38 @@ from market import (
     HistoryRequest,
     Inventory,
     IssStopped,
+    Leg,
+    LegDays,
     MarketWorker,
     PointValue,
     StoredHalt,
     Timeframe,
     WorkerClosed,
+    asset_of,
     bar_start,
     build_bars,
+    chain_around,
+    chain_covering,
+    expiry_verdict,
     is_synthetic,
+    pieces,
+    rows_of_asset,
     warmup_bars,
 )
-from strategies import EmaReverse
+from market import (
+    Candle as MarketCandle,
+)
+from market.contracts import monthly_assets
+from ui.formatting import fmt_datetime
 from ui.models import (
+    FIELD_CAPTIONS,
+    STEP_WAIT,
     BacktestOptions,
     BacktestRequest,
     Candle,
     ChartData,
     Connection,
+    ContractNotice,
     DecisionLevel,
     DecisionRow,
     HaltCause,
@@ -90,15 +117,13 @@ from ui.models import (
     RunOrigin,
     Settings,
     TakeGuard,
+    TimeExitKind,
+    TradeRow,
+    switch_blocked_reason,
 )
-from ui.formatting import fmt_datetime
 from ui.ports import Sanitize, TerminalPort
-
+from ui.trade_story import PaperReport, PaperReportRequest
 from ui.version import version
-
-from app import convert
-from app.observe import LiveObserver
-from app.runs import RunConditions, RunLog, result_note, settings_text
 
 if TYPE_CHECKING:  # только для проверки типов: в рантайме модуль не нужен
     from _typeshed import DataclassInstance
@@ -177,25 +202,33 @@ NO_LIVE = (
 
 #: Три предохранителя из `CLAUDE.md`, без которых к деньгам подходить нельзя.
 #:
+#: ⚠️ **Эта строка — живой код, и закомментирована быть не может.** Она уходит
+#: в журнал решений уровнем WARNING при каждом запуске (`announce`), и она —
+#: единственное, что осталось говорить о трёх предохранителях вслух после того,
+#: как сами они выключены на этапе: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113),
+#: решение заказчика 15.09.2026 (решение 0060 §4). Вместе с кодом замолчали
+#: и 35 его сторожей; эта строка и её тест остаются на посту за всех.
+#:
 #: ⚠️ Текст обязан совпадать с тем, что предохранители делают **сегодня**,
-#: и это не пожелание, а `D-037`. Прежняя редакция говорила «в движке
+#: и это не пожелание, а `D-037`. Редакция до 05.09.2026 говорила «в движке
 #: отсутствуют, поля ничего не ограничивают»; 05.09.2026 все три провели
 #: из окна, и строка стала ложью — уходя в журнал уровнем WARNING при каждом
 #: запуске. Владелец счёта, включивший потолок, читал бы, что потолка нет:
-#: ровно тот случай, ради которого текст писался, только наоборот.
+#: ровно тот случай, ради которого текст писался, только наоборот. Редакция
+#: 05.09–16.09.2026 («проведены в движок и работают каждый от своей галочки»)
+#: стала ложью **в обратную сторону** ровно тем же способом: галочек больше
+#: нет, а обещание осталось бы. Оба раза врал не механизм, а текст — поэтому
+#: он и стоит под тестом.
 #:
-#: Разойтись снова тексту не даёт `tests/test_app_port.py`: он сверяет строку
-#: с таблицей `app/convert._GUARDS` — каждый заведённый предохранитель обязан
-#: быть здесь назван, и обещание «сняты по умолчанию» сверяется с самими
-#: умолчаниями `ui.models.Settings`.
+#: Разойтись снова тексту не даёт `tests/test_app_port.py`.
 NO_GUARDS = (
-    "Потолок объёма, дневной лимит убытка и запас свободных средств "
-    "проведены в движок и работают каждый от своей галочки в настройках; "
-    "все три галочки по умолчанию сняты, и пока они сняты, робот ведёт себя "
-    "в точности как прежде. Дневной лимит и запас средств вдобавок считаются "
-    "от размера счёта, а портфель у брокера программа не читает: включённые, "
-    "они пишут «НЕ ПРОВЕРЕНО» и не срабатывают, а в боевом режиме такой "
-    "предохранитель вход запретит (решение 0037). К боевой торговле "
+    "⚠️ ПРЕДОХРАНИТЕЛЕЙ ПО ДЕНЬГАМ НЕТ НИ ОДНОГО. Потолок объёма, дневной "
+    "лимит убытка и запас свободных средств убраны на этапе разработки "
+    "решением владельца счёта и вернутся перед боевым запуском. Пока их нет: "
+    "робот не остановится ни при каком убытке за день, не проверит, хватает "
+    "ли свободных средств под обеспечение, и подаст заявку тем объёмом, "
+    "который стоит в настройках, каким бы он ни был. Остановить его можно "
+    "концом торгового окна или переключением режима. К боевой торговле "
     "программа не допущена."
 )
 
@@ -312,6 +345,8 @@ _WORKS: tuple[_Work, ...] = (
         "скачанное к этому времени в базе остаётся.",
     ),
     _Work("facts", "чтение описи базы свечей", STUCK_AFTER),
+    _Work("paper", "чтение сделок симуляции из базы", STUCK_AFTER),
+    _Work("contract", "чтение таблицы контрактов", STUCK_AFTER),
     _Work("options", "чтение списка инструментов из базы", STUCK_AFTER),
     _Work("draw", "дорисовка свечи по живому потоку", STUCK_AFTER),
     _Work("growing", "перерисовка текущей свечи", STUCK_AFTER),
@@ -320,9 +355,19 @@ _WORKS: tuple[_Work, ...] = (
     _Work("halt", "запись остановки робота в базу", STUCK_AFTER),
 )
 
+#: Как часто часы смотрят, не сменились ли сутки с последнего уточнения
+#: таблицы контрактов (`HistoryPort.sync_contracts`). Не торговое число:
+#: на решения робота не влияет, только на то, как быстро узнаётся экспирация.
+_SYNC_LOOK_MS = 60 * 60 * 1000
+
 #: Та же таблица ключом наружу. Собирается из `_WORKS`, а не пишется руками:
 #: два списка одних и тех же работ разошлись бы молча.
 _BY_KEY: dict[str, _Work] = {work.key: work for work in _WORKS}
+
+#: Сколько строк прогона симуляции читать за раз для «Отчётов». Не торговое
+#: число: месяц пересчёта — полторы тысячи заявок; обрезка, если случится,
+#: названа оговоркой в окне.
+_PAPER_LIMIT = 200_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,7 +430,54 @@ class _Backtest:
 
     span: _Span | None = None
     pending: BacktestRequest | None = None
+    #: Последний отказ, случившийся при обещанном отчёте, — им окно узнает,
+    #: почему отчёта не будет (`HistoryPort._forget_report`).
+    trouble: str = ""
     options: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True)
+class _Term:
+    """Срок торгуемого кода по таблице контрактов (ТЗ §4.6, решение 0016).
+
+    `rows` — таблица, прочитанная последней проверкой (`_check_contract`);
+    `None` — ещё не читалась: срок неизвестен, отвергается только собранный
+    ряд. Нужна синхронным командам (`stream`, `apply_settings`), которые
+    в базу сами не ходят. `day` — день МСК, за который срок сверен при живом
+    ходе: сверка раз в сутки, а не на каждом баре. `said` — последнее
+    сказанное «срок не известен»: одна строка, а не на каждой сверке.
+    """
+
+    rows: list[ContractRow] | None = None
+    day: date | None = None
+    said: str = ""
+    #: Связь попросили раньше, чем прочитана таблица (`--stream` при сборке):
+    #: подключение ждёт первого чтения, а не открывается на код с неизвестным
+    #: сроком — он мог давно истечь.
+    waiting: bool = False
+    #: Идёт уточнение таблицы у биржи (`sync_contracts`). Пока оно идёт,
+    #: подключение ждёт так же, как ждёт непрочитанной таблицы: прочитанная,
+    #: но не уточнённая (пустая на свежей базе) даёт «срок неизвестен» —
+    #: и поток открылся бы на давно истёкший код. Замер 29.09.2026 на базе
+    #: владельца счёта: ровно так поток встал на MXU6 через 12 дней после
+    #: его экспирации.
+    syncing: bool = False
+    #: Первое уточнение при запуске держит прогоны (`refresh`), а попрошенный
+    #: за это время (`held`) пойдёт после него — уже на том контракте,
+    #: на котором программа останется. Суточное уточнение прогонов не держит.
+    holding: bool = False
+    held: str = ""
+    #: Слот загрузки занят уточнением у биржи, а не загрузкой минут:
+    #: плашка и отказ «занято» называют работу её именем.
+    asking: bool = False
+    #: День МСК последнего удавшегося уточнения: раз в сутки, а не на каждом
+    #: взгляде часов. Неудавшееся повторяется на следующем взгляде.
+    synced: date | None = None
+    #: Последний сказанный отказ уточнения: без связи часы смотрят каждый час,
+    #: и повтор той же строки похоронил бы журнал под собой.
+    failed: str = ""
+    #: Часы суточного уточнения; заводит первое `sync_contracts`.
+    daily: QTimer | None = None
 
 
 @dataclass(slots=True)
@@ -410,6 +502,24 @@ class _History:
 
     facts: asyncio.Task[None] | None = None
     load: asyncio.Task[None] | None = None
+    #: Прогон, отложенный на время загрузки: пойдёт, когда она кончится.
+    after_load: str = ""
+    #: Идёт загрузка минут в базу (не уточнение контрактов): прогон ждёт.
+    filling: bool = False
+    #: Чтение таблицы контрактов: какой действующий (решение 0061).
+    contract: asyncio.Task[None] | None = None
+    #: Чтение сделок симуляции для окна «Отчёты» (`request_paper_report`).
+    paper: asyncio.Task[None] | None = None
+    #: Что про действующий контракт уже сказано в журнал: повтор молчит.
+    told: ContractNotice | None = None
+    #: Срок торгуемого кода по той же таблице (ТЗ §4.6, решение 0016).
+    term: _Term = field(default_factory=_Term)
+    #: Последний сказанный отказ склейки главного окна: повтор на каждом
+    #: «Применить» похоронил бы строку под собой же (как `_Term.said`).
+    stitch_said: str = ""
+    #: Активы, у которых биржа назвала месячные контракты (`ChainNotQuarterly`):
+    #: загрузка по ним идёт по дням, и опись для диалога обязана это знать.
+    monthly: set[str] = field(default_factory=set)
     chunk: FetchResult | None = None
     candles: int = 0
     pages: int = 0
@@ -457,11 +567,12 @@ class _Edge:
 
 @dataclass(slots=True)
 class _Watch:
-    """Живой ход движка в порту: четыре поля, которые живут и гаснут вместе.
+    """Живой ход движка в порту: поля, которые живут и гаснут вместе.
 
     Значение, а не россыпь в `__init__`, по двум причинам сразу. Первая —
-    они действительно одна вещь: наблюдение либо идёт, либо нет, и все четыре
-    меняются в двух местах (`_observe`, `_retire`). Вторая названа замером
+    они действительно одна вещь: наблюдение либо идёт, либо нет, и первые
+    четыре меняются в двух местах (`_observe`, `_retire`); `forming`
+    и `opened` — у прохода на первой минуте бара (решение 0065). Вторая названа замером
     `tests/test_function_size.py`: поля с объяснениями раздували `__init__`
     порта за предел длины, а объяснение полей — не то, ради чего читают
     сборку объекта.
@@ -485,6 +596,11 @@ class _Watch:
     observer: LiveObserver | None = None
     key: tuple[object, ...] | None = None
     retiring: asyncio.Task[None] | None = None
+    #: Незакрытый бар этого прохода, собранный без дыр (`_forming_of`),
+    #: и начало бара, на первой минуте которого проход уже просили
+    #: (`_first_minute`). Решение 0065: исполнение по первой минуте бара.
+    forming: MarketCandle | None = None
+    opened: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -525,15 +641,21 @@ class _HaltWrite:
 
     `cause` — причину поднять. `lift` — причину с таким текстом снять.
     Заполнено ровно одно из двух.
+
+    `at` — когда причина встала, **по часам порта** (`D-111`). Без него база
+    ставила бы отметку по часам машины, и время остановки в окне (память)
+    и после перезапуска (база) разошлось бы с часами, которые подменяет
+    проверка.
     """
 
     cause: HaltRecord | None = None
     lift: str = ""
+    at: datetime | None = None
 
     async def apply(self, worker: MarketWorker) -> None:
         """Сделать правку в базе."""
         if self.cause is not None:
-            await worker.raise_halt(self.cause)
+            await worker.raise_halt(self.cause, now=self.at)
             return
         await worker.lift_halt(self.lift)
 
@@ -725,6 +847,16 @@ class _Point:
     asked_at: dict[str, float] = dataclasses.field(default_factory=dict)
     task: asyncio.Task[None] | None = None
     trouble: str = ""
+    #: Шаг цены по каждому контракту, как его сообщила биржа (`MINSTEP`).
+    #: Источник шага один — карточка; файл настроек и окно его не задают
+    #: (решение владельца счёта 05.10.2026). Нет контракта — шаг неизвестен.
+    steps: dict[str, float] = dataclasses.field(default_factory=dict)
+    #: Контракты склейки, чей шаг ещё не спрошен, — спрашиваются той же
+    #: задачей после текущего инструмента (`_point_value`).
+    wanted: list[str] = dataclasses.field(default_factory=list)
+    #: Контракты склейки, про чей неизвестный шаг журнал уже сказал.
+    guessed: set[str] = dataclasses.field(default_factory=set)
+    filed: float = 0.0
 
 
 @dataclass(slots=True)
@@ -806,6 +938,15 @@ class _Stuck:
         return cls(tick=min(STUCK_TICK, max(after / 4, 0.005)), after=after)
 
 
+def moscow_now() -> datetime:
+    """Рабочие часы порта: системное время, приведённое к московскому.
+
+    Отдельной функцией, а не выражением на месте, ровно ради довода
+    `clock` ниже: подменяемым может быть только то, у чего есть имя.
+    """
+    return datetime.now(MSK)
+
+
 class HistoryPort(TerminalPort):
     """Окно ↔ прогон по истории.
 
@@ -833,7 +974,43 @@ class HistoryPort(TerminalPort):
         (`_Stuck.watching`), вторым доводом не заводится: срок и шаг
         осмысленны только вместе, а разъехавшись — дают сторожа, который
         просыпается реже, чем истекает его собственный срок.
+    :param clock: откуда порт берёт «сейчас». Умолчание — системные часы
+        в московском времени, и на работе программы довод не сказывается
+        никак. Существует он по той же причине, что `redraw_gap`: отрезок
+        загрузки считается **от сегодняшнего дня** (`_load_span`), и проверка,
+        которая не может назвать этот день сама, проверяет календарь машины,
+        а не программу. Так и вышло: четыре сторожа кнопки загрузки, зелёные
+        06.09.2026, покраснели 14.09.2026 сами по себе — данные подставной
+        биржи уехали за левую границу отрезка (`B-049`).
+
+        ⚠️ Это **значение**, а не режим: порт получает момент времени и не
+        узнаёт, кто его дал. Довод вида «мы под тестом» был бы нарушением
+        первого железного правила.
     """
+
+    #: Что записать в файл настроек: настройки, имена полей, которые из них
+    #: взять (пустой кортеж — все), и пары «поле, чем оно обязано быть в файле
+    #: сейчас» (пустой — без условия).
+    #: Отдельный сигнал, а не эхо `settings_applied`: эхо уходит на каждое
+    #: изменение, в том числе сделанное программой самой (ответ биржи
+    #: о шаге и стоимости пункта, открытие окна настроек), а файл владельца
+    #: счёта пишется **только** по действию человека (`B-050`, находка
+    #: аудитов 05.10.2026). Исключение одно и названо — переход с истёкшего
+    #: контракта на действующий (`_switch_to_current`). Слушает сборка
+    #: (`app/main.py::_keep_settings`); окну этот сигнал не нужен.
+    settings_to_file = Signal(object, object, object)
+
+    #: Прежние контракты и стыки для показа (решение 0061), прочитанные
+    #: проходом прямо перед `_show`. Объявлено у класса, а не в `__init__`:
+    #: сборка порта упирается в предел длины функции, а значение неизменяемое,
+    #: и общее на класс умолчание для него безопасно.
+    _context: contract_view.ChartContext = contract_view.ChartContext()
+    #: Последний прогон по склейке (решение 0061) — ради подписи сделки
+    #: на стыке и разбивки итога по контрактам. `None` — прогон одним рядом.
+    _stitched: stitched_view.StitchedRun | None = None
+    #: «Считается на: …» последнего прогона по склейке (B-069) — в шапку
+    #: отчёта и в «Отчёты». Пусто — прогон одним рядом.
+    _basis: str = ""
 
     def __init__(
         self,
@@ -847,15 +1024,16 @@ class HistoryPort(TerminalPort):
         sanitize: Sanitize,
         redraw_gap: float = REDRAW_GAP,
         stuck_after: float | None = None,
+        clock: Callable[[], datetime] = moscow_now,
     ) -> None:
         super().__init__(parent)
+        self._clock = clock
         self._worker = worker
         self._sanitize = sanitize
-        self._values = values or Settings()
+        self._values, self._engine_settings, refused = _startup_settings(values, mode)
         self._mode = mode
         self._days = days
         self._until = until
-        self._engine_settings = convert.engine_settings(self._values, self._mode)
         self._notes: list[DecisionRow] = []
         self._journal: tuple[DecisionRow, ...] = ()
         self._run: HistoryRun | None = None
@@ -922,6 +1100,56 @@ class HistoryPort(TerminalPort):
         self._point = _Point()  # стоимость пункта; разбор полей — в `_Point`
         self._history = _History()  # загрузка истории; разбор полей — в `_History`
         self._stuck = _Stuck.watching(stuck_after)  # часы долгих работ; см. `_Stuck`
+        self._take_startup_substitution(values, refused)  # `B-050`: после сборки
+
+    def _take_startup_substitution(self, given: Settings | None, refused: str) -> None:
+        """Настройки из файла приняты не целиком (`B-050`): запомнить и сказать.
+
+        Зовётся последней строкой сборки: `note` нужны часы, чистка и поля
+        хода, которых раньше нет. Окно к сигналу в этот момент ещё не
+        подключено, и это не потеря: строка лежит в `_notes` и уходит в окно
+        с журналом первого же прохода (`_publish_journal`).
+
+        `_file_holds` — что лежит в файле вместо подменённого. Подмена живёт
+        в памяти и в журнале, а файл владельца счёта не трогает, пока человек
+        сам не нажал «Применить» (`for_file`).
+        """
+        #: Шаг цены, записанный в файле. Не действует (шаг сообщает биржа);
+        #: нужен ровно для одной строки журнала, если с биржевым он разошёлся
+        #: (`_step_taken`). Ноль — сказано или сравнивать не с чем.
+        self._point.filed = given.price_step if given is not None else 0.0
+        self._file_holds: dict[str, Any] = {
+            item.name: getattr(given, item.name)
+            for item in dataclasses.fields(Settings)
+            if given is not None
+            and getattr(given, item.name) != getattr(self._values, item.name)
+        }
+        #: Подмена при запуске словами и поле, которое её лечит, — для плашки
+        #: главного окна (`RobotState.settings_trouble`). Строка журнала одна
+        #: и обрезается колонкой; плашка с кнопкой «Открыть настройки» стоит,
+        #: пока человек не применил настройки сам. Пусто — подмены нет.
+        self._trouble = (refused, self._trouble_field()) if refused else ("", "")
+        if refused:
+            self.note("Настройки не приняты", refused, DecisionLevel.ERROR)
+
+    def _trouble_field(self) -> str:
+        """Поле окна, правкой которого лечится подмена при запуске.
+
+        Шаг цены здесь не называется никогда: его сообщает биржа, человеку
+        вписывать нечего (решение 05.10.2026), и подмена шага из файла
+        лечится ответом биржи, а не окном настроек.
+        """
+        return next((name for name in self._file_holds if name != "price_step"), "")
+
+    @property
+    def startup_substituted(self) -> frozenset[str]:
+        """Поля, которые порт при запуске поставил не так, как прочитано из файла.
+
+        Нужны сборке (`app/main.py::_say_what_was_read`): строка чтения
+        файла про такое поле говорит о значении, которое уже не действует,
+        и рядом со строкой порта читалась бы как вторая правда.
+        """
+        return frozenset(self._file_holds)
 
     # ------------------------------------------------------- выход наружу
 
@@ -1007,6 +1235,29 @@ class HistoryPort(TerminalPort):
                 "Подключение к брокеру не собрано: программа запущена без него.",
             )
             return
+        self._history.term.waiting = False
+        if on:
+            if self._history.term.syncing:
+                # Таблицу уточняют у биржи — подключение продолжит сам
+                # уточнитель (`_sync`), когда станет ясно, какой код живой.
+                self._history.term.waiting = True
+                return
+            if self._history.term.rows is None:
+                # Таблица ещё не прочитана — ждать её, а не подписываться
+                # вслепую: истёкший код отсюда не отличить от живого.
+                # Подключение продолжит `_check_contract`, прочитав таблицу.
+                self._history.term.waiting = True
+                self.check_contract()
+                return
+            verdict = self._expiry(self._values.instrument)
+            if verdict.kind.refused:
+                # Код, по которому брокер не торгует или робот торговать
+                # не вправе: склейка, истёкший, архивный. Подписка не
+                # заводится, живого хода — а значит и заявки — не будет.
+                self.connection = Connection.OFFLINE
+                self._refuse("Подключение к брокеру", verdict.text)
+                self.restate()
+                return
         refusal = self._stream(on)
         if refusal is None:
             self._observe(on)
@@ -1140,7 +1391,7 @@ class HistoryPort(TerminalPort):
         # настроек движка. Обновить только первое значит поменять подпись
         # в панели и оставить прогон прежним: окно говорит «Только закрытие»,
         # а робот на графике продолжает входить.
-        fresh = convert.engine_settings(self._values, mode, self._engine_settings)
+        fresh = _engine_of(self._values, mode, self._engine_settings)
         changes = fresh.changes_from(self._engine_settings)
         self._mode = mode
         self._engine_settings = fresh
@@ -1150,15 +1401,48 @@ class HistoryPort(TerminalPort):
             if changes else f"Режим «{mode.label}» уже стоял",
         )
 
-    def apply_settings(self, settings: Settings) -> None:
-        """Принять настройки окна и пересчитать прогон.
+    @property
+    def values(self) -> Settings:
+        """Настройки, принятые портом, — после подмены при сборке (`B-050`).
+
+        Окно собирается с ними, а не с прочитанным из файла: иначе до первого
+        открытия настроек оно держало бы вариант, которого робот не умеет,
+        и тестер, шаблоны, календарь и плашка контракта отказывали бы
+        или несли его дальше. В файл по-прежнему идёт `for_file`.
+        """
+        return self._values
+
+    def for_file(self, values: Settings) -> Settings:
+        """Настройки, которые можно записать в файл, — без подмены при сборке.
+
+        Поле, подменённое при сборке порта (`_startup_settings`, `B-050`),
+        уходит в файл тем, что в нём и лежало, пока человек не применил
+        настройки сам. Отпускает подмену только `apply_settings(by_person=True)`;
+        программа, меняющая настройки сама (`_point_taken`), зовёт его
+        с `by_person=False`.
+
+        ⚠️ Сам файл пишется не по эху, а по `settings_to_file`: только
+        по действию человека и при переходе с истёкшего контракта. Ответ
+        биржи (шаг, стоимость пункта) действует в памяти и в файл не идёт.
+        """
+        return dataclasses.replace(values, **self._file_holds) if self._file_holds else values
+
+    def apply_settings(
+        self, settings: Settings, *, by_person: bool = True,
+        event: str = "Настройки изменены",
+    ) -> None:
+        """Принять настройки окна и пересчитать прогон. `by_person` — см. `for_file`.
+
+        `event` — заголовок строки журнала. Программа, применяющая ответ
+        биржи (`_point_taken`), называет его своим: «Настройки изменены»
+        на каждом запуске читалось бы как правка, которой человек не делал.
 
         Разбор строк окна — громкий: незнакомый размер свечи и пустой
         инструмент отвергаются с объяснением, а не подменяются умолчанием.
 
         Строки изменений собираются из **трёх** источников, и это не мелочь:
         движок (`EngineSettings.changes_from`) и торговый модуль
-        (`EmaReverseSettings.changes_from`) знают только свои поля, а пять
+        (`StrategySettings.changes_from`) знают только свои поля, а пять
         полей окна не принадлежат ни одному из них — инструмент, размер свечи
         и три поля предохранителей. Пока их строки писал только движок, смена
         инструмента давала в журнал «Значения совпали с прежними», после чего
@@ -1168,14 +1452,30 @@ class HistoryPort(TerminalPort):
         Три поля предохранителей выделены в отдельную строку уровня
         «предупреждение»: за ними сегодня не стоит ничего, и молчаливое
         «принято» читалось бы как «ограничение поставлено».
+
+        ⚠️ Шаг цены из пришедших настроек **не берётся**: его сообщает биржа
+        (`_point.steps`, решение 05.10.2026). Окно настроек, открытое до
+        ответа биржи, прислало бы на «ОК» ноль и стёрло бы биржевой шаг.
         """
+        # Шаг цены — от биржи. Убранный алгоритм и требования алгоритма —
+        # выставляются вслух, а не дают отказ (решение 0063): строка уходит
+        # в журнал ниже.
+        settings, adjusted = convert.settled(
+            settings.replace(price_step=self._step_of(settings.instrument))
+        )
         try:
-            fresh = convert.engine_settings(settings, self._mode, self._engine_settings)
+            fresh = _engine_of(settings, self._mode, self._engine_settings)
             convert.timeframe_of(settings.timeframe)
             convert.instrument_of(settings.instrument)
-            module = convert.strategy_settings(settings)
+            # Настройки алгоритма собираются здесь ради **проверки**: отказ
+            # обязан случиться до того, как новые значения станут текущими.
+            # Сами они пересобираются там, где нужны, — в живом ходе и в
+            # прогоне (`_watcher`, `_replay`).
+            convert.strategy_settings(settings)
+            convert.expiry_days_of(settings)
+            self._check_switch(settings)
         except convert.SettingsRefused as refusal:
-            self._refuse("Настройки не приняты", str(refusal))
+            self._refuse_settings(str(refusal), refusal.field)
             return
         except (ValueError, TypeError) as error:
             # ⚠️ Проверки самих настроек (`__post_init__` движка и торгового
@@ -1183,25 +1483,34 @@ class HistoryPort(TerminalPort):
             # сегодня не приходят, но `apply_settings` — публичная команда
             # порта и зовётся из слота Qt: непойманное исключение здесь
             # означает трассировку в консоль и молчащее окно.
-            self._refuse(
-                "Настройки не приняты",
+            self._refuse_settings(
                 f"Значение не годится: {error}. Прежние настройки остались в силе.",
             )
             return
 
         changes = convert.window_changes(self._values, settings)
         changes += fresh.changes_from(self._engine_settings)
-        changes += module.changes_from(convert.strategy_settings(self._values))
+        # ⚠️ Строки про правило собирает `convert`, а не порт: сравнивать
+        # настройки алгоритма можно только с настройками **того же** алгоритма,
+        # а при смене самого алгоритма прежние принадлежат другому классу.
+        # Порт этого различить не может — он не знает, какие бывают алгоритмы.
+        changes += convert.rule_changes(self._values, settings)
+        changes += _unseen_changes(self._values, settings)
         guards = convert.guard_changes(self._values, settings)
         self._values = settings
         self._engine_settings = fresh
-        if self._retarget is not None:
-            # Поток котировок идёт за настройкой, а не остаётся на инструменте,
-            # выбранном при сборке (`B-020`). Зовётся **всегда**, даже когда
-            # инструмент тот же: решение «менять или нет» принимает тот, кто
-            # знает, на что подписан сейчас, а порт этого не знает.
-            self._retarget(convert.instrument_of(settings.instrument))
+        if by_person:  # применённое человеком — его выбор, и в файл идёт оно
+            self._file_holds.clear()
+            self._trouble = ("", "")
+        self._follow_instrument(settings.instrument)
         self._send(self.settings_applied, settings)
+        if by_person:
+            self._send(self.settings_to_file, settings, (), ())
+        self._send(self.algorithms_changed, convert.algorithms(settings))
+        # Инструмент мог смениться — плашка «действующий контракт» обязана
+        # отозваться сразу, а не при следующем запуске.
+        self.check_contract()
+        self._say_settled(adjusted)
         if guards:
             self.note(
                 "Предохранители изменены",
@@ -1214,10 +1523,52 @@ class HistoryPort(TerminalPort):
             reason = "Торговые значения не изменились"
         else:
             reason = "Значения совпали с прежними"
-        self._apply("Настройки изменены", reason)
+        self._apply(event, reason)
+
+    def _say_settled(self, adjusted: tuple[str, ...]) -> None:
+        """Что выставлено под алгоритм (`convert.settled`) — строкой в журнал.
+
+        Пусто — молчать: выставлять было нечего.
+        """
+        if adjusted:
+            self.note(
+                "Настройки выставлены под алгоритм",
+                " ".join(adjusted),
+                DecisionLevel.WARNING,
+            )
+
+    def _step_of(self, instrument: str) -> float:
+        """Шаг цены инструмента по данным биржи. Ноль — биржа ещё не сообщила."""
+        return self._point.steps.get(instrument.strip(), 0.0)
+
+    def _follow_instrument(self, instrument: str) -> None:
+        """Поток котировок — за инструментом только что принятых настроек."""
+        verdict = self._expiry(instrument)
+        if verdict.kind.refused:
+            # Новый код брокеру не отдаётся вовсе: подписка на прежнем
+            # не остаётся (она перестала бы совпадать с окном, `B-020`),
+            # а снимается вслух. Живого хода без подписки нет.
+            if self._watch.observing:
+                self.stream(False)
+            self._refuse("Поток котировок не переключён", verdict.text)
+        elif self._retarget is not None:
+            # Поток котировок идёт за настройкой, а не остаётся на инструменте,
+            # выбранном при сборке (`B-020`). Зовётся **всегда**, даже когда
+            # инструмент тот же: решение «менять или нет» принимает тот, кто
+            # знает, на что подписан сейчас, а порт этого не знает.
+            self._retarget(convert.instrument_of(instrument))
 
     def request_settings(self) -> None:
+        """Текущие настройки и текущее правило робота словами.
+
+        Два сигнала, а не один: правило `ui/` посчитать не может — окно
+        не импортирует торговые слои (ARCHITECTURE.md §2). Отправляется оно
+        **вместе** с настройками и здесь, и при их применении: окно, спросившее
+        настройки при открытии, иначе показывало бы поля без объяснения,
+        что робот с ними делает, до первого «Применить».
+        """
         self._send(self.settings_applied, self._values)
+        self._send(self.algorithms_changed, convert.algorithms(self._values))
 
     def request_chart(self, instrument: str, timeframe: str) -> None:
         self.apply_settings(self._values.replace(instrument=instrument, timeframe=timeframe))
@@ -1313,9 +1664,52 @@ class HistoryPort(TerminalPort):
                         f"{_plain(error)}. Какие инструменты в ней есть — неизвестно.",
             ))
             return
-        self._send(
-            self.backtest_options_ready, BacktestOptions(instruments=tuple(found))
-        )
+        self._send(self.backtest_options_ready, BacktestOptions(
+            instruments=tuple(found), periods=await self._periods(found),
+        ))
+
+    async def _periods(
+        self, found: list[InstrumentInfo]
+    ) -> tuple[InstrumentInfo, ...]:
+        """Периоды ближних контрактов, по которым в базе есть свечи.
+
+        Покрытие каждого — пересечение его периода с тем, что лежит в базе:
+        тестер не должен предлагать дни, за которые свечей нет. Таблица
+        не читается — пусто, и окно остаётся выбором тикера, как прежде.
+        """
+        try:
+            rows = await self._worker.contracts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # выбор тикером по-прежнему работает
+            log.exception("таблица контрактов не прочитана для тестера")
+            return ()
+        # Только цепочка актива из настроек: периоды RI в тестере MX —
+        # это прогон чужого актива со стоимостью пункта своего.
+        try:
+            rows = rows_of_asset(rows, asset_of(self._values.instrument.strip()))
+        except ContractError:
+            return ()
+        known = {info.symbol: info for info in found}
+        made: list[InstrumentInfo] = []
+        for row in sorted(
+            (one for one in rows if one.active_from is not None),
+            key=lambda one: one.active_from or date.min,
+        ):
+            info = known.get(row.symbol)
+            if info is None or info.first is None or info.last is None:
+                continue
+            assert row.active_from is not None
+            start = datetime.combine(row.active_from, datetime.min.time(), MSK)
+            first = max(in_moscow(info.first), start)
+            last = in_moscow(info.last)
+            if row.active_to is not None:
+                last = min(last, datetime.combine(
+                    row.active_to + timedelta(days=1), datetime.min.time(), MSK
+                ) - timedelta(minutes=1))
+            if first <= last:
+                made.append(InstrumentInfo(row.symbol, first, last, info.minutes))
+        return tuple(made)
 
     def run_backtest(self, request: BacktestRequest) -> None:
         """Прогнать робота по истории на выбранном отрезке.
@@ -1332,33 +1726,37 @@ class HistoryPort(TerminalPort):
         от неудачной попытки.
         """
         if self._task is not None and not self._task.done():
-            self._refuse_busy(
+            self._send(self.backtest_refused, self._refuse_busy(
                 "run",
                 "Прогон на истории не начат",
                 "Дождитесь его конца или нажмите «Отменить» — два прогона "
                 "разом дали бы в окно два разных ответа на один вопрос.",
-            )
+            ))
             return
         if request.until < request.since:
-            self._refuse(
-                "Прогон на истории не начат",
+            self._refuse_backtest(
                 "Конец отрезка раньше его начала. Проверьте даты «от» и «до».",
             )
             return
+        # Убранный алгоритм и требования алгоритма выставляются, а не дают
+        # отказ (решение 0063); строка — в журнал, после проверок ниже.
+        fixed, adjusted = convert.settled(request.settings)
+        request = dataclasses.replace(request, settings=fixed)
         try:
-            convert.engine_settings(request.settings, self._mode, self._engine_settings)
+            _engine_of(request.settings, self._mode, self._engine_settings)
             convert.timeframe_of(request.settings.timeframe)
             convert.instrument_of(request.settings.instrument)
             convert.strategy_settings(request.settings)
         except (convert.SettingsRefused, ValueError, TypeError) as error:
-            self._refuse(
-                "Прогон на истории не начат",
-                f"Настройки не годятся: {error}. Ни отрезок, ни настройки "
-                "не изменились.",
+            self._refuse_backtest(
+                f"Настройки не годятся: {str(error).rstrip('.')}. Ни отрезок, "
+                "ни настройки не изменились.",
             )
             return
+        self._say_settled(adjusted)
         self._back.span = _Span(request.since, request.until, request.settings_source)
         self._back.pending = request
+        self._back.trouble = ""
         self.note(
             "Прогон на истории запрошен",
             f"{convert.instrument_of(request.settings.instrument)}, "
@@ -1432,7 +1830,128 @@ class HistoryPort(TerminalPort):
                         f"{_plain(error)}. Что по инструменту уже загружено — неизвестно.",
             ))
             return
-        self._send(self.history_facts_ready, _facts_of(symbol, inventory))
+        facts = _facts_of(symbol, inventory)
+        if _chain_of(symbol) and asset_of(symbol) not in self._history.monthly:
+            try:
+                rows = await self._worker.contracts()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # рубеж уточнится при загрузке; опись важнее
+                log.exception("таблица контрактов не прочитана для описи")
+                rows = []
+            asset = asset_of(symbol)
+            if asset in monthly_assets(rows):
+                # Месячность актива биржа назвала в прошлом сеансе, и след
+                # остался в таблице (`D-125`): загрузка пойдёт по дням.
+                self._history.monthly.add(asset)
+                self._send(self.history_facts_ready, facts)
+                return
+            row = next((one for one in rows if one.symbol == symbol), None)
+            facts = dataclasses.replace(
+                facts,
+                by_contract=True,
+                # Квартальность подтверждается у биржи перед записью таблицы
+                # (`confirm_quarterly`): есть в ней цепочка актива — проверено.
+                # Нет — загрузка по контракту пойдёт, только если биржа
+                # подтвердит; у месячного актива (BR) она пойдёт по дням.
+                quarterly_unchecked=not any(
+                    _asset_or_empty(one.symbol) == asset for one in rows
+                ),
+                contract_from=row.active_from if row is not None else None,
+                warmup_bars=max(self._values.average_period, 1),
+            )
+        self._send(self.history_facts_ready, facts)
+
+    def request_paper_report(self, request: PaperReportRequest) -> None:
+        """Сделки симуляции из базы для окна «Отчёты». Ответ — `paper_report_ready`.
+
+        Возврат немедленный: чтение идёт в потоке данных, и прогон симуляции
+        с месяцем пересчёта — это полторы тысячи заявок и тысяча строк
+        журнала на каждый. Новая просьба снимает прежнюю, недочитанную:
+        окну нужен ответ на последний вопрос.
+        """
+        code = request.instrument.strip() or self._values.instrument.strip()
+        before = self._history.paper
+        if before is not None and not before.done():
+            before.cancel()
+        self._history.paper = self._begin("paper", self._paper_report(code))
+
+    async def _paper_report(self, instrument: str) -> None:
+        """Прочитать прогоны симуляции инструмента, отобрать и отправить окну.
+
+        Отказ базы — не пустой отчёт, а названная причина: пустая таблица
+        читается как «сделок не было», и это другое утверждение (правило 13).
+        """
+        try:
+            found = await self._paper_read(instrument)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # окно не должно падать вместе с базой
+            log.exception("сделки симуляции не прочитаны")
+            found = PaperReport(
+                instrument=instrument,
+                trouble=f"Сделки симуляции из базы {self._worker.path} прочитать "
+                        f"не удалось: {_plain(error)}. Таблица не показана, чтобы "
+                        "не выдать отказ за «сделок не было».",
+            )
+        self._send(self.paper_report_ready, found)
+
+    async def _paper_read(self, instrument: str) -> PaperReport:
+        """Чтение и отбор: прогоны, их сделки и заявки, журнал нужных прогонов."""
+        notes: list[str] = []
+        codes = await self._paper_codes(instrument, notes)
+        rows: list[paper_report.RunRows] = []
+        for run in await self._worker.paper_runs(codes):
+            if run.mark is None:
+                rows.append(paper_report.RunRows(run))
+                continue
+            number = run.session.id
+            trades = await self._worker.trades(session_id=number, limit=_PAPER_LIMIT)
+            orders = await self._worker.orders(session_id=number, limit=_PAPER_LIMIT)
+            if trades.truncated or orders.truncated:
+                notes.append(f"Прогон №{number}: прочитаны не все строки — в базе их "
+                             f"больше {_PAPER_LIMIT}, разбор неполон.")
+            rows.append(paper_report.RunRows(
+                run, trades.rows, tuple(order.record for order in orders)
+            ))
+        books: dict[int, paper_report.RunBook] = {}
+        wanted = set(paper_report.needed(rows))
+        for item in rows:
+            if item.run.session.id not in wanted:
+                continue
+            journal = await self._worker.decisions(
+                session_id=item.run.session.id, limit=_PAPER_LIMIT
+            )
+            if journal.truncated:
+                notes.append(f"Прогон №{item.run.session.id}: журнал решений прочитан "
+                             f"не весь — строк больше {_PAPER_LIMIT}, разбор неполон.")
+            books[item.run.session.id] = paper_report.RunBook.of(
+                item.run.session, item.orders, (row.record for row in journal)
+            )
+        return paper_report.report(instrument, rows, books, notes)
+
+    async def _paper_codes(self, instrument: str, notes: list[str]) -> list[str]:
+        """Коды инструмента на экране: все контракты актива одним рядом (В3).
+
+        Таблица контрактов — главный источник; цепочка вокруг кода добавлена
+        на случай, если таблица ещё не знает прошлых контрактов. Отказ таблицы
+        не роняет отчёт: прогоны ищутся по цепочке, и это сказано оговоркой.
+        """
+        asset = _asset_or_empty(instrument)
+        if not asset:
+            return [instrument]
+        codes = [instrument, *_chain_of(instrument)]
+        try:
+            table = await self._worker.contracts()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.exception("таблица контрактов не прочитана для отчёта симуляции")
+            notes.append(f"Таблица контрактов не прочитана ({_plain(error)}): прогоны "
+                         f"искались по {instrument} и соседним контрактам цепочки.")
+            table = []
+        codes += [row.symbol for row in rows_of_asset(table, asset)]
+        return list(dict.fromkeys(codes))
 
     def load_history(self, request: HistoryLoadRequest) -> None:
         """Скачать историю с биржи и положить в базу. Ход и конец — сигналами.
@@ -1460,8 +1979,20 @@ class HistoryPort(TerminalPort):
         self._history.chunk = None
         self._history.candles = 0
         self._history.pages = 0
+        request = dataclasses.replace(request, symbol=code)
+        chain = _chain_of(code)
+        if chain and request.since is not None:
+            # B-069: цепочка назад до начала отрезка из окна — иначе первый
+            # его контракт остался бы без начала периода и выпал бы из кусков.
+            today = in_moscow(self._clock()).date()
+            chain = chain_covering(code, min(request.since, today), today)
+        # Код квартального фьючерса — загрузка по контракту: с рубежа плюс
+        # прогрев, без хвоста (решение 0061). Прочие коды — по дням, как
+        # прежде: у них нет цепочки контрактов, и хвоста нет тоже.
         self._history.load = self._begin(
-            "load", self._load_history(dataclasses.replace(request, symbol=code))
+            "load",
+            self._load_contract(request, chain) if chain
+            else self._load_history(request),
         )
 
     def cancel_history_load(self) -> None:
@@ -1491,12 +2022,12 @@ class HistoryPort(TerminalPort):
     async def _load_history(self, request: HistoryLoadRequest) -> None:
         """Снять отметки (если просили заново), загрузить, рассказать итог."""
         symbol = request.symbol
-        since, until = _load_span(request, now=datetime.now(MSK))
+        since, until = _load_span(request, now=self._clock())
         self.note("Загрузка истории начата", _load_lead(request, since, until))
         try:
             if request.replace:
                 await self._worker.forget_day_marks(symbol, since, until)
-            outcome = await self._worker.load_history(
+            outcome = await self._filling(self._worker.load_history(
                 HistoryRequest(
                     symbol=symbol,
                     market=FUTURES,
@@ -1506,7 +2037,7 @@ class HistoryPort(TerminalPort):
                     timeframe=convert.timeframe_of(self._values.timeframe),
                 ),
                 progress=lambda result: self._load_tick(since, until, result),
-            )
+            ))
         except asyncio.CancelledError:
             raise
         except IssStopped as stopped:
@@ -1527,6 +2058,598 @@ class HistoryPort(TerminalPort):
             ))
             return
         self._done_loading(_load_result(outcome))
+
+    async def _load_contract(
+        self, request: HistoryLoadRequest, chain: list[str]
+    ) -> None:
+        """Загрузка по контракту: уточнить рубежи у биржи, затем минуты по кускам.
+
+        Порядок не вкусовой: откуда начинать, знает только таблица
+        контрактов, а её уточняет первый шаг. Отрезок — с даты из окна
+        по сегодня, и на каждом его куске грузится свой ближний контракт
+        (B-069: прежде грузился только код из настроек, и хвост архивного
+        MXU6 не грузил никто). Даты нет (переход при запуске) — с рубежа
+        кода, как прежде. После загрузки — сверка дней с биржей.
+        """
+        symbol = request.symbol
+        now = self._clock()
+        today = in_moscow(now).date()
+        warmup = max(self._values.average_period, 1)
+        started = time.monotonic()
+        self.note(
+            "Загрузка истории начата",
+            f"{symbol}: у биржи уточняются сроки и рубежи контрактов "
+            f"{', '.join(chain)} по дневным объёмам. Токен брокера не нужен.",
+        )
+        legs: list[Leg] = []
+        loads: list[ContractLoad] = []
+        try:
+            rows = await self._refresh_chain(chain, symbol, now)
+            if self._not_started(symbol, rows):
+                return
+            row = next(one for one in rows if one.symbol == symbol)
+            assert row.active_from is not None  # проверено `not_started`
+            since = row.active_from if request.since is None else min(request.since, today)
+            legs = await self._worker.call(
+                lambda store: pieces(store, since, today, asset=asset_of(symbol))
+            )
+            if request.replace:
+                await self._forget_legs(legs, since)
+            self.note("Загрузка минут контракта",
+                      contract_view.legs_lead(legs, warmup, since, today))
+            # Все куски — одним `_filling`: прогон, попросившийся между
+            # кусками, пошёл бы по недогруженной базе.
+            await self._filling(self._load_legs(legs, loads, warmup, (since, today), now))
+        except asyncio.CancelledError:
+            raise
+        except ChainNotQuarterly as error:
+            self._history.monthly.add(asset_of(symbol))
+            self._refuse("Загрузка по контракту не начата",
+                         f"{_plain(error)}. Загрузка идёт по дням, как для кода без цепочки.")
+            await self._load_history(request)
+            self.check_contract()
+            return
+        except IssStopped as stopped:
+            self.check_contract()
+            self._done_loading(HistoryLoadOutcome(
+                symbol=symbol, cancelled=True, headline="Загрузка остановлена",
+                detail=f"{stopped}. {contract_view.legs_done(legs, loads)}",
+            ))
+            return
+        except Exception as error:  # окно не должно падать вместе с биржей
+            log.exception("загрузка контракта не удалась")
+            self.check_contract()
+            self._done_loading(HistoryLoadOutcome(
+                symbol=symbol,
+                headline="Загрузка не удалась",
+                trouble=f"{_plain(error)}. {contract_view.legs_done(legs, loads)} "
+                        "Скачанное до обрыва записано и отмечено: повторная "
+                        "загрузка продолжит с этого места.",
+            ))
+            return
+        checked, said = await self._check_days(legs, since, today)
+        # ⚠️ Не в `finally`: при отмене (`aclose` при выходе) новая задача
+        # чтения таблицы завелась бы уже после того, как закрытие собрало
+        # свои задачи, и писала бы в окно, которого нет.
+        self.check_contract()
+        self._done_loading(contract_view.legs_outcome(
+            symbol, loads, checked, seconds=time.monotonic() - started, said=said,
+        ))
+
+    async def _load_legs(
+        self,
+        legs: Sequence[Leg],
+        loads: list[ContractLoad],
+        warmup: int,
+        span: tuple[date, date],
+        now: datetime,
+    ) -> None:
+        """Минуты каждого куска своим контрактом — с прогревом перед куском.
+
+        Загруженное дописывается в `loads` по ходу, а не возвращается в конце:
+        при обрыве посередине зовущий называет, какие куски загружены.
+        """
+        for leg in legs:
+            loads.append(await self._worker.load_contract(ContractRequest(
+                symbol=leg.symbol, market=FUTURES, until=leg.until, since=leg.since,
+                warmup_bars=warmup, now=now,
+                timeframe=convert.timeframe_of(self._values.timeframe),
+                progress=lambda result: self._load_tick(*span, result),
+            )))
+
+    def _not_started(self, symbol: str, rows: list[ContractRow]) -> bool:
+        """У кода нет рубежа — сказать окну и журналу; `True` — загрузка не идёт."""
+        refusal = contract_view.not_started(symbol, rows)
+        if refusal:
+            self.check_contract()
+            self._done_loading(HistoryLoadOutcome(
+                symbol=symbol, headline="Загрузка не начата", trouble=refusal,
+            ))
+        return bool(refusal)
+
+    async def _forget_legs(self, legs: Sequence[Leg], since: date) -> None:
+        """«Заново»: снять отметки по каждому куску, с глубиной поиска прогрева.
+
+        Не раньше даты из окна: дни до неё человек перезапрашивать не просил.
+        """
+        for leg in legs:
+            start = max(since, leg.since - timedelta(days=WARMUP_LOOK_BACK_DAYS))
+            await self._worker.forget_day_marks(leg.symbol, start, leg.until)
+
+    async def _check_days(
+        self, legs: Sequence[Leg], since: date, today: date
+    ) -> tuple[list[LegDays], list[str]]:
+        """Сверка дней с биржей после загрузки — и что сказать сверх неё.
+
+        Сверх неё — дни отрезка без контракта в таблице и отказ самой сверки.
+        Минуты уже в базе, и отказ сверки загрузку не отменяет: он говорится
+        строкой беды, а не «Загрузка не удалась».
+        """
+        said = contract_view.no_contract(legs, since, today)
+        if not legs:
+            return [], said
+        try:
+            return await self._worker.check_days(legs, market=FUTURES), said
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # минуты в базе; сверка — отдельная беда
+            log.exception("сверка дней с биржей не сделана")
+            return [], [*said, (
+                f"Сверка дней с биржей не сделана: {_plain(error)}. Пропуски "
+                "в базе не проверены — повторите загрузку."
+            )]
+
+    async def _refresh_chain(
+        self, chain: list[str], symbol: str, now: datetime
+    ) -> list[ContractRow]:
+        """Уточнить таблицу по цепочке; рубеж не нашёлся посередине — по укороченной.
+
+        Рубеж не нашёлся посреди цепочки — так бывает, когда сам контракт ещё
+        не стал ближним: за ним стоит следующий, и слой данных честно называет
+        это недокачкой. Цепочка до контракта включительно отвечает на вопрос
+        «стал ли он ближним» прямо. Месячный актив (`ChainNotQuarterly`)
+        укороченная цепочка квартальным не сделает — он летит дальше как есть.
+
+        Код с края цепочки, которого биржа не знает, выпадает без отказа
+        (`B-054`), и сказать об этом человеку больше некому: слой данных
+        отдаёт фразу в `said`, порт кладёт её в журнал решений. Иначе
+        прежний громкий отказ стал бы тихим частичным успехом.
+        """
+        try:
+            rows = await self._worker.refresh_contracts(chain, market=FUTURES, now=now)
+        except ChainNotQuarterly:
+            raise
+        except ContractError:
+            rows = await self._worker.refresh_contracts(
+                chain[: chain.index(symbol) + 1], market=FUTURES, now=now
+            )
+        for text in rows.said:
+            self.note("Контракт не уточнён у биржи", text, DecisionLevel.WARNING)
+        return rows
+
+    def first_run(self, why: str) -> None:
+        """Запуск: уточнить контракты у биржи, затем первый прогон.
+
+        Прогон ждёт уточнения (`hold`), подключение тоже (`stream`): на коде,
+        который истёк, не рисуется и не подписывается ничего. Зовётся
+        **после** проводки файла настроек — переход на действующий контракт
+        уходит в файл сигналом `settings_to_file`, и неподключённый сигнал
+        потерял бы его.
+        """
+        self.sync_contracts(why, hold=True)
+        self.refresh(why)
+
+    def sync_contracts(self, why: str, *, hold: bool = False) -> None:
+        """Уточнить у биржи таблицу контрактов актива из настроек — в фоне.
+
+        Зовёт сборка при запуске (`app/main.py`, `hold=True`) и часы раз
+        в сутки. Без этого таблица уточнялась только кнопкой «Загрузить
+        историю», и программа, открытая после экспирации, не знала, что код
+        из настроек истёк: замер 29.09.2026 — график и поток на MXU6 через
+        12 дней после его последнего дня, плашка молчит.
+
+        Идёт в слоте загрузки (`load`): поток данных один, и ручная загрузка
+        в это время получает обычный отказ «занято», а не очередь за спиной.
+        `hold` — первое уточнение держит прогоны (`refresh`) до своего конца:
+        иначе окно сначала нарисовало бы истёкший контракт.
+
+        Код не квартальный или актив месячный — уточнять нечего, молча:
+        у таких кодов цепочки нет (`_chain_of`, `D-127`).
+        """
+        term = self._history.term
+        if term.daily is None:
+            # Часы заводятся всегда, до фильтров: инструмент, сменённый
+            # на квартальный позже, иначе не уточнялся бы до перезапуска.
+            # Первый же взгляд часов после смены уточняет сразу — `synced`
+            # по нему ещё не выставлен.
+            term.daily = QTimer(self)
+            term.daily.setInterval(_SYNC_LOOK_MS)
+            term.daily.timeout.connect(self._daily_sync)
+            term.daily.start()
+        symbol = self._values.instrument.strip()
+        chain = _chain_of(symbol)
+        if not chain or asset_of(symbol) in self._history.monthly:
+            return
+        task = self._history.load
+        if task is not None and not task.done():
+            return  # поток данных занят; часы спросят ещё раз через час
+        term.syncing = True
+        term.holding = term.holding or hold
+        if hold:
+            self._send(self.busy_changed, True, "Уточняю у биржи действующий контракт…")
+        self._history.load = self._begin("load", self._sync(symbol, chain, why))
+
+    def _daily_sync(self) -> None:
+        """Взгляд часов: сутки сменились с последнего уточнения — уточнить снова."""
+        if self._history.term.synced != in_moscow(self._clock()).date():
+            self.sync_contracts("смена суток")
+
+    async def _sync(self, symbol: str, chain: list[str], why: str) -> None:
+        """Уточнить таблицу, при истёкшем коде перейти на действующий, догрузить.
+
+        Порядок — данные решения, а не вкус: сначала биржа (без неё истёкший
+        код не отличить от живого), потом переход, потом отпустить прогон
+        и подключение (`_release_sync`), и только потом загрузка минут —
+        она долгая, и держать ради неё окно пустым незачем.
+        """
+        now = self._clock()
+        today = in_moscow(now).date()
+        term = self._history.term
+        if term.syncing and await self._vouched(symbol):
+            # Таблица в базе уже ручается за код: он живой. Держать окно
+            # пустым на время похода к бирже (замер 29.09.2026: 27 с) незачем —
+            # прогон и подключение идут сразу, биржа — после первого прогона.
+            # ⚠️ Именно после: поток данных один, и уточнение, занявшее его
+            # раньше, задержало бы чтение свечей для графика на те же 27 с.
+            self._release_sync()
+            if self._task is not None:
+                await _quiet(self._task)
+        try:
+            term.asking = True
+            try:
+                await self._refresh_chain(chain, symbol, now)
+            finally:
+                term.asking = False
+            notice, rows = await self._worker.call(
+                lambda store: (
+                    contract_view.notice_of(store, symbol, today=today),
+                    store.contracts(),
+                )
+            )
+        except asyncio.CancelledError:
+            term.syncing = term.holding = False
+            raise
+        except ChainNotQuarterly as error:
+            self._monthly_found(symbol, error)
+            return
+        except Exception as error:  # нет связи — работа идёт как раньше
+            log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                "таблица контрактов не уточнена у биржи (%s)", why, extra={"panel": False}
+            )
+            text = (
+                f"{_plain(error)}. Программа работает по таблице, что уже есть "
+                "в базе: истёк ли контракт из настроек, она может не знать. "
+                "Уточнение повторится само через час."
+            )
+            if text != term.failed:
+                term.failed = text
+                self.note("Контракты не уточнены у биржи", text, DecisionLevel.WARNING)
+            self._release_sync()
+            return
+        term.failed = ""
+        term.synced = today
+        term.rows = rows
+        switched = self._switch_and_release(symbol, notice, rows)
+        if switched:
+            # Сначала прогон на новом коде (по склейке — то, что уже есть
+            # в базе), потом загрузка: поток данных один, и загрузка, занявшая
+            # его раньше, оставила бы окно пустым на всё своё время (замер
+            # 29.09.2026 на копии базы владельца счёта: 51 с до первого графика).
+            if self._task is not None:
+                await _quiet(self._task)
+            self._history.chunk = None
+            self._history.candles = 0
+            self._history.pages = 0
+            await self._load_contract(
+                HistoryLoadRequest(symbol=switched), chain_around(switched)
+            )
+
+    def _monthly_found(self, symbol: str, error: ChainNotQuarterly) -> None:
+        """Биржа назвала актив месячным: пометить, сказать правду, отпустить.
+
+        Квартальной цепочки у месячного актива нет, и повторять уточнение
+        через час незачем — ответ будет тот же. Актив помечается
+        (`monthly`), и `sync_contracts` его больше не трогает.
+        """
+        self._history.monthly.add(asset_of(symbol))
+        self.note(
+            "Контракты не уточняются у биржи",
+            f"{_plain(error)}. Для месячного актива программа не уточняет "
+            "у биржи действующий контракт и сама на новый код не переходит: "
+            "инструмент в настройках меняется вручную.",
+            DecisionLevel.WARNING,
+        )
+        self._release_sync()
+
+    def _switch_and_release(
+        self, symbol: str, notice: ContractNotice, rows: list[ContractRow]
+    ) -> str:
+        """Переход (`_switch_to_current`), и в любом исходе — отпустить уточнение.
+
+        ⚠️ `_release_sync` — в `finally`: исключение при переходе иначе
+        оставило бы `syncing`/`holding` навсегда — прогон и подключение
+        ждали бы вечно, полоска «Уточняю у биржи…» висела бы молча
+        (правило 13). Исключение — строка в журнал решений.
+        """
+        try:
+            return self._switch_to_current(symbol, notice, rows)
+        except Exception as error:  # окно не должно встать из-за перехода
+            log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                "переход на действующий контракт не удался", extra={"panel": False}
+            )
+            # Строка — по факту, а не по намерению: исключение могло
+            # случиться и после того, как инструмент уже сменён.
+            now_on = self._values.instrument.strip()
+            if notice.current and now_on == notice.current:
+                self.note(
+                    "Переход на действующий контракт не доведён",
+                    f"{_plain(error)}. Инструмент в настройках уже сменён "
+                    f"с {symbol} на {now_on}; история {now_on} загружается.",
+                    DecisionLevel.WARNING,
+                )
+                return now_on
+            self.note(
+                "Переход на действующий контракт не удался",
+                f"{_plain(error)}. Инструмент в настройках остался {now_on}; "
+                "действующий контракт — на плашке, перейти можно кнопкой.",
+                DecisionLevel.WARNING,
+            )
+            return ""
+        finally:
+            self._release_sync()
+
+    async def _vouched(self, symbol: str) -> bool:
+        """Ручается ли таблица в базе, что код живой: срок известен и не истёк.
+
+        Только чтение базы. Базы нет, таблица пуста, срок неизвестен, код
+        истёк или архивный — не ручается: тогда прогон и подключение ждут
+        биржу, иначе окно нарисовало бы истёкший контракт.
+        """
+        if not self._worker.path.exists():
+            return False
+        try:
+            rows = await self._worker.call(lambda store: store.contracts())
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # не прочитали — значит, не ручается; спросим биржу
+            log.exception("таблица контрактов не прочитана перед уточнением")
+            return False
+        kind = expiry_verdict(
+            rows, symbol, today=in_moscow(self._clock()).date(),
+            halt_days=self._values.expiry_halt_days,
+        ).kind
+        if kind not in (Expiry.OK, Expiry.NEAR):
+            return False
+        self._history.term.rows = rows
+        return True
+
+    def _switch_to_current(
+        self, symbol: str, notice: ContractNotice, rows: list[ContractRow]
+    ) -> str:
+        """Код из настроек истёк — перейти на действующий. Ответ — новый код или пусто.
+
+        Решение владельца счёта 29.09.2026 (к решению 0061): инструмент
+        обязан быть действующим, и программа ставит его сама, записью
+        в файл настроек. Решение 0016 при этом в силе целиком: при
+        запущенном роботе или открытой позиции перехода нет — условие то же,
+        что гасит кнопку плашки (`switch_blocked_reason`), и остаётся
+        плашка с кнопкой.
+
+        Сам переходит **только с истёкшего** кода: его последний день
+        обращения прошёл, позиции по нему на счёте быть не может. С
+        **архивного** (период ближнего кончился, но код ещё торгуется до
+        своего последнего дня) — только плашка с кнопкой, как по решению
+        0016 (решение координатора 29.09.2026). Причина: при запуске снимка
+        состояния ещё нет (`_last_state` — `None`), и половина условия «нет
+        позиции» пуста — позиция по ещё торгуемому коду осталась бы без
+        присмотра. Суточная проверка идёт по тому же правилу.
+        """
+        verdict = self._expiry(symbol)
+        if verdict.kind is not Expiry.EXPIRED:
+            return ""
+        current = notice.current
+        if not current or current == symbol or self._values.instrument.strip() != symbol:
+            return ""  # действующий неизвестен, либо человек уже сменил код сам
+        if switch_blocked_reason(self._last_state):
+            return ""  # плашка с кнопкой и причиной — `check_contract`
+        row = next(one for one in rows if one.symbol == symbol)
+        # Вердикт истёкшего обещает поле последнего дня (`expiry_verdict`).
+        gone = f"{symbol} истёк {row.last_trade_day:%d.%m.%Y}"
+        held = self._file_holds.pop("instrument", None)
+        try:
+            self.apply_settings(self._values.replace(instrument=current), by_person=False)
+        finally:
+            # И при отказе, и при исключении придержка файла возвращается.
+            if held is not None and self._values.instrument.strip() != current:
+                self._file_holds["instrument"] = held
+        if self._values.instrument.strip() != current:
+            return ""  # отказ `apply_settings` уже сказан вслух
+        # Единственная запись в файл без «ОК» (решение координатора 29.09.2026,
+        # решение 0016): истёкший код в файле — каждый запуск начинался бы
+        # с него. Пишется одно поле и только поверх истёкшего кода: инструмент,
+        # названный ключом `--symbol`, в файл не попадает (`D-026`).
+        # Строка о переходе — **до** записи и без слов «записан в файл»: чем
+        # кончилась запись, порт не знает. Это говорит запись сама строкой
+        # ниже — «Настройки записаны в файл» или «Настройки не сохранены»
+        # (`app/main.py::_keep_settings`, аудит /risk 06.10.2026).
+        self.note(
+            "Переход на действующий контракт",
+            f"{gone}; перешёл на действующий {current}"
+            + (f" (ближний с {notice.current_since:%d.%m.%Y})" if notice.current_since else "")
+            + f". Инструмент в настройках сменён, история {current} загружается с биржи.",
+            DecisionLevel.WARNING,
+        )
+        self._send(
+            self.settings_to_file, self._values, ("instrument",), (("instrument", symbol),),
+        )
+        return current
+
+    def _release_sync(self) -> None:
+        """Уточнение кончилось: отпустить подключение и прогон, сверить плашку.
+
+        Флаги снимаются **до** чтения таблицы: прочитавшая её задача
+        (`_check_contract`) открывает ждущее подключение, и видеть она
+        обязана уже уточнённую таблицу, а не ворота закрытыми.
+        """
+        term = self._history.term
+        holding, held = term.holding, term.held
+        term.syncing = term.holding = False
+        term.held = ""
+        self.check_contract()
+        if held:
+            self.refresh(held)
+        elif holding:
+            self._send(self.busy_changed, False, "")
+
+    def _expiry(self, instrument: str) -> ExpiryVerdict:
+        """Срок кода по последней прочитанной таблице контрактов."""
+        return expiry_verdict(
+            self._history.term.rows,
+            instrument.strip(),
+            today=in_moscow(self._clock()).date(),
+            halt_days=self._values.expiry_halt_days,
+        )
+
+    def _check_switch(self, settings: Settings) -> None:
+        """Смена инструмента при запущенном роботе или открытой позиции — отказ.
+
+        То же правило, что гасит кнопку плашки (`switch_blocked_reason`), но
+        на двери, через которую проходят **все** дороги: кнопка плашки, поле
+        «Инструмент» в настройках, шаблон. Проверка только на кнопке оставляла
+        обход через окно настроек открытым.
+
+        :raises convert.SettingsRefused: инструмент меняется, а нельзя.
+        """
+        if settings.instrument.strip() == self._values.instrument.strip():
+            return
+        reason = switch_blocked_reason(self._last_state)
+        if reason:
+            raise convert.SettingsRefused(
+                f"Инструмент не сменён: {reason} Прежние настройки остались в силе.",
+                field="instrument",
+            )
+
+    def _judge_expiry(self) -> bool:
+        """Сверить срок кода при живом ходе: отказ, остановка или предупреждение.
+
+        Ответ — «код отвергнут» (склейка, истёкший, архивный): смена суток
+        по нему закрывает ход, не подав движку ни одного бара (`D-126`).
+
+        Зовётся после чтения таблицы контрактов. Без живого хода молчит:
+        робот не работает, останавливать нечего, а расхождение с действующим
+        контрактом и так на плашке.
+
+        * отказ (склейка, истёкший, архивный) — поток снимается вслух;
+        * близкая экспирация — остановка робота (ТЗ §4.6, решение 0016),
+          снимается только рукой, после перехода на новый контракт;
+        * срок неизвестен — предупреждение одной строкой: остановка перед
+          экспирацией на этом коде не сработает, и молчать об этом нельзя.
+        """
+        if not self._watch.observing or self._history.term.rows is None:
+            # Таблица не прочитана — про срок сказать нечего, и «не известен»
+            # здесь было бы ложью: его узнают через мгновение.
+            return False
+        self._history.term.day = in_moscow(self._clock()).date()
+        verdict = self._expiry(self._values.instrument)
+        if verdict.kind.refused:
+            self.stream(False)
+            self._refuse("Поток котировок остановлен", verdict.text)
+            return True
+        if verdict.kind is Expiry.NEAR:
+            self.halt(
+                "Остановка перед экспирацией", verdict.text, kind=HaltKind.ENGINE
+            )
+        elif verdict.kind is Expiry.UNKNOWN and verdict.text != self._history.term.said:
+            self._history.term.said = verdict.text
+            self.note("Срок контракта не известен", verdict.text, DecisionLevel.WARNING)
+        return False
+
+    async def _reread_term(self) -> bool:
+        """Перечитать таблицу контрактов и сразу сверить срок кода.
+
+        Ждётся вызывающим, в отличие от `check_contract`: смена суток
+        обязана решить «стоять или работать» до того, как движок увидит бар.
+        Ответ — как у `_judge_expiry`: код отвергнут.
+        """
+        try:
+            self._history.term.rows = await self._worker.contracts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # остаётся прежняя таблица; сверка всё равно идёт
+            log.exception("таблица контрактов не перечитана на смене суток")
+        return self._judge_expiry()
+
+    def check_contract(self) -> None:
+        """Сверить инструмент из настроек с действующим контрактом таблицы.
+
+        Только чтение базы, в сеть не ходит. Ответ — `contract_checked`.
+        Тикер здесь не меняется (решение 0016): расхождение уходит в окно
+        плашкой и одной строкой в журнал. Сама программа переходит только
+        с истёкшего кода, после уточнения у биржи (`_switch_to_current`).
+        """
+        task = self._history.contract
+        if task is not None and not task.done():
+            return
+        self._history.contract = self._begin("contract", self._check_contract())
+
+    async def _check_contract(self) -> None:
+        configured = self._values.instrument.strip()
+        today = in_moscow(self._clock()).date()
+        if not self._worker.path.exists():
+            self._history.term.rows = []
+            notice = ContractNotice(
+                configured=configured,
+                trouble="Базы свечей ещё нет: какой контракт действующий, "
+                        "программа узнает у биржи при загрузке истории.",
+            )
+        else:
+            try:
+                notice, self._history.term.rows = await self._worker.call(
+                    lambda store: (
+                        contract_view.notice_of(store, configured, today=today),
+                        store.contracts(),
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # окно не должно падать вместе с базой
+                log.exception("таблица контрактов не прочитана")
+                # Чтение было, ответа нет: срок неизвестен, и об этом
+                # скажет `_judge_expiry` — ждать второго чтения нечего.
+                self._history.term.rows = []
+                notice = ContractNotice(
+                    configured=configured,
+                    trouble=f"Таблицу контрактов прочитать не удалось: {_plain(error)}.",
+                )
+        # Настройку сверяем с той, что стоит **сейчас**: «Применить» могло
+        # прийти, пока читалась таблица.
+        notice = dataclasses.replace(notice, configured=self._values.instrument.strip())
+        if notice.mismatch and notice != self._history.told:
+            self.note(
+                "Действующий контракт сменился",
+                f"По дневным объёмам биржи действующий контракт — {notice.current}"
+                + (f" с {notice.current_since:%d.%m.%Y}" if notice.current_since else "")
+                + f", а робот настроен на {notice.configured}. Сама программа переходит "
+                "только с истёкшего кода и только при остановленном роботе без "
+                "позиции; здесь переход — вашим подтверждением (кнопка на плашке "
+                "над графиком или поле «Инструмент» в настройках).",
+                DecisionLevel.WARNING,
+            )
+        self._history.told = notice
+        self._send(self.contract_checked, notice)
+        self._judge_expiry()
+        if self._history.term.waiting:
+            self.stream(True)
 
     def _load_tick(self, since: date, until: date, result: FetchResult) -> None:
         """Ход загрузки — в окно. **Зовётся в потоке данных**, на каждой странице.
@@ -1601,6 +2724,7 @@ class HistoryPort(TerminalPort):
             f"«Терминал», версия {version()}. Всё время в программе — московское.",
         )
         self.note("База свечей", f"Файл {database}")
+        self.check_contract()
         self.note("Предохранители по деньгам", NO_GUARDS, DecisionLevel.WARNING)
         if self._values.commission_per_side_rub is None:
             self.note(
@@ -1634,7 +2758,7 @@ class HistoryPort(TerminalPort):
         Торговых причин здесь нет — они приходят из `engine/`.
         """
         row = DecisionRow(
-            time=datetime.now(MSK),
+            time=self._clock(),
             event=event,
             reason=reason,
             level=level,
@@ -1642,9 +2766,35 @@ class HistoryPort(TerminalPort):
         )
         self._notes.append(row)
         self._send(self.decision_appended, row)
+        # Единственный выход строк журнала программы в ленту «Отладка».
+        debug_feed.note(event, reason, level)
 
     def refresh(self, why: str = "") -> None:
         """Поставить прогон в очередь цикла событий. Возврат — немедленный."""
+        if self._history.term.holding:
+            # Первое уточнение контрактов ещё идёт: прогон на коде из файла
+            # показал бы истёкший контракт, а через секунду — другой.
+            # Просьба не теряется: её пустит `_sync`, когда решит, на чём стоять.
+            self._history.term.held = why or "повтор"
+            self._refuse_busy(
+                "load", "Пересчёт отложен",
+                "Применю после ответа биржи: прогон на коде из файла мог бы "
+                "показать истёкший контракт.",
+            )
+            return
+        load = self._history.load
+        if self._history.filling and load is not None and not load.done():
+            # Поток сети отдельно от базы: прогон прошёл бы между страницами
+            # загрузки и посчитал бы сделки по недогруженной базе без пометки.
+            if not self._history.after_load:
+                load.add_done_callback(lambda _done: self._after_load())
+            self._history.after_load = why or "повтор"
+            self._refuse_busy(
+                "load", "Пересчёт отложен",
+                "Прогон пойдёт сам, когда она закончится: по недогруженной "
+                "базе он посчитал бы не все сделки.",
+            )
+            return
         if self._task is not None and not self._task.done():
             # Два прогона разом дали бы в окно два потока событий и два разных
             # ответа на один вопрос. Но и потерять просьбу нельзя: настройки,
@@ -1658,6 +2808,24 @@ class HistoryPort(TerminalPort):
             )
             return
         self._task = self._begin("run", self._refresh(why))
+
+    async def _filling[T](self, work: Awaitable[T]) -> T:
+        """Загрузка минут: пока она идёт, прогон откладывается (`refresh`)."""
+        self._history.filling = True
+        try:
+            return await work
+        finally:
+            self._history.filling = False
+
+    def _after_load(self) -> None:
+        """Загрузка кончилась — пустить прогон, отложенный на её время."""
+        why, self._history.after_load = self._history.after_load, ""
+        if not why:
+            return
+        if self._task is not None and not self._task.done():
+            self._again = self._again or why
+            return
+        self.refresh(why)
 
     def live_candle(self, symbol: str) -> None:
         """Минута записана в базу: дорисовать свечу, а не гонять прогон заново.
@@ -1678,7 +2846,9 @@ class HistoryPort(TerminalPort):
 
         * бар ещё набирается — только рисунок: `candle_appended` на новый бар,
           `candle_updated` на растущий текущий. Прогон не нужен, потому что
-          решать не на чем;
+          решать не на чем. Исключение одно (решение 0065): первая минута
+          бара, когда живой ход ждёт его открытия, — один проход на бар,
+          и заявка исполняется по открытию сейчас (`_first_minute`);
         * бар закрылся — **прогон, как прежде**, со всеми метками, средней,
           уровнями и затенением. Он больше не сбрасывает масштаб: `show_chart`
           на обеих поверхностях сохраняет вид, когда инструмент и размер свечи
@@ -1761,24 +2931,24 @@ class HistoryPort(TerminalPort):
         неточного: программа, не закрывающаяся по кнопке, не имеет обхода.
         """
         for _ in range(_WAIT_ROUNDS):
-            if self._point.task is not None:
-                await _quiet(self._point.task)
-            if self._growing is not None:
-                await _quiet(self._growing)
-            if self._draw is not None:
-                await _quiet(self._draw)
-            if self._task is not None:
-                await _quiet(self._task)
-            if self._watch.retiring is not None:
-                await _quiet(self._watch.retiring)
-            if self._back.options is not None:
-                await _quiet(self._back.options)
-            # ⚠️ Запись остановки в базу ждётся наравне с прогоном, а не
-            # «когда-нибудь». Без этой строки круг ожидания крутился бы
-            # вхолостую: `_busy()` видел бы незаконченную задачу, а уступить
-            # ей управление было бы негде — задача не начиналась бы вовсе.
-            if self._halt.saving is not None:
-                await _quiet(self._halt.saving)
+            # Таблица, а не цепочка `if`: порядок ожидания — данные.
+            # * чтение таблицы контрактов — от него зависит, откроется ли
+            #   подключение, попрошенное до чтения (`stream`, `_Term.waiting`);
+            # * ⚠️ запись остановки в базу ждётся наравне с прогоном, а не
+            #   «когда-нибудь». Без неё круг ожидания крутился бы вхолостую:
+            #   `_busy()` видел бы незаконченную задачу, а уступить ей
+            #   управление было бы негде — задача не начиналась бы вовсе.
+            for task in (
+                self._point.task, self._growing, self._draw, self._task,
+                self._watch.retiring, self._back.options,
+                self._history.contract, self._halt.saving, self._history.paper,
+                # Загрузка — и та, что заводит уточнение контрактов при
+                # запуске (`sync_contracts`): снимок экрана без неё ловил
+                # окно до перехода на действующий контракт.
+                self._history.load,
+            ):
+                if task is not None:
+                    await _quiet(task)
             if not self._busy():
                 return
 
@@ -1801,6 +2971,10 @@ class HistoryPort(TerminalPort):
         # в окно, которого уже нет.
         if self._stuck.timer is not None:
             self._stuck.timer.stop()
+        # Отложенный прогон закрывающейся программе не нужен.
+        self._history.after_load = ""
+        if self._history.term.daily is not None:
+            self._history.term.daily.stop()
         # ⚠️ Идущей загрузке истории сначала говорится «остановись», и только
         # потом снимается задача: поток данных занят ею целиком, и отмена
         # `await` не прерывает работу, которая уже идёт в потоке (`market.worker`).
@@ -1811,6 +2985,7 @@ class HistoryPort(TerminalPort):
         for task in (
             self._point.task, self._growing, self._draw, self._task,
             self._back.options, self._history.facts, self._history.load,
+            self._history.contract, self._history.paper,
         ):
             if task is not None and not task.done():
                 task.cancel()
@@ -1822,6 +2997,8 @@ class HistoryPort(TerminalPort):
         self._back.options = None
         self._history.facts = None
         self._history.load = None
+        self._history.contract = None
+        self._history.paper = None
         # ⚠️ Запись остановки **дожидается**, а не снимается. Она и заведена
         # ради того, чтобы пережить закрытие программы (`D-043`); отменённая
         # на выходе, она теряла бы предохранитель ровно в тот момент, когда
@@ -1844,10 +3021,33 @@ class HistoryPort(TerminalPort):
         self.note(event, reason)
         self.refresh(event)
 
-    def _refuse(self, event: str, reason: str) -> None:
-        """Отказ: и в журнал, и в строку состояния. Молча не отказываем."""
+    def _refuse(self, event: str, reason: str, *, run: bool = False) -> None:
+        """Отказ: и в журнал, и в строку состояния. Молча не отказываем.
+
+        Отказ **прогона** (`run`), случившийся, пока обещан отчёт о прогоне,
+        запоминается: им `_forget_report` объяснит в окне, почему отчёта
+        не будет. Посторонний отказ в это время (загрузка «занято»,
+        подключение) не запоминается — иначе окно назвало бы чужую причину.
+        """
         self.note(event, reason, DecisionLevel.WARNING)
+        if run and self._back.pending is not None:
+            self._back.trouble = reason
         self._send(self.failed, reason)
+
+    def _refuse_settings(self, reason: str, field: str = "") -> None:
+        """«Применить» не принято: в журнал, в строку состояния и окну настроек.
+
+        Окну уходят и **настройки, оставшиеся в силе**: без них оно помнило
+        бы отвергнутый набор как принятый и отдало бы его следующему прогону
+        (дефект 29.09.2026).
+        """
+        self._refuse("Настройки не приняты", reason, run=True)
+        self._send(self.settings_refused, self._values, reason, field)
+
+    def _refuse_backtest(self, reason: str) -> None:
+        """Прогон не начат: в журнал, в строку состояния и окну — закрыть полоску."""
+        self._refuse("Прогон на истории не начат", reason, run=True)
+        self._send(self.backtest_refused, reason)
 
     # ------------------------------------------------- часы долгих работ
 
@@ -1868,7 +3068,9 @@ class HistoryPort(TerminalPort):
             "retire": self._watch.retiring,
             "options": self._back.options,
             "facts": self._history.facts,
+            "paper": self._history.paper,
             "load": self._history.load,
+            "contract": self._history.contract,
             "halt": self._halt.saving,
         }
 
@@ -1956,7 +3158,7 @@ class HistoryPort(TerminalPort):
         now = time.monotonic()
         running = False
         stuck: list[tuple[_Work, float]] = []
-        for work in _WORKS:
+        for work in map(self._named, _WORKS):
             task = tasks[work.key]
             if task is None or task.done():
                 self._stuck.heard.pop(work.key, None)
@@ -1981,6 +3183,17 @@ class HistoryPort(TerminalPort):
             self._send(self.stuck_changed, said)
         return running
 
+    def _named(self, work: _Work) -> _Work:
+        """Работа под именем, которое она носит сейчас.
+
+        Слот загрузки делят загрузка минут и уточнение контрактов у биржи;
+        «загрузка истории не отвечает» человеку, ничего не загружавшему,
+        не говорит ничего.
+        """
+        if work.key == "load" and self._history.term.asking:
+            return dataclasses.replace(work, title="уточнение контрактов у биржи")
+        return work
+
     def _busy_with(self, key: str) -> str:
         """Чем порт занят и сколько уже: «прогон робота по истории, 12 с».
 
@@ -1988,11 +3201,11 @@ class HistoryPort(TerminalPort):
         операцией» без названия операции человеку не отвечает ни на что —
         он и так видит, что ничего не происходит.
         """
-        work = _BY_KEY[key]
+        work = self._named(_BY_KEY[key])
         now = time.monotonic()
         return f"{work.title}, идёт уже {_lasting(now - self._stuck.heard.get(key, now))}"
 
-    def _refuse_busy(self, key: str, event: str, what_next: str) -> None:
+    def _refuse_busy(self, key: str, event: str, what_next: str) -> str:
         """Отказ «занято»: что идёт, сколько уже идёт и что будет дальше.
 
         ⚠️ В окно уходит **каждый** отказ, в журнал — один на занятость.
@@ -2008,6 +3221,7 @@ class HistoryPort(TerminalPort):
             self._stuck.refused.add(key)
             self.note(event, reason, DecisionLevel.WARNING)
         self._send(self.failed, reason)
+        return reason
 
     async def _refresh(self, why: str) -> None:
         """Прогон и, если за время прогона просили ещё, следующий за ним.
@@ -2024,7 +3238,7 @@ class HistoryPort(TerminalPort):
     async def _pass(self, why: str) -> None:
         # Снимок настроек на начало прохода. Дальше в этом проходе `self._values`
         # и `self._engine_settings` не читаются ни разу: см. докстринг `_Frame`.
-        frame = _Frame(self._values, self._engine_settings)
+        frame = _Frame(_in_force(self._values), self._engine_settings)
         self._send(self.busy_changed, True, "Читаю свечи из базы…")
         try:
             symbol = convert.instrument_of(frame.values.instrument)
@@ -2033,7 +3247,8 @@ class HistoryPort(TerminalPort):
             # Разбор, почему именно здесь и почему не ожиданием, — в
             # `_ask_point_value`.
             self._ask_point_value(symbol)
-            candles = await self._candles(frame, symbol, timeframe)
+            candles, stitch = await self._series(frame, symbol, timeframe)
+            debug_feed.bars_read(symbol, frame.values.timeframe, candles)
             # Чтение базы долей сделанного не отчитывается: это один запрос
             # в поток данных. Отметка здесь делит проход надвое, и молчанием
             # считается каждая половина отдельно, а не проход целиком.
@@ -2045,24 +3260,41 @@ class HistoryPort(TerminalPort):
                 "Движок идёт по живому ряду…" if self._watch.observing
                 else "Прогон робота по истории…",
             )
-            run = await self._advance(frame, symbol, candles)
+            self._basis = stitch.basis if stitch is not None else ""
+            if stitch is not None:
+                # Склейка — только прогон по истории: живой ход идёт одним
+                # контрактом, и его развилка (`_advance`) сюда не заходит.
+                await self._retire()
+                run = await self._replay(frame, symbol, candles, stitch)
+                self._context = contract_view.ChartContext(seams=tuple(
+                    (seam.time, seam.symbol, seam.previous) for seam in stitch.seams
+                ))
+            else:
+                self._stitched = None
+                run = await self._advance(frame, symbol, candles)
+                self._context = await self._contract_context(symbol, timeframe, candles)
             self._run = run
             self._show(frame, symbol, timeframe, candles, run)
             self._report(candles, run)
         except asyncio.CancelledError:
             raise
         except convert.SettingsRefused as refusal:
-            self._refuse("Настройки не приняты", str(refusal))
+            self._refuse("Настройки не приняты", str(refusal), run=True)
         except Exception as error:  # окно не должно падать вместе с прогоном
             # Человеку — фраза, разработчику — трассировка. ⚠️ Файлового
             # технического лога у программы пока нет (он ставится вместе
             # с чисткой токена, `ROADMAP.md` §9.1): трассировка уходит
             # в стандартный вывод ошибок, и обещать файл нельзя.
-            log.exception("прогон по истории не удался (%s)", why or "старт")
+            # Мимо ленты «Отладка»: отказ стоит в ней строкой журнала `_refuse`,
+            # и второй строкой, красной, тот же отказ читался бы как два.
+            log.exception(
+                "прогон по истории не удался (%s)", why or "старт", extra={"panel": False}
+            )
             self._refuse(
                 "Прогон не удался",
                 f"Не удалось построить прогон по истории: {_plain(error)}. "
                 "Подробность — в выводе программы в консоли.",
+                run=True,
             )
         finally:
             self._forget_report()
@@ -2102,6 +3334,19 @@ class HistoryPort(TerminalPort):
             return
         if self._point.task is not None and not self._point.task.done():
             return
+        load = self._history.load
+        if load is not None and not load.done():
+            # Поток сети один и занят загрузкой: запрос встал бы за ней
+            # в очередь, и сторож назвал бы его «не отвечает» при исправной
+            # работе. Отметка не ставится — спросим, как только загрузка
+            # кончится. ⚠️ Не «на следующем проходе»: следующего может
+            # не быть вовсе (история без живого потока), и шаг цены от биржи
+            # не пришёл бы никогда — плашка «биржа не сообщила шаг» стояла бы
+            # при исправной сети (путь владельца 05.10.2026).
+            load.add_done_callback(
+                lambda done: None if done.cancelled() else self._ask_point_value(symbol)
+            )
+            return
         now = time.monotonic()
         if now - self._point.asked_at.get(symbol, float("-inf")) < POINT_VALUE_GAP:
             return
@@ -2109,7 +3354,14 @@ class HistoryPort(TerminalPort):
         self._point.task = self._begin("point", self._point_value(symbol))
 
     async def _point_value(self, symbol: str) -> None:
-        """Ответ биржи о стоимости пункта: применить либо сказать, почему нет."""
+        """Ответ биржи о стоимости пункта и шаге цены: применить либо сказать, почему нет.
+
+        Шаг цены (`MINSTEP`) берётся **независимо** от стоимости пункта:
+        у акций стоимости шага нет, а шаг есть, и потерять его из-за
+        соседнего поля значило бы держать плашку «биржа не сообщила шаг»
+        при сообщённом шаге. Следом — шаги контрактов склейки, если о них
+        просил прогон (`_piece_steps`).
+        """
         ask = self._point.ask
         if ask is None:
             return
@@ -2119,26 +3371,111 @@ class HistoryPort(TerminalPort):
             raise
         except Exception as error:  # окно не должно падать вместе с запросом
             log.exception("карточка инструмента не прочитана (%s)", symbol)
+            # Прежний шаг, если биржа его уже сообщала, остаётся в силе:
+            # отказ сети не делает его неверным.
             self._point_trouble(
                 f"биржа не ответила про {symbol}: {error}. Стоимость пункта "
                 "осталась той, что стояла в настройках"
             )
-            return
-        if answer.rubles is None:
-            self._point_trouble(answer.told)
-            return
-        self._point_taken(symbol, answer.rubles, answer.told)
+        else:
+            self._learn_step(symbol, answer)
+            if answer.rubles is None:
+                self._point_trouble(answer.told)
+            self._point_taken(symbol, answer.rubles, answer.told)
+        await self._piece_steps(ask)
 
-    def _point_taken(self, symbol: str, rubles: float, told: str) -> None:
+    def _learn_step(self, symbol: str, answer: PointValue) -> bool:
+        """Запомнить шаг цены из карточки. Истина — шаг новый или сменился."""
+        spec = answer.spec
+        step = spec.price_step if spec is not None else 0.0
+        if not math.isfinite(step) or step <= 0 or self._point.steps.get(symbol) == step:
+            return False
+        self._point.steps[symbol] = step
+        return True
+
+    async def _piece_steps(self, ask: Callable[[str], Awaitable[PointValue]]) -> None:
+        """Шаги контрактов склейки, о которых просил прогон (`_piece_steps_for`).
+
+        Новый шаг пересчитывает прогон: кусок, посчитанный с шагом соседнего
+        контракта, иначе так и остался бы посчитанным с чужим.
+        """
+        learned = False
+        while self._point.wanted:
+            symbol = self._point.wanted.pop(0)
+            self._point.asked_at[symbol] = time.monotonic()
+            try:
+                answer = await ask(symbol)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # шаг этого куска остаётся взятым у соседа, вслух
+                log.exception("карточка контракта склейки не прочитана (%s)", symbol)
+                continue
+            learned = self._learn_step(symbol, answer) or learned
+        if learned:
+            self.refresh("шаг цены контракта склейки")
+
+    def _want_steps(self, symbols: Sequence[str]) -> None:
+        """Попросить шаги контрактов склейки. Возврат немедленный, ответ — потом."""
+        now = time.monotonic()
+        fresh = [
+            symbol for symbol in symbols
+            if symbol not in self._point.wanted
+            and now - self._point.asked_at.get(symbol, float("-inf")) >= POINT_VALUE_GAP
+        ]
+        if not fresh or self._point.ask is None:
+            return
+        self._point.wanted.extend(fresh)
+        if self._point.task is not None and not self._point.task.done():
+            return  # идущая задача возьмёт их следом за своим ответом
+        load = self._history.load
+        if load is not None and not load.done():
+            return  # сеть занята загрузкой — спросим на следующем проходе
+        self._point.task = self._begin("point", self._piece_steps(self._point.ask))
+
+    def _piece_steps_for(
+        self, frame: _Frame, symbol: str, stitch: stitched_view.Stitch
+    ) -> dict[str, float]:
+        """Шаг цены каждого контракта склейки — свой, из его карточки.
+
+        Неизвестный шаг куска берётся у текущего контракта (у контрактов
+        одной серии он одинаков), и это говорится вслух — один раз
+        на контракт, — а сама карточка спрашивается (`_want_steps`).
+        Говорить незачем, если шаг в прогоне ни на что не влияет.
+        """
+        known = {
+            piece.symbol: self._point.steps[piece.symbol]
+            for piece in stitch.pieces if piece.symbol in self._point.steps
+        }
+        missing = [piece.symbol for piece in stitch.pieces if piece.symbol not in known]
+        self._want_steps(missing)
+        step = frame.values.price_step
+        matters = bool(step_wait(frame.values.replace(price_step=0.0)))
+        for other in missing:
+            if other == symbol or other in self._point.guessed or step <= 0 or not matters:
+                continue
+            self._point.guessed.add(other)
+            self.note(
+                "Шаг цены контракта склейки не подтверждён",
+                f"Биржа не сообщила шаг цены {other}: этот кусок склейки "
+                f"посчитан с шагом {_step_text(step)} — шагом {symbol}. У контракта, "
+                "который больше не торгуется, карточки на бирже может не быть "
+                "вовсе; у контрактов одной серии шаг обычно одинаков.",
+                DecisionLevel.WARNING,
+            )
+        return known
+
+    def _point_taken(self, symbol: str, rubles: float | None, told: str) -> None:
         """Положить подтверждённую биржей величину в настройки — через окно.
 
         Через `apply_settings`, а не присваиванием в поле, и это не лишний
-        крюк. Тем же путём величина попадает в четыре места разом: в настройки
+        крюк. Тем же путём величина попадает в три места разом: в настройки
         движка (иначе деньги отчёта считались бы по-прежнему), в окно эхом
-        `settings_applied`, в файл настроек (его пишет тот, кто слушает эхо),
-        и строкой в журнал изменений — с прежним и новым значением, как
+        `settings_applied` и строкой в журнал изменений — с прежним и новым значением, как
         требует ТЗ §4.4 А. Присваивание дало бы тихую подмену числа, по
         которому считаются деньги, а это ровно то, против чего заведён `B-021`.
+
+        Величин две: стоимость пункта (`rubles`, `None` — биржа её не назвала,
+        остаётся прежняя) и шаг цены (`_point.steps`, решение 05.10.2026).
 
         Три условия молчания, и каждое по названной причине.
 
@@ -2147,7 +3484,7 @@ class HistoryPort(TerminalPort):
         та же беда, от которой `parse_security` выбирает строку по режиму
         торгов, только с другой стороны.
 
-        **Число и строка совпали с прежними.** Тогда применять нечего:
+        **Числа и строка совпали с прежними.** Тогда применять нечего:
         `apply_settings` погнал бы прогон по всей истории и написал бы строку
         «Значения совпали с прежними» — раз в десять минут, весь день.
 
@@ -2160,14 +3497,42 @@ class HistoryPort(TerminalPort):
             return
         if shown != symbol:
             return
-        self._point.trouble = ""
-        if (self._values.ruble_per_point, self._values.ruble_per_point_source) == (
-            rubles, told
-        ):
+        step = self._step_of(symbol)
+        if rubles is None:
+            rubles, told = self._values.ruble_per_point, self._values.ruble_per_point_source
+        else:
+            self._point.trouble = ""
+        if (
+            self._values.ruble_per_point, self._values.ruble_per_point_source,
+            self._values.price_step,
+        ) == (rubles, told, step):
             return
+        if step > 0:
+            self._step_taken(step)
         self.apply_settings(
-            self._values.replace(ruble_per_point=rubles, ruble_per_point_source=told)
+            self._values.replace(ruble_per_point=rubles, ruble_per_point_source=told),
+            by_person=False, event=FROM_EXCHANGE,
         )
+
+    def _step_taken(self, step: float) -> None:
+        """Биржа сообщила шаг: файлу он больше не перечит, а расхождение — вслух, один раз.
+
+        Шаг из файла настроек не действует (решение 05.10.2026), но человек,
+        вписавший его руками прежней сборкой, вправе узнать, что действует
+        другой. Строка одна: после неё сравнивать не с чем.
+        """
+        filed, self._point.filed = self._point.filed, 0.0
+        # Шаг из файла больше не придерживается. В файл биржевой шаг попадёт
+        # только с «ОК» человека (`settings_to_file`), сам по себе — нет.
+        self._file_holds.pop("price_step", None)
+        if filed > 0 and filed != step:
+            self.note(
+                "Шаг цены взят у биржи",
+                f"В файле настроек записан шаг цены {_step_text(filed)}, биржа "
+                f"сообщает {_step_text(step)}. Действует биржевой: шаг цены "
+                "программа берёт у биржи сама, вписывать его не нужно.",
+                DecisionLevel.WARNING,
+            )
 
     def _point_trouble(self, reason: str) -> None:
         """Сказать, что величина не подтверждена. Одну причину — один раз.
@@ -2245,6 +3610,12 @@ class HistoryPort(TerminalPort):
                 "дальше — бары по мере закрытия. Заявки к брокеру не подаются: "
                 "показываются решения и расчётные сделки.",
             )
+            # Срок кода — сразу по уже прочитанной таблице (обычно она есть
+            # с запуска), и ещё раз по свежей: окна «поток идёт, а робот
+            # не знает, что пора стоять» быть не должно. Отказ сюда не доходит:
+            # `stream` сверил тот же код по той же таблице до подключения.
+            self._judge_expiry()
+            self.check_contract()
             self.refresh("наблюдение включено")
             return
         # ⚠️ Прогон отсюда **не** запускается, и строка выше поэтому обещает
@@ -2296,6 +3667,18 @@ class HistoryPort(TerminalPort):
         if not self._watch.observing or self._back.span is not None:
             await self._retire()
             return await self._replay(frame, symbol, candles)
+        if self._history.term.day != in_moscow(self._clock()).date():
+            # Сутки сменились при работающем ходе — срок кода сверяется заново,
+            # **до** первого бара нового дня: программа живёт через ночь,
+            # а экспирация наступает по календарю. Остановка обнуляет ключ
+            # хода, и ниже он закрывается, не разобрав ни одного бара.
+            if await self._reread_term():
+                # Отказ по сроку (истёк, архивный): ход закрывается здесь же,
+                # а не ждёт задачи, поставленной снятием потока, — иначе этот
+                # же проход подал бы бар движку на отвергнутом коде (`D-126`).
+                # Ответ зависит от вердикта, а не от того, как снимается поток.
+                await self._retire()
+                return await self._replay(frame, symbol, candles)
         key = self._watch_key(frame, symbol)
         if self._watch.observer is not None and key != self._watch.key:
             # Настройки, инструмент или размер свечи сменились. Ход, начатый
@@ -2314,7 +3697,9 @@ class HistoryPort(TerminalPort):
             self._watch.observer = self._watcher(frame, symbol, candles)
             self._watch.key = key
             await self._watch.observer.start()
-        run = await self._watch.observer.feed(candles)
+        # Незакрытый бар, собранный без дыр, — тем же проходом (решение 0065):
+        # заявка, поданная на прошлом закрытии, исполняется по его открытию.
+        run = await self._watch.observer.feed(candles, self._watch.forming)
         # Остановка снимается с хода **до** того, как ход будет закрыт.
         # Забрать её позже неоткуда: закрытый наблюдатель уносит `halted`
         # с собой, и следующий проход увидит чистого движка.
@@ -2358,9 +3743,10 @@ class HistoryPort(TerminalPort):
         она уже стоит в памяти порта, — но о нём говорится вслух
         (`_save_halt`): молчаливо потерянный предохранитель это `D-043`.
         """
-        self._halt.marks[reason] = _Mark(kind=kind, at=datetime.now(MSK))
+        at = self._clock()
+        self._halt.marks[reason] = _Mark(kind=kind, at=at)
         self._write_halt(
-            _HaltWrite(cause=HaltRecord(kind=kind, reason=reason, event=event))
+            _HaltWrite(cause=HaltRecord(kind=kind, reason=reason, event=event), at=at)
         )
 
     def _write_halt(self, write: _HaltWrite) -> None:
@@ -2401,7 +3787,9 @@ class HistoryPort(TerminalPort):
             except Exception as error:
                 # Тип отказа базы человеку не говорит ничего, а фраза говорит:
                 # разбор по типам ушёл бы в технический лог и остался там.
-                log.exception("остановка робота не записана в базу")
+                log.exception(  # мимо ленты «Отладка»: в ней — строка журнала ниже
+                    "остановка робота не записана в базу", extra={"panel": False}
+                )
                 self.note(
                     "Остановка робота и база",
                     f"{write.trouble} Причина отказа базы: {error}",
@@ -2440,14 +3828,7 @@ class HistoryPort(TerminalPort):
         except Exception as error:
             # Та же причина, что в `_save_halt`: человеку нужна фраза, а не тип.
             log.exception("остановка робота не прочитана из базы")
-            self.note(
-                "Остановка робота и база",
-                "Не удалось прочитать, был ли робот остановлен в прошлый раз. "
-                "Если он был остановлен, программа об этом сейчас не знает — "
-                "посмотрите журнал решений за прошлый запуск, прежде чем "
-                f"запускать робота. Причина отказа базы: {error}",
-                DecisionLevel.WARNING,
-            )
+            self._halt_unread(error)
             return
         if not standing:
             return
@@ -2465,6 +3846,45 @@ class HistoryPort(TerminalPort):
         self._watch.key = None
         self.note(_restored_halt_event(standing), _restored_halt_words(standing),
                   DecisionLevel.ERROR)
+
+    def _halt_unread(self, error: Exception) -> None:
+        """Остановку прочитать не удалось — робот стоит (`D-091`).
+
+        Неизвестно, стоял ли запрет, — значит стоял. Прежде здесь была строка
+        `WARNING`, и робот поднимался **неостановленным**: предохранитель,
+        поставленный вчера по дневному лимиту или по неизвестному исходу
+        заявки, молча пропадал ровно при старте, среди прочих строк.
+
+        Причина стоит **только в памяти**, а не в базе, и это не упущение:
+        база только что не прочиталась, и отказ записи в неё дал бы вторую
+        строку «после перезапуска запрет не восстановится» — неправду, потому
+        что при следующем запуске чтение будет спрошено заново и, не удавшись,
+        остановит робота снова. Путь `halt` поэтому не годится.
+
+        Вид — `ACCOUNT`, «состояние счёта неизвестно». Из прошлых причин
+        самая требовательная — неизвестный исход команды брокеру, и снимать
+        её можно только после похода к брокеру. Какие причины стояли,
+        неизвестно, поэтому требуется самое строгое из действий.
+
+        Хвост тот же, что у удачного чтения и у `halt` (`said`, `_watch.key`,
+        строка `ERROR`), но общим помощником не вынесен: `halt` пишет в базу
+        и сам заводит прогон, удачное чтение ставит много причин разом
+        с пометкой «из прошлого сеанса», а здесь одна причина без записи.
+        Помощник с флагами на эти различия был бы хуже трёх коротких тел.
+        """
+        reason = (
+            "Не удалось прочитать из базы, был ли робот остановлен в прошлый "
+            "раз, поэтому он остановлен сейчас: неизвестно, стоял ли запрет, — "
+            "значит стоял. Прежде чем возобновлять, посмотрите журнал решений "
+            "за прошлый запуск и позицию у брокера. «Возобновить работу» здесь "
+            "означает, что вы проверили и согласны работать без остановок "
+            f"прошлого запуска. Причина отказа базы: {error}"
+        )
+        if self._halt.add(reason):
+            self._halt.marks[reason] = _Mark(kind=HaltKind.ACCOUNT, at=self._clock())
+        self._halt.said = self._halt.reason
+        self._watch.key = None
+        self.note("Остановка робота и база", reason, DecisionLevel.ERROR)
 
     def _say_no_restart(self) -> None:
         """Сказать однажды: ход не пересобран, потому что робот остановлен.
@@ -2651,6 +4071,9 @@ class HistoryPort(TerminalPort):
                 DecisionLevel.WARNING,
             )
         self.refresh("снята причина остановки" if rest else "остановка снята")
+        # Сняли остановку на прежнем коде — сверка остановит робота снова:
+        # переход на новый контракт делается до возобновления (решение 0016).
+        self.check_contract()
 
     def _watch_key(self, frame: _Frame, symbol: str) -> tuple[object, ...]:
         """Чем задан живой ход. Разошлось хоть одно — ход начинается заново.
@@ -2688,6 +4111,12 @@ class HistoryPort(TerminalPort):
         return (
             symbol,
             frame.values.timeframe,
+            # ⚠️ Имя алгоритма — отдельной частью ключа, а не через настройки
+            # модуля: у двух алгоритмов настройки бывают одинаковыми по полям
+            # и разными по смыслу. Без него окно показывало бы новый алгоритм,
+            # а решения считал бы прежний (ловушка 7 миниплана
+            # `strategy-modules-switchable.md`).
+            frame.values.strategy_id,
             frame.engine,
             convert.strategy_settings(frame.values),
             convert.run_costs(frame.values),
@@ -2709,31 +4138,46 @@ class HistoryPort(TerminalPort):
         Теперь у живого хода одна запись, и чистка её не тронет: происхождение
         `PAPER`, а `market/storage.py` убирает только прогоны по истории.
 
-        Итог дописывается **при закрытии хода** — выключили поток, сменили
-        настройку, закрыли программу. Обновлять его по дороге нельзя: колонка
+        Строки хода — решения, заявки и сделки — ложатся в базу в конце
+        каждого прохода (`app/paper_log.py`); итог дописывается **при
+        закрытии хода** — выключили поток, сменили настройку, закрыли
+        программу. Обновлять итог по дороге нельзя: колонка
         называется «чем прогон кончился», и промежуточное число в ней было бы
         неправдой ровно там, где человек ищет, что случилось. Ход, оборванный
         закрытием программы, остаётся без времени конца, то есть читается
         как прерванный, — так же, как прогон по истории.
         """
         module = convert.strategy_settings(frame.values)
+        algorithm = convert.chosen_algorithm(frame.values)
         record = RunConditions(
             origin=convert.stored_origin(_WATCH_ORIGIN),
             symbol=symbol,
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=EmaReverse.title,
+            algorithm=algorithm,
             app_version=version(),
             days=self._days,
             until=self._until,
+            program=ProgramFields.of(frame.values),
         ).record(candles)
         observer = LiveObserver(
-            strategy=EmaReverse(module),
+            # ⚠️ Модуль собирает **реестр** по выбранной записи, а не порт
+            # по имени класса: имени алгоритма в этом файле нет вовсе,
+            # иначе окно показывало бы второй алгоритм, а решения считал бы
+            # первый (миниплан `strategy-modules-switchable.md`, З2).
+            strategy=algorithm.build(module),
             settings=frame.engine,
             say=self.note,
             costs=convert.run_costs(frame.values),
-            around=lambda: self._runs.around(record),
+            # Строки хода — решения, заявки, сделки — пишутся в ту же базу
+            # (`app/paper_log.py`): симуляцию после перезапуска иначе
+            # не открыть. Проход по истории (`_replay`) их не пишет.
+            recording=RunRecording(
+                around=lambda: self._runs.around(record),
+                store=self._worker,
+                symbol=symbol,
+            ),
         )
         return observer
 
@@ -2791,8 +4235,112 @@ class HistoryPort(TerminalPort):
             DecisionLevel.ERROR,
         )
 
-    async def _replay(
+    async def _series(
+        self, frame: _Frame, symbol: str, timeframe: Timeframe
+    ) -> tuple[list[MarketCandle], stitched_view.Stitch | None]:
+        """Бары прохода — и нарезка по контрактам, если прогон идёт по склейке.
+
+        Решение 0061: прогон по истории квартального фьючерса идёт кусками
+        по контрактам, с прогревом ровно на период средней и закрытием
+        на стыке. Бары прогрева (для MXZ6 — конец 16.09) в сделки не входят
+        (`B-053`). Тестер берёт все куски выбранного периода — он выбирает
+        период, а не тикер; главное окно — контракт из настроек и те, что
+        были до него. Живой ход склейку не получает: он идёт одним рядом.
+        """
+        tester = self._back.span is not None
+        chain = bool(_chain_of(symbol))
+        if tester and chain:
+            span = self._back.span
+            assert span is not None
+            stitch = await self._stitch(
+                frame, timeframe, (span.since, span.until), (symbol, None), ()
+            )
+            if stitch is not None:
+                return stitch.candles, stitch
+        candles = await self._candles(frame, symbol, timeframe)
+        if candles and chain and not tester and self._watch.observing:
+            return await self._live_series(frame, symbol, candles), None
+        if not candles or tester or not chain or self._watch.observing:
+            return candles, None
+        last = candles[-1].time
+        since = (
+            min(candles[0].time, last - timedelta(days=self._days - 1))
+            if self._days > 0 else None
+        )
+        stitch = await self._stitch(
+            frame, timeframe, (since, last + timeframe.delta), (symbol, symbol), candles
+        )
+        return (stitch.candles, stitch) if stitch is not None else (candles, None)
+
+    async def _live_series(
         self, frame: _Frame, symbol: str, candles: list[MarketCandle]
+    ) -> list[MarketCandle]:
+        """Ряд живого хода: контракт с рубежа и ровно N баров прогрева перед ним.
+
+        Живой ход склейку не получает, но правило рубежа у него то же, что
+        у последнего куска склейки (решение 0061, `B-053`): день прогрева
+        качается целиком, и без обрезки его бары решали бы и давали бы
+        сделки контрактом вне его периода — список сделок менялся бы
+        от включения потока. Рубеж — по таблице контрактов, прочитанной
+        здесь же: к первому проходу кэш порта может быть ещё пуст.
+        Рубежа нет в таблице — ряд как есть (контракт не нарезан).
+        """
+        try:
+            rows = await self._worker.contracts()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # без таблицы рубеж неизвестен; ход важнее
+            log.exception("таблица контрактов не прочитана для живого хода")
+            return candles
+        self._history.term.rows = rows
+        row = next((one for one in rows if one.symbol == symbol), None)
+        if row is None or row.active_from is None:
+            return candles
+        return stitched_view.live_series(
+            candles, row.active_from, stitched_view.warmup_of(frame.values)
+        )
+
+    async def _stitch(
+        self,
+        frame: _Frame,
+        timeframe: Timeframe,
+        span: tuple[datetime | None, datetime],
+        codes: tuple[str, str | None],
+        own: Sequence[MarketCandle],
+    ) -> stitched_view.Stitch | None:
+        """Нарезка периода по цепочке актива `codes[0]`. Не режется — сказать и идти одним рядом.
+
+        `codes` — код из настроек (по нему актив) и код, которым главное окно
+        обрезает куски (`None` — тестер, берёт все куски периода). Цепочки
+        актива в таблице нет или она противоречит сама себе — строка
+        в журнал: чужой цепочкой прогон не режется никогда. В главном окне
+        повтор той же строки молчит — она пришла бы на каждое «Применить».
+        """
+        since, until = stitched_view.period(*span)
+        try:
+            # Сегодня — по часам порта: идущий день пропуском не считается.
+            request = dataclasses.replace(stitched_view.request_of(
+                frame.values, timeframe, since, until, asset=asset_of(codes[0])
+            ), today=in_moscow(self._clock()).date())
+            made = await stitched_view.plan(
+                self._worker, request, symbol=codes[1], own=own,
+            )
+        except ContractError as error:
+            reason = f"{_plain(error)}. Прогон идёт одним контрактом из настроек."
+            if codes[1] is None or reason != self._history.stitch_said:
+                self._history.stitch_said = reason
+                self._refuse("Склейка по контрактам не собрана", reason)
+            return None
+        # Собралась — отказ снова будет сказан, если вернётся (правило 13).
+        self._history.stitch_said = ""
+        return made
+
+    async def _replay(
+        self,
+        frame: _Frame,
+        symbol: str,
+        candles: list[MarketCandle],
+        stitch: stitched_view.Stitch | None = None,
     ) -> HistoryRun:
         """Прогон движка по ряду — и строка журнала прогонов вокруг него.
 
@@ -2807,28 +4355,47 @@ class HistoryPort(TerminalPort):
         (ARCHITECTURE.md §1), и тем более не различает, записывают ли его.
         """
         module = convert.strategy_settings(frame.values)
+        algorithm = convert.chosen_algorithm(frame.values)
         conditions = RunConditions(
             origin=convert.stored_origin(_ORIGIN),
             symbol=symbol,
             timeframe=frame.values.timeframe,
             engine=frame.engine,
             strategy=module,
-            strategy_title=EmaReverse.title,
+            algorithm=algorithm,
             app_version=version(),
             days=self._days,
             until=self._until,
+            program=ProgramFields.of(frame.values),
         )
+        # Подавать ли минутки — одно правило с склейкой (B-058, `app/minutes.py`).
+        plan = minute_plan(frame.values, convert.timeframe_of(frame.values.timeframe))
         async with self._runs.around(conditions.record(candles)) as entry:
-            run = await replay(
+            if stitch is not None:
+                self._stitched = await stitched_view.run(
+                    stitch, frame.values, frame.engine,
+                    steps=self._piece_steps_for(frame, symbol, stitch),
+                )
+                run = plan.mark(stitched_view.as_history(
+                    self._stitched, convert.run_costs(frame.values)
+                ))
+                entry.note = f"{result_note(run)} Склейка {stitch.symbols}."
+                return run
+            run = plan.mark(await replay(
                 candles,
-                EmaReverse(module),
+                algorithm.build(module),
                 frame.engine,
                 # Издержки прогона задаются в окне: проскальзывание меняет цену
                 # каждого исполнения, а значит все деньги отчёта. Умолчание —
                 # ноль шагов, ровно как считал прототип (`app/convert.py`).
                 costs=convert.run_costs(frame.values),
+                # Минутки под барами — уровни внутри бара по ним (решение 0059);
+                # только скользящему уровню на свече не крупнее порога.
+                minutes=None if plan.order is None else await minutes_under(
+                    self._worker, symbol, candles, plan.order
+                ),
                 on_progress=self._progress,
-            )
+            ))
             entry.note = result_note(run)
         return run
 
@@ -2885,7 +4452,7 @@ class HistoryPort(TerminalPort):
         )
 
     async def _draw_live(self, symbol: str) -> None:
-        frame = _Frame(self._values, self._engine_settings)
+        frame = _Frame(_in_force(self._values), self._engine_settings)
         bars = await self._live_bars(frame, symbol)
         if not bars:
             return
@@ -2908,6 +4475,9 @@ class HistoryPort(TerminalPort):
             if edge is not None:
                 self._edge = dataclasses.replace(edge, forming=None)
             self.refresh(f"живая свеча: закрылся бар {symbol}")
+            # После `refresh`, а не до: строка ленты не стоит между отметкой
+            # закрытого бара и пересчётом по нему (`app/debug_feed.py`).
+            debug_feed.bar_due(symbol, frame.values.timeframe, closed)
             return
 
         if edge is None or (edge.instrument, edge.timeframe) != (symbol, frame.values.timeframe):
@@ -2916,6 +4486,25 @@ class HistoryPort(TerminalPort):
             return
 
         self._put_on_edge(frame, symbol, bars[-1])
+        # После рисунка, а не до: проход вернёт набирающийся бар на график
+        # с края (`_keep_forming`), и края без него не должно быть.
+        self._first_minute(symbol, bars[-1])
+
+    def _first_minute(self, symbol: str, bar: MarketCandle) -> None:
+        """Первая записанная минута бара при ждущей заявке — один проход на бар.
+
+        Решение 0065: заявка, поданная на закрытии прошлого бара, исполняется
+        по открытию этого, и владелец счёта видит сделку сейчас, а не через
+        пять минут. Проход один на бар: следующие минуты того же бара прогон
+        не гоняют (`B-009`), заявки ждать нечего — ход ничего не ждёт.
+        """
+        observer = self._watch.observer
+        if not bar.unsettled or observer is None or not observer.awaits_open:
+            return
+        if self._watch.opened is not None and bar.time <= self._watch.opened:
+            return
+        self._watch.opened = bar.time
+        self.refresh(f"живая свеча: открылся бар {symbol}, заявка ждёт исполнения")
 
     async def _draw_growing(self, symbol: str, minute: MarketCandle) -> None:
         """Одна растущая минута: собрать её бар и положить на правый край.
@@ -2928,7 +4517,7 @@ class HistoryPort(TerminalPort):
         а закрытие бара прогоном, и их отказ порт говорит вслух.
         """
         try:
-            frame = _Frame(self._values, self._engine_settings)
+            frame = _Frame(_in_force(self._values), self._engine_settings)
             bar = await self._growing_bar(frame, symbol, minute)
             if bar is None or self._already_closed(bar):
                 return
@@ -3050,8 +4639,9 @@ class HistoryPort(TerminalPort):
             self._empty(
                 frame,
                 symbol,
-                f"Базы свечей нет: файл {path} не найден. Программа не загружает "
-                "историю сама — автозагрузка (Э1-5) ещё не сделана.",
+                "Свечей ещё нет: история не загружалась. Нажмите «Загрузить "
+                "историю» — свечи возьмутся у Московской биржи, токен брокера "
+                "для этого не нужен.",
             )
             return []
         coverage = await self._worker.coverage(symbol)
@@ -3099,6 +4689,7 @@ class HistoryPort(TerminalPort):
         settled = [candle for candle in candles if not candle.unsettled]
         if settled:
             self._settled_seen = settled[-1].close_time
+        self._watch.forming = self._forming_of(candles, known_until, timeframe)
         trusted = self._trusted(symbol, candles, timeframe)
         if not trusted:
             self._empty(
@@ -3108,6 +4699,26 @@ class HistoryPort(TerminalPort):
                 f"{timeframe.name} за выбранный период.",
             )
         return trusted
+
+    def _forming_of(
+        self, candles: list[MarketCandle], known_until: datetime, timeframe: Timeframe
+    ) -> MarketCandle | None:
+        """Незакрытый бар для живого хода — или `None` (решение 0065).
+
+        Только когда проход пойдёт живым ходом (наблюдение просили, отрезок
+        не закреплён, робот не остановлен) и только бар **без дыр**: минуток
+        в нём столько, сколько минут интервала прошло (`known_until`). Бар,
+        у которого первая минута потеряна, открыт чужой ценой — заявка по ней
+        не исполняется, она ждёт следующего бара, как и прежде (то же правило
+        сомнительных, что у `_trusted`).
+        """
+        if not self._watch.observing or self._back.span is not None or self._halt.reason:
+            return None
+        if not candles or not candles[-1].unsettled:
+            return None
+        bar = candles[-1]
+        passed = min((known_until - bar.time) // timedelta(minutes=1), timeframe.minutes)
+        return bar if bar.filled_minutes == passed else None
 
     def _trusted(
         self, symbol: str, candles: list[MarketCandle], timeframe: Timeframe
@@ -3139,9 +4750,16 @@ class HistoryPort(TerminalPort):
         Чего правило не закрывает: дыры прошлых сеансов — после перезапуска
         вчерашняя дыра лежит до `_Trust.end` и выглядит как «сделок не было»;
         лечит только догрузка (миниплан Э1-5, §4.6).
+
+        ⚠️ Незакрытый бар, который живой ход покажет движку (`_Watch.forming`,
+        решение 0065), в счёт строки не входит: рядом с ней встала бы сделка
+        по открытию того же бара, и «такой бар не участвует» прочлось бы
+        как «заявки не было». Решений по нему робот и правда не принимает —
+        только исполняет ждущую заявку, и об этом говорит строка сделки.
         """
         settled = [candle for candle in candles if not candle.unsettled]
-        dropped = len(candles) - len(settled)
+        fed = 0 if self._watch.forming is None else 1
+        dropped = len(candles) - len(settled) - fed
         if dropped:
             self.note(
                 "Незакрытые свечи не в прогоне",
@@ -3261,7 +4879,7 @@ class HistoryPort(TerminalPort):
             ChartData(instrument=symbol, timeframe=frame.values.timeframe),
         )
         self._send(self.trades_replaced, (), None)
-        self._refuse("Свечей нет", reason)
+        self._refuse("Свечей нет", reason, run=True)
         self._publish_journal()
         self._publish_state(self._state(frame, symbol, None, None))
 
@@ -3275,6 +4893,31 @@ class HistoryPort(TerminalPort):
             "Прогон по истории",
         )
 
+    async def _contract_context(
+        self, symbol: str, timeframe: Timeframe, candles: list[MarketCandle]
+    ) -> contract_view.ChartContext:
+        """Прежние контракты для показа — по таблице контрактов, без прогона.
+
+        Прогон на истории (закреплённый отрезок) не трогается: склейка
+        в прогоне — фаза Ф3. Отказ чтения — показ как прежде, одним
+        контрактом, и строка в технический лог: график без стыков хуже
+        графика со стыками, но лучше пустого.
+        """
+        if self._back.span is not None or not candles:
+            return contract_view.ChartContext()
+        last = candles[-1].time
+        since = min(candles[0].time, last - timedelta(days=self._days - 1)) \
+            if self._days > 0 else None
+        try:
+            return await contract_view.chart_context(
+                self._worker, symbol, timeframe, since, last + timeframe.delta
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # показ одним контрактом — не повод ронять проход
+            log.exception("стыки контрактов не прочитаны (%s)", symbol)
+            return contract_view.ChartContext()
+
     def _show(
         self,
         frame: _Frame,
@@ -3287,16 +4930,24 @@ class HistoryPort(TerminalPort):
 
         Всё берётся из снимка прохода (`frame`), а не из полей порта: за время
         прогона поля могли смениться, и кадр вышел бы смешанный.
+
+        `self._context` — прежние контракты и стыки (решение 0061), прочитаны
+        прямо перед этим вызовом (`_contract_context`). На график они
+        идут **только свечами**: прогон шёл по одному контракту, и его метки
+        до рубежа этого контракта не рисуются — там показан другой.
         """
         markers, paths = convert.markers_and_paths(
             run,
             pairs(run, ruble_per_point=frame.engine.ruble_per_point),
             reversal_entries(run.deals),
             timeframe,
+            pending=_pending_of(pinned=self._back.span is not None, halted=self.halted),
         )
         before = self._edge
-        shown = tuple(convert.window_candle(candle) for candle in candles)
-        self._send(self.chart_replaced, ChartData(
+        context = self._context
+        drawn, seams = contract_view.split_shown(context, candles)
+        shown = tuple(convert.window_candle(candle) for candle in drawn)
+        self._send(self.chart_replaced, contract_view.trim_before(context.since, ChartData(
             instrument=symbol,
             timeframe=frame.values.timeframe,
             candles=shown,
@@ -3306,16 +4957,25 @@ class HistoryPort(TerminalPort):
             paths=paths,
             levels=_levels(run),
             shades=convert.shades_of(candles, frame.engine),
-        ))
+            seams=seams,
+            basis=self._basis,
+        )))
         self._keep_forming(
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
         )
         self._send(
             self.trades_replaced,
-            tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals),
+            self._seam_rows(
+                tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals)
+            ),
             convert.trades_summary(run),
         )
-        self._say_result(frame, symbol, candles, run)
+        # Прогон по склейке называет все контракты периода, а не код из настроек.
+        named = (
+            " → ".join(one.piece.symbol for one in self._stitched.pieces)
+            if self._stitched is not None else symbol
+        )
+        self._say_result(frame, named, candles, run)
         self._publish_journal(run)
         self._publish_state(self._state(frame, symbol, candles, run))
 
@@ -3333,8 +4993,14 @@ class HistoryPort(TerminalPort):
         if self._back.pending is None:
             return
         self._back.pending = None
+        trouble, self._back.trouble = self._back.trouble, ""
+        # ⚠️ Своим сигналом, а не `failed`: полоску прогона закрывает окно,
+        # и без этого отказа ей закрыться нечем — прохода могло не быть вовсе
+        # (настройки отвергнуты в `apply_settings`), а значит, не будет
+        # и «работа кончилась».
         self._send(
-            self.failed,
+            self.backtest_refused,
+            f"{trouble} Отчёта о прогоне не будет." if trouble else
             "Отчёта о прогоне не будет: прогон не дошёл до конца. Причина — "
             "последней строкой в журнале решений.",
         )
@@ -3357,14 +5023,31 @@ class HistoryPort(TerminalPort):
         if request is None:
             return
         self._back.pending = None
-        self._send(self.backtest_finished, convert.run_report(
-            run, candles, request,
+        report = convert.run_report(
+            run, candles, request, mode=self._mode,
             settings_text=settings_text(
                 self._engine_settings,
                 convert.strategy_settings(self._values),
-                strategy_title=EmaReverse.title,
+                algorithm=convert.chosen_algorithm(self._values),
+                program=ProgramFields.of(self._values),
             ),
-        ))
+        )
+        if self._stitched is not None:
+            # Склейка: разбивка по контрактам и подпись сделки на стыке.
+            report = dataclasses.replace(
+                report,
+                instrument=" → ".join(one.piece.symbol for one in self._stitched.pieces),
+                trades=self._seam_rows(report.trades),
+                contracts=stitched_view.lines(self._stitched),
+                basis=self._basis,
+            )
+        self._send(self.backtest_finished, report)
+
+    def _seam_rows(self, rows: tuple[TradeRow, ...]) -> tuple[TradeRow, ...]:
+        """Строки сделок; у сделки на стыке — «смена контракта», а не «конец отрезка»."""
+        if self._stitched is None:
+            return rows
+        return stitched_view.relabel(rows, stitched_view.seam_reason(self._stitched))
 
     def _keep_forming(self, before: _Edge | None, now: _Edge) -> None:
         """Вернуть на график бар, который ещё набирается: прогон о нём не знает.
@@ -3450,7 +5133,16 @@ class HistoryPort(TerminalPort):
             # Закреплённый отрезок обязан быть виден всё время, пока он стоит:
             # живых свечей на него не приходит, и без плашки это неотличимо
             # от потерянной связи (`_Span`).
-            history_span=_span_note(self._back.span),
+            history_span=_span_note(
+                self._back.span,
+                None if candles is None or self._back.span is None
+                else convert.run_days(candles),
+            ),
+            settings_trouble=self._trouble[0],
+            settings_field=self._trouble[1],
+            # Считается из состояния, а не запоминается: шаг пришёл — плашка
+            # ушла сама, без того, чтобы её кто-то снимал.
+            step_wait=step_wait(self._values),
             day_profit_rub=day.net_profit if day is not None else None,
             day_commission_rub=day.commission if day is not None else None,
             day_trades=day.trades if day is not None else None,
@@ -3519,6 +5211,32 @@ def _restored_halt_words(standing: Sequence[StoredHalt]) -> str:
             "работу…» на панели сверху: сначала самая ранняя, потом следующая."
         )
     return f"{head}\n{listed}\n{tail}"
+
+
+def _pending_of(*, pinned: bool, halted: str) -> convert.Unfilled:
+    """Что будет с заявками из `run.waiting` по сведениям порта — одна причина.
+
+    Движок этого не знает, а порт знает: прогон идёт по закреплённому
+    отрезку, или робот остановлен причиной не из движка. Остановку **движка**
+    (`run.halted`) проверяет `convert.markers_and_paths`, и она главнее.
+
+    Цепочка «условие → ответ», порядок — данные, первая подошедшая главнее:
+
+    1. закреплённый отрезок тестера (`_back.span`, решение 0050) — прогон
+       кончился на его границе, следующая свеча в прогон не войдёт, даже
+       если она есть в базе. Раньше остановки порта: показан прогон тестера,
+       а не живой ход, и его заявке помешала граница отрезка, а не то,
+       что остановлен живой робот;
+    2. робот остановлен у порта (`halted`) — ход закрыт, исполнять некому:
+       показан прогон по истории, у которого `run.halted` пуст (решение 0065).
+
+    Ни одно не подошло — заявка исполнится по открытию следующей свечи.
+    """
+    chain = (
+        (pinned, convert.Unfilled.CUT),
+        (bool(halted), convert.Unfilled.MISSED),
+    )
+    return next((fate for hit, fate in chain if hit), convert.Unfilled.WAITING)
 
 
 def _levels(run: HistoryRun) -> tuple[PriceLevel, ...]:
@@ -3688,6 +5406,11 @@ def _day_summary(
     )
 
 
+def _step_text(value: float) -> str:
+    """Шаг цены подписью: без хвостовых нулей и с запятой."""
+    return f"{value:g}".replace(".", ",")
+
+
 def _rubles(value: float) -> str:
     """Стоимость пункта одной подписью: без хвостовых нулей и с запятой.
 
@@ -3698,7 +5421,183 @@ def _rubles(value: float) -> str:
     return (text or "0").replace(".", ",")
 
 
-def _span_note(span: _Span | None) -> str:
+#: Что сказать человеку, пока биржа не сообщила шаг цены, — по полю, которое
+#: без шага не посчитать. Таблица, а не две ветки: у каждой строки одна форма
+#: «поле требует шага → чем оно заменено, пока шага нет». Текст простой,
+#: без жаргона: человек шаг не вписывает и сделать ничего не должен.
+_STEPLESS: tuple[tuple[str, Callable[[Settings], bool], Any, str], ...] = (
+    (
+        "time_exit_order",
+        lambda values: values.time_exit_order is TimeExitKind.LIMIT,
+        TimeExitKind.MARKET,
+        "выход по концу окна идёт по рынку",
+    ),
+    (
+        "slippage_steps",
+        lambda values: values.slippage_steps > 0,
+        0.0,
+        "проскальзывание в отчёте не учитывается",
+    ),
+)
+
+
+#: Заголовок строки журнала, когда настройки меняет ответ биржи, а не человек.
+FROM_EXCHANGE = "Данные биржи об инструменте применены"
+
+
+def _unseen_changes(before: Settings, after: Settings) -> list[str]:
+    """Выбор формы заявки, которого движок пока не получил, — строкой «было → стало».
+
+    Пока биржа не сообщила шаг цены, «С предельной ценой» до движка
+    не доходит (`convert._time_exit_in_force`), и его `changes_from` молчит. Без этой строки
+    выбор человека давал бы в журнал «Значения совпали с прежними».
+    Поле одно — остальные зависящие от шага поля движку не принадлежат,
+    и о них говорит `convert.window_changes`.
+    """
+    old, new = before.time_exit_order, after.time_exit_order
+    if old is new or _in_force(after).time_exit_order is new:
+        return []
+    return [
+        f"«{FIELD_CAPTIONS['time_exit_order']}»: {old.label} → {new.label}; "
+        f"{STEP_WAIT.lower()} — пока выход по концу окна идёт по рынку"
+    ]
+
+
+def _in_force(values: Settings) -> Settings:
+    """Настройки, которые действуют **сейчас**: без шага цены — без того, что от него зависит.
+
+    Шаг цены сообщает биржа (решение владельца счёта 05.10.2026), и до её
+    ответа он неизвестен. Выбор человека в `values` при этом не трогается:
+    заявка «с предельной ценой» остаётся выбранной и включается сама, как
+    только шаг пришёл. Здесь подмена — для издержек тестера (`_Frame`)
+    и плашки (`step_wait`); движок получает выбор человека, а форму заявки
+    подменяет сам `convert._time_exit_in_force` — галочка закрытия по концу
+    окна при этом не теряется (аудит /risk 06.10.2026).
+    """
+    if values.price_step > 0:
+        return values
+    fixed = {name: instead for name, needs, instead, _ in _STEPLESS if needs(values)}
+    return values.replace(**fixed) if fixed else values
+
+
+def step_wait(values: Settings) -> str:
+    """Плашка «биржа ещё не сообщила шаг цены» словами. Пусто — подменять нечего."""
+    if values.price_step > 0:
+        return ""
+    told = [said for _, needs, _, said in _STEPLESS if needs(values)]
+    return f"{STEP_WAIT} — пока {' и '.join(told)}." if told else ""
+
+
+def _engine_of(
+    values: Settings, mode: Mode, base: EngineSettings | None = None
+) -> EngineSettings:
+    """Настройки движка из выбора человека; подмену без шага делает `convert.engine_settings`.
+
+    ⚠️ Не `_in_force(values)`: подменённое «по рынку» стирает сам выбор
+    предельной цены, а он значит «закрывать по концу окна всегда».
+    Без шага движок не закрывал бы позицию по концу окна при снятой галочке
+    старого файла (аудит /risk 06.10.2026). Проскальзывание, вторая строка
+    `_STEPLESS`, движку не принадлежит — его подмена нужна только издержкам.
+    """
+    return convert.engine_settings(values, mode, base)
+
+
+def _startup_settings(
+    given: Settings | None, mode: Mode
+) -> tuple[Settings, EngineSettings, str]:
+    """Настройки для сборки порта: движок обязан их принять, программа — открыться.
+
+    `B-050`: файл настроек укладывает любое значение перечисления, а движок
+    принимает не все (`AfterTakeProfit.unavailable`). Прежде отказ летел
+    из конструктора порта, и программа не открывалась вовсе — не «настройки
+    не приняты», а трассировка вместо окна.
+
+    Поле с невыполнимым вариантом ставится в умолчание программы, остальные
+    остаются прочитанными. Третье значение — фраза для журнала, пусто, если
+    подменять не пришлось. Причина берётся из самого отказа движка: вторая
+    формулировка одной причины разошлась бы с первой.
+
+    Шаг цены из файла **не берётся** (решение владельца счёта 05.10.2026):
+    шаг сообщает биржа в карточке инструмента (`_point_taken`), до её ответа
+    он неизвестен — ноль. Заявка «с предельной ценой» при этом остаётся
+    в настройках выбранной; пока шага нет, движок получает «по рынку»
+    (`convert._time_exit_in_force`), и это видно плашкой (`step_wait`).
+
+    ⚠️ Отказ, который подменой не лечится (программа собрана несогласованно,
+    `convert._ENGINE_GAP`), не глотается: чинить его значениями настроек
+    нечем, и работать с ним нельзя.
+    """
+    values = (given or Settings()).replace(price_step=0.0)
+    try:
+        return values, _engine_of(values, mode), ""
+    except (ValueError, TypeError):
+        # Число из файла, которого движок не принимает (с Ф3 задачи З8 —
+        # отступ и ожидание выхода с предельной ценой). Окно такое не даст:
+        # границы полей; файл, правленный руками или прежней сборкой, — даст.
+        return _numbers_repaired(values, mode)
+    except convert.SettingsRefused as refusal:
+        defaults = Settings()
+        fixed = {
+            item.name: getattr(defaults, item.name)
+            for item in dataclasses.fields(values)
+            if getattr(getattr(values, item.name), "unavailable", "")
+        }
+        if not fixed:
+            raise
+        repaired = dataclasses.replace(values, **fixed)
+        # Негодное число в том же файле всплывает только после этой подмены:
+        # отказ выше случился раньше, чем движок дошёл до чисел.
+        try:
+            engine, more = _engine_of(repaired, mode), ""
+        except (ValueError, TypeError):
+            repaired, engine, more = _numbers_repaired(repaired, mode)
+        chosen = ", ".join(
+            f"«{getattr(value, 'label', value)}»" for value in fixed.values()
+        )
+        return repaired, engine, " ".join(part for part in ((
+            f"В файле настроек выбрано то, чего робот не умеет. {refusal} "
+            f"Вместо этого поставлено умолчание программы: {chosen}; остальные "
+            "настройки из файла в силе. Файл настроек не изменён: умолчание "
+            "запишется в него, когда вы сами измените настройки — «Применить», "
+            "шаблон, день в календаре, переход на контракт. Другой вариант "
+            "выбирается в окне настроек."
+        ), more) if part)
+
+
+def _numbers_repaired(values: Settings, mode: Mode) -> tuple[Settings, EngineSettings, str]:
+    """Поля файла, которых движок не принимает, — в умолчание, вслух.
+
+    Какое поле негодно, решает **правило движка**, а не список здесь: поле
+    проверяется в одиночку на умолчаниях программы, и отказ движка
+    на нём — это и есть причина, которая уходит в журнал. Второй
+    формулировки тех же границ в программе не появляется.
+    """
+    defaults = Settings()
+    fixed: dict[str, Any] = {}
+    reasons: list[str] = []
+    for item in dataclasses.fields(values):
+        value = getattr(values, item.name)
+        if value == getattr(defaults, item.name):
+            continue
+        try:
+            _engine_of(defaults.replace(**{item.name: value}), mode)
+        except (ValueError, TypeError) as error:
+            fixed[item.name] = getattr(defaults, item.name)
+            reasons.append(str(error))
+        except convert.SettingsRefused:
+            continue  # зависит от соседнего поля — не этот случай
+    if not fixed:
+        raise ValueError("настройки из файла не собрать, и подменить нечего")
+    repaired = dataclasses.replace(values, **fixed)
+    return repaired, _engine_of(repaired, mode), (
+        "В файле настроек числа, которых робот не принимает: "
+        + "; ".join(reasons)
+        + ". Вместо них поставлены умолчания программы; остальные настройки "
+        "из файла в силе, файл не изменён. Значения выбираются в окне настроек."
+    )
+
+
+def _span_note(span: _Span | None, days: int | None = None) -> str:
     """Закреплённый отрезок словами — для плашки окна. Пусто, если не закреплён.
 
     Текст один на все места, где об отрезке надо сказать: разные формулировки
@@ -3707,9 +5606,12 @@ def _span_note(span: _Span | None) -> str:
     if span is None:
         return ""
     made = f", настройки: {span.source}" if span.source else ""
+    # Число дней — то же, что в отчёте (`convert.run_days` по тем же свечам):
+    # отчёт закрыт, а плашка висит, и главное число не должно уходить с ним.
+    counted = f", торговых дней: {days}" if days is not None else ""
     return (
         f"Показан прогон на истории: {_when(span.since)} — {_when(span.until)} "
-        f"МСК{made}. Живые свечи на этот отрезок не приходят."
+        f"МСК{counted}{made}. Живые свечи на этот отрезок не приходят."
     )
 
 
@@ -3740,6 +5642,27 @@ def _facts_of(symbol: str, inventory: Inventory) -> HistoryFacts:
         sparse_days=len(inventory.sparse),
         minutes=inventory.minutes,
     )
+
+
+def _asset_or_empty(symbol: str) -> str:
+    """Актив кода таблицы; не квартальный код — пусто, а не отказ."""
+    try:
+        return asset_of(symbol)
+    except ContractError:
+        return ""
+
+
+def _chain_of(symbol: str) -> list[str]:
+    """Цепочка контрактов вокруг кода — либо пусто, если код не квартальный.
+
+    Пусто — не отказ: у такого кода нет цепочки, и загрузка идёт по дням,
+    как прежде. Решает `market.contracts.chain_around`, здесь только
+    перевод отказа в «нет цепочки».
+    """
+    try:
+        return chain_around(symbol)
+    except ContractError:
+        return []
 
 
 def _load_span(request: HistoryLoadRequest, *, now: datetime) -> tuple[date, date]:
@@ -3788,6 +5711,7 @@ def _load_result(outcome: HistoryOutcome) -> HistoryLoadOutcome:
     lines = [
         f"Пришло с биржи {got} свечей."
         if report is None else
+        f"{contract_view.asked_text([report])} "
         f"Пришло с биржи {got} свечей: {report.inserted} новых, "
         f"{report.updated} обновлено"
         + (f", {report.kept} отвергнуто" if report.kept else "")

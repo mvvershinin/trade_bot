@@ -64,6 +64,7 @@ from broker.errors import (
     Timeout,
     TokenExpired,
     TokenFileError,
+    TokenRefused,
     UnexpectedAnswer,
     WrongAddress,
 )
@@ -183,6 +184,7 @@ __all__ = [
     "TokenExpired",
     "TokenFileError",
     "TokenNotice",
+    "TokenRefused",
     "TokenScope",
     "TokenStore",
     "UnexpectedAnswer",

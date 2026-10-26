@@ -39,6 +39,12 @@ def session_of(day: date, *, minutes: int = 5, at_hour: int = 10) -> list:
     return [minute(since + timedelta(minutes=i), open=100.0 + i) for i in range(minutes)]
 
 
+#: Больше запросов не делает ни одна проверка файла. Загрузка, ушедшая
+#: по кругу (кусок раз за разом перезапускается с того же дня, `D-149`),
+#: падает на этом пороге, а не вешает прогон: таймаута у проверок нет.
+REQUEST_LIMIT = 100
+
+
 class Server:
     """Подставной ISS: отдаёт заготовленные свечи по датам запроса."""
 
@@ -52,6 +58,10 @@ class Server:
         until = date.fromisoformat(params["till"])
         offset = int(params["start"])
         if offset == 0:
+            if len(self.requests) >= REQUEST_LIMIT:
+                raise RuntimeError(
+                    f"запрос №{REQUEST_LIMIT + 1} ({since}—{until}): загрузка ходит по кругу"
+                )
             self.requests.append((since, until))
         candles = [
             candle
@@ -724,3 +734,245 @@ def test_the_border_between_trusted_and_suspicious_is_one_day(store) -> None:
     summary_report = sync_minutes(store, client(Server({})), "MXU6", market=FUTURES,
                          since=since, until=beyond_the_trusted_horizon, now=now_moment)
     assert len(summary_report.incomplete) == EMPTY_CHUNK_TRUSTED_DAYS + 1
+
+
+# -- поток прошёл дальше дня (D-149) -----------------------------------------
+#
+# 14.08.2026 — пятница, 15–16.08 — выходные без торгов, 17.08 — понедельник.
+# 16.09 — конец периода MXU6, 17.09 — его последний день торгов.
+
+FRI, SAT, SUN, MON = (date(2026, 8, 14) + timedelta(days=n) for n in range(4))
+
+
+def _monday_in_the_base(store: CandleStore, *, weekend_marked: bool) -> None:
+    """В базе понедельник с минутами и отметкой; пятница не отмечена."""
+    store.put_minutes("MXU6", session_of(MON), Source.ISS)
+    marked = [SAT, SUN, MON] if weekend_marked else [MON]
+    store.mark_days_requested("MXU6", marked, now=msk(2026, 8, 20, 12, 0))
+
+
+def test_a_chain_is_proven_by_the_next_day_already_in_the_base(store: CandleStore) -> None:
+    """Стережёт (а): цепочка пт–вс доказана понедельником из базы в том же запросе.
+
+    Запрос дотянут до ближайшего дня с минутами в базе; поток прошёл через
+    него — пятница и выходные отмечены. Минуты понедельника пришли только
+    в счёт покрытия: в базу не пишутся и названы в отчёте отдельно.
+    """
+    _monday_in_the_base(store, weekend_marked=False)
+    server = Server({FRI: session_of(FRI), MON: session_of(MON)})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES,
+                          since=FRI, until=MON, now=msk(2026, 8, 20, 12, 0))
+
+    assert server.requests == [(FRI, MON)]
+    assert {FRI, SAT, SUN} <= store.settled_days("MXU6")
+    assert report.incomplete == [], report.note
+    assert report.ranges == [(FRI, SUN)] and report.proofs == [(MON, MON)]
+    assert (report.fetched, report.inserted, report.updated, report.proof_candles) == (10, 5, 0, 5)
+    assert "5 свечей пришло только для проверки" in report.summary()
+
+
+def test_an_empty_answer_to_a_proof_marks_nothing(store: CandleStore) -> None:
+    """Стережёт (Б): пустой ответ на запрос-доказательство не отмечает ни одного дня.
+
+    Короткому пустому куску верят как выходным — но за днями этого запроса
+    данные заведомо есть (понедельник лежит в базе). Пустота здесь — «ответ
+    не дошёл», и пятница с выходными остаются неотмеченными.
+    """
+    _monday_in_the_base(store, weekend_marked=False)
+    server = Server({})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES,
+                          since=FRI, until=MON, now=msk(2026, 8, 20, 12, 0))
+
+    assert server.requests == [(FRI, MON)]
+    assert store.settled_days("MXU6") == {MON}
+    assert report.incomplete == [FRI, SAT, SUN]
+    assert "не дал ни одной свечи" in report.note
+
+
+def test_a_proof_answer_broken_inside_the_day_does_not_mark_it(store: CandleStore) -> None:
+    """Стережёт (Б): ответ оборвался посреди пятницы — пятница не отмечена.
+
+    Запрос дотянут до понедельника, а поток кончился в пятницу 10:06.
+    По прежнему правилу пятницу закрыл бы понедельник из базы
+    (`_settle_tails`), хотя этот ответ до него не дошёл.
+    """
+    _monday_in_the_base(store, weekend_marked=True)
+    server = Server({FRI: session_of(FRI, minutes=7)})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES,
+                          since=FRI, until=MON, now=msk(2026, 8, 20, 12, 0))
+
+    assert server.requests == [(FRI, MON)]
+    assert FRI not in store.settled_days("MXU6")
+    assert report.incomplete == [FRI]
+    assert "запрос дотянут по 2026-08-17" in report.note
+
+
+def test_the_last_day_of_a_closed_contract_is_proven_past_until_and_nothing_is_kept(
+    store: CandleStore,
+) -> None:
+    """Стережёт (б) и 0061: 16.09 доказан минутами 17.09, а 17.09 в базе нет.
+
+    Ни минут, ни отметки позже `until`: хвост после периода не качается, как
+    и до рубежа. День-доказательство не попадает и в «недошедшие».
+    """
+    until, last_trade = date(2026, 9, 16), date(2026, 9, 17)
+    server = Server({until: session_of(until), last_trade: session_of(last_trade)})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES,
+                          since=until, until=until, now=msk(2026, 10, 9, 12, 0),
+                          proof_until=last_trade)
+
+    assert server.requests == [(until, last_trade)]
+    assert store.settled_days("MXU6") == {until}
+    assert store.trading_days("MXU6") == [until]
+    assert store.days_to_request("MXU6", last_trade, last_trade) == [last_trade]
+    assert report.incomplete == []
+
+
+def test_a_proof_past_until_broken_inside_the_last_day_marks_nothing(
+    store: CandleStore,
+) -> None:
+    """Стережёт (Б, б): поток оборвался в 16.09 — 16.09 не отмечен, 17.09 не назван."""
+    until, last_trade = date(2026, 9, 16), date(2026, 9, 17)
+    server = Server({until: session_of(until, minutes=7)})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES,
+                          since=until, until=until, now=msk(2026, 10, 9, 12, 0),
+                          proof_until=last_trade)
+
+    assert server.requests == [(until, last_trade)]
+    assert store.settled_days("MXU6") == set()
+    assert report.incomplete == [until], "день-доказательство назван недошедшим"
+
+
+def test_the_proof_does_not_reach_past_today(store: CandleStore) -> None:
+    """Последний день торгов впереди — доказательство тянется по сегодня, не дальше."""
+    day = date(2026, 9, 16)
+    server = Server({day: session_of(day), day + timedelta(days=1): session_of(day)})
+
+    sync_minutes(store, client(server), "MXU6", market=FUTURES,
+                 since=day, until=day, now=msk(2026, 9, 17, 12, 0),
+                 proof_until=date(2026, 12, 17))
+
+    assert server.requests == [(day, date(2026, 9, 17))]
+
+
+def test_the_proof_day_rides_in_the_last_chunk_of_the_chain(store: CandleStore) -> None:
+    """Стережёт (Г, пункт 1): 90 дней кусками по 30 — 17.09 в одном запросе с 16.09.
+
+    Отдельным четвёртым куском день-доказательство ничего бы не доказал:
+    его минуты в базу не пишутся, и `_settle_tails` искал бы их там зря —
+    16.09 остался бы неотмеченным, а вторая загрузка спросила бы его снова.
+    """
+    since, until, last_trade = date(2026, 6, 19), date(2026, 9, 16), date(2026, 9, 17)
+    server = Server({since + timedelta(days=n): session_of(since + timedelta(days=n))
+                     for n in range((last_trade - since).days + 1)})
+    now_moment = msk(2026, 10, 9, 12, 0)
+
+    sync_minutes(store, client(server), "MXU6", market=FUTURES, since=since, until=until,
+                 now=now_moment, chunk_days=30, proof_until=last_trade)
+
+    assert server.requests == [
+        (since, date(2026, 7, 18)), (date(2026, 7, 19), date(2026, 8, 17)),
+        (date(2026, 8, 18), last_trade),
+    ]
+    assert store.days_to_request("MXU6", since, until) == []
+    server.requests.clear()
+    sync_minutes(store, client(server), "MXU6", market=FUTURES, since=since, until=until,
+                 now=now_moment, chunk_days=30, proof_until=last_trade)
+    assert server.requests == [], "вторая загрузка спросила прошлые дни"
+
+
+def test_a_chunk_ending_on_an_empty_weekend_hands_its_edge_to_the_next(
+    store: CandleStore,
+) -> None:
+    """Стережёт (Г, пункт 2, в): кусок пт–вс передаёт пятницу следующему куску.
+
+    `chunk_days=3`: первый кусок — пятница и пустые выходные. Данные
+    кончились в пятницу, и прежде пятница с выходными уходили в «недошедшие»
+    навсегда: подтвердить их было нечем. Следующий кусок начинается с пятницы,
+    конец его прежний; поток проходит в понедельник — отмечено всё, кроме
+    последнего дня отрезка. Журнал не обещает перезапроса доказанных дней.
+    """
+    days = [FRI, MON, MON + timedelta(days=1), MON + timedelta(days=2), MON + timedelta(days=3)]
+    server = Server({day: session_of(day) for day in days})
+    last = days[-1]
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES, since=FRI, until=last,
+                          now=msk(2026, 8, 21, 12, 0), chunk_days=3)
+
+    assert server.requests == [(FRI, SUN), (FRI, days[3]), (last, last)]
+    assert store.days_to_request("MXU6", FRI, last) == [last]
+    assert report.incomplete == [last]
+    assert str(SAT) not in report.note and str(FRI) not in report.note, report.note
+    assert report.ranges == [(FRI, SUN), (FRI, days[3]), (last, last)]
+
+
+def test_a_handed_chunk_that_breaks_on_the_same_day_is_not_handed_again(
+    store: CandleStore,
+) -> None:
+    """Стережёт (Г, пункт 2, без зацикливания): переданный кусок оборвался там же.
+
+    Данные есть только за пятницу. Второй кусок, начатый с пятницы, снова
+    обрывается на ней — и дальше пятница не передаётся: третий кусок идёт
+    со своего начала, каждый запрос — один раз. Неотмеченные дни названы.
+    Кусок, перезапускаемый с пятницы без конца, упирается в `REQUEST_LIMIT`:
+    проверка падает, а не виснет.
+    """
+    server = Server({FRI: session_of(FRI)})
+    last = MON + timedelta(days=3)
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES, since=FRI, until=last,
+                          now=msk(2026, 8, 21, 12, 0), chunk_days=3)
+
+    assert server.requests == [(FRI, SUN), (FRI, MON + timedelta(days=2)), (last, last)]
+    assert not {FRI, SAT, SUN, MON} & store.settled_days("MXU6")
+    assert report.incomplete[:4] == [FRI, SAT, SUN, MON]
+
+
+def test_a_proof_stops_at_the_next_unmarked_chain_and_asks_no_day_twice(
+    store: CandleStore,
+) -> None:
+    """Стережёт (а): запрос цепочки не дотягивается через следующую цепочку.
+
+    Пятница не отмечена, выходные отмечены пустыми, понедельник и вторник
+    не отмечены — две цепочки, у закрытого контракта последний день торгов
+    в среду. Минут позже пятницы в базе нет, и дотягивать её запрос не до
+    чего: пятницу подтверждает понедельник, записанный запросом второй
+    цепочки (`_settle_tails`). Доказательство, дотянутое через неотмеченные
+    дни по последний день торгов, спросило бы понедельник и вторник дважды.
+    """
+    tue, wed = MON + timedelta(days=1), MON + timedelta(days=2)
+    store.mark_days_requested("MXU6", [SAT, SUN], now=msk(2026, 8, 20, 12, 0))
+    server = Server({day: session_of(day) for day in (FRI, MON, tue, wed)})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES, since=FRI, until=tue,
+                          now=msk(2026, 8, 25, 12, 0), proof_until=wed)
+
+    assert server.requests == [(FRI, FRI), (MON, wed)]
+    assert {FRI, MON, tue} <= store.settled_days("MXU6")
+    assert report.incomplete == [], report.note
+
+
+def test_a_chunk_hands_its_edge_only_to_the_chunk_right_after_it(store: CandleStore) -> None:
+    """Стережёт (в): край передаётся только следующему куску **той же** цепочки.
+
+    Пятница с пустыми выходными — одна цепочка; понедельник и вторник уже
+    отмечены (праздники, минут нет); среда и четверг — другая цепочка.
+    Переданная через отмеченные дни, пятница потянула бы их с биржи заново —
+    ровно то, от чего `D-149`. Пятница с выходными остаются неотмеченными
+    и названы: подтвердит их следующая загрузка, когда среда будет в базе.
+    """
+    tue, wed, thu = (MON + timedelta(days=n) for n in (1, 2, 3))
+    store.mark_days_requested("MXU6", [MON, tue], now=msk(2026, 8, 20, 12, 0))
+    server = Server({day: session_of(day) for day in (FRI, wed, thu)})
+
+    report = sync_minutes(store, client(server), "MXU6", market=FUTURES, since=FRI, until=thu,
+                          now=msk(2026, 8, 25, 12, 0))
+
+    assert server.requests == [(FRI, SUN), (wed, thu)]
+    assert report.incomplete == [FRI, SAT, SUN, thu]
+    assert not {FRI, SAT, SUN} & store.settled_days("MXU6")

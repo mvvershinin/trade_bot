@@ -68,13 +68,16 @@ from backtest.split import (
 )
 from backtest.sweep import (
     AVERAGE_PERIODS,
+    GRID_STRATEGY_ID,
     MINUTES_IN_HOUR,
     TAKE_PERCENTS,
     WINDOW_DURATIONS,
     WINDOW_STARTS,
     Money,
     Point,
+    grid_strategy,
     lay_out,
+    refuse_foreign_strategy,
 )
 from backtest.table import plural
 from engine import MSK, EngineSettings, Reversal, TradingWindow, in_moscow
@@ -82,7 +85,7 @@ from market.aggregate import build_bars
 from market.candles import M5, Candle
 from market.chain import daily_volume, legs_of_chain
 from market.storage import CandleStore
-from strategies import EmaReverse, EmaReverseSettings
+from strategies import MaReverseAlwaysSettings, StrategySettings
 
 __all__ = [
     "CHAIN",
@@ -126,7 +129,9 @@ ENOUGH_TRADES = 40
 #: Цепочка контрактов, из которой собран ряд `@MX`. Нужна, чтобы найти дни
 #: стыков: в такой день средняя считает ценовой разрыв соседних контрактов
 #: ходом рынка, и сделки этого дня — артефакт склейки (`D-057`).
-CHAIN = ("MXM5", "MXU5", "MXZ5", "MXH6", "MXM6", "MXU6")
+#: MXZ6 добавлен 27.09.2026 (решение 0061). Контракт без свечей в базе ряда
+#: `seam_days` пропускает, так что ряд, собранный до MXZ6, считается как был.
+CHAIN = ("MXM5", "MXU5", "MXZ5", "MXH6", "MXM6", "MXU6", "MXZ6")
 
 #: Секунд на прогон одного сочетания по ряду `@MX` (64 407 пятиминуток).
 #: Замер 06.09.2026 по шести углам сетки: от 8,16 до 9,56 с, и **ширина окна
@@ -164,14 +169,14 @@ class Recipe:
     average_period: int
     take_percent: float
     take_on: bool = True
-    same_bar_reversal: bool = False
+    same_bar_reversal: bool = True
     stop_after_take: bool = True
     #: Положение на осях сетки. Пусто — точка вне сетки, соседей нет.
     axes: tuple[tuple[str, float], ...] = ()
 
 
 def point_of(
-    recipe: Recipe, engine: EngineSettings, strategy: EmaReverseSettings
+    recipe: Recipe, engine: EngineSettings, strategy: MaReverseAlwaysSettings
 ) -> Point:
     """Рецепт → сочетание для прогона. Всё остальное берётся у поданной основы."""
     return Point(
@@ -227,8 +232,9 @@ def windows() -> tuple[tuple[str, time, time, tuple[tuple[str, float], ...]], ..
 
 
 #: Момент переворота: подпись для имени шаблона, флаг и значение оси.
+#: Только в одной свече — этого требует алгоритм (решение 0063); «через»
+#: убрано вместе с «Реверсом по скользящей средней».
 REVERSALS: tuple[tuple[str, bool, float], ...] = (
-    ("через", False, 0.0),
     ("в одной", True, 1.0),
 )
 
@@ -299,7 +305,7 @@ def reference_recipes() -> tuple[tuple[Recipe, str], ...]:
     for label, start, end in REFERENCE_WINDOWS:
         made.append((
             Recipe(
-                label=f"{label} · EMA{DEFAULT_PERIOD} · 0,5 % · через · стоп",
+                label=f"{label} · EMA{DEFAULT_PERIOD} · 0,5 % · в одной · стоп",
                 window_start=start, window_end=end,
                 average_period=DEFAULT_PERIOD, take_percent=DEFAULT_TAKE,
             ),
@@ -516,7 +522,11 @@ class Ground:
     #: движка обязаны совпасть по построению, а перевод между ними живёт
     #: в одном месте (`app/convert.py`).
     engine: EngineSettings
-    strategy: EmaReverseSettings
+    strategy: MaReverseAlwaysSettings
+    #: Имя алгоритма, чьи настройки лежат в `strategy`. Сетка написана
+    #: под один алгоритм и объявляет это (`backtest/sweep.py`); чужой —
+    #: отказ вслух, а не молчаливый подбор по чужим полям.
+    strategy_id: str
     split: Fold
     folds: tuple[Fold, ...]
     seams: frozenset[date]
@@ -535,6 +545,15 @@ class Ground:
     contract: str = ""
     contract_database: pathlib.Path | None = None
     contract_tuning_days: int = 36
+
+    def __post_init__(self) -> None:
+        """Условия согласованы с сеткой — или отказ вслух (ловушка 14).
+
+        Проверка стоит в **модели данных**: через эти поля настройки
+        алгоритма расходятся по всему замеру, включая рабочие процессы,
+        и перехватывать их в каждой двери означало бы забыть одну.
+        """
+        refuse_foreign_strategy(self.strategy_id, self.strategy)
 
 
 @dataclass(slots=True)
@@ -624,9 +643,15 @@ async def score(
     point = point_of(one, ground.engine, ground.strategy)
     run = await replay(
         bars,
-        EmaReverse(point.strategy),
+        # Алгоритм собирает реестр по имени, под которое написана сетка
+        # (`backtest/sweep.py::GRID_STRATEGY_ID`), а не этот файл по имени
+        # класса: подбор, объявивший себя написанным под один алгоритм
+        # и гоняющий другой, врал бы числами, а не падал.
+        grid_strategy().build(point.strategy),
         replace(point.engine, commission_per_side=ground.costs.per_side),
         costs=ground.costs,
+        # Минуток нет намеренно (З9 Ф5): основа — умолчания окна, рецепт
+        # скользящий тейк не включает, неподвижному минутки сделок не меняют.
     )
     trial = lay_out(point, run.deals, periods, halted=run.halted)
     return Scored(
@@ -771,7 +796,7 @@ async def legs_of(  # noqa: PLR0913 — шесть доводов: рецепт,
     costs: Costs,
     *,
     engine: EngineSettings,
-    strategy: EmaReverseSettings,
+    strategy: MaReverseAlwaysSettings,
 ) -> tuple[Stretch, ...]:
     """Прогнать набор по каждому отрезку отдельно и вернуть отрезки с итогами.
 
@@ -789,8 +814,9 @@ async def legs_of(  # noqa: PLR0913 — шесть доводов: рецепт,
     for period in periods:
         inside = part(bars, period)
         run = await replay(
-            inside, EmaReverse(point.strategy),
+            inside, grid_strategy().build(point.strategy),
             replace(point.engine, commission_per_side=costs.per_side), costs=costs,
+            # Без минуток — по той же причине, что `score`.
         )
         made.append(Stretch(period=period, bars=inside, run=run))
     return tuple(made)
@@ -1585,9 +1611,10 @@ def prepare(  # noqa: PLR0913 — условия замера: ряд, деле�
     symbol: str,
     *,
     engine: EngineSettings,
-    strategy: EmaReverseSettings,
+    strategy: StrategySettings,
     days: Sequence[date],
     costs: Costs,
+    strategy_id: str = GRID_STRATEGY_ID,
     tuning_share: float = 0.5,
     checking_days: int = 5,
     every: int = 1,
@@ -1608,13 +1635,21 @@ def prepare(  # noqa: PLR0913 — условия замера: ряд, деле�
         от сборки готовыми, а не строятся здесь: набор окна и настройки
         движка обязаны совпасть по построению, и единственное место,
         где перевод живёт, — `app/convert.py`.
+    :param strategy_id: имя выбранного торгового алгоритма. Умолчание —
+        тот, под который написана сетка: у неё один автор и один адресат.
+        Чужое имя — отказ вслух (`ForeignStrategy`), а не подбор по чужим
+        полям, показанный как ваш.
     """
     tuning = max(1, round(len(days) * tuning_share))
     return Ground(
         database=database,
         symbol=symbol,
         engine=engine,
-        strategy=strategy,
+        # Сужение на границе: настройки приходят портом, а сетка умеет менять
+        # поля **своего** алгоритма. Чужие — отказ вслух, а не подбор
+        # по чужим полям, показанный как ваш.
+        strategy=refuse_foreign_strategy(strategy_id, strategy),
+        strategy_id=strategy_id,
         split=single_split(days, tuning=tuning),
         folds=walk_forward(days, tuning=tuning, checking=checking_days),
         seams=seam_days(database),

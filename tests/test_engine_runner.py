@@ -40,7 +40,7 @@ from engine import (
     intake,
     to_bar,
 )
-from strategies import Bar, EmaReverse, Intent
+from strategies import Bar, MaReverseAlways, Intent
 from tests.engine_helpers import (
     MSK,
     FakeCandle,
@@ -636,6 +636,106 @@ def test_an_executor_that_cannot_report_deals_stops_the_robot_as_well() -> None:
     assert lines[-1].event == "Сделки исполнителя не получены"
 
 
+class _FillsRaise:
+    """Исполнитель, у которого запрос сделок кончается заданным исключением."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def submit(self, order) -> None:
+        raise AssertionError("до подачи заявки дойти не должно")
+
+    async def fills_at(self, market_candle):
+        raise self.error
+
+
+class _LinkDown(Exception):
+    """Чужой отказ неизвестного движку типа — как будущий отказ боевого слоя."""
+
+
+def _halt_on_fills(error: BaseException) -> tuple[Engine, list[JournalEntry]]:
+    lines: list[JournalEntry] = []
+    engine = Engine(
+        ScriptedStrategy([decision(Intent.LONG)]), WORKING, journal=lines.append
+    )
+    asyncio.run(engine.on_market_candle(candle(10, 5), _FillsRaise(error)))
+    return engine, lines
+
+
+def test_a_defect_inside_the_executor_is_not_called_silence() -> None:
+    """`B-048`: исполнитель упал в своём коде — причина названа ошибкой.
+
+    Стережёт: исключение типа «ошибка в коде» из `fills_at` останавливает
+    робота, и и в остановке, и в строке журнала стоит ошибка внутри
+    исполнителя с её типом и текстом, а не «исполнитель не ответил».
+    """
+    engine, lines = _halt_on_fills(AssertionError("цена вне размаха свечи"))
+
+    assert engine.halted, "дефект исполнителя обязан остановить робота"
+    for text in (engine.halted, f"{lines[-1].event}. {lines[-1].reason}"):
+        assert "Ошибка внутри исполнителя" in text
+        assert "AssertionError: цена вне размаха свечи" in text
+        assert "не ответил" not in text, "дефект назван молчанием"
+    assert lines[-1].level is JournalLevel.ERROR
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ZeroDivisionError("деление на ноль в цене исполнения"),
+        ValueError("объём исполнения отрицательный"),
+        TypeError("цена пришла строкой"),
+        KeyError("order-1"),
+        IndexError("list index out of range"),
+        AttributeError("у свечи нет поля close"),
+        NameError("name 'price' is not defined"),
+    ],
+    ids=["arithmetic", "value", "type", "key", "index", "attribute", "name"],
+)
+def test_every_kind_of_code_defect_in_the_executor_is_named_a_defect(
+    error: Exception,
+) -> None:
+    """`B-048`: «сломана арифметика» — не одно `AssertionError`.
+
+    Список видов записан здесь руками, а не взят из `engine.runner`: сторож
+    из величин проверяемого правила зеленел бы вместе с ним. Выпади вид
+    из перечня движка — такой дефект снова назвали бы молчанием связи.
+    """
+    engine, lines = _halt_on_fills(error)
+
+    assert engine.halted
+    for text in (engine.halted, f"{lines[-1].event}. {lines[-1].reason}"):
+        assert "Ошибка внутри исполнителя" in text, text
+        assert f"{type(error).__name__}: {error}" in text, text
+        assert "не ответил" not in text, "дефект назван молчанием"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ConnectionError("связь с брокером потеряна"),
+        TimeoutError("ответ брокера не пришёл за 5 с"),
+        _LinkDown("отказ боевого слоя"),
+    ],
+    ids=["connection", "timeout", "unknown-type"],
+)
+def test_silence_of_the_executor_keeps_the_old_reason(error: Exception) -> None:
+    """Молчание и неизвестный отказ — прежняя причина «не ответил».
+
+    Стережёт обратное направление: отказ, не являющийся ошибкой в коде,
+    дефектом не объявляется — иначе обрыв связи боевого брокера ушёл бы
+    разбирать арифметику.
+    """
+    engine, lines = _halt_on_fills(error)
+
+    assert engine.halted
+    for text in (engine.halted, f"{lines[-1].event}. {lines[-1].reason}"):
+        assert "Сделки исполнителя не получены" in text
+        assert f"Исполнитель не ответил на запрос сделок: {type(error).__name__}" in text
+        assert "Ошибка внутри исполнителя" not in text
+    assert lines[-1].level is JournalLevel.ERROR
+
+
 def test_a_halted_engine_refuses_the_synchronous_entry_too() -> None:
     """Остановка действует и на синхронное ядро, а не только на адаптер."""
     def broken(entry: JournalEntry) -> None:
@@ -697,7 +797,7 @@ def test_a_candle_going_backwards_is_not_smoothed_over() -> None:
     Это не повтор: повтор штатен, а ряд, поехавший назад, дальше считать
     нельзя. Останавливает его торговый модуль — он ведёт свой ряд.
     """
-    engine = Engine(EmaReverse(), WORKING)
+    engine = Engine(MaReverseAlways(), WORKING)
     engine.on_candle(candle(10, 10))
     with pytest.raises(ValueError):
         engine.on_candle(candle(10, 5))

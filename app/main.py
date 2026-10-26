@@ -28,9 +28,13 @@
    останутся недоделанными.
 4. **Один** ``loop.run_until_complete(main())``, всё завершение — внутри этой
    корутины, ``loop.close()`` в ``finally``. ``qasync.run()`` не используется:
-   это ``asyncio.run``, а он входит в цикл ещё раз ради ``shutdown_asyncgens``,
-   и на программе с QtWebEngine внутри это даёт SIGSEGV или зависание
-   (PYSIDE-3451, замер в решении 0005).
+   это ``asyncio.run``, а он входит в цикл ещё раз ради ``shutdown_asyncgens``.
+   Замерено это было на программе с QtWebEngine внутри — там повторный вход
+   давал SIGSEGV или зависание (PYSIDE-3451, решение 0005). QtWebEngine из
+   программы ушёл 09.09.2026 вместе с веб-графиком, **правило осталось**:
+   замера, разрешающего входить в цикл дважды, никто не делал, а вторая
+   половина причины — дозапись журнала и закрытие базы внутри одной
+   корутины — от WebEngine и не зависела.
 
 Чего эта программа сегодня не делает
 ------------------------------------
@@ -46,24 +50,63 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import os
 import pathlib
 import signal
 import sys
+from collections.abc import Callable
 from typing import TYPE_CHECKING
+
+from app.collector import collect_in_main_thread  # Qt внутри, не при ввозе
 
 if TYPE_CHECKING:  # ⚠️ только для подписей: настоящие импорты слоёв идут
     # внутри `_run`, после того как выставлены QT_API и QT_QPA_PLATFORM.
     # Наверху они подняли бы Qt при разборе ключей и при `--help`.
+    from PySide6.QtGui import QPalette, QPixmap
+    from PySide6.QtWidgets import QApplication
+
     from app.live_feed import LiveLink
     from app.logs import LogSetup
     from app.port import HistoryPort
     from app.settings_store import Loaded, SettingsStore
     from market import MarketWorker
+    from ui.main_window import MainWindow
     from ui.models import DecisionLevel, Settings
 
 __all__ = ["main"]
+
+def _shot_wish(args: argparse.Namespace) -> "_Shot":
+    """Ключи командной строки → просьба о снимке. Одна строка в главной корутине.
+
+    Отдельной функцией, а не сборкой на месте: главная корутина стоит вплотную
+    к пределу длины (`tests/test_function_size.py`), и разбор ключей — не то,
+    ради чего читают сборку программы.
+    """
+    return _Shot(pathlib.Path(args.snapshot), args.shot_of, args.shot_tab)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Shot:
+    """Просьба о снимке: куда сохранить, что снять и какую вкладку показать.
+
+    Одной вещью, а не тремя аргументами подряд: три строки в подписи легко
+    переставить местами, и перепутанные «что» и «куда» дали бы файл с именем
+    вкладки. Заодно это одно место, где видно, из чего просьба состоит.
+    """
+
+    target: pathlib.Path
+    what: str = "window"
+    tab: str = ""
+
+
+#: Пауза перед снимком открытого окна, миллисекунды.
+#:
+#: Не «на всякий случай»: `exec()` начинает свой цикл событий, и первому же
+#: таймеру в нём достаётся окно, которое Qt ещё не разложил. Снимок вышел бы
+#: с недорисованными полями — то есть картинкой, по которой ничего не проверишь.
+_SHOT_PAUSE_MS = 250
 
 log = logging.getLogger(__name__)
 
@@ -127,17 +170,14 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
         prog="python3 -m app.main",
         description="«Терминал» — прогон робота по истории из базы свечей.",
     )
-    parser.add_argument(
-        "--shot", dest="snapshot", metavar="FILE",
-        help="сохранить вид окна в файл и выйти (работает на машине без экрана)",
-    )
+    _add_shot_arguments(parser)
     parser.add_argument(
         "--db", dest="database", metavar="FILE",
         help="файл базы свечей; по умолчанию — тот, что назначен market/paths.py",
     )
     parser.add_argument(
         "--symbol", dest="symbol", metavar="CODE",
-        help="инструмент, по умолчанию MXU6",
+        help="инструмент, по умолчанию MXZ6",
     )
     parser.add_argument(
         "--days", dest="days", type=_positive, default=None, metavar="N",
@@ -180,7 +220,44 @@ def _arguments(argv: list[str] | None) -> argparse.Namespace:
     )
     _add_journal_arguments(parser)
     _add_fetch_arguments(parser)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if (args.shot_of != "window" or args.shot_tab) and not args.snapshot:
+        # Отказ вслух, а не молчаливое «ключ ничего не сделал». Ключ без
+        # `--shot` — это просьба снять окно, которую некуда сохранить.
+        parser.error(
+            "ключи --shot-of и --shot-tab работают только вместе с --shot: "
+            "снимок некуда сохранить"
+        )
+    return args
+
+
+def _add_shot_arguments(parser: argparse.ArgumentParser) -> None:
+    """Ключи снимка экрана. Отдельной функцией — как журнал и загрузка.
+
+    ⚠️ `--shot-of` заведён по цене дефекта. Снимки окна выбора алгоритма
+    делались `tools/demo.py`, где каталог подаётся диалогу прямо в конструктор:
+    настоящая дорога — порт, сигнал, окно — снимком не проверялась ни разу,
+    и пустой список дожил до владельца счёта 09.09.2026. Правило 12
+    `CLAUDE.md`: проверка идёт тем путём, которым пойдёт человек.
+    """
+    parser.add_argument(
+        "--shot", dest="snapshot", metavar="FILE",
+        help="сохранить вид окна в файл и выйти (работает на машине без экрана)",
+    )
+    parser.add_argument(
+        "--shot-of", dest="shot_of", default="window", metavar="WHAT",
+        choices=("window", "settings", "algorithm"),
+        help="что именно снимать ключом --shot: window — главное окно "
+             "(по умолчанию), settings — окно настроек, algorithm — окно "
+             "выбора торгового алгоритма. Окна при этом открываются тем же "
+             "путём, каким их открывает человек: щелчком по кнопке настоящей "
+             "программы, а не постройкой диалога вручную",
+    )
+    parser.add_argument(
+        "--shot-tab", dest="shot_tab", default="", metavar="NAME",
+        help="какую вкладку окна настроек показать на снимке, например "
+             "«Сигнал». Без ключа снимается та, что открылась",
+    )
 
 
 def _add_journal_arguments(parser: argparse.ArgumentParser) -> None:
@@ -271,6 +348,27 @@ def wants_dark(args: argparse.Namespace) -> bool:
     return not args.light
 
 
+def _dress_application(application: "QApplication", args: argparse.Namespace) -> None:
+    """Палитра и шрифт приложения — до сборки первого окна, одним вызовом.
+
+    Шрифт крупнее системного в `ui.theme.FONT_SCALE` раз (просьба владельца
+    счёта 05.10.2026, `ROADMAP.md` Н2). Ставится **приложению**, а не окнам:
+    все виджеты, созданные после, наследуют его сами, и ни одно окно
+    не останется с прежним кеглем по забывчивости.
+
+    ⚠️ После палитры: `setStyle` внутри `_use_dark_palette` шрифт не трогает,
+    но порядок «стиль, затем шрифт» не оставляет места проверять это.
+    """
+    from ui.theme import scaled_font  # noqa: PLC0415 — `ui` тянет Qt, а Qt
+    # поднимается только после QT_API и QT_QPA_PLATFORM (шапка модуля)
+
+    if wants_dark(args):
+        _use_dark_palette(application)
+    else:
+        application.setPalette(_light_palette(application.palette()))
+    application.setFont(scaled_font(application.font()))
+
+
 def _use_dark_palette(application) -> None:
     """Тёмная палитра для машины со светлой системной темой.
 
@@ -280,6 +378,47 @@ def _use_dark_palette(application) -> None:
 
     ⚠️ Зовётся **до** сборки окна: тема читается при создании виджетов,
     и подмена после `MainWindow(...)` дошла бы не до всех.
+    """
+    application.setStyle("Fusion")
+    application.setPalette(_dark_palette())
+
+
+#: Текст выключенного поля и кнопки в тёмной палитре. Числа — у цикла
+#: по `ColorGroup.Disabled` в `_dark_palette`.
+_DISABLED_INK = "#aaa5b0"
+
+#: То же для светлой (системной) палитры. Системный `#bebebe` на сером фоне
+#: окна `#efefef` давал 1,6:1 — неактивные поля окна настроек («С предельной
+#: ценой», «Закрывать позицию в конце окна») почти не читались (снимок
+#: 05.10.2026). `#5f5f5f` — 5,6:1 против 18:1 у живого чёрного.
+_LIGHT_DISABLED_INK = "#5f5f5f"
+
+#: Роли текста, которые красятся отдельно в выключенном состоянии.
+_DISABLED_TEXT_ROLES = ("ButtonText", "WindowText", "Text")
+
+
+def _light_palette(system: "QPalette") -> "QPalette":
+    """Системная светлая палитра, у которой выключенный текст читается.
+
+    Меняется только выключенный текст: всё остальное — как у системы.
+    Возвращает копию — проверяется без подмены палитры общего приложения.
+    """
+    from PySide6.QtGui import QColor, QPalette  # noqa: PLC0415 — Qt после QT_API
+
+    palette = QPalette(system)
+    for name in _DISABLED_TEXT_ROLES:
+        role = getattr(QPalette.ColorRole, name)
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(_LIGHT_DISABLED_INK))
+    return palette
+
+
+def _dark_palette() -> "QPalette":
+    """Сама палитра, отдельно от её установки — чтобы её можно было проверить.
+
+    Проверка цветов иначе требовала бы подменить палитру **общего на весь
+    прогон** приложения Qt и вернуть её назад: сосед по процессу, которому
+    достался промежуток, красился бы не тем. Функция, возвращающая палитру,
+    проверяется без единого глобального изменения.
     """
     from PySide6.QtGui import QColor, QPalette  # noqa: PLC0415 — Qt поднимается
     # только внутри `main()`, после QT_QPA_PLATFORM; наверху он поднялся бы
@@ -300,8 +439,34 @@ def _use_dark_palette(application) -> None:
     palette.setColor(QPalette.ColorRole.Mid, QColor("#8a8590"))
     palette.setColor(QPalette.ColorRole.Highlight, QColor("#d9a441"))
     palette.setColor(QPalette.ColorRole.HighlightedText, paper)
-    application.setStyle("Fusion")
-    application.setPalette(palette)
+    # ⚠️ Выключенное состояние обязано быть **видно**, и без этих строк его
+    # видно не было. `setColor(role, цвет)` красит **все** группы разом,
+    # включая `Disabled`: текст выключенной кнопки выходил того же цвета,
+    # что и живой, и отличалась она одной рамкой (замер 09.09.2026: 314
+    # различающихся точек из 3350 против 1039 в системной палитре).
+    #
+    # Кнопка, выглядящая живой и молчащая на нажатие, — это молчание
+    # по правилу 13 `CLAUDE.md`, и касается это не одной кнопки: так же
+    # выглядели «Старт» на токене только для чтения и любое другое
+    # запрещённое действие. Цвет взят не новый, а уже стоящий в палитре
+    # (`Mid`): 4,8:1 на кнопке против 13,9:1 у живого текста — втрое тусклее
+    # и по-прежнему читаемо.
+    #
+    # С 05.10.2026 цвет свой, светлее `Mid`: владелец счёта назвал
+    # неактивные поля «очень плохо видно». 7,2:1 против 13,9:1 у живого —
+    # вдвое тусклее, отличить по-прежнему можно. `Mid` остался прежним:
+    # им Fusion рисует рамки и фаски, а не текст.
+    for role in (
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(_DISABLED_INK))
+    # Серый текст-подсказка в пустом поле («по умолчанию — папка userdata/logs»,
+    # «Выберите строку…» в «Отчётах»). Без этой строки Qt выводил его из
+    # `Text` с прозрачностью, и на снимке 05.10.2026 он почти не читался.
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(_DISABLED_INK))
+    return palette
 
 
 def _speak_utf8() -> None:
@@ -333,6 +498,41 @@ def _speak_utf8() -> None:
             pass
 
 
+def _named_userdata(args: argparse.Namespace) -> pathlib.Path | None:
+    """Папка данных этого запуска, если её назвали ключом `--db`; иначе `None`.
+
+    Одна функция вместо двух копий одной строки (`main()` и `_run()`) — `D-041`.
+    `None`, а не `database.parent` всегда, потому что `database.parent`
+    и `userdata_dir()` совпадают в бою, но не в прогоне тестов:
+    `tests/conftest.py::logs_go_to_a_temporary_folder` подменяет именно
+    `userdata_dir()` (через `app.logs`/`app.runs`), а не то, что вернёт
+    `market.default_db_path()`. Подставить `database.parent` безусловно
+    значило бы обходить эту подмену стороной и писать лог и библиотеку
+    шаблонов в боевую папку `userdata/` при каждом прямом (не через
+    подпроцесс) вызове программы без `--db` — ровно та потеря, ради которой
+    подмена и заведена.
+    """
+    named = getattr(args, "database", None)  # тесты зовут `_run` с голым Namespace
+    return pathlib.Path(named).parent if named else None
+
+
+def _start_logging(named_userdata: pathlib.Path | None) -> None:
+    """Технический лог и сразу за ним лента «Отладка» — до всех веток.
+
+    Лента ставится здесь, а не при сборке окна: строки, сказанные до окна
+    (чтение настроек, подмены при сборке порта), иначе в неё не попали бы.
+    Ветки без окна (`--fetch`, `--inspect`, `--runs`) её не читают, и цена
+    этому — буфер не больше `debug_feed.BUFFER` строк. Модуль ленты PySide6
+    не тянет (сторож в `tests/test_debug_panel.py`), ветки без экрана
+    остаются без Qt.
+    """
+    from app.debug_feed import install  # noqa: PLC0415 — слои после разбора ключей
+    from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
+
+    setup_logging(userdata=named_userdata)
+    install()
+
+
 def main(argv: list[str] | None = None) -> int:
     """Собрать и запустить программу. Возвращает код возврата процесса."""
     _speak_utf8()
@@ -341,9 +541,13 @@ def main(argv: list[str] | None = None) -> int:
     # они тоже пишут в логгеры. Без этой строки любое предупреждение любого
     # слоя летело владельцу счёта в консоль сырым текстом (`D-021`).
     # Здесь же встаёт чистка секретов — тем же вызовом, на все ветки сразу.
-    from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
+    from market import default_db_path  # noqa: PLC0415 — Qt не трогает
 
-    setup_logging()
+    # ⚠️ `database` — до первой строки лога, `named_userdata` — её адрес,
+    # см. докстринг `_named_userdata` (`D-041`).
+    named_userdata = _named_userdata(args)
+    database = pathlib.Path(args.database) if args.database else default_db_path()
+    _start_logging(named_userdata)
 
     if args.fetch or args.inspect or args.runs is not None:
         # ⚠️ Ветка стоит ДО первого касания Qt намеренно: загрузка истории
@@ -367,9 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     # счёта поймал это живьём 06.09.2026: окна нет, вывода нет, Ctrl+C
     # не помогает. Молчание в этой программе — самостоятельный дефект.
     from app.single_instance import OneCopy, Purpose  # noqa: PLC0415 — слои
-    from market import default_db_path  # noqa: PLC0415 — Qt не трогает
 
-    database = pathlib.Path(args.database) if args.database else default_db_path()
     single = OneCopy(database.parent)
     verdict = single.take(Purpose.WINDOW)
     if not verdict.taken:
@@ -392,8 +594,9 @@ def main(argv: list[str] | None = None) -> int:
     # См. шапку модуля, пункт 3: закрытие окна не останавливает цикл.
     application.setQuitOnLastWindowClosed(False)
 
-    if wants_dark(args):
-        _use_dark_palette(application)
+    _dress_application(application, args)
+
+    collect_in_main_thread(application)  # сборка мусора — в потоке окна, `B-057`
 
     loop = qasync.QEventLoop(application)
     asyncio.set_event_loop(loop)
@@ -531,13 +734,14 @@ async def _run(
     """
     # Все пять — после того, как `main()` выставил QT_API и QT_QPA_PLATFORM.
     from app.port import HistoryPort  # noqa: PLC0415
+    from app.userdata_notice import missing_data_notice  # noqa: PLC0415
     from broker.redaction import scrub  # noqa: PLC0415
     from market import MarketWorker  # noqa: PLC0415
-    from ui.main_window import MainWindow  # noqa: PLC0415
     from ui.models import DecisionLevel  # noqa: PLC0415
 
-    if not _userdata_ready(database.parent):
+    if not _database_ready(database, _named_userdata(args)):  # см. её докстринг, D-041/D-129
         return 1
+    missing = missing_data_notice(database)  # до чтения настроек — шапка модуля, D-080
     store, loaded, values, depth = _stored_settings(database.parent, args)
 
     # ⚠️ Чистка секретов ставится ЗДЕСЬ, при сборке, а не внутри слоя данных.
@@ -580,23 +784,23 @@ async def _run(
                            until=args.until, sanitize=scrub)
         port.attach_exchange(worker.point_value)
 
-        window = MainWindow(port=port, settings=values, sanitize=scrub)
-        window.resize(1440, 900)
+        window = _main_window(port, scrub, missing)
 
         closed = asyncio.Event()
         application.lastWindowClosed.connect(closed.set)
         _on_interrupt(closed)
 
-        port.announce(database)
+        _announce(port, database, missing=missing, level=DecisionLevel.WARNING)
         await _restore_halt(port, database)
-        _wire_settings_and_log(port, store, loaded, values, level=DecisionLevel.WARNING)
+        _wire_settings_and_log(
+            port, store, loaded, values, _named_userdata(args), level=DecisionLevel.WARNING)
         if note:  # папка данных не держит замок «одна копия» (решение 0039)
             port.note("Один экземпляр программы", note, DecisionLevel.WARNING)
-        port.refresh("запуск программы")
+        port.first_run("запуск программы")
         window.show()
         live = _live_feed(port, worker, database.parent, values, args)
         if args.snapshot:
-            return await _snapshot(application, window, port, pathlib.Path(args.snapshot))
+            return await _snapshot(application, window, port, _shot_wish(args))
         await closed.wait()
         return 0
     finally:
@@ -628,6 +832,62 @@ async def _restore_halt(port: HistoryPort, database: pathlib.Path) -> None:
     if not database.exists():
         return
     await port.restore_halt()
+
+
+def _database_ready(database: pathlib.Path, named_userdata: pathlib.Path | None) -> bool:
+    """Всё, что зависит от места базы, — до сборки окна.
+
+    Две вещи: окно шаблонов смотрит в ту же базу, что программа
+    (`_templates_read_runs_from`), и папка данных готова к записи
+    (`_userdata_ready`, отказ — фразой).
+
+    :param named_userdata: `database.parent`, если папку данных назвали
+        ключом `--db`; иначе `None` (см. `main()`, `D-041`/`D-129`).
+    """
+    _templates_read_runs_from(database, named_userdata)
+    return _userdata_ready(database.parent)
+
+
+def _templates_read_runs_from(
+    database: pathlib.Path, named_userdata: pathlib.Path | None
+) -> None:
+    """Окно шаблонов читает прогоны и держит библиотеку там же, где запущена программа.
+
+    Створку двери (`ui/backend.py`) вставляет `app/runs.py` при импорте,
+    и ключа `--db` он не знает: без этой проводки при `--db FILE` статистика
+    шаблонов читалась бы из базы по умолчанию, и человек решил бы, что набор
+    не гонялся (`D-052`). Та же путаница ждала библиотеку шаблонов —
+    `userdata`: она переезжала бы за базой при обычном запуске и оставалась
+    в умолчании при `--db`, то есть у одного запуска получались бы две разные
+    папки данных разом (решение 0003, `D-129`).
+
+    `userdata` в створке переставляется, только когда `named_userdata` не
+    пуст — то есть только когда `--db` действительно назвали. Без ключа
+    исходная `_library` (`app/runs.py`) сама зовёт `userdata_dir()` при
+    каждом обращении, и это то самое место, которое вправе подменить прогон
+    тестов (`tests/conftest.py::logs_go_to_a_temporary_folder`). Переставить
+    её безусловно на `database.parent` значило бы обходить эту подмену
+    стороной при каждом запуске окна без `--db`.
+
+    ⚠️ `app.runs` импортируется **здесь, первым**: створка ставится при его
+    импорте, и импорт, случившийся позже этой замены, затёр бы её молча.
+    """
+    from app.runs import matching_runs  # noqa: PLC0415 — слои после QT_API
+    from ui import backend  # noqa: PLC0415
+
+    door = backend.current()
+    if door is None:
+        return
+    if named_userdata is not None:
+        backend.use(dataclasses.replace(
+            door,
+            runs=lambda sets: matching_runs(database, sets),
+            userdata=lambda: named_userdata,
+        ))
+    else:
+        backend.use(dataclasses.replace(
+            door, runs=lambda sets: matching_runs(database, sets)
+        ))
 
 
 def _userdata_ready(userdata: pathlib.Path) -> bool:
@@ -692,11 +952,67 @@ def _say_where_the_log_goes(port: HistoryPort, setup: LogSetup, *, level: Decisi
         )
 
 
-def _wire_settings_and_log(
+def _announce(
+    port: HistoryPort, database: pathlib.Path, *, missing: str = "", level: DecisionLevel
+) -> None:
+    """Строки старта (`HistoryPort.announce`) и — следом — о папке данных.
+
+    Вторая пишется, если переменная папки данных задана и не действует
+    (`market.paths.ignored_override`): человек, выставивший её, иначе
+    искал бы базу и остановку робота не там. `database` — база этого запуска:
+    названная ключом `--database`, она и называется в строке, а не папка
+    по умолчанию (`D-124`). Рядом со строкой «База свечей», а не в
+    `_wire_settings_and_log`: база к настройкам отношения не имеет.
+
+    Третья — `missing`, «данных нет» (`app/userdata_notice.py`, `D-080`):
+    та же фраза, что на плашке окна, уровнем INFO — на новой машине это
+    обычный первый запуск, а не беда. Пусто — строки нет.
+    """
+    from market.paths import ignored_override  # noqa: PLC0415 — слои после разбора ключей
+
+    port.announce(database)
+    ignored = ignored_override(database)
+    if ignored:
+        log.warning("%s", ignored, extra={"panel": False})  # в ленте — строка журнала
+        port.note("Папка данных", ignored, level)
+    if missing:
+        log.info("%s", missing, extra={"panel": False})  # в ленте — строка журнала
+        port.note("Папка данных", missing)
+
+
+def _main_window(port: HistoryPort, scrub: Callable[[str], str], missing: str) -> MainWindow:
+    """Окно программы — собранное, с плашкой «данных нет», но ещё не показанное.
+
+    `settings=port.values`, а не прочитанное из файла (`B-050`): порт
+    подменяет то, чего робот не умеет, и окно держит подменённое с первой
+    секунды. `missing` — текст плашки (`app/userdata_notice.py`, `D-080`)
+    или пусто. Прямой вызов метода окна из сборки — тот же приём, что
+    `open_settings` у снимка (`_shot_of_dialog`).
+
+    `scrub` — та же чистка и **под тем же именем**, что у слоя данных и порта
+    в `_run`: одно имя на три места сверяет `tests/test_app_port.py`.
+
+    Отдельной функцией, а не тремя строками в `_run`: главная корутина стоит
+    на пределе длины (`tests/test_function_size.py`) и числа операторов.
+    """
+    from app.debug_feed import install  # noqa: PLC0415 — слои после разбора ключей
+    from ui.main_window import MainWindow  # noqa: PLC0415 — слои после QT_API
+
+    # `install` повторный вызов не дублирует: отдаёт ленту, поставленную
+    # в `_start_logging`, а при сборке мимо `main()` (проверки) ставит свою.
+    window = MainWindow(port=port, settings=port.values, sanitize=scrub,  # B-050
+                        debug=install())
+    window.resize(1440, 900)
+    window.show_missing_data(missing)
+    return window
+
+
+def _wire_settings_and_log(  # noqa: PLR0913 — шестой довод это папка лога: `named_userdata` (D-041)
     port: HistoryPort,
     store: SettingsStore,
     loaded: Loaded,
     values: Settings,
+    named_userdata: pathlib.Path | None,
     *,
     level: DecisionLevel,
 ) -> None:
@@ -712,38 +1028,99 @@ def _wire_settings_and_log(
     3. **говорится, что вышло при чтении** настроек — до первой записи,
        иначе она затрёт файл, о котором ещё не сказано ни слова;
     4. **включается запись** применённых настроек.
+
+    Перед ними сборка зовёт `_announce`.
+
+    `named_userdata` — умолчание запасной папки лога: `database.parent`,
+    если папку данных назвали ключом `--db`, иначе `None`. Если названная
+    в настройках папка не открылась, лог обязан уехать туда же, куда легла
+    база этого запуска — но **только** когда её действительно назвали
+    ключом; иначе умолчание обязано остаться пустым и дать `setup_logging`
+    самому спросить `userdata_dir()` — то место, которое вправе подменить
+    прогон тестов (`tests/conftest.py::logs_go_to_a_temporary_folder`).
+    Подставить `database.parent` безусловно значило бы обходить эту подмену
+    стороной при каждом запуске окна без `--db` (находка ревью, `D-041`).
     """
     from app.logs import setup_logging  # noqa: PLC0415 — слои после разбора ключей
 
-    _say_where_the_log_goes(port, setup_logging(values.log_directory), level=level)
+    setup = setup_logging(values.log_directory, userdata=named_userdata)
+    _say_where_the_log_goes(port, setup, level=level)
     _say_what_was_read(port, loaded, store, level=level)
-    _keep_settings(port, store, level=level)
+    _keep_settings(port, store, loaded.values, level=level)
 
 
 def _keep_settings(
-    port: HistoryPort, store: SettingsStore, *, level: DecisionLevel
+    port: HistoryPort, store: SettingsStore, read: Settings, *, level: DecisionLevel
 ) -> None:
-    """Записывать настройки в файл, как только порт их принял.
+    """Записывать в файл настроек то, что порт велел записать, — и только это.
 
-    Слушается `settings_applied` — эхо порта, а не сигнал окна: в файл обязано
-    попасть то, что **принято**, а не то, что нажато. Отвергнутые настройки
-    порт эхом не отдаёт.
+    Слушается `settings_to_file`, а не эхо `settings_applied`. Эхо уходит
+    на каждое изменение, в том числе сделанное программой самой: ответ биржи
+    о шаге цены и стоимости пункта, открытие окна настроек. Пока запись шла
+    по эху, карточка биржи без единого нажатия меняла в файле владельца
+    счёта `price_step`, `ruble_per_point_source` и дописывала ключи, которых
+    в нём не было (находка аудитов 05.10.2026, обещание `B-050`: файл
+    пишется только по действию человека). Порт шлёт сигнал на «ОК» и
+    «Применить» человека и при переходе с истёкшего контракта — больше ни
+    на что.
 
-    Здесь же порту сообщается новая глубина показа: она живёт в настройках
-    программы, а не в настройках движка (`D-026`), и без этой строки менялась
-    бы только до перезапуска. Прогон следом порт заводит сам.
+    На эхо здесь сообщается порту только новая глубина показа: она живёт
+    в настройках программы, а не в настройках движка (`D-026`). Прогон
+    следом порт заводит сам.
+
+    `only` — какие поля взять из присланных (пусто — все); `over` — пары
+    «поле, чем оно обязано быть в файле»: запись поверх другого значения
+    не делается и говорится вслух. Так переход с истёкшего кода не пишет
+    в файл инструмент, названный ключом `--symbol`, поверх файла владельца.
 
     ⚠️ Отказ записи не бросается, а становится строкой журнала. Слот Qt,
     из которого летит исключение, оставляет владельца счёта с трассировкой
     в консоли и молчащим окном.
+
+    ⚠️ Пишется только **изменение**: `read` — то, что прочитано из файла,
+    дальше — то, что записано последним.
     """
-    def remember(values: Settings) -> None:
+    kept = [read]
+
+    def follow(values: Settings) -> None:
         port.set_depth(values.depth_days)
-        failure = store.save(values)
+
+    def remember(
+        values: Settings, only: tuple[str, ...], over: tuple[tuple[str, object], ...]
+    ) -> None:
+        if any(getattr(kept[0], name) != value for name, value in over):
+            port.note(
+                "Настройки не сохранены",
+                "Программа сменила настройку сама, но в файле настроек стоит не то "
+                "значение, поверх которого она это сделала (так бывает, когда "
+                "инструмент назван ключом при запуске): в файле "
+                + ", ".join(f"{getattr(kept[0], name)}, а не {value}" for name, value in over)
+                + ". Файл оставлен как есть, смена действует до закрытия программы.",
+            )
+            return
+        if only:
+            wanted = dataclasses.replace(
+                kept[0], **{name: getattr(values, name) for name in only}
+            )
+        else:
+            wanted = port.for_file(values)
+        if wanted == kept[0]:
+            return
+        # Без человека — только названные поля и только они: подмены при
+        # чтении и ключи, которых в файле не было, остаются как есть.
+        failure = store.patch(wanted, only) if only else store.save(wanted)
         if failure:
             port.note("Настройки не сохранены", failure, level)
+            return
+        kept[0] = wanted
+        if only:
+            # Запись без «ОК» человека — вслух и в обе стороны: об отказе
+            # строкой выше, об успехе здесь. Строка о переходе с истёкшего
+            # контракта результат записи не обещает (`HistoryPort._switch_to_current`).
+            port.note("Настройки записаны в файл", store.patched(wanted, only))
 
-    port.settings_applied.connect(remember)
+    port.settings_applied.connect(follow)
+    port.settings_to_file.connect(remember)
 
 
 def _say_what_was_read(
@@ -756,8 +1133,16 @@ def _say_what_was_read(
     настройка, вернувшаяся к умолчанию, меняет сделки, а владелец счёта
     об этом не узнает никак иначе.
     """
+    # Строка про требование алгоритма, которое порт при запуске снял снова
+    # (предельная цена без шага, З8), — вторая правда рядом с его строкой
+    # «сейчас идёт „по рынку“». Говорит порт; здесь молчат об этом поле.
+    overridden = {
+        text for field, text in loaded.demanded
+        if field in port.startup_substituted
+    }
     for trouble in loaded.troubles:
-        port.note("Настройки прочитаны не полностью", trouble, level)
+        if trouble not in overridden:
+            port.note("Настройки прочитаны не полностью", trouble, level)
     for note in loaded.notes:
         port.note("Настройки прочитаны", note)
     if not loaded.troubles and not loaded.notes:
@@ -859,27 +1244,120 @@ def _unreadable(database: pathlib.Path, error: Exception) -> str:
     )
 
 
-async def _snapshot(application, window, port, target: pathlib.Path) -> int:
-    """Сохранить вид окна в файл. Работает на машине без экрана."""
+async def _snapshot(
+    application: QApplication, window: MainWindow, port: HistoryPort, shot: _Shot
+) -> int:
+    """Сохранить вид окна в файл. Работает на машине без экрана.
+
+    ⚠️ `_Shot.what` снимает не только главное окно, и заведён он по цене дефекта.
+    Пустой список алгоритмов и указание «выберите один из списка», выбирать
+    в котором было не из чего, дожили до владельца счёта 09.09.2026 потому,
+    что проверялись снимками из `tools/demo.py`, **где каталог подаётся
+    диалогу прямо в конструктор**. Настоящая дорога — порт, сигнал, окно —
+    снимком не проверялась ни разу. Правило 12 `CLAUDE.md`: проверка идёт
+    тем путём, которым пойдёт человек.
+    """
     await port.wait()
     # Прогон рассылает сигналы; окну надо дать их разобрать и разложить
     # виджеты, иначе снимок получится с недорисованным графиком.
+    #
+    # ⚠️ `application.processEvents()` здесь не зовётся — `D-072`. Цикл
+    # asyncio под qasync и есть цикл Qt (`QApplication.exec()`,
+    # `qasync.QEventLoop.run_forever`): каждый `await` уже отдаёт ему
+    # управление, и виджеты раскладываются без ручной прокрутки очереди.
+    # Прямой вызов открывал бы **вложенный** цикл Qt изнутри шага корутины —
+    # ту же мину, что и `B-026`: соседняя задача, которой Qt даёт слово
+    # из вложенного цикла, получает `RuntimeError: Cannot enter into task…`,
+    # потому что эта корутина в этот момент сама числится текущей задачей.
+    # Замер, что мина настоящая: `asyncio.ensure_future` соседа рядом
+    # с `QTimer.singleShot(0, ...)`, открывающим вложенный `QEventLoop`
+    # во время снимка, ронял соседа ровно так, с `processEvents()`
+    # на месте, и переставал ронять без него.
     for _ in range(3):
-        application.processEvents()
         await asyncio.sleep(0)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    shot.target.parent.mkdir(parents=True, exist_ok=True)
+    picture = window.grab() if shot.what == "window" else _shot_of_dialog(
+        application, window, shot.what, tab=shot.tab
+    )
+    if picture is None:
+        print(
+            f"не удалось снять окно «{shot.what}»: программа его не открыла. "
+            "Если это окно выбора алгоритма — вероятнее всего кнопка выбора "
+            "выключена, потому что каталог алгоритмов до окна не доехал",
+            file=sys.stderr,
+        )
+        return 1
     # Результат `save()` обязателен к проверке: он возвращает False молча —
     # например, когда по расширению не удалось понять формат. Отчёт,
     # сообщающий «сохранено» там, где файла нет, хуже отсутствующего.
-    if not window.grab().save(str(target)):
+    if not picture.save(str(shot.target)):
         print(
-            f"не удалось сохранить снимок в {target}. Проверьте расширение "
+            f"не удалось сохранить снимок в {shot.target}. Проверьте расширение "
             "файла (.png) и права на каталог",
             file=sys.stderr,
         )
         return 1
-    print(f"снимок сохранён: {target.resolve()}")
+    print(f"снимок сохранён: {shot.target.resolve()}")
     return 0
+
+
+def _shot_of_dialog(
+    application: QApplication, window: MainWindow, what: str, *, tab: str = ""
+) -> QPixmap | None:
+    """Снимок окна, которое программа открывает **сама**, а не мы за неё.
+
+    Ни один диалог здесь не строится. Открывается настоящее окно настроек
+    (`MainWindow.open_settings`), а окно выбора — **щелчком по той самой
+    кнопке**, которую жмёт человек. Поэтому снимок доказывает и то, что
+    каталог доехал, и то, что кнопка не выключена: выключенная `click()`
+    не срабатывает вовсе (`QAbstractButton::click` выходит на неактивной
+    кнопке), окно не откроется, и снимка не будет — отказом, а не пустой
+    картинкой.
+
+    Возврат `None` означает «окно не открылось», и молчать об этом нельзя:
+    файл, сохранённый с главным окном вместо запрошенного, — это ровно тот
+    подложный снимок, из-за которого дефект и дожил до владельца счёта.
+
+    ⚠️ Работа идёт таймерами, потому что `exec()` крутит **свой** цикл
+    событий: изнутри него до нас управление не вернётся, и снять окно можно
+    только тем, что исполнится в этом же цикле.
+    """
+    from PySide6.QtCore import QTimer  # noqa: PLC0415 — слои Qt после QT_API
+
+    from ui.settings_dialog import SettingsDialog  # noqa: PLC0415 — то же
+
+    taken: list[QPixmap] = []
+
+    def take_the_topmost() -> None:
+        """Снять самое верхнее модальное окно и закрыть его."""
+        top = application.activeModalWidget()
+        if top is None:
+            return
+        taken.append(top.grab())
+        top.close()
+
+    def inside_the_settings() -> None:
+        """Мы внутри цикла окна настроек: снять его либо пойти глубже.
+
+        ⚠️ Проверка типа — не про подписи. Наверху могло оказаться не то
+        окно (предупреждение, подтверждение), и снимок такого под именем
+        «настройки» был бы подлогом того же рода, что и снимок из демонстрации.
+        """
+        dialog = application.activeModalWidget()
+        if not isinstance(dialog, SettingsDialog):
+            return
+        if tab and (page := dialog.page_of(tab)) is not None:
+            dialog.tabs.setCurrentWidget(page)
+        if what == "algorithm":
+            QTimer.singleShot(_SHOT_PAUSE_MS, take_the_topmost)
+            dialog.algorithm_button.click()
+        else:
+            taken.append(dialog.grab())
+        dialog.close()
+
+    QTimer.singleShot(_SHOT_PAUSE_MS, inside_the_settings)
+    window.open_settings()
+    return taken[0] if taken else None
 
 
 def _on_interrupt(closed: asyncio.Event) -> None:

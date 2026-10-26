@@ -65,7 +65,7 @@ case "$FILE_PATH" in
 
     # ── Слои продукта ────────────────────────────────────────────────────────
     *strategies/*|*engine/*)
-        msg="📝 Тронута торговая логика. Проверь .docs/PROTOTYPE.md и .docs/DOMAIN.md §3, запусти /parity." ;;
+        msg="📝 Тронута торговая логика. Проверь .docs/PROTOTYPE.md и .docs/DOMAIN.md §3, прогони tests/test_golden_deals.py." ;;
     *broker/*)
         msg="📝 Тронут слой брокера. Проверь .docs/DOMAIN.md §6-7, запусти /risk." ;;
     *market/*)

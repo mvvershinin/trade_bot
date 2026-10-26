@@ -26,15 +26,15 @@ import json
 import logging
 import pathlib
 import textwrap
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Final, cast
 
 import pytest
 
-from app import live_feed
+from app import backfill, live_feed
 from app.live_feed import LiveFeed, LiveLink, MinuteTally, Watchers, tally_after, to_minute
 from app.main import _arguments, _live_feed
 from broker.account import AccountSnapshot, Money
@@ -47,15 +47,30 @@ from broker.errors import (
     NotFound,
     ServerFailure,
     TokenFileError,
+    TokenRefused,
     WrongAddress,
 )
 from broker.margin import MarginPerContract, MarginSource
 from broker.redaction import FOREIGN_LOGGERS, MASK, RedactingFilter, RedactingSink
 from broker.schedule import DailySchedule, Schedule, SessionKind, TradingStatus
-from broker.session import ADDRESS_SENSITIVE, TRADING_STATUS_PATH, BrokerSession
+from broker.session import (
+    ADDRESS_SENSITIVE,
+    CANDLES_PATH,
+    DAILY_SCHEDULE_PATH,
+    TRADING_STATUS_PATH,
+    BrokerSession,
+)
 from broker.stream import CandleSnapshot, StreamRejected
-from market import MSK, Candle, CandleStore, MarketWorker, Source, WriteStats
-from market.iss import Market
+from market import (
+    MSK,
+    Candle,
+    CandleStore,
+    LoadReport,
+    MarketWorker,
+    Source,
+    WriteStats,
+)
+from market.iss import FetchResult, IssClient, Market
 from market.point import PointValue
 from ui.models import Connection, DecisionLevel, Settings
 
@@ -368,6 +383,21 @@ class FakeWorker:
         self.asked_point_value: list[str] = []
         #: Что отвечать на карточку: тикер → ответ биржи.
         self.point_values: dict[str, PointValue] = {}
+        #: Записанные минуты: тикер → время → свеча. Догрузка читает окно
+        #: отсюда (`minutes`, `minute_times`), и только из него строит план.
+        self._stored: dict[str, dict[datetime, Candle]] = {}
+        #: Дни, отмеченные «у источника спрашивали»: тикер → дни (`D-017`).
+        self.marked_days: dict[str, set[date]] = {}
+        #: Отчёты о загрузке, по порядку. Догрузка пишет отчёт последним
+        #: шагом — непустой список значит, что она дошла до конца, а не упала.
+        self.load_reports: list[LoadReport] = []
+        #: Обращения к бирже за минутками. Сети у дублёра нет: ответ пустой.
+        self.asked_exchange: list[tuple[str, date, date]] = []
+
+    def _require_open(self) -> None:
+        """Отказ оригинала, когда базы нет: до `open()` и после `close()`."""
+        if not self._open:
+            raise RuntimeError("поток данных не запущен: сначала `await worker.open()`")
 
     @property
     def opened(self) -> bool:
@@ -389,11 +419,79 @@ class FakeWorker:
     async def put_minutes(
         self, symbol: str, candles: Iterable[Candle], source: Source
     ) -> WriteStats:
-        if not self._open:
-            raise RuntimeError("поток данных не запущен: сначала `await worker.open()`")
+        self._require_open()
         batch = list(candles)
         self.written.append((symbol, batch, source))
+        kept = self._stored.setdefault(symbol, {})
+        kept.update((candle.time, candle) for candle in batch)
         return WriteStats(inserted=len(batch))
+
+    async def minutes(
+        self,
+        symbol: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[Candle]:
+        """Записанные минуты в полуинтервале `[since, until)`, как у оригинала."""
+        self._require_open()
+        return [self._stored[symbol][moment] for moment in self._times(symbol, since, until)]
+
+    async def minute_times(
+        self,
+        symbol: str,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[datetime]:
+        """Только времена — тот же полуинтервал, что у `minutes`."""
+        self._require_open()
+        return self._times(symbol, since, until)
+
+    def _times(
+        self, symbol: str, since: datetime | None, until: datetime | None
+    ) -> list[datetime]:
+        return sorted(
+            moment
+            for moment in self._stored.get(symbol, {})
+            if (since is None or moment >= since) and (until is None or moment < until)
+        )
+
+    async def settled_days(self, symbol: str) -> set[date]:
+        """Отмеченные дни. Все отмеченные: дублёр не ведёт календарь закрытия."""
+        self._require_open()
+        return set(self.marked_days.get(symbol, set()))
+
+    async def mark_days_requested(
+        self,
+        symbol: str,
+        days: Iterable[date],
+        *,
+        counts: dict[date, int] | None = None,
+        now: datetime,
+    ) -> None:
+        self._require_open()
+        self.marked_days.setdefault(symbol, set()).update(days)
+
+    async def write_load_report(
+        self, report: LoadReport, *, now: datetime | None = None
+    ) -> int:
+        """Отчёт в журнал. Номер записи — порядковый, с единицы, как у базы."""
+        self._require_open()
+        self.load_reports.append(report)
+        return len(self.load_reports)
+
+    async def fetch_minutes(
+        self,
+        symbol: str,
+        *,
+        market: Market,
+        since: date,
+        until: date,
+        client: IssClient | None = None,
+    ) -> FetchResult:
+        """Биржа без сети: пустой ответ. Оригинал тоже требует открытой базы."""
+        self._require_open()
+        self.asked_exchange.append((symbol, since, until))
+        return FetchResult()
 
     async def point_value(
         self,
@@ -417,16 +515,23 @@ class FakeWorker:
 
 
 def _worker_calls() -> set[str]:
-    """Что живой поток просит у потока данных — разбором `app/live_feed.py`.
+    """Что живой поток и его догрузка просят у потока данных — разбором кода.
 
     Разбор, а не поиск по подстроке: имя берётся из выражения `self._worker.X`
     целиком, поэтому ни слово в комментарии, ни своё поле `_worker` в списке
     не окажутся.
+
+    ⚠️ Модулей два, а не один (`D-017`). Догрузку пропущенного звено строит
+    само (`LiveLink._backfiller`) и отдаёт ей **тот же** поток данных. Разбор
+    одного `app/live_feed.py` не видел, что догрузка просит `minutes`,
+    `minute_times`, `settled_days` и ещё четыре метода: дублёр их не умел,
+    догрузка падала `AttributeError` внутри своей задачи строкой в лог,
+    а прогон оставался зелёным.
     """
-    tree = ast.parse(inspect.getsource(live_feed))
     return {
         node.attr
-        for node in ast.walk(tree)
+        for module in (live_feed, backfill)
+        for node in ast.walk(ast.parse(inspect.getsource(module)))
         if isinstance(node, ast.Attribute)
         and isinstance(node.value, ast.Attribute)
         and node.value.attr == "_worker"
@@ -819,7 +924,7 @@ def test_the_link_hands_a_growing_minute_to_the_port_without_a_run(
     зелёной, а свечу — снова замершей.
     """
     monkeypatch.setattr(live_feed, "BrokerSession", lambda store: SimpleNamespace(
-        stored=lambda: SimpleNamespace(permissions_were_loose=False),
+        stored=lambda: SimpleNamespace(permissions_were_loose=False, scope_notice=None),
     ))
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
     port: Any = FakePort()
@@ -962,6 +1067,35 @@ def test_a_refusal_that_a_retry_cannot_fix_takes_the_stream_down(monkeypatch) ->
     assert heard.warnings()[0] == "Инструмент не найден у брокера"
     assert "повтор здесь не поможет" in heard.warnings()[1]
     assert "«Подключиться»" in heard.warnings()[1]
+
+
+def test_a_token_the_broker_refused_takes_the_stream_down_without_a_retry_loop(
+    monkeypatch,
+) -> None:
+    """Стережёт `B-062`: на `invalid_grant` поток не переподключается по кругу.
+
+    Отказ снимает поток с первого раза, в журнал окна — «Брокер не принял
+    токен», а не «ошибка программы»; повтор — только кнопкой.
+    """
+    heard, worker = Heard(), FakeWorker()
+    refusal = TokenRefused("Token is not active", "авторизация: HTTP 400, код invalid_grant")
+    stream = FakeStream(refusal)
+    feed = feed_of(monkeypatch, stream, worker, heard)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(lambda: Connection.OFFLINE in heard.connections, "поток снят")
+            await asyncio.sleep(0.02)  # повтору дать шанс случиться
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+    assert len(stream.requests) == 1, "на отвергнутом токене поток переподключался"
+    assert heard.connections == [Connection.RECONNECTING, Connection.OFFLINE]
+    said = heard.warnings()[0]
+    assert said.startswith("Брокер не принял токен: токен не действует"), said
+    assert "ошибка программы" not in said
 
 
 @pytest.mark.parametrize(
@@ -1216,6 +1350,8 @@ class FakePort:
         #: Остановки робота, пришедшие от звена. Настоящий порт кладёт причину
         #: в `_Halt` — туда же, куда ложится остановка движка (`HistoryPort.halt`).
         self.halts: list[tuple[str, str]] = []
+        #: Границы полноты, подтверждённые догрузкой (`HistoryPort.history_confirmed`).
+        self.confirmed: list[tuple[str, datetime]] = []
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))
@@ -1228,6 +1364,11 @@ class FakePort:
 
     def refresh(self, why: str = "") -> None:
         self.refreshed.append(why)
+
+    def history_confirmed(self, symbol: str, until: datetime) -> bool:
+        """Догрузка подтвердила полноту по `until`. Граница у дублёра не ведётся."""
+        self.confirmed.append((symbol, until))
+        return False
 
     def live_candle(self, symbol: str) -> None:
         self.drawn.append(symbol)
@@ -1334,13 +1475,16 @@ def test_switching_on_again_reuses_the_session_and_restarts_the_stream(
     sessions: list[Any] = []
     built: list[LiveFeed] = []
 
-    class FakeSession:
+    class FakeSession(ScheduleDesk):
+        """Расписание — по документации брокера (`ScheduleDesk`, `D-116`)."""
+
         def __init__(self, store: object) -> None:
+            super().__init__()
             sessions.append(self)
             self.closed = 0
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             self.closed += 1
@@ -1385,6 +1529,283 @@ def test_switching_on_again_reuses_the_session_and_restarts_the_stream(
     assert sessions[0].closed == 1
     # RECONNECTING, ONLINE, OFFLINE, RECONNECTING, ONLINE — и ни одного повтора.
     assert port.restated == 5
+    schedule_was_asked()
+
+
+class ScheduleDesk:
+    """Сессия-дублёр отвечает на расписание торгов так, как брокер (`D-116`).
+
+    До 28.09.2026 у дублёров сессии в тестах звена `read` не было вовсе:
+    `broker/schedule.py` падал `AttributeError`, звено писало в лог
+    «расписание торгов не спрошено» и шло дальше как без расписания, а тесты
+    оставались зелёными. Проверялось звено, у которого расписание сломано.
+
+    Поля — по документации брокера (`.docs/broker-api/06-trading-status.md`,
+    `05-daily-schedule.md`): статус `tradingSessionTypeId`,
+    `tradingSessionType`, `tradingSessionStatus` (`OPEN`/`CLOSE`),
+    `nextSessionDate` с поясом; расписание дня `isWorkDay` и `dailySchedule`
+    из `startDate`, `endDate`, `tradingSessionType`, `tradingSessionStatus`.
+    Сайт брокера 28.09.2026 не сверен: обращение к нему из разработки
+    закрыто предохранителем боевого режима.
+
+    Торги идут (`OPEN`): звено подключается, как подключалось бы без
+    расписания, — остальное поведение теста не меняется. Любой другой адрес —
+    отказ вслух: молча отвечающий дублёр спрятал бы новое обращение сессии.
+
+    Каждый дублёр записывается в `ScheduleDesk.made`; сторож
+    `schedule_is_really_asked` после теста требует, чтобы каждый был
+    спрошен о статусе торгов.
+    """
+
+    #: Дублёры, построенные текущим тестом. Опустошает сторож.
+    made: list[ScheduleDesk] = []
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+        ScheduleDesk.made.append(self)
+
+    def allow_token_retry(self) -> None:
+        """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
+
+    def answers(self, path: str) -> bool:
+        return path in (TRADING_STATUS_PATH, DAILY_SCHEDULE_PATH)
+
+    async def read(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        params: Mapping[str, str] | None = None,
+        json: object = None,
+    ) -> dict[str, object]:
+        self.asked.append(path)
+        if path == TRADING_STATUS_PATH:
+            later = datetime.now(UTC) + timedelta(hours=1)
+            return {
+                "tradingSessionTypeId": 1,
+                "tradingSessionType": "Торговый период",
+                "tradingSessionStatus": "OPEN",
+                "nextSessionDate": later.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            }
+        if path == DAILY_SCHEDULE_PATH:
+            return {
+                "isWorkDay": True,
+                "dailySchedule": [
+                    {"startDate": "09:00:00", "endDate": "23:50:00",
+                     "tradingSessionType": "Торговый период",
+                     "tradingSessionStatus": "OPEN"},
+                ],
+            }
+        raise RuntimeError(f"дублёр сессии отвечает только на расписание, а спросили {path}")
+
+
+#: Тесты, ломающие расписание **нарочно**: подставной `hours` падает
+#: `RuntimeError`, и проверяется именно реакция звена на эту беду.
+SCHEDULE_BROKEN_ON_PURPOSE: Final[tuple[str, ...]] = (
+    "test_an_unknown_schedule_behaves_exactly_as_it_did_before",
+    "test_a_schedule_that_breaks_says_it_is_our_own_defect",
+)
+
+
+@pytest.fixture(autouse=True)
+def schedule_is_really_asked(
+    request: pytest.FixtureRequest, caplog: pytest.LogCaptureFixture
+) -> Iterator[None]:
+    """Сторож `D-116`: расписание в тестах звена не упало — ни в одном тесте.
+
+    Строка «расписание торгов не спрошено» в логе значит, что дублёр
+    не умеет того, что спрашивает `broker/schedule.py` (было: `AttributeError`
+    у восьми тестов, и все зелёные). Вторая половина — что расписание
+    вообще спрошено — у тестов, доходящих до подключения:
+    `schedule_was_asked`. Здесь её нет: часть тестов снимает звено раньше
+    первого захода, и спрашивать там нечего.
+    """
+    ScheduleDesk.made.clear()
+    yield
+    ScheduleDesk.made.clear()
+    if request.node.originalname in SCHEDULE_BROKEN_ON_PURPOSE:
+        return
+    # `get_records("call")`, а не `records`: здесь уже разбор после теста,
+    # и `records` отдал бы пустой список этой стадии — сторож молчал бы всегда.
+    broken = [
+        record for record in caplog.get_records("call")
+        if record.getMessage().startswith("расписание торгов не спрошено")
+    ]
+    assert not broken, (
+        f"звено не смогло спросить расписание — дублёр сессии не отвечает "
+        f"тому, что спрашивает `broker/schedule.py`: {broken[0].exc_info!r}"
+    )
+
+
+def schedule_was_asked() -> None:
+    """Каждый дублёр сессии этого теста спрошен о статусе торгов (`D-116`).
+
+    Зовётся в конце теста, дошедшего до подключения. Без неё сторож
+    `schedule_is_really_asked` зеленел бы и на звене, переставшем спрашивать
+    расписание вовсе: нет вопроса — нет и упавшего вопроса в логе.
+    """
+    assert ScheduleDesk.made, "дублёр сессии с расписанием в тесте не построен"
+    for desk in ScheduleDesk.made:
+        assert TRADING_STATUS_PATH in desk.asked, (
+            f"звено подключалось, а статус торгов у сессии не спросило: {desk.asked}"
+        )
+
+
+class CandleTape:
+    """Брокер, отвечающий на запрос исторических свечей, — для догрузки (`D-017`).
+
+    Имена полей ответа и параметров запроса — из документации брокера,
+    страница «Исторические свечи» (`.docs/broker-api/07-historical-candles.md`,
+    снимок сайта 04.09.2026): вверху `ticker`, `classCode`, `startDate`,
+    `endDate`, `timeFrame` и список `bars`; в баре `time`, `open`, `high`,
+    `low`, `close`, `volume`. `volume` у брокера — оборот в рублях, а не
+    контракты: поэтому здесь цена, умноженная на число контрактов.
+
+    Отдаются бары из ленты, попавшие в `[startDate, endDate]` запроса, — ровно
+    как сервер, а не «всё, что есть»: иначе дублёр прощал бы неверный период.
+    Любой другой адрес — отказ вслух, а не пустой ответ: дублёр, молча
+    отвечающий на всё, спрятал бы новое обращение сессии.
+    """
+
+    def __init__(self, bars: Iterable[tuple[datetime, float, float]]) -> None:
+        #: Лента: момент открытия → (цена, контракты).
+        self.bars = {moment.astimezone(UTC): (price, lots) for moment, price, lots in bars}
+        self.asked: list[dict[str, str]] = []
+
+    async def read(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        params: Mapping[str, str] | None = None,
+        json: object = None,
+    ) -> dict[str, object]:
+        if path != CANDLES_PATH:
+            raise RuntimeError(f"дублёр сессии отвечает только на свечи, а спросили {path}")
+        query = dict(params or {})
+        self.asked.append(query)
+        start = datetime.fromisoformat(query["startDate"].replace("Z", "+00:00"))
+        end = datetime.fromisoformat(query["endDate"].replace("Z", "+00:00"))
+        return {
+            "ticker": query["ticker"],
+            "classCode": query["classCode"],
+            "startDate": query["startDate"],
+            "endDate": query["endDate"],
+            "timeFrame": query["timeFrame"],
+            "bars": [
+                {
+                    "time": moment.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                    "open": price,
+                    "close": price,
+                    "high": price,
+                    "low": price,
+                    "volume": price * lots,
+                }
+                for moment, (price, lots) in sorted(self.bars.items())
+                if start <= moment <= end
+            ],
+        }
+
+
+def test_the_link_backfill_reaches_the_load_report_instead_of_the_log(
+    tmp_path: pathlib.Path, monkeypatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Догрузка, запущенная звеном, доходит до отчёта о загрузке, а не падает в лог.
+
+    `D-017`: дублёр потока данных не умел `minutes`, и в тестах живого потока
+    догрузка падала `AttributeError` внутри своей задачи. Падение уходило
+    строкой в лог, прогон оставался зелёным, а тесты, где догрузка должна
+    была отработать, проверяли поведение при её падении.
+
+    Здесь в базе три минуты, за ними дыра в три минуты до первой минуты потока.
+    Брокер отдаёт все шесть; записаться обязаны ровно три пустые, с источником
+    «история брокера», и заход обязан кончиться отчётом о загрузке.
+    """
+    before = [MINUTE_A - timedelta(minutes=back) for back in (6, 5, 4)]
+    hole = [MINUTE_A - timedelta(minutes=back) for back in (3, 2, 1)]
+    tape = CandleTape((moment, 100.0, 2.0) for moment in (*before, *hole))
+
+    class FakeSession:
+        def __init__(self, store: object) -> None:
+            self.clock = ClockWatch()
+            #: Расписание торгов — по документации брокера (`D-116`).
+            self.desk = ScheduleDesk()
+
+        async def read(
+            self,
+            path: str,
+            *,
+            method: str = "GET",
+            params: Mapping[str, str] | None = None,
+            json: object = None,
+        ) -> dict[str, object]:
+            # Свечи — лента, общая с проверками теста; расписание — дублёр.
+            answer = self.desk if self.desk.answers(path) else tape
+            return await answer.read(path, method=method, params=params, json=json)
+
+        def stored(self) -> SimpleNamespace:
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
+
+        async def close(self) -> None:
+            pass
+
+        def allow_token_retry(self) -> None:
+            """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
+
+    monkeypatch.setattr(live_feed, "BrokerSession", FakeSession)
+    monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
+    monkeypatch.setattr(
+        live_feed,
+        "candle_stream",
+        FakeStream(FakeSocket([wire(snapshot(MINUTE_A, close=100.0, turnover=100.0))])),
+    )
+    monkeypatch.setattr(live_feed, "RETRY_FIRST", 0.0)
+    port: Any = FakePort()
+    worker = FakeWorker()
+    link = link_of(port, worker, tmp_path / "userdata")
+    seeded = [
+        Candle(
+            time=moment.astimezone(MSK), open=100.0, high=100.0, low=100.0, close=100.0, volume=2.0
+        )
+        for moment in before
+    ]
+
+    async def scenario() -> None:
+        await worker.open()
+        await worker.put_minutes("MXU6", seeded, Source.ISS)
+        assert link.switch(True) is None
+        # Ждётся либо отчёт, либо падение в лог: упавшая догрузка должна
+        # называть причину сразу, а не таймаутом через три секунды (`B-001`).
+        await settle(
+            lambda: bool(worker.load_reports)
+            or any(record.name == "app.backfill" for record in caplog.records),
+            "отчёт догрузки о загрузке",
+        )
+        await link.aclose()
+        await worker.close()
+
+    with caplog.at_level(logging.ERROR, logger="app.backfill"):
+        asyncio.run(scenario())
+
+    failed = [
+        f"{record.getMessage()}: {record.exc_info[1]!r}" if record.exc_info else record.getMessage()
+        for record in caplog.records
+        if record.name == "app.backfill"
+    ]
+    assert failed == [], f"догрузка упала в лог вместо работы: {failed}"
+    assert tape.asked, "догрузка не спросила брокера о свечах"
+    filled = [
+        candle.time
+        for _, batch, source in worker.written
+        if source is Source.BROKER_HISTORY
+        for candle in batch
+    ]
+    assert filled == [moment.astimezone(MSK) for moment in hole], (
+        f"записаны не пустые минуты дыры: {filled}"
+    )
+    [report] = worker.load_reports
+    assert report.inserted == len(hole)
+    schedule_was_asked()
 
 
 def test_the_feed_names_the_first_minute_of_every_session_exactly_once(
@@ -1423,6 +1844,49 @@ def test_the_feed_names_the_first_minute_of_every_session_exactly_once(
     ], f"объявлены не те минуты: {heard.leading}"
 
 
+@pytest.mark.parametrize(
+    ("ticker", "timeframe"),
+    [
+        pytest.param("MXU6", "M5", id="m5-in-m1-channel"),
+        pytest.param("SiU6", "M1", id="foreign-ticker"),
+    ],
+)
+def test_the_first_minute_of_a_session_is_set_by_our_own_snapshot(
+    monkeypatch, ticker: str, timeframe: str
+) -> None:
+    """Границу догрузки задаёт первый **свой** снимок захода, а не первый пришедший (`D-023`).
+
+    Чужой снимок раньше своего сдвинул бы границу левее настоящей, и минуты
+    между ними не догрузились бы никогда.
+    """
+    heard = Heard()
+    stream = FakeStream(
+        FakeSocket(
+            [
+                wire(dataclasses.replace(
+                    snapshot(MINUTE_A, close=100.0, turnover=100.0),
+                    ticker=ticker, timeframe=timeframe,
+                )),
+                wire(snapshot(MINUTE_C, close=100.0, turnover=100.0)),
+            ]
+        )
+    )
+    feed = feed_of(monkeypatch, stream, FakeWorker(), heard)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(lambda: len(heard.growing) == 1, "свой снимок принят")
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+
+    assert heard.leading == [MINUTE_C.astimezone(MSK)], (
+        f"граница догрузки поставлена не по своему снимку: {heard.leading}"
+    )
+
+
 def test_the_link_starts_the_backfill_on_every_connection(
     tmp_path: pathlib.Path, monkeypatch
 ) -> None:
@@ -1446,12 +1910,14 @@ def test_the_link_starts_the_backfill_on_every_connection(
         async def aclose(self) -> None:
             closed.append("догрузка")
 
-    class FakeSession:
+    class FakeSession(ScheduleDesk):
+        """Расписание — по документации брокера (`ScheduleDesk`, `D-116`)."""
+
         def __init__(self, store: object) -> None:
-            pass
+            super().__init__()
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             closed.append("сессия")
@@ -1496,6 +1962,7 @@ def test_the_link_starts_the_backfill_on_every_connection(
         "ту же сессию, поэтому снимается первой, а сессия закрывается последней. "
         f"Получено {closed}"
     )
+    schedule_was_asked()
 
 
 def test_repeated_failed_presses_build_one_session(tmp_path: pathlib.Path, monkeypatch) -> None:
@@ -1511,9 +1978,13 @@ def test_repeated_failed_presses_build_one_session(tmp_path: pathlib.Path, monke
         def __init__(self, store: object) -> None:
             sessions.append(self)
             self.closed = 0
+            self.retries = 0
 
         def stored(self) -> SimpleNamespace:
             raise no_token()
+
+        def allow_token_retry(self) -> None:
+            self.retries += 1
 
         async def close(self) -> None:
             self.closed += 1
@@ -1525,6 +1996,9 @@ def test_repeated_failed_presses_build_one_session(tmp_path: pathlib.Path, monke
     answers = [link.switch(True), link.switch(True), link.switch(True)]
     assert answers == ["Токен брокера ещё не введён."] * 3
     assert len(sessions) == 1, "на каждое нажатие построена новая сессия"
+    # `B-062`: нажатие — единственное, что снимает запомненный отказ токена.
+    # Первое нажатие сессию только строит; второе и третье снимают отказ.
+    assert sessions[0].retries == 2, "нажатие «Подключиться» не сняло отказ токена"
     asyncio.run(link.aclose())
     assert sessions[0].closed == 1
 
@@ -1537,7 +2011,10 @@ def test_loose_token_file_permissions_are_reported_to_the_journal(
             self.store = store
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=True)
+            return SimpleNamespace(permissions_were_loose=True, scope_notice=None)
+
+        def allow_token_retry(self) -> None:
+            """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
         async def close(self) -> None:
             return None
@@ -1555,6 +2032,65 @@ def test_loose_token_file_permissions_are_reported_to_the_journal(
     asyncio.run(scenario())
     warnings = [(event, level) for event, _, level in port.notes if "токеном" in event]
     assert warnings == [("Права файла с токеном", DecisionLevel.WARNING)]
+
+
+def test_token_type_mismatch_is_told_to_the_owner(tmp_path: pathlib.Path, monkeypatch) -> None:
+    """Стережёт правило 13: тип в файле расходится с токеном — строка в журнал решений.
+
+    `StoredToken` настоящий, прочитан `TokenStore` из файла: токен — JWT с
+    `azp=trade-api-read`, в поле файла «торговля». Подменена только сессия,
+    чтобы к брокеру ничего не ушло. Мутация «убрать `port.note` о типе» роняет тест.
+    """
+    import base64
+
+    def segment(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    token = ".".join(
+        (segment(b'{"alg":"HS512"}'), segment(b'{"azp":"trade-api-read"}'), "FAKEsig")
+    )
+    directory = tmp_path / "token" / "userdata"
+    directory.mkdir(parents=True)
+    path = directory / "broker-token.json"
+    path.write_text(
+        json.dumps(
+            {"version": 1, "token": token, "scope": "trade-api-write",
+             "issued": "2026-10-04T10:00:00+00:00", "account": None}
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    stored = live_feed.TokenStore(directory).load()
+
+    class MismatchSession:
+        def __init__(self, store: object) -> None:
+            self.store = store
+
+        def stored(self) -> object:
+            return stored
+
+        def allow_token_retry(self) -> None:
+            """Дублёру снимать нечего."""
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(live_feed, "BrokerSession", MismatchSession)
+    monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
+    monkeypatch.setattr(live_feed, "candle_stream", FakeStream())
+    port: Any = FakePort()
+    link = link_of(port, FakeWorker(), tmp_path / "userdata")
+
+    async def scenario() -> None:
+        assert link.switch(True) is None
+        await link.aclose()
+
+    asyncio.run(scenario())
+    told = [(text, level) for event, text, level in port.notes if event == "Тип токена"]
+    assert len(told) == 1, port.notes
+    text, level = told[0]
+    assert level is DecisionLevel.WARNING
+    assert "«только для чтения»" in text and "«для торговли и чтения данных»" in text
 
 
 # ====================================================== сборка: `_live_feed`
@@ -1692,7 +2228,7 @@ def test_a_closed_minute_asks_for_a_drawing_not_for_a_whole_run(
     проверку зелёной, а поток — без перерисовки вовсе.
     """
     monkeypatch.setattr(live_feed, "BrokerSession", lambda store: SimpleNamespace(
-        stored=lambda: SimpleNamespace(permissions_were_loose=False),
+        stored=lambda: SimpleNamespace(permissions_were_loose=False, scope_notice=None),
     ))
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
     port: Any = FakePort()
@@ -1781,17 +2317,23 @@ def quiet_session(monkeypatch) -> None:
     ⚠️ `close` именно ожидаемый. Заглушка с обычным `close` роняла звено
     на `aclose` — «object NoneType can't be used in await», — и падение
     выглядело бы дефектом правки, а не дублёра.
+
+    Расписание торгов отвечает по документации брокера (`ScheduleDesk`,
+    `D-116`): без `read` звено шло дальше с упавшим расписанием.
     """
 
-    class Session:
+    class Session(ScheduleDesk):
         def __init__(self, store: object) -> None:
-            pass
+            super().__init__()
 
         def stored(self) -> SimpleNamespace:
-            return SimpleNamespace(permissions_were_loose=False)
+            return SimpleNamespace(permissions_were_loose=False, scope_notice=None)
 
         async def close(self) -> None:
             pass
+
+        def allow_token_retry(self) -> None:
+            """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
     monkeypatch.setattr(live_feed, "BrokerSession", Session)
 
@@ -2468,7 +3010,7 @@ def test_the_link_hands_the_feed_the_real_trading_schedule(
             super().follow(hours)
 
     monkeypatch.setattr(live_feed, "BrokerSession", lambda store: SimpleNamespace(
-        stored=lambda: SimpleNamespace(permissions_were_loose=False),
+        stored=lambda: SimpleNamespace(permissions_were_loose=False, scope_notice=None),
     ))
     monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
     monkeypatch.setattr(live_feed, "LiveFeed", WatchedFeed)
@@ -2669,6 +3211,161 @@ def test_the_pause_between_attempts_starts_over_after_the_exchange_opens(
     )
 
 
+def recorded_pauses(monkeypatch) -> list[float]:
+    """Подменить `asyncio.sleep` потока записью: паузы настоящей длины, но не ожидаются.
+
+    Возвращается список, куда пишутся все просьбы подождать. Паузы повторов —
+    от десятых секунды и больше; опрос `settle` — тысячные, отсеиваются по длине.
+    """
+    slept: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def remember(seconds: float) -> None:
+        slept.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(live_feed.asyncio, "sleep", remember)
+    return slept
+
+
+def ticking_clock(monkeypatch, step: float) -> None:
+    """Подменить `monotonic` потока: каждое обращение сдвигает время на `step` секунд.
+
+    Поток спрашивает часы дважды за удачный заход: на первом снимке и при
+    обрыве. `step` 0 — заход не прожил ни секунды; `step`, равный потолку, —
+    прожил ровно потолок.
+    """
+    now = [1000.0]
+
+    def tick() -> float:
+        now[0] += step
+        return now[0]
+
+    monkeypatch.setattr(live_feed, "monotonic", tick)
+
+
+def test_a_snapshot_then_an_immediate_drop_keeps_growing_the_pause(monkeypatch) -> None:
+    """Снимок и сразу обрыв, раз за разом, — пауза растёт до потолка (`D-025`).
+
+    Стережётся поведение: заход, отдавший снимок и тут же оборванный,
+    паузу **не** сбрасывает. Так рвёт брокер при второй сессии на том же
+    токене; со сбросом на первом снимке повтор шёл каждые 0,5 с без
+    нарастания, и каждый заход звал догрузку истории у брокера.
+
+    Числа написаны руками: 0,5 → 1 → 2 → 4 → 4. Со сбросом было бы пять раз 0,5.
+    """
+    heard, worker = Heard(), FakeWorker()
+    brief = [
+        FakeSocket([wire(snapshot(MINUTE_A, close=100.0, turnover=100.0))], then_close=True)
+        for _ in range(5)
+    ]
+    stream = FakeStream(
+        *brief, FakeSocket([wire(snapshot(MINUTE_B, close=100.0, turnover=100.0))])
+    )
+    feed = feed_of(monkeypatch, stream, worker, heard)
+    monkeypatch.setattr(live_feed, "RETRY_FIRST", 0.5)
+    monkeypatch.setattr(live_feed, "RETRY_CAP", 4.0)
+    ticking_clock(monkeypatch, step=0.0)
+    slept = recorded_pauses(monkeypatch)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(
+                lambda: heard.connections.count(Connection.ONLINE) == 6, "шестой заход"
+            )
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+    pauses = [seconds for seconds in slept if seconds >= 0.1]
+    assert pauses == [0.5, 1.0, 2.0, 4.0, 4.0], (
+        f"короткий заход со снимком сбросил паузу повторов: {pauses}"
+    )
+
+
+def test_the_pause_starts_over_after_an_entry_that_lived_the_cap(monkeypatch) -> None:
+    """Заход, проживший не меньше потолка паузы, начинает её заново (`D-025`).
+
+    Стережётся поведение: после долгого захода следующий обрыв ждёт
+    **первую** паузу, а не удвоенную накопленную. Иначе шесть обрывов
+    за день выводили её на потолок навсегда до перезапуска потока.
+    Заход живёт **ровно** потолок: граница входит в сброс.
+
+    Сценарий: обрыв → обрыв (пауза выросла) → заход со снимком, прожил 4 с,
+    брокер закрыл сокет → обрыв → заход. Паузы: 0,5; 1; **0,5**; 1.
+    Без сброса третья была бы 2, четвёртая 4.
+    """
+    heard, worker = Heard(), FakeWorker()
+    boom = NoConnection("поток свечей: OSError: reset — подделка")
+    stream = FakeStream(
+        boom,
+        boom,
+        FakeSocket(
+            [wire(snapshot(MINUTE_A, close=100.0, turnover=100.0))], then_close=True
+        ),
+        boom,
+        FakeSocket([wire(snapshot(MINUTE_B, close=100.0, turnover=100.0))]),
+    )
+    feed = feed_of(monkeypatch, stream, worker, heard)
+    monkeypatch.setattr(live_feed, "RETRY_FIRST", 0.5)
+    monkeypatch.setattr(live_feed, "RETRY_CAP", 4.0)
+    ticking_clock(monkeypatch, step=4.0)
+    slept = recorded_pauses(monkeypatch)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(
+                lambda: heard.connections.count(Connection.ONLINE) == 2, "второй удачный заход"
+            )
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+    pauses = [seconds for seconds in slept if seconds >= 0.1]
+    assert pauses == [0.5, 1.0, 0.5, 1.0], (
+        f"после долгого захода пауза повторов не начата заново: {pauses}"
+    )
+
+
+def test_the_pause_between_attempts_stops_growing_at_the_cap(monkeypatch) -> None:
+    """Пауза повторов растёт вдвое до минуты и дальше не растёт (`D-064`).
+
+    Стережётся поведение: седьмой обрыв подряд ждёт столько же, сколько
+    шестой, — 60 секунд, а не 64 и не 128. Без потолка пауза за час обрывов
+    дорастала бы до часов, и связь не вернулась бы и после возврата интернета.
+
+    Числа написаны здесь руками, а не взяты из `RETRY_FIRST` и `RETRY_CAP`:
+    проверка из величин проверяемого правила зеленела бы вместе с ним.
+    Константы модуля при этом **не подменяются** — стережётся настоящий потолок.
+    """
+    first, cap = live_feed.RETRY_FIRST, live_feed.RETRY_CAP
+    heard, worker = Heard(), FakeWorker()
+    boom = NoConnection("поток свечей: OSError: reset — подделка")
+    stream = FakeStream(
+        *([boom] * 7), FakeSocket([wire(snapshot(MINUTE_A, close=100.0, turnover=100.0))])
+    )
+    feed = feed_of(monkeypatch, stream, worker, heard)
+    # `feed_of` обнуляет обе константы ради быстрых сценариев — здесь вернуть настоящие.
+    monkeypatch.setattr(live_feed, "RETRY_FIRST", first)
+    monkeypatch.setattr(live_feed, "RETRY_CAP", cap)
+    slept = recorded_pauses(monkeypatch)
+
+    async def scenario() -> None:
+        feed.start()
+        try:
+            await settle(lambda: Connection.ONLINE in heard.connections, "связь после обрывов")
+        finally:
+            await feed.aclose()
+
+    asyncio.run(scenario())
+    pauses = [seconds for seconds in slept if seconds >= 0.1]
+    assert pauses == [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0], (
+        f"пауза повторов не упирается в потолок в минуту: {pauses}"
+    )
+
+
 # ============================================ смена инструмента (`B-020`)
 
 
@@ -2823,6 +3520,7 @@ def test_retargeting_before_the_first_connection_only_moves_the_ticker(
     assert stream.requests == [("SiU6", "SPBFUT")], (
         f"подписка ушла на прежний инструмент: {stream.requests}"
     )
+    schedule_was_asked()
 
 
 def test_the_first_minute_of_a_session_reaches_the_port_as_well_as_the_backfill(
@@ -2868,6 +3566,7 @@ def test_the_first_minute_of_a_session_reaches_the_port_as_well_as_the_backfill(
         f"порт не узнал минуту первого снимка: {port.leads}"
     )
     assert started == [MINUTE_A.astimezone(MSK)]
+    schedule_was_asked()
 
 
 def test_the_assembly_wires_both_the_switch_and_the_retarget(
@@ -3557,6 +4256,7 @@ def test_the_link_polls_the_account_from_the_moment_the_stream_is_online(
     # `ONLINE`, обязан быть снят. Снятие несуществующей задачи ничего не стоит.
     assert log.index("start") < len(log) - 1, f"после запуска опрос не снят: {log}"
     assert log[log.index("start") + 1] == "stop", log
+    schedule_was_asked()
 
 
 def test_a_broken_link_stops_the_account_poll_without_any_button(
@@ -3590,6 +4290,7 @@ def test_a_broken_link_stops_the_account_poll_without_any_button(
         await link.aclose()
 
     asyncio.run(scenario())
+    schedule_was_asked()
 
 
 def test_the_account_poll_is_queued_before_the_backfill(
@@ -3635,6 +4336,7 @@ def test_the_account_poll_is_queued_before_the_backfill(
 
     asyncio.run(scenario())
     assert order == ["счёт", "догрузка"], order
+    schedule_was_asked()
 
 
 def test_changing_the_instrument_moves_the_account_poll_too(
@@ -3696,6 +4398,7 @@ def test_without_a_receiver_the_link_never_asks_about_the_account(
 
     asyncio.run(scenario())
     assert "счёт" not in built, "портфель спросили без боевой сборки"
+    schedule_was_asked()
 
 
 async def _noop_aclose() -> None:

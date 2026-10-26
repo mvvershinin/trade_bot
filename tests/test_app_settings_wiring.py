@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import pathlib
 from datetime import datetime, timedelta
@@ -27,8 +28,24 @@ from app import convert
 from app.main import _keep_settings, _stored_settings
 from app.port import HistoryPort
 from app.settings_store import SettingsStore
-from market import MSK, Candle, CandleStore, MarketWorker, Source, Timeframe, redact
-from ui.models import DecisionRow, Mode, Settings
+from market import (
+    MSK,
+    Candle,
+    CandleStore,
+    MarketWorker,
+    PointValue,
+    Source,
+    Timeframe,
+    redact,
+)
+from tests.exchange_card import exchange
+from ui.models import AfterTakeProfit, DecisionRow, Mode, Settings, TimeExitKind
+
+#: Инструмент синтетической истории — тот, что стоит в окне по умолчанию.
+#: Порт читает базу по инструменту настроек, а умолчание сменяется вместе
+#: с текущим контрактом (MXU6 → MXZ6 17.09.2026): символ, записанный
+#: буквой, отвязал бы свечи в базе от умолчания и опустошил график.
+SYMBOL = Settings().instrument
 
 DAY = datetime(2026, 6, 19, 7, 0, tzinfo=MSK)
 
@@ -54,8 +71,8 @@ def _minutes(count: int, start: datetime) -> list[Candle]:
 def database(tmp_path: pathlib.Path) -> pathlib.Path:
     path = tmp_path / "candles.sqlite3"
     with CandleStore(path) as store:
-        store.put_minutes("MXU6", _minutes(300, DAY - timedelta(days=2)), Source.ISS)
-        store.put_minutes("MXU6", _minutes(300, DAY), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY - timedelta(days=2)), Source.ISS)
+        store.put_minutes(SYMBOL, _minutes(300, DAY), Source.ISS)
     return path
 
 
@@ -67,6 +84,11 @@ def _replay(loop, database: pathlib.Path, values: Settings, **kwargs):
         worker = MarketWorker(database)
         await worker.open()
         port = HistoryPort(worker, values=values, sanitize=redact, **kwargs)
+        if values.price_step > 0:
+            # Шаг цены порт берёт только у биржи (05.10.2026): подставная
+            # карточка с шагом из настроек проверки, рубль в пункте — как
+            # у умолчания, чтобы деньги отличались только шагом.
+            port.attach_exchange(exchange(values.price_step))
         port.trades_replaced.connect(lambda rows, summary: seen.append((rows, summary)))
         try:
             port.refresh("тест")
@@ -233,49 +255,45 @@ def test_closing_at_the_window_end_comes_from_the_window() -> None:
     previous = convert.engine_settings(Settings(), Mode.REVERSE)
     assert previous.close_on_time_end is True, "умолчание изменилось без замера"
 
+    # Галочка действует только при выходе «по рынку»: предельная цена сама
+    # значит «закрывать всегда» (`test_owner_file_without_step.py::
+    # test_an_old_unticked_window_close_still_closes_before_and_after_the_card`).
+    market = Settings(time_exit_order=TimeExitKind.MARKET)
     off = convert.engine_settings(
-        Settings(close_on_time_end=False), Mode.REVERSE, previous
+        market.replace(close_on_time_end=False), Mode.REVERSE, previous
     )
     assert off.close_on_time_end is False, (
         "снятая галочка не доехала до движка: выход по времени остался включён"
     )
-    back = convert.engine_settings(Settings(), Mode.REVERSE, off)
+    back = convert.engine_settings(market, Mode.REVERSE, off)
     assert back.close_on_time_end is True, (
         "поставленная галочка не доехала: значение тащится из прежних настроек"
     )
 
 
-def test_the_saw_filter_is_not_reset_by_applying_settings() -> None:
-    """Включённый фильтр против пилы переживает применение настроек (`D-029`).
-
-    ⚠️ `filter_enabled=True` здесь обязателен и не является поблажкой тесту:
-    05.09.2026 у фильтра появился выключатель, и при снятой галочке
-    до модуля доходят его умолчания. Без галочки этот тест проверял бы
-    ровно обратное тому, ради чего написан.
-    """
-    values = Settings(filter_enabled=True, threshold_percent=0.4, confirm_bars=3)
-    module = convert.strategy_settings(values)
-    assert module.threshold_percent == pytest.approx(0.4), (
-        "порог фильтра сброшен в «выключено» при переводе настроек"
-    )
-    assert module.confirm_bars == 3, "подтверждение сброшено в «выключено»"
-
-
 def test_a_new_field_of_the_strategy_cannot_be_forgotten() -> None:
-    """Поле торгового модуля, не названное в таблице, — отказ вслух.
+    """Поле торгового алгоритма, не названное в таблице, — отказ вслух.
 
     Проверка на механизм, а не на сегодняшний список полей: пустой список
     расхождений и есть утверждение «таблица полна».
+
+    ⚠️ Таблица переехала из `app/convert.py` в запись реестра
+    (`StrategyEntry.fields`) — сборка больше не знает, какие поля бывают
+    у алгоритма. Проверка от этого стала сильнее, а не слабее: она идёт
+    **по всем** записям реестра, то есть второй алгоритм получает её даром.
     """
-    import dataclasses
+    from strategies import registry
 
-    from strategies import EmaReverseSettings
-
-    known = {field.name for field in dataclasses.fields(EmaReverseSettings)}
-    assert known == set(convert._STRATEGY_FIELDS), (  # noqa: SLF001 — проверяется
-        # именно внутренняя таблица: она и есть то, что забывают пополнить
-        "таблица перевода настроек торгового модуля разошлась с самим модулем"
-    )
+    for entry in registry.entries():
+        assert entry.settings_gap() == (), (
+            f"у алгоритма «{entry.title}» есть настройки, которых таблица "
+            f"полей не называет: {entry.settings_gap()}. Они молча получили "
+            "бы умолчания вместо выбранного в окне"
+        )
+        assert entry.stray_fields() == (), (
+            f"таблица полей алгоритма «{entry.title}» называет настройки, "
+            f"которых у него нет: {entry.stray_fields()}"
+        )
 
 
 def test_a_new_field_of_the_engine_cannot_be_forgotten() -> None:
@@ -311,9 +329,9 @@ def test_applied_settings_reach_the_file(loop, database, tmp_path) -> None:
         worker = MarketWorker(database)
         await worker.open()
         port = HistoryPort(worker, values=Settings(), days=0, sanitize=redact)
-        _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
+        _keep_settings(port, store, Settings(), level=convert.DecisionLevel.WARNING)
         try:
-            port.apply_settings(Settings(instrument="MXU6", volume=3, depth_days=12))
+            port.apply_settings(Settings(instrument=SYMBOL, volume=3, depth_days=12))
             await port.wait()
         finally:
             await port.aclose()
@@ -335,7 +353,7 @@ def test_a_depth_change_reaches_the_port_without_a_restart(loop, database, tmp_p
         await worker.open()
         port = HistoryPort(worker, values=Settings(depth_days=0), days=0, sanitize=redact)
         port.trades_replaced.connect(lambda rows, total: seen.append((rows, total)))
-        _keep_settings(port, store, level=convert.DecisionLevel.WARNING)
+        _keep_settings(port, store, Settings(depth_days=0), level=convert.DecisionLevel.WARNING)
         try:
             port.refresh("тест")
             await port.wait()
@@ -377,7 +395,7 @@ def test_the_log_directory_from_the_settings_is_used(loop, database, tmp_path) -
         port = HistoryPort(worker, values=values, days=0, sanitize=redact)
         try:
             _wire_settings_and_log(
-                port, store, store.load(), values,
+                port, store, store.load(), values, database.parent,
                 level=convert.DecisionLevel.WARNING,
             )
             logging.getLogger("terminal").warning("проверочная строка")
@@ -410,7 +428,7 @@ def test_the_journal_says_where_the_log_goes(loop, database, tmp_path) -> None:
         port.decision_appended.connect(said.append)
         try:
             _wire_settings_and_log(
-                port, store, store.load(), values,
+                port, store, store.load(), values, database.parent,
                 level=convert.DecisionLevel.WARNING,
             )
         finally:
@@ -455,11 +473,18 @@ def test_the_new_window_fields_have_a_journal_line() -> None:
         depth_days=30, price_step=25.0, slippage_steps=1.0,
         log_directory="/tmp/логи",
     )
-    lines = convert.window_changes(before, after)
+    # ⚠️ С Ф3 задачи З8 шаг цены — поле движка, и строку о нём пишет
+    # движок; поэтому собирается всё, что видит журнал, а не только окно.
+    lines, refused = convert.all_changes(before, after)
+    assert not refused, refused
     joined = " | ".join(lines)
     for word in ("Глубина показа", "Шаг цены", "Проскальзывание", "Каталог"):
         assert word in joined, f"про «{word}» в журнале не сказано: {joined}"
-    assert joined.count("→") == 4, f"строк меньше, чем изменений: {joined}"
+    # Пятая строка — от движка: с шагом цены выход по концу окна становится
+    # «с предельной ценой» (умолчание с 05.10.2026, решение 0063); без шага
+    # движок получает «по рынку».
+    assert joined.count("→") == 5, f"строк меньше, чем изменений: {joined}"
+    assert "Выход по концу окна" in joined, joined
     assert "вся история" not in joined, "ноль дней подписан не тем словом"
 
 
@@ -470,16 +495,197 @@ def test_an_unchanged_pair_gives_no_lines() -> None:
     assert convert.guard_changes(values, values) == []
 
 
-def test_the_guards_are_reported_apart_from_the_rest() -> None:
-    """Три поля предохранителей идут отдельной строкой уровня «предупреждение».
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): полей предохранителей в окне нет, и отделять от прочих нечего.
+# def test_the_guards_are_reported_apart_from_the_rest() -> None:
+#     """Три поля предохранителей идут отдельной строкой уровня «предупреждение».
+#
+#     Тихое «принято» читалось бы как «ограничение поставлено», а за ними
+#     сегодня не стоит ничего.
+#     """
+#     before = Settings()
+#     after = before.replace(volume_cap=7, daily_loss_limit_pct=5.0)
+#     assert convert.window_changes(before, after) == [], (
+#         "предохранители попали в обычную строку и потеряли предупреждение"
+#     )
+#     guards = convert.guard_changes(before, after)
+#     assert len(guards) == 2 and all("→" in line for line in guards)
 
-    Тихое «принято» читалось бы как «ограничение поставлено», а за ними
-    сегодня не стоит ничего.
+
+def test_ignored_userdata_variable_is_said_in_the_journal(
+    loop, database, tmp_path, monkeypatch
+) -> None:
+    """`TERMINAL_USERDATA` вне тестового прогона не действует — и это строка журнала.
+
+    Ревью 27.09.2026, находка 9: молча проигнорированная переменная —
+    человек ищет базу и остановку робота в папке, которой программа не видит.
     """
-    before = Settings()
-    after = before.replace(volume_cap=7, daily_loss_limit_pct=5.0)
-    assert convert.window_changes(before, after) == [], (
-        "предохранители попали в обычную строку и потеряли предупреждение"
+    from app.main import _announce
+    from market.paths import TEST_RUN_ENV, USERDATA_ENV
+
+    monkeypatch.setenv(USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(TEST_RUN_ENV, raising=False)
+    values = Settings(log_directory=str(tmp_path / "логи"))
+    said: list[DecisionRow] = []
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        port.decision_appended.connect(said.append)
+        try:
+            _announce(port, database, level=convert.DecisionLevel.WARNING)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+
+    about = [row for row in said if row.event == "Папка данных"]
+    assert about, "проигнорированная переменная папки данных в журнале не названа"
+    assert USERDATA_ENV in about[0].reason
+
+
+def test_ignored_userdata_line_names_the_database_given_by_the_key(
+    loop, database, tmp_path, monkeypatch
+) -> None:
+    """Стережёт `D-124` в окне: база названа ключом — строка называет её, не папку.
+
+    При `--database FILE` и выставленной `TERMINAL_USERDATA` журнал писал
+    «база, журналы и остановка робота берутся из <папка по умолчанию>» —
+    неправда ровно там, где человек ищет свои данные.
+
+    Мутация: `ignored_override()` без базы в `_announce` —
+    в строке снова папка по умолчанию, пути базы нет.
+    """
+    from app.main import _announce
+    from market.paths import TEST_RUN_ENV, USERDATA_ENV
+
+    monkeypatch.setenv(USERDATA_ENV, str(tmp_path / "чужая"))
+    monkeypatch.delenv(TEST_RUN_ENV, raising=False)
+    values = Settings(log_directory=str(tmp_path / "логи"))
+    said: list[DecisionRow] = []
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=values, days=0, sanitize=redact)
+        port.decision_appended.connect(said.append)
+        try:
+            _announce(port, database, level=convert.DecisionLevel.WARNING)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+
+    (about,) = [row for row in said if row.event == "Папка данных"]
+    assert str(database) in about.reason, f"база из ключа не названа: {about.reason}"
+    assert "берутся из" not in about.reason, f"названа папка по умолчанию: {about.reason}"
+
+
+# ------------------------------------------- подмена при сборке — не в файл
+
+def _file_settings(store: SettingsStore) -> dict[str, object]:
+    body: dict[str, dict[str, object]] = json.loads(store.path.read_text(encoding="utf-8"))
+    return body["settings"]
+
+
+def _start_with_restore(loop, database, tmp_path, work) -> SettingsStore:
+    """Файл с вариантом, которого движок не принимает; порт собран по нему, как в `main`.
+
+    Биржа — заглушкой: на вопрос о стоимости пункта отвечает новым числом.
+    Это та запись в файл, которую делает сама программа, без человека
+    (`HistoryPort._point_taken`), — ею файл и переписывался при запуске.
+    """
+    store = SettingsStore(tmp_path / "userdata")
+    assert not store.save(
+        Settings(instrument=SYMBOL, after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
     )
-    guards = convert.guard_changes(before, after)
-    assert len(guards) == 2 and all("→" in line for line in guards)
+    loaded = store.load()
+    assert loaded.values.after_take_profit is AfterTakeProfit.RESTORE_AT_ONCE
+
+    async def ask(symbol: str) -> PointValue:
+        return PointValue(symbol=symbol, rubles=7.5, told="биржей — заглушка проверки")
+
+    async def go():
+        worker = MarketWorker(database)
+        await worker.open()
+        port = HistoryPort(worker, values=loaded.values, days=0, sanitize=redact)
+        _keep_settings(port, store, loaded.values, level=convert.DecisionLevel.WARNING)
+        port.attach_exchange(ask)
+        try:
+            port.refresh("тест")
+            await port.wait()
+            point = port._point.task  # noqa: SLF001 — задача запроса наружу не отдаётся
+            assert point is not None, "порт не спросил биржу о стоимости пункта — проверка вакуумна"
+            await point
+            await port.wait()
+            await work(port)
+        finally:
+            await port.aclose()
+            await worker.close()
+
+    loop.run_until_complete(go())
+    return store
+
+
+def test_the_startup_substitution_does_not_rewrite_the_owners_file(
+    loop, database, tmp_path
+) -> None:
+    """`B-050`: ни подмена при запуске, ни ответ биржи файл владельца не трогают.
+
+    Сторожит: запуск с `after_take_profit = restore`, биржа ответила новой
+    стоимостью пункта, «Применить» никто не нажимал — байты файла те же.
+    Канарейка — ответ биржи **в памяти**: без неё равенство байтов
+    зеленело бы и тогда, когда ответа не было вовсе.
+
+    Мутации, которые тест ловит: `_keep_settings` снова пишет по эху
+    `settings_applied`; порт шлёт `settings_to_file` и при `by_person=False`.
+    """
+    seen: dict[str, float] = {}
+
+    async def remember(port: HistoryPort) -> None:
+        seen["rubles"] = port.values.ruble_per_point
+
+    path = tmp_path / "userdata" / "settings.json"
+    store = _start_with_restore(loop, database, tmp_path, remember)
+    assert store.path == path
+    before = SettingsStore(tmp_path / "before")
+    assert not before.save(
+        Settings(instrument=SYMBOL, after_take_profit=AfterTakeProfit.RESTORE_AT_ONCE)
+    )
+
+    assert seen["rubles"] == 7.5, "ответ биржи не дошёл до настроек в памяти — проверка вакуумна"
+    assert store.path.read_bytes() == before.path.read_bytes(), (
+        "файл владельца счёта переписан без «ОК»: "
+        f"{_file_settings(store)}"
+    )
+
+
+def test_opening_the_settings_window_does_not_write_the_substitution(
+    loop, database, tmp_path
+) -> None:
+    """Открытие окна настроек (`request_settings`) — тоже не «Применить»."""
+
+    async def open_window(port: HistoryPort) -> None:
+        port.request_settings()
+
+    store = _start_with_restore(loop, database, tmp_path, open_window)
+
+    assert _file_settings(store)["after_take_profit"] == "restore"
+
+
+def test_the_persons_apply_writes_what_the_window_shows(loop, database, tmp_path) -> None:
+    """Обратная сторона: «Применить» человека — его выбор, и он в файл попадает.
+
+    Мутация, которую тест ловит: подмена не отпускается по «Применить» —
+    файл навсегда остался бы с вариантом, которого робот не умеет.
+    """
+
+    async def apply(port: HistoryPort) -> None:
+        port.apply_settings(port._values)  # noqa: SLF001 — то, что окно показывает
+        await port.wait()
+
+    store = _start_with_restore(loop, database, tmp_path, apply)
+
+    assert _file_settings(store)["after_take_profit"] == "stop"

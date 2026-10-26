@@ -3,7 +3,6 @@
 Запуск из корня рабочей копии:
 
     .venv/bin/python tools/build.py            # обычная сборка
-    .venv/bin/python tools/build.py --with-web # плюс QtWebEngine (веб-график)
     .venv/bin/python tools/build.py --dry-run  # только показать команду
 
 Что здесь намеренно НЕ делается
@@ -18,12 +17,12 @@
 
 QtWebEngine
 -----------
-Веб-график (`ui/chart/web_surface.py`) отключён, пока в `ui/chart/vendor/`
-нет файла библиотеки: `is_available()` отвечает отказом и фабрика берёт
-отрисовку на Qt. Но `QWebEngineView` импортируется в теле `__init__`,
-а Nuitka разбирает импорты и внутри функций — без явного запрета он утянет
-QtWebEngine целиком. Отсюда `--noinclude-...` ниже и ключ `--with-web`
-на тот день, когда файл библиотеки появится.
+Из программы удалён 09.09.2026 вместе с веб-графиком (решение 0056), и ключа
+`--with-web` больше нет. Имена его модулей остались в `QT_UNUSED` ниже —
+не как след, а по той же причине, что и остальные сорок: PySide6 везёт весь Qt,
+и всё, чего программа не импортирует, надо назвать вслух, иначе Nuitka положит
+его в поставку. Цена этих четырёх строк измерена: `QtWebEngineCore` тянет
+за собой 298 МБ (`.docs/packaging/build-recon-2026-09-05-1624.md` §2.3).
 
 Linux
 -----
@@ -85,8 +84,9 @@ NAME = "Terminal"
 APP_VERSION = os.environ.get("TERMINAL_VERSION", "0.1.0")
 
 #: Модули Qt, которых в программе нет. Замер импортов по дереву 05.09.2026:
-#: используются только QtWidgets, QtCore, QtGui (и QtWebEngineWidgets —
-#: отдельным ключом). Всё остальное — вес без применения.
+#: используются только QtWidgets, QtCore, QtGui. Всё остальное — вес
+#: без применения. С 09.09.2026 сюда безусловно входит и семейство WebEngine:
+#: исключений из этого списка больше нет ни при каких ключах.
 QT_UNUSED = (
     "PySide6.QtQuick", "PySide6.QtQuick3D", "PySide6.QtQml", "PySide6.QtCharts",
     "PySide6.QtDataVisualization", "PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets",
@@ -121,26 +121,27 @@ LAZY_PACKAGES = ("websockets",)
 DEV_ONLY = ("pytest", "_pytest", "mypy", "ruff", "nuitka", "setuptools", "pip", "tkinter")
 
 
-def command(*, with_web: bool, jobs: int) -> list[str]:
+def command(*, jobs: int) -> list[str]:
     """Полная команда сборки. Собрана здесь, чтобы её можно было прочитать."""
-    unused = [m for m in QT_UNUSED if not (with_web and "WebEngine" in m)]
-    if with_web:
-        unused = [m for m in unused if m != "PySide6.QtWebChannel"]
     argv = [
         sys.executable, "-m", "nuitka",
         "--standalone",                    # НЕ --onefile, решение 0001
         "--enable-plugin=pyside6",
         "--assume-yes-for-downloads",
-        # ⚠️ Без этого ключа сборка ПАДАЕТ ПРИ СТАРТЕ, а не собирается плохо.
-        # `ui/chart/web_surface.is_available()` спрашивает у системы импорта,
-        # есть ли QtWebEngine: `importlib.util.find_spec(...)`. В обычном
-        # Python отсутствующий модуль — это `None`, и фабрика графика мирно
-        # берёт отрисовку на Qt. У Nuitka на исключённый модуль тот же вызов
-        # ПОДНИМАЕТ ImportError («actively excluded from Nuitka compilation»),
-        # исключение проходит сквозь `create_surface` (там обёрнуто создание
-        # отрисовщика, но не опрос доступности) и уносит главное окно.
-        # Замер 05.09.2026: с ключом `find_spec` отвечает `None`, без ключа —
-        # трассировка на `ui/chart/factory.py:42` и пустой экран.
+        # ⚠️ Ключ снимает предохранитель Nuitka: обращение к исключённому
+        # модулю (`find_spec`, `import` в try/except) у неё по умолчанию
+        # ПОДНИМАЕТ ImportError «actively excluded from Nuitka compilation»
+        # вместо обычного `None`/`ModuleNotFoundError`, и такое исключение
+        # уносит главное окно. Замер 05.09.2026: без ключа программа падала
+        # на `ui/chart/factory.py` пустым экраном — веб-график спрашивал
+        # у системы импорта, есть ли QtWebEngine.
+        #
+        # Тот вызов ушёл 09.09.2026 вместе с веб-графиком, и известного
+        # потребителя у ключа сегодня нет. Ключ **оставлен**: он ничего
+        # не добавляет в поставку и ничего не весит, а снимать его —
+        # значит менять поведение собранной программы при исключённом
+        # модуле, и проверяется это только настоящей сборкой с запуском,
+        # а не прогоном тестов. Отдельной задачей, с замером (`D-104`).
         "--no-deployment-flag=excluded-module-usage",
         f"--output-dir={OUT}",
         f"--output-filename={NAME}",
@@ -153,7 +154,7 @@ def command(*, with_web: bool, jobs: int) -> list[str]:
         "--remove-output",
     ]
     argv += [f"--include-package={name}" for name in LAZY_PACKAGES]
-    argv += [f"--nofollow-import-to={name}" for name in (*unused, *DEV_ONLY)]
+    argv += [f"--nofollow-import-to={name}" for name in (*QT_UNUSED, *DEV_ONLY)]
     if platform.system() == "Windows":
         argv += _windows_flags()
     # Ключ ставится, только если папка есть: Nuitka на несуществующий каталог
@@ -162,8 +163,6 @@ def command(*, with_web: bool, jobs: int) -> list[str]:
     # молчание: `tests/test_ui_templates.py`.
     if (ROOT / EXAMPLES).is_dir():
         argv.append(f"--include-data-dir={EXAMPLES}={EXAMPLES}")
-    if with_web:
-        argv.append("--include-data-dir=ui/chart/vendor=ui/chart/vendor")
     argv.append(str(ENTRY.relative_to(ROOT)))
     return argv
 
@@ -249,8 +248,6 @@ def _environment(tool: str | None) -> dict[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Портативная сборка «Терминала»")
-    parser.add_argument("--with-web", action="store_true",
-                        help="включить QtWebEngine: нужен файл библиотеки в ui/chart/vendor/")
     parser.add_argument("--jobs", type=int, default=4,
                         help="потоков компиляции C (по умолчанию 4)")
     parser.add_argument("--dry-run", action="store_true", help="показать команду и выйти")
@@ -261,9 +258,6 @@ def main() -> int:
         print("patchelf не найден: Nuitka откажется собирать standalone. "
               "Поставить в окружение: pip install patchelf==0.19.1.0", file=sys.stderr)
         return 2
-    if args.with_web and not (ROOT / "ui" / "chart" / "vendor").is_dir():
-        print("нет ui/chart/vendor/ — включать QtWebEngine не за чем", file=sys.stderr)
-        return 2
     if not (ROOT / EXAMPLES).is_dir():
         # Предупреждение, а не отказ: без примеров программа работает.
         # Но собрать поставку, где кнопка «взять из примеров» показывает
@@ -271,7 +265,7 @@ def main() -> int:
         print(f"⚠️ нет папки {EXAMPLES}/ — примеры наборов настроек в поставку "
               "не попадут", file=sys.stderr)
 
-    argv = command(with_web=args.with_web, jobs=args.jobs)
+    argv = command(jobs=args.jobs)
     print(" ".join(argv), flush=True)
     if args.dry_run:
         return 0

@@ -19,27 +19,36 @@ from datetime import date, datetime, time, timedelta
 
 import pytest
 
-from engine import EngineSettings, ExitReason, Fill, JournalEntry, JournalLevel, OrderAction
+from app import convert
+from backtest import Deal, HistoryRun, Pair, Plan, Summary
+from engine import (
+    DayMarks,
+    EngineSettings,
+    ExitReason,
+    Fill,
+    JournalEntry,
+    JournalLevel,
+    OrderAction,
+    TradingWindow,
+)
 from engine import Mode as EngineMode
 from engine import Side as EngineSide
-from engine import DayMarks, TradingWindow
 from engine import window as engine_window
-from market import Candle, MSK, Timeframe
+from market import MSK, Candle, Timeframe
 from strategies import AverageKind as StrategyAverageKind
+from strategies import registry
 from ui.models import (
     AfterTakeProfit,
     AverageKind,
     DecisionLevel,
     Layer,
+    Marker,
+    MarkerKind,
     Mode,
-    OnPriceEqualsAverage,
     ReversalMoment,
     Settings,
     Side,
 )
-
-from app import convert
-from backtest import Deal, HistoryRun, Pair, Plan, Summary
 
 
 def candle(hour: int, minute: int, minutes: int = 5) -> Candle:
@@ -168,7 +177,8 @@ def test_the_markers_of_a_trade_stand_on_the_candles_of_the_chart() -> None:
         at=fill_at, order_id="open:long:тест",
     )
     markers, _ = convert.markers_and_paths(
-        HistoryRun(), (Pair("open:long:тест", plan, fill),), frozenset(), frame
+        HistoryRun(), (Pair("open:long:тест", plan, fill),), frozenset(), frame,
+        pending=convert.Unfilled.WAITING,
     )
     plan_marker = next(m for m in markers if m.layer is Layer.PLAN)
     fact_marker = next(m for m in markers if m.layer is Layer.FACT)
@@ -214,7 +224,8 @@ def test_the_trade_paths_of_both_layers_are_drawn_on_the_axis_of_the_candles() -
         )),
     )
     _, paths = convert.markers_and_paths(
-        HistoryRun(deals=(deal,)), plans, frozenset(), frame
+        HistoryRun(deals=(deal,)), plans, frozenset(), frame,
+        pending=convert.Unfilled.WAITING,
     )
     fact = next(p for p in paths if p.layer is Layer.FACT)
     assert fact.entry_time == datetime(2026, 6, 19, 10, 10, tzinfo=MSK)
@@ -232,6 +243,158 @@ def test_the_trade_paths_of_both_layers_are_drawn_on_the_axis_of_the_candles() -
     assert fact.entry_time - plan_path.entry_time == frame.delta, (
         "расчётная линия и линия факта совпали по времени входа — наложение "
         "слоёв перестало показывать задержку исполнения"
+    )
+
+
+# ------------------------------------------------ заявка ждёт открытия свечи
+#
+# Просьба владельца счёта 12.10.2026: решение «вход в лонг» на закрытии
+# свечи 09:55 до 10:00 стояло с ⊗ «сигнал пропущен», хотя заявка была
+# подана и исполнилась по открытию следующей свечи. Он решил, что заявки
+# не было. Решение 0065: план без исполнения, чья заявка ещё ждёт
+# (`HistoryRun.waiting`), — «заявка подана»; у остановленного робота ждущих
+# нет, его заявка уже не исполнится.
+
+_PENDING = "open:long:ждёт"
+
+
+def _waiting_plan_marker(
+    run: HistoryRun, *, pending: convert.Unfilled = convert.Unfilled.WAITING
+) -> Marker:
+    """Метка слоя «прогноз» решения на последней свече, исполнения ещё нет.
+
+    `pending` — что про ждущие заявки сказал порт (`app.port._pending_of`);
+    умолчание — порт ничему не мешает, живой ход.
+    """
+    plan = Plan(
+        order_id=_PENDING, decided_at=datetime(2026, 6, 19, 10, 0, tzinfo=MSK),
+        price=100.0, side=EngineSide.LONG, action=OrderAction.OPEN,
+    )
+    markers, _ = convert.markers_and_paths(
+        run, (Pair(_PENDING, plan),), frozenset(), Timeframe(5), pending=pending,
+    )
+    (marker,) = markers
+    assert marker.layer is Layer.PLAN
+    return marker
+
+
+@pytest.mark.parametrize(
+    ("run", "expected"),
+    [
+        (HistoryRun(waiting=(_PENDING,)), MarkerKind.WAITING),
+        (HistoryRun(waiting=(_PENDING,), halted="Дневной лимит убытка"), MarkerKind.MISSED),
+        (HistoryRun(waiting=("open:short:чужая",)), MarkerKind.MISSED),
+    ],
+    ids=["ждёт-и-робот-работает", "робот-остановлен", "заявки-нет-среди-ждущих"],
+)
+def test_a_plan_without_a_fill_is_waiting_only_while_its_order_waits(
+    run: HistoryRun, expected: MarkerKind
+) -> None:
+    """Без исполнения: «заявка подана», только если она ждёт и робот работает.
+
+    Три случая — три обязанности `_plan_kind`: ждущую заявку не рисовать ⊗;
+    у остановленного робота «ждёт» не обещать; чужое имя среди ждущих
+    не делать «ждущим» любой план без исполнения.
+    """
+    marker = _waiting_plan_marker(run)
+    assert marker.kind is expected, (
+        f"план без исполнения при waiting={run.waiting}, halted={run.halted!r} "
+        f"нарисован «{marker.kind.label}», а надо «{expected.label}»"
+    )
+
+
+def test_the_hint_of_a_waiting_order_says_it_is_in_and_not_that_it_failed() -> None:
+    """Подсказка «заявка подана» говорит, что она подана, а не «не состоялся».
+
+    Метка сменилась, а подсказка при наведении осталась бы прежней —
+    и человек, наведя мышь, прочёл бы ровно то, что прочёл 12.10.2026.
+    Подсказка ⊗ рядом сверяется тоже: проверка обязана различать два случая,
+    а не совпадать с обоими.
+    """
+    waiting = _waiting_plan_marker(HistoryRun(waiting=(_PENDING,))).tooltip
+    missed = _waiting_plan_marker(HistoryRun()).tooltip
+
+    assert "не состоялся" in missed, f"подсказка ⊗ изменилась: «{missed}»"
+    for wrong in ("не состоялся", "пропущ"):
+        assert wrong not in waiting, (
+            f"подсказка ждущей заявки говорит «{wrong}»: «{waiting}»"
+        )
+    assert "подана" in waiting and "следующей свечи" in waiting, (
+        f"подсказка не говорит, что заявка подана и когда исполнится: «{waiting}»"
+    )
+
+
+# Находка `/review` 12.10.2026: на закреплённом отрезке тестера (решение 0050)
+# ждущая заявка не исполнится — следующая свеча за границей отрезка, хотя
+# в базе она есть. Часы там — обещание сделки, которой не будет.
+
+_CUT = "прогон кончился до исполнения"
+_MISSED = "не состоялся"
+_WAITS = "исполнится по открытию следующей свечи"
+
+
+def test_a_waiting_order_on_a_pinned_span_is_cut_and_says_so() -> None:
+    """Стережёт: «отрезок кончился» (`CUT`) — ⊗ со своей подсказкой; без него — часы.
+
+    Один и тот же план, одна и та же ждущая заявка, разница — только то,
+    что сказал порт про закреплённый отрезок (`app.port._pending_of`).
+    Подсказка говорит, что прогон кончился, а не «пропущен»
+    и не «не состоялся»: заявка была подана, и человек должен это прочесть.
+    """
+    run = HistoryRun(waiting=(_PENDING,))
+    cut = _waiting_plan_marker(run, pending=convert.Unfilled.CUT)
+    free = _waiting_plan_marker(run, pending=convert.Unfilled.WAITING)
+
+    assert free.kind is MarkerKind.WAITING, (
+        f"без закрепления ждущая заявка нарисована «{free.kind.label}», а не часами"
+    )
+    assert cut.kind is MarkerKind.MISSED, (
+        f"на закреплённом отрезке ждущая заявка нарисована «{cut.kind.label}», а не ⊗"
+    )
+    assert _CUT in cut.tooltip and "подана" in cut.tooltip, (
+        f"подсказка не говорит, что заявка подана, а прогон кончился: «{cut.tooltip}»"
+    )
+    for wrong in ("пропущ", _MISSED, _WAITS):
+        assert wrong not in cut.tooltip, (
+            f"подсказка ждущей заявки на конце отрезка говорит «{wrong}»: «{cut.tooltip}»"
+        )
+
+
+_ENGINE_HALTED = HistoryRun(waiting=(_PENDING,), halted="Дневной лимит убытка")
+
+
+@pytest.mark.parametrize(
+    ("run", "pending", "kind", "says"),
+    [
+        (HistoryRun(waiting=(_PENDING,)), convert.Unfilled.WAITING,
+         MarkerKind.WAITING, _WAITS),
+        (HistoryRun(waiting=(_PENDING,)), convert.Unfilled.CUT, MarkerKind.MISSED, _CUT),
+        (_ENGINE_HALTED, convert.Unfilled.CUT, MarkerKind.MISSED, _MISSED),
+        (_ENGINE_HALTED, convert.Unfilled.WAITING, MarkerKind.MISSED, _MISSED),
+        (HistoryRun(waiting=(_PENDING,)), convert.Unfilled.MISSED,
+         MarkerKind.MISSED, _MISSED),
+        (HistoryRun(waiting=("open:short:чужая",)), convert.Unfilled.CUT,
+         MarkerKind.MISSED, _MISSED),
+    ],
+    ids=[
+        "ждёт", "отрезок", "отрезок-и-остановка-движка", "остановка-движка",
+        "остановка-порта", "отрезок-заявки-нет-среди-ждущих",
+    ],
+)
+def test_the_reason_of_an_unfilled_plan_follows_the_order_of_the_chain(
+    run: HistoryRun, pending: convert.Unfilled, kind: MarkerKind, says: str
+) -> None:
+    """Стережёт: остановка движка главнее того, что сказал порт.
+
+    Остановка движка на прогоне главнее отрезка: заявка не исполнилась
+    из-за неё. Отрезок не делает «оборванной» заявку, которой нет среди
+    ждущих. Порядок «отрезок главнее остановки порта» считает порт —
+    его стережёт `tests/test_app_port.py::test_the_port_says_a_pinned_span_before_its_own_halt`.
+    """
+    marker = _waiting_plan_marker(run, pending=pending)
+    assert (marker.kind, says in marker.tooltip) == (kind, True), (
+        f"run.halted={run.halted!r}, pending={pending.name}: "
+        f"«{marker.kind.label}», «{marker.tooltip}»; надо «{kind.label}» и «{says}»"
     )
 
 
@@ -257,6 +420,9 @@ def test_every_engine_field_has_a_source() -> None:
         # Календарь владельца счёта: он ставит отметки мышкой, значит источник
         # — окно (`F-002`).
         "calendar",
+        # Шаг цены — одно поле окна на всю программу, общее с издержками
+        # тестера (решение владельца счёта 04.10.2026, задача З8).
+        "price_step",
     }
     from_the_previous = {
         "close_on_time_end", "trade_in_weekend", "partial_candles",
@@ -265,14 +431,22 @@ def test_every_engine_field_has_a_source() -> None:
         # факт про мир мышкой не снимается (решение 0038). Кладёт их тот, кто
         # говорил с брокером; окно обязано их сохранить, а не стереть.
         "exchange_days",
+        # Выход по концу окна с предельной ценой: полей в окне пока нет
+        # (Ф3 задачи З8), «Применить» не должно их стирать.
+        "time_exit_order", "time_exit_limit_steps", "time_exit_wait_bars",
     }
-    # Три предохранителя по деньгам. Проведены 05.09.2026 (`D-030`), но
-    # **через галочку**: числа доезжают до движка только при своём
-    # выключателе. Здесь они в «из окна» именно поэтому — источник у них
-    # окно, а не прежние настройки.
-    from_the_window |= {
-        "volume_cap", "daily_loss_limit_percent", "free_funds_reserve_percent",
-    }
+    # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): предохранителей в настройках движка больше нет.
+    # # Три предохранителя по деньгам. Проведены 05.09.2026 (`D-030`), но
+    # # **через галочку**: числа доезжают до движка только при своём
+    # # выключателе. Здесь они в «из окна» именно поэтому — источник у них
+    # # окно, а не прежние настройки.
+    # from_the_window |= {
+    #     "volume_cap", "daily_loss_limit_percent", "free_funds_reserve_percent",
+    # }
+    # ⚠️ Порог выхода по обратному сигналу поля в окне не имеет и иметь пока
+    # не должен — прямые слова владельца счёта 10.09.2026. Берётся у прежних
+    # настроек: умолчание молча выключило бы правило, включённое из кода.
+    from_the_previous |= {"min_exit_profit_sides"}
     every_field = {field.name for field in fields(EngineSettings)}
     named = from_the_window | from_the_previous
     assert every_field == named, (
@@ -281,89 +455,91 @@ def test_every_engine_field_has_a_source() -> None:
     )
 
 
-def test_the_guards_are_wired_but_switched_off_by_default() -> None:
-    """Проводка предохранителей ничего не включила сама по себе.
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): сторожа проводки трёх предохранителей из окна в движок.
+# def test_the_guards_are_wired_but_switched_off_by_default() -> None:
+#     """Проводка предохранителей ничего не включила сама по себе.
+#
+#     **Главное условие задачи `D-030`.** В окне стоят потолок 5 контрактов
+#     и дневной лимит 2 %; провести их «как есть» значило бы включить
+#     остановку торговли, которой владелец счёта не просил, и сломать сверку
+#     с прототипом — у неё предохранителей нет ни одного.
+#
+#     Проверяется сравнением с умолчанием движка целиком по трём полям,
+#     а не «примерно тем же»: цена ошибки здесь — другой список сделок.
+#     """
+#     default = EngineSettings()
+#     produced = convert.engine_settings(
+#         Settings(volume_cap=5, daily_loss_limit_pct=2.0, free_funds_reserve_pct=30.0),
+#         Mode.REVERSE,
+#     )
+#     assert produced.volume_cap is default.volume_cap is None
+#     assert produced.daily_loss_limit_percent == default.daily_loss_limit_percent == 0.0
+#     assert produced.free_funds_reserve_percent == default.free_funds_reserve_percent == 0.0
+#
+#
+# def test_a_switched_on_guard_reaches_the_engine() -> None:
+#     """Поставленная галочка доводит число до движка — иначе поле бутафория."""
+#     produced = convert.engine_settings(
+#         Settings(
+#             volume_cap_enabled=True, volume_cap=7,
+#             daily_loss_limit_enabled=True, daily_loss_limit_pct=3.5,
+#             free_funds_reserve_enabled=True, free_funds_reserve_pct=25.0,
+#         ),
+#         Mode.REVERSE,
+#     )
+#     assert produced.volume_cap == pytest.approx(7.0)
+#     assert produced.daily_loss_limit_percent == pytest.approx(3.5)
+#     assert produced.free_funds_reserve_percent == pytest.approx(25.0)
+#
+#
+# @pytest.mark.parametrize("switch", [
+#     "volume_cap_enabled", "daily_loss_limit_enabled", "free_funds_reserve_enabled",
+# ])
+# def test_each_guard_has_its_own_switch(switch: str) -> None:
+#     """Галочки не одна на троих: включение одного не включает остальных.
+#
+#     Иначе владелец счёта, поставивший потолок объёма, молча получил бы
+#     остановку торговли по дневному лимиту.
+#     """
+#     produced = convert.engine_settings(
+#         Settings().replace(**{switch: True}), Mode.REVERSE
+#     )
+#     default = EngineSettings()
+#     off = [
+#         name for name, value in (
+#             ("volume_cap", produced.volume_cap),
+#             ("daily_loss_limit_percent", produced.daily_loss_limit_percent),
+#             ("free_funds_reserve_percent", produced.free_funds_reserve_percent),
+#         )
+#         if value != getattr(default, name)
+#     ]
+#     assert len(off) == 1, (
+#         f"галочка «{switch}» включила не только своё: {off}"
+#     )
+#
+#
+# def test_the_off_value_of_every_guard_is_the_default_of_the_engine() -> None:
+#     """Таблица `_GUARDS` согласована с умолчаниями движка — по полю, а не на глаз.
+#
+#     Канарейка: тесты выше сравнивают **результат** перевода, этот — саму
+#     таблицу. Разъехавшись, они бы дали «выключено», которое что-то включает.
+#     """
+#     from app.convert import _GUARDS
+#
+#     default = EngineSettings()
+#     for engine_field, guard in _GUARDS.items():
+#         assert getattr(default, engine_field) == guard.off, (
+#             f"«выключено» для {engine_field} разошлось с умолчанием движка"
+#         )
 
-    **Главное условие задачи `D-030`.** В окне стоят потолок 5 контрактов
-    и дневной лимит 2 %; провести их «как есть» значило бы включить
-    остановку торговли, которой владелец счёта не просил, и сломать сверку
-    с прототипом — у неё предохранителей нет ни одного.
 
-    Проверяется сравнением с умолчанием движка целиком по трём полям,
-    а не «примерно тем же»: цена ошибки здесь — другой список сделок.
-    """
-    default = EngineSettings()
-    produced = convert.engine_settings(
-        Settings(volume_cap=5, daily_loss_limit_pct=2.0, free_funds_reserve_pct=30.0),
-        Mode.REVERSE,
-    )
-    assert produced.volume_cap is default.volume_cap is None
-    assert produced.daily_loss_limit_percent == default.daily_loss_limit_percent == 0.0
-    assert produced.free_funds_reserve_percent == default.free_funds_reserve_percent == 0.0
-
-
-def test_a_switched_on_guard_reaches_the_engine() -> None:
-    """Поставленная галочка доводит число до движка — иначе поле бутафория."""
-    produced = convert.engine_settings(
-        Settings(
-            volume_cap_enabled=True, volume_cap=7,
-            daily_loss_limit_enabled=True, daily_loss_limit_pct=3.5,
-            free_funds_reserve_enabled=True, free_funds_reserve_pct=25.0,
-        ),
-        Mode.REVERSE,
-    )
-    assert produced.volume_cap == pytest.approx(7.0)
-    assert produced.daily_loss_limit_percent == pytest.approx(3.5)
-    assert produced.free_funds_reserve_percent == pytest.approx(25.0)
-
-
-@pytest.mark.parametrize("switch", [
-    "volume_cap_enabled", "daily_loss_limit_enabled", "free_funds_reserve_enabled",
-])
-def test_each_guard_has_its_own_switch(switch: str) -> None:
-    """Галочки не одна на троих: включение одного не включает остальных.
-
-    Иначе владелец счёта, поставивший потолок объёма, молча получил бы
-    остановку торговли по дневному лимиту.
-    """
-    produced = convert.engine_settings(
-        Settings().replace(**{switch: True}), Mode.REVERSE
-    )
-    default = EngineSettings()
-    off = [
-        name for name, value in (
-            ("volume_cap", produced.volume_cap),
-            ("daily_loss_limit_percent", produced.daily_loss_limit_percent),
-            ("free_funds_reserve_percent", produced.free_funds_reserve_percent),
-        )
-        if value != getattr(default, name)
-    ]
-    assert len(off) == 1, (
-        f"галочка «{switch}» включила не только своё: {off}"
-    )
-
-
-def test_the_off_value_of_every_guard_is_the_default_of_the_engine() -> None:
-    """Таблица `_GUARDS` согласована с умолчаниями движка — по полю, а не на глаз.
-
-    Канарейка: тесты выше сравнивают **результат** перевода, этот — саму
-    таблицу. Разъехавшись, они бы дали «выключено», которое что-то включает.
-    """
-    from app.convert import _GUARDS
-
-    default = EngineSettings()
-    for engine_field, guard in _GUARDS.items():
-        assert getattr(default, engine_field) == guard.off, (
-            f"«выключено» для {engine_field} разошлось с умолчанием движка"
-        )
-
-
-def test_switching_a_guard_is_a_journal_line() -> None:
-    """Включение предохранителя называется словом, а не `True`/`False`."""
-    lines = convert.guard_changes(
-        Settings(), Settings(volume_cap_enabled=True)
-    )
-    assert lines == ["Потолок объёма: выключен → включён"], lines
+# ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
+# def test_switching_a_guard_is_a_journal_line() -> None:
+#     """Включение предохранителя называется словом, а не `True`/`False`."""
+#     lines = convert.guard_changes(
+#         Settings(), Settings(volume_cap_enabled=True)
+#     )
+#     assert lines == ["Потолок объёма: выключен → включён"], lines
 
 
 def test_fields_absent_from_the_window_are_taken_from_the_previous_settings() -> None:
@@ -475,131 +651,17 @@ def test_the_window_values_reach_the_engine() -> None:
 def test_the_strategy_settings_are_assembled_field_by_field() -> None:
     values = Settings(
         average_period=9, average_kind=AverageKind.SMA,
-        on_price_equals_average=OnPriceEqualsAverage.TREAT_AS_SHORT,
     )
+    from strategies import MaReverseAlwaysSettings
+
     module = convert.strategy_settings(values)
+    # ⚠️ Сужение — часть проверки, а не поклон системе типов. Сборщик
+    # объявлен через порт настроек и класс алгоритма не называет; убедиться,
+    # что он собрал настройки **выбранного** алгоритма, а не какие-нибудь, —
+    # ровно то, ради чего проверка и стоит.
+    assert isinstance(module, MaReverseAlwaysSettings)
     assert module.period == 9
     assert module.kind is StrategyAverageKind.SMA
-    assert module.on_equal.value == "short"
-
-
-def test_a_switched_off_filter_gives_the_module_exactly_its_own_defaults() -> None:
-    """Снятая галочка фильтра = умолчания торгового модуля, поле в поле.
-
-    **Это сторож сверки с прототипом.** Она сходится 127 сделок из 127 на
-    выключенном фильтре, у прототипа фильтра нет вовсе, и любое ненулевое
-    значение, просочившееся сюда, сломает её молча: список сделок другой,
-    а ошибки нигде нет.
-
-    Сравнение целиком, а не по двум полям: третье поле фильтра, заведённое
-    завтра и забытое в `_FILTER_OFF`, обошло бы поимённую проверку.
-    """
-    from strategies import EmaReverseSettings
-
-    values = Settings(
-        filter_enabled=False, threshold_percent=0.4, confirm_bars=5
-    )
-    produced = convert.strategy_settings(values)
-    default = EmaReverseSettings(
-        period=values.average_period,
-        kind=StrategyAverageKind.EMA,
-        on_equal=produced.on_equal,
-    )
-    assert produced == default, (
-        "выключённый фильтр отдал модулю не его умолчания — сверка "
-        "с прототипом поедет молча"
-    )
-
-
-def test_a_switched_on_filter_carries_both_numbers_to_the_module() -> None:
-    """Включённая галочка отдаёт модулю то, что стоит в полях."""
-    produced = convert.strategy_settings(
-        Settings(filter_enabled=True, threshold_percent=0.04, confirm_bars=3)
-    )
-    assert produced.threshold_percent == pytest.approx(0.04)
-    assert produced.confirm_bars == 3
-
-
-def test_the_off_values_of_the_filter_are_the_defaults_of_the_module() -> None:
-    """`_FILTER_OFF` совпадает с умолчаниями модуля — по таблице, а не на глаз.
-
-    Канарейка к тесту выше: тот сравнивает результат перевода, этот —
-    саму таблицу. Разъехавшись, они бы дали «выключено», которое выключает
-    не туда.
-    """
-    from app.convert import _FILTER_OFF
-    from strategies import EmaReverseSettings
-
-    default = EmaReverseSettings()
-    for name, value in _FILTER_OFF.items():
-        assert getattr(default, name) == value, (
-            f"«выключено» для поля {name} разошлось с умолчанием модуля"
-        )
-
-
-def test_a_field_of_the_filter_missing_from_the_assembler_is_refused(
-    monkeypatch,
-) -> None:
-    """Поле «выключенного фильтра», которого нет у сборщика, — отказ вслух.
-
-    Проверка полноты считается один раз при импорте, поэтому подменяется
-    её результат, а не таблица: иначе тест проверял бы не сторожа,
-    а собственную арифметику.
-    """
-    monkeypatch.setattr(convert, "_FILTER_OFF_GAP", ("выдуманное_поле",))
-    with pytest.raises(convert.SettingsRefused, match="выдуманное_поле"):
-        convert.strategy_settings(Settings())
-
-
-def test_switching_the_filter_is_a_line_in_the_journal() -> None:
-    """Переключение фильтра называется словом, а не `True`/`False`.
-
-    Строку пишет порт (`_WINDOW_TOLD`): сам выключатель в настройки
-    торгового модуля не переводится, и рассказать о нём больше некому.
-    """
-    lines = convert.window_changes(
-        Settings(filter_enabled=False), Settings(filter_enabled=True)
-    )
-    assert lines == ["Фильтр против пилы: выключен → включён"], lines
-
-
-def test_a_muted_filter_number_is_journalled_and_says_it_is_muted() -> None:
-    """Правка числа при снятой галочке — строка, и в ней сказано, что она инертна.
-
-    ТЗ §4.4 А требует строку на **каждое** изменение поля окна. Молчать
-    нельзя: владелец счёта подбирает порог при снятой галочке, а потом
-    восстановить, что он крутил, будет нечем. Врать «включено» тоже нельзя —
-    отсюда оговорка прямо в строке.
-    """
-    lines = convert.window_changes(
-        Settings(filter_enabled=False, threshold_percent=0.0),
-        Settings(filter_enabled=False, threshold_percent=0.5),
-    )
-    assert len(lines) == 1, lines
-    assert "фильтр выключен" in lines[0] and "0,50" in lines[0], lines
-
-
-def test_a_number_of_a_working_filter_is_not_journalled_twice() -> None:
-    """При включённом фильтре про число говорит только торговый модуль."""
-    assert convert.window_changes(
-        Settings(filter_enabled=True, threshold_percent=0.0),
-        Settings(filter_enabled=True, threshold_percent=0.5),
-    ) == []
-
-
-def test_the_numbers_of_the_filter_are_journalled_as_they_act() -> None:
-    """Журнал пишет **действующее** значение фильтра, а не то, что в поле.
-
-    Включение галочки при заранее набранных числах обязано дать строки
-    модуля «0,00% → 0,04%»: именно это изменение поведения и произошло.
-    """
-    off = Settings(filter_enabled=False, threshold_percent=0.04, confirm_bars=3)
-    on = off.replace(filter_enabled=True)
-    lines = convert.strategy_settings(on).changes_from(
-        convert.strategy_settings(off)
-    )
-    joined = " ".join(lines)
-    assert "0,04" in joined and "3" in joined, joined
 
 
 @pytest.mark.parametrize("mode", list(Mode))
@@ -850,3 +912,280 @@ def test_every_non_trading_rule_has_words_for_the_band() -> None:
         rule for rule, trading, _ in engine_window._DAY_RULES if not trading
     }
     assert silent == set(convert._QUIET_OF_RULE)
+
+
+# ---------------------------------------------------------------------------
+# Выбор торгового алгоритма: строка журнала, каталог для окна, громкий отказ
+# ---------------------------------------------------------------------------
+#
+# Задача З4 миниплана `strategy-modules-switchable.md`, редакция 08.09.2026.
+# Здесь проверяется дорога от поля окна до журнала и до окна выбора; само
+# описание правила проверяется у алгоритма (`tests/test_strategies_description.py`),
+# а окно — в `tests/test_ui_algorithm_dialog.py`.
+
+
+def test_the_change_of_algorithm_is_named_in_the_journal() -> None:
+    """Сменили алгоритм — в журнале строка с прежним и новым **названием**.
+
+    ТЗ §4.4 А: изменение настройки пишется с прежним и новым значением.
+    Смена алгоритма — самое крупное изменение, какое бывает: меняется
+    не число в правиле, а само правило.
+
+    ⚠️ Значения здесь не проверяются на принадлежность реестру намеренно:
+    `window_changes` — сборщик строк журнала, и строка обязана получиться
+    и на имени, которого в сборке нет. Иначе разбор «что случилось» пропадал
+    бы ровно в том случае, ради которого его читают.
+
+    Мутация, обязанная ронять проверку: убрать `strategy_id` из `_WINDOW_TOLD`.
+    """
+    said = convert.window_changes(
+        Settings(),
+        Settings().replace(strategy_id="atr_channel"),
+    )
+    line = next((row for row in said if row.startswith("Торговый алгоритм")), "")
+    assert line, f"смена алгоритма не попала в журнал ни одной строкой: {said}"
+    assert "→" in line, "строка не показывает прежнее и новое значение"
+    before, _, after = line.partition("→")
+    assert "Реверс" in before, (
+        "прежний алгоритм назван именем латиницей, а не названием для человека"
+    )
+    assert "atr_channel" in after and "нет" in after, (
+        "новое имя не названо либо не сказано, что такого алгоритма в сборке нет"
+    )
+
+
+def test_a_field_without_a_journal_line_cannot_appear() -> None:
+    """Канарейка предыдущей проверки: поле без подписи роняет сборку строк.
+
+    Строка про безымянные поля собирается один раз при импорте
+    (`_SILENT_FIELDS`), поэтому проверяется она, а не текст журнала.
+    """
+    assert convert._SILENT_FIELDS == (), (  # noqa: SLF001 — сторож на внутреннюю таблицу
+        "поля окна остались без строки в журнале: "
+        f"{convert._SILENT_FIELDS}"  # noqa: SLF001 — то же
+    )
+
+
+def test_an_unknown_algorithm_is_refused_out_loud() -> None:
+    """Незнакомый алгоритм — отказ с фразой, а не подстановка умолчания.
+
+    Подстановка означала бы торговлю правилом, которого владелец счёта
+    не выбирал, при исправном виде окна. Отказ ловит `HistoryPort`
+    и показывает «Настройки не приняты», прежние остаются в силе.
+    """
+    with pytest.raises(convert.SettingsRefused) as refusal:
+        convert.strategy_settings(Settings().replace(strategy_id="atr_channel"))
+    said = str(refusal.value)
+    assert "atr_channel" in said, "отказ не называет, какой алгоритм требуется"
+    assert registry.DEFAULT_ID in said, "отказ не называет, какие алгоритмы есть"
+
+
+def test_the_window_default_algorithm_is_the_registry_default() -> None:
+    """Умолчание окна и умолчание реестра — одно и то же имя.
+
+    Окно реестра не видит (ARCHITECTURE.md §2), поэтому имя стоит в нём
+    строкой. Разъехавшись, эти два умолчания дали бы сборку, которая торгует
+    не тем правилом, о котором договаривались, и заметить это по экрану
+    нельзя.
+    """
+    assert Settings().strategy_id == registry.DEFAULT_ID
+
+
+def test_the_catalogue_carries_the_algorithms_own_words() -> None:
+    """Каталог для окна собран из реестра, а не написан в `app/`.
+
+    ⚠️ Сверяется с тем, что говорит о себе сам алгоритм. Второй текст рядом
+    с первым разошёлся бы при первой правке алгоритма — молча, текст не падает.
+    """
+    values = Settings()
+    catalogue = convert.algorithms(values)
+    assert catalogue, "каталог алгоритмов пуст — выбирать человеку не из чего"
+    assert [item.id for item in catalogue] == list(registry.known_ids())
+    chosen = next(item for item in catalogue if item.chosen)
+    assert chosen.id == values.strategy_id
+    entry = registry.find(chosen.id)
+    assert chosen.title == entry.title
+    assert chosen.summary == entry.summary(convert.strategy_settings(values))
+    assert chosen.details == convert.strategy_rule(values)
+
+
+def test_the_catalogue_shows_the_numbers_that_are_applied() -> None:
+    """Описание выбранного алгоритма считается по применённым настройкам.
+
+    Мутация, обязанная ронять проверку: собирать описание по умолчаниям
+    алгоритма вместо полей окна. Человек читал бы правило про период 15,
+    имея в настройках 40.
+    """
+    chosen = convert.algorithms(Settings().replace(average_period=40))[0]
+    assert "40" in chosen.details, "описание не увидело нынешнего периода"
+    assert not any(sign.isdigit() for sign in chosen.summary), (
+        "правило одной фразой обязано читаться без чисел: оно показывается "
+        "до всякого «Применить»"
+    )
+
+
+def test_the_summary_of_the_chosen_algorithm_follows_the_applied_settings() -> None:
+    """Правило одной фразой считается по вашим настройкам, а не по умолчаниям.
+
+    ⚠️ Чисел в этой отрисовке нет — и на этом держался дефект. Довод «`brief()`
+    цифр не содержит, значит от настроек не зависит» неверен: тип средней
+    меняет **формулировку** — «простой средней» против «экспоненциальной»
+    (`B-039`).
+
+    Мутация, обязанная ронять проверку: собирать `summary` из умолчаний
+    алгоритма вместо применённых настроек.
+    """
+    values = Settings().replace(average_kind=AverageKind.SMA)
+    chosen = next(item for item in convert.algorithms(values) if item.chosen)
+    entry = registry.find(chosen.id)
+    assert chosen.summary == entry.summary(convert.strategy_settings(values)), (
+        "краткое правило выбранного алгоритма собрано не из применённых настроек"
+    )
+    assert "простой средней" in chosen.summary, (
+        "выбрана простая средняя, а правило одной фразой говорит про другую: "
+        f"«{chosen.summary}»"
+    )
+    assert chosen.summary != entry.summary(entry.defaults()), (
+        "правило с простой средней совпало с правилом по умолчанию — значит "
+        "считается по умолчаниям"
+    )
+
+
+def test_an_algorithm_that_is_not_chosen_says_whose_numbers_it_shows() -> None:
+    """У невыбранного числа свои, и строка списка обязана сказать это.
+
+    Показывать умолчания чужого алгоритма честно — его полей в окне нет,
+    брать неоткуда. Молчать об этом нельзя: правило читается как «вот что
+    будет у меня». До 09.09.2026 оговорка стояла только над подробным
+    описанием (`ui/algorithm_dialog.py::details_preamble`), а строка списка
+    и подсказка на вкладке молчали.
+
+    ⚠️ Ветка «алгоритм не выбран» при одной записи в реестре достижима
+    единственным честным способом: в настройках стоит имя, которого в этой
+    сборке нет, — файл настроек от более новой сборки. Подстраивать реестр
+    ради проверки нельзя, подделка досталась бы соседям (`D-078`).
+    """
+    values = Settings().replace(strategy_id="atr_channel")
+    catalogue = convert.algorithms(values)
+    assert catalogue, "каталог пуст — проверять нечего"
+    assert not any(item.chosen for item in catalogue), (
+        "в настройках стоит алгоритм, которого в сборке нет, — выбранным "
+        "не может оказаться ни один"
+    )
+    for option in catalogue:
+        assert "умолчаниями" in option.summary, (
+            f"алгоритм «{option.id}» не выбран, а строка списка не говорит, "
+            f"что числа в нём не ваши: «{option.summary}»"
+        )
+
+
+def test_the_summary_of_the_chosen_algorithm_carries_no_disclaimer() -> None:
+    """У выбранного числа ваши — оговорка про умолчания читалась бы как отказ."""
+    chosen = next(item for item in convert.algorithms(Settings()) if item.chosen)
+    assert "умолчаниями" not in chosen.summary, (
+        f"строка выбранного алгоритма говорит про чужие числа: «{chosen.summary}»"
+    )
+
+
+def test_the_catalogue_does_not_fall_over_a_refusal() -> None:
+    """Настройки собрать не удалось — каталог всё равно приезжает и говорит это.
+
+    Окно выбора — место, куда человек приходит разобраться. Окно, упавшее
+    вместо ответа, лишает его и разбора тоже. Причина отказа обязана быть
+    в тексте, а не в трассировке.
+    """
+    # Период 0 приходит не из окна (там поле начинается с 5), а из файла
+    # настроек, правленного руками, — и проверку на него делает сам алгоритм.
+    catalogue = convert.algorithms(Settings().replace(average_period=0))
+    assert catalogue, "каталог не приехал вовсе"
+    assert "Показать правило с вашими числами не удалось" in catalogue[0].details
+    assert "период средней" in catalogue[0].details, (
+        "причина отказа названа не словами алгоритма, а общей фразой"
+    )
+    assert "умолчаниями" in catalogue[0].details, (
+        "не сказано, что числа в показанном правиле не принадлежат человеку"
+    )
+
+
+def _as_bar(candle: Candle):
+    """Свеча слоя данных → свеча торгового модуля. Как это делает движок.
+
+    Перекладка явная и здесь тоже: у свечи слоя данных `time` — это НАЧАЛО,
+    а модуль ждёт время ЗАКРЫТИЯ (ARCHITECTURE.md §2).
+    """
+    from strategies import Bar
+
+    return Bar(
+        closes_at=candle.close_time,
+        open=candle.open, high=candle.high, low=candle.low,
+        close=candle.close, volume=candle.volume,
+    )
+
+
+def test_the_window_default_minute_order_is_the_run_default() -> None:
+    """Стережёт: умолчание окна и умолчание прогона — одно и то же.
+
+    Два перечисления живут в разных слоях; разъехавшиеся умолчания значили
+    бы, что «как по умолчанию» в окне и в прогоне — разный порядок.
+    """
+    from backtest import Minutes
+
+    assert convert.minute_order_of(Settings()) is Minutes(candles=()).order
+
+
+def test_changing_the_minute_order_is_a_journal_line() -> None:
+    """Стережёт: смена порядка цен минутки — строка в журнале, подписями окна.
+
+    Движок этого допущения не знает, рассказать больше некому: без строки
+    в `_WINDOW_TOLD` смена прошла бы молча («Значения совпали с прежними»).
+    """
+    from ui.models import MinutePriceOrder
+
+    lines = convert.window_changes(
+        Settings(), Settings(minute_order=MinutePriceOrder.ADVERSE_FIRST)
+    )
+    assert lines == [
+        "Порядок цен внутри минуты: Сначала цена, ближняя к открытию → "
+        "Сначала худшая для позиции цена"
+    ], lines
+
+
+# ------------------------------- наибольшая свеча для проверки по минуткам (B-058)
+
+def test_the_minute_bar_limit_offers_only_known_bar_sizes_up_to_fifteen() -> None:
+    """Стережёт: в списке порога — ровно размеры свечей программы не крупнее 15 минут.
+
+    Вход извне — перечень размеров свечей окна (`convert.TIMEFRAMES`).
+    Порог, которого нет среди размеров свечей, не значил бы ничего; порог
+    крупнее 15 минут вернул бы остановку прогона (`B-058`). Подпись порога
+    обязана быть подписью того же размера свечи.
+    """
+    from ui.models import MinuteBarLimit
+
+    expected = {
+        frame.minutes for frame in convert.TIMEFRAMES.values() if frame.minutes <= 15
+    }
+    assert {one.minutes for one in MinuteBarLimit} == expected
+    for one in MinuteBarLimit:
+        assert convert.TIMEFRAMES[one.label].minutes == one.minutes, one
+
+
+def test_the_window_default_minute_bar_limit_is_five_minutes() -> None:
+    """Стережёт: умолчание порога — 5 минут, решение владельца счёта (`B-058`)."""
+    assert convert.minute_bar_limit_of(Settings()) == 5
+
+
+def test_changing_the_minute_bar_limit_is_a_journal_line() -> None:
+    """Стережёт: смена порога — строка в журнале, подписью и значениями окна.
+
+    Движок этого допущения не знает, рассказать больше некому: без строки
+    в `_WINDOW_TOLD` смена прошла бы молча («Значения совпали с прежними»).
+    """
+    from ui.models import MinuteBarLimit
+
+    lines = convert.window_changes(
+        Settings(), Settings(minute_bar_limit=MinuteBarLimit.FIFTEEN)
+    )
+    assert lines == [
+        "Наибольшая свеча для проверки по минуткам: 5 минут → 15 минут"
+    ], lines
