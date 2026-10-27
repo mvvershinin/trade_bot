@@ -1328,14 +1328,14 @@ PDF `trade-api-docs.pdf`, «Создание торговой заявки»; в
 
 > **Сделано 16.09.2026** по миниплану [`safeguards-off-for-the-stage.md`](plans/safeguards-off-for-the-stage.md).
 > **Возврат — одним поиском по метке** `ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)`:
-> 112 меток в `engine/{settings,guards,pipeline,runner,__init__}.py`,
+> 114 меток в 20 файлах: `engine/{settings,guards,pipeline,runner,__init__}.py`,
 > `app/{convert,runs,port,settings_store}.py`, `ui/{models,settings_dialog}.py`
 > и в проверках. Удалить метку вместе с её прозой и снять с блока под ней **ровно один** слой `# `;
 > где метка говорит «удалить живую замену» — удалить живую строку-заглушку. Переписанные докстринги, текст `NO_GUARDS`,
 > живые списки полей в тестах окна, `day_result(...)` (разбит под E501) и заголовок шага «между 5 и 6» в `pipeline.py`,
 > `timedelta` в импорте `tests/test_engine_guards.py` — сверить с `git show 4572c9f:<путь>`.
 > Вернуть поля в окно, вернуть шесть ключей в `examples/settings-templates.json`.
-> **Чем проверить возврат:** `KNOWN_MYPY_FINDINGS` обязан вернуться с 187 к 192 (с 27.09.2026 +2 находки импорта помощников в `tests/test_ui_unused_fields.py` и `tests/test_market_contracts.py`, к предохранителям не относятся)
+> **Чем проверить возврат:** `KNOWN_MYPY_FINDINGS` обязан вернуться с 184 к 189 (`tests/test_lint_ratchet.py:165`)
 > (закомментированный код `mypy` не видит; не вернулось — вернули не всё),
 > и `tests/test_engine_guards.py` обязан снова собирать 35 своих сторожей.
 > **Что осталось живым и стережёт молчание:** `app/port.NO_GUARDS`,
