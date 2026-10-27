@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +54,7 @@ from broker.errors import BrokerError, NoConnection, from_status
 from broker.parsing import aware_moment
 from broker.redaction import LOGGER_NAME
 from broker.session import BrokerSession
+from broker.tokens import AccessToken
 
 #: Сокет рыночных данных. Один на все четыре канала, различает `dataType`.
 MARKET_DATA_WS: Final[str] = (
@@ -287,7 +288,40 @@ async def candle_stream(
         "instruments": [{"classCode": class_code, "ticker": ticker}],
         "timeFrame": timeframe,
     }
+    async with authorized_socket(
+        token, url, logger_name=SOCKET_LOGGER, where="поток свечей"
+    ) as socket:
+        await socket.send(json.dumps(request))
+        yield socket
 
+
+@asynccontextmanager
+async def authorized_socket(
+    token: AccessToken,
+    url: str,
+    *,
+    logger_name: str,
+    where: str,
+    options: Mapping[str, Any] | None = None,
+) -> AsyncIterator[Any]:
+    """Сокет брокера с рабочим токеном в рукопожатии — **одно место на все потоки слоя**.
+
+    Вынесено из `candle_stream` 27.10.2026, когда появился второй сокет —
+    поток статусов заявок (`broker/order_stream.py`). Второе место, где токен
+    уходит в заголовок, — это разговор с владельцем счёта, а не строка
+    в таблице (`tests/test_broker_no_leak.py::test_reveal_lives_where_declared`);
+    общая функция оставляет место одно, и всё, что ниже сказано про заголовок,
+    действует для обоих потоков сразу.
+
+    `token` — рабочий токен (`BrokerSession.access_token()`), его берёт
+    вызывающий: так каждое подключение получает токен, действующий на момент
+    подключения. `options` уходят в `websockets.connect` как есть (keepalive
+    потока заявок); у потока свечей их нет — там умолчания библиотеки.
+
+    Отказы переводятся в отказы слоя: рукопожатие с HTTP-кодом — по таблице
+    `from_status` (401 — токен не принят, 5xx — неполадка у брокера), прочее
+    сетевое — `NoConnection`, в том числе поднятое из тела контекста.
+    """
     # ⚠️ Заголовок собирается из двух кусков, а не одной f-строкой.
     # Причина не в красоте: сторож секретов (`tests/test_layers.py`) считает
     # похожим на утечку любой файл, где рядом стоят слово-заголовок и длинная
@@ -304,34 +338,35 @@ async def candle_stream(
     # 401 и 503; 401 — самый вероятный первый отказ (токен не принят),
     # и цикл переподключения в `app/` приводит к нему повторно.
     # Тот же приём и по той же причине — `session.py::_authorized`.
-    headers = {"Authorization": "Bearer " + token.secret.reveal()}
+    # Строка собирается **внутри** `try` (находка С7 гейта Э4): между сборкой
+    # и `try` не стоит ничего, что унесло бы словарь мимо `finally`.
+    headers: dict[str, str] = {}
     try:
+        headers["Authorization"] = "Bearer " + token.secret.reveal()
         async with websockets.connect(
             url,
             additional_headers=headers,
             # Логгер рукопожатия — наш, см. `SOCKET_LOGGER`.
-            logger=logging.getLogger(SOCKET_LOGGER),
+            logger=logging.getLogger(logger_name),
+            **(options or {}),
         ) as socket:
-            await socket.send(json.dumps(request))
             try:
                 yield socket
             except (websockets.exceptions.WebSocketException, OSError) as error:
-                raise NoConnection(_transport(error)) from None
+                raise NoConnection(_transport(where, error)) from None
     except websockets.exceptions.InvalidStatus as error:
-        raise from_status(
-            error.response.status_code, where="поток свечей: рукопожатие"
-        ) from None
+        raise from_status(error.response.status_code, where=f"{where}: рукопожатие") from None
     except (websockets.exceptions.WebSocketException, OSError) as error:
-        raise NoConnection(_transport(error)) from None
+        raise NoConnection(_transport(where, error)) from None
     finally:
         # Выполняется и на пути исключения, поднятого обработчиком выше:
         # `finally` отрабатывает до того, как новый отказ покинет кадр.
         headers.clear()
 
 
-def _transport(error: BaseException) -> str:
+def _transport(where: str, error: BaseException) -> str:
     """Технический текст сетевого отказа: тип и слова библиотеки, без заголовков."""
-    return f"поток свечей: {type(error).__name__}: {error}"
+    return f"{where}: {type(error).__name__}: {error}"
 
 
 def snapshot_of(raw: str | bytes) -> CandleSnapshot | None:

@@ -155,6 +155,14 @@ from typing import Any
 
 from market.aggregate import build_bars
 from market.candles import MINUTE, MSK, Candle, Timeframe, ensure_msk, floor_to_minute
+from market.commands import (
+    BrokerCommand,
+    BrokerExecution,
+    CommandAction,
+    CommandSide,
+    CommandStatus,
+    StoredCommand,
+)
 from market.gaps import Gap, count_missing_minutes, find_gaps
 from market.journal import (
     BACKTEST_SESSIONS_KEPT,
@@ -257,6 +265,17 @@ __all__ = ["Source", "Coverage", "ContractRow", "WriteStats", "CandleStore", "SC
 #: версия отняла бы откат на 0.2.4 без копии `userdata/`, ничего не защитив.
 #: Фаза заявки (`journal_order.phase`, 12.10.2026) — тоже без подъёма:
 #: таблица не выпускалась, колонку дописывает открытие (`_add_order_phase`).
+#:
+#: 7 без подъёма (27.10.2026). В базе поселился журнал команд брокеру
+#: и таблица исполнений (`broker_command`, `broker_execution`,
+#: `market.commands`). Вывод тот же, что 11.10.2026: смысл прежних строк
+#: не меняется, а сборка 0.2.5 на такой базе не теряет ни предохранителя,
+#: ни строки — настоящих заявок она не подаёт, журнал команд ей не нужен,
+#: а его сторожа она не трогает (`_install_guards` пересоздаёт только своих).
+#: ⚠️ Вопрос встанет снова, когда журнал начнёт **держать** поведение
+#: (шаг 2 Э4: запрет пересборки «факта» при незакрытой команде, сверка
+#: при старте): тогда откат на сборку, которая подаёт заявки и журнала
+#: не читает, станет обходом предохранителя — ровно случай 5 → 6.
 SCHEMA_VERSION = 7
 
 #: Начиная с этой версии ключ `ts` — гарантированно начало минуты. База
@@ -282,6 +301,7 @@ _SCHEMA_WITH_CONTRACT_VOLUME = 5
 _JOURNAL_TABLES: tuple[str, ...] = (
     "journal_session", "journal_decision", "journal_trade",
     "journal_order", "journal_run_rows",
+    "broker_command", "broker_execution",
 )
 
 #: Счётчик номеров прогонов в снимке журнала (`_journal_snapshot`): строка
@@ -534,6 +554,107 @@ _ORDER_CHECKED_COLUMNS: tuple[str, ...] = ("kind", "side", "phase")
 #: Необязательные числа заявки: `None` — числа у заявки нет, а не ноль.
 _ORDER_NUMBERS: tuple[str, ...] = ("close_price", "average", "level", "limit_price")
 
+#: Колонки команды брокеру — в порядке записи и чтения (`_command_of`).
+_COMMAND_COLUMNS: tuple[str, ...] = (
+    "session_id", "client_order_id", "action", "order_id", "symbol", "side",
+    "volume", "price", "target_client_order_id", "at", "status", "status_at", "reason",
+)
+
+#: Что у команды меняется после записи: статус, его время и его причина.
+#: Всё остальное — условия команды и заморожено сторожем
+#: `broker_command_terms_are_final`; список замороженных **выводится**
+#: вычитанием, как у прогона (`_FROZEN_SESSION_COLUMNS`).
+_COMMAND_STATUS_COLUMNS: tuple[str, ...] = ("status", "status_at", "reason")
+
+_FROZEN_COMMAND_COLUMNS: tuple[str, ...] = ("id",) + tuple(
+    name for name in _COMMAND_COLUMNS if name not in _COMMAND_STATUS_COLUMNS
+)
+
+#: Текст команды, идущий через чистку (`_clean`). Ключи UUID сюда не входят
+#: намеренно: они **проверяются** форматом (`market.commands`), а не чистятся —
+#: чистка, изменившая ключ, развела бы строку и заявку у брокера. Полноту
+#: списка сверяет тест с `PRAGMA table_info(broker_command)`.
+_COMMAND_TEXT_COLUMNS: tuple[str, ...] = ("order_id", "symbol", "reason")
+_COMMAND_KEY_COLUMNS: tuple[str, ...] = ("client_order_id", "target_client_order_id")
+_COMMAND_CHECKED_COLUMNS: tuple[str, ...] = ("action", "side", "status")
+
+#: Колонки исполнения — в порядке записи и чтения. Весь текст здесь чужой
+#: (ключи брокера) и идёт через чистку.
+_EXECUTION_COLUMNS: tuple[str, ...] = (
+    "execution_id", "client_order_id", "volume", "price", "at", "commission",
+)
+_EXECUTION_TEXT_COLUMNS: tuple[str, ...] = ("execution_id", "client_order_id")
+
+_COMMAND_ACTION_VALUES: tuple[str, ...] = tuple(action.value for action in CommandAction)
+_COMMAND_SIDE_VALUES: tuple[str, ...] = tuple(side.value for side in CommandSide)
+#: Закрытые статусы — **выводятся** из `CommandStatus.closed`: выбор
+#: незакрытых и сторож закрытой команды держат одно правило.
+_CLOSED_STATUS_VALUES: tuple[str, ...] = tuple(
+    status.value for status in CommandStatus if status.closed
+)
+
+#: Журнал команд брокеру и исполнения (`market.commands`). Отдельной
+#: константой, а не только внутри `_SCHEMA`: тест пересборки прогонов
+#: ставит эти таблицы в базу прежней схемы тем же текстом.
+#:
+#: ⚠️ **Внешнего ключа на прогон нет, и это выбор, а не упущение.** Строка
+#: команды обязана пережить прогон, а у внешнего ключа три поведения, и все
+#: три хуже номера: `CASCADE` уносит команду вместе с прогоном — живая заявка
+#: у брокера становится чужой; `SET NULL` теряет, кто её подал; запрет
+#: удаления (`NO ACTION`) делает одну строку команды на прогоне по истории
+#: причиной отказа чистки, а чистка идёт внутри открытия каждого прогона
+#: (`open_journal_session`) — программа перестала бы открывать прогоны.
+#: Номер прогона после его удаления остаётся однозначным: `AUTOINCREMENT`
+#: номера не повторяет, и пересборка переносит счётчик
+#: (`_carry_the_run_counter`). Что прогон существует при записи, проверяет
+#: `record_broker_command`.
+#:
+#: Ключ команды — `UNIQUE` в самой таблице. Оговорка у `journal_trade_identity`
+#: («уникальный индекс на базе с дублем не открывается») здесь не действует:
+#: таблица новая, дублей в ней быть не может.
+_BROKER_TABLES = """
+CREATE TABLE IF NOT EXISTS broker_command (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id             INTEGER NOT NULL,
+    client_order_id        TEXT    NOT NULL UNIQUE,
+    action                 TEXT    NOT NULL CHECK (action IN ({actions})),
+    order_id               TEXT    NOT NULL,
+    symbol                 TEXT    NOT NULL,
+    side                   TEXT    CHECK (side IN ({sides})),
+    volume                 INTEGER CHECK (volume >= 1),
+    price                  REAL,
+    target_client_order_id TEXT,
+    at                     INTEGER NOT NULL,
+    status                 TEXT    NOT NULL,
+    status_at              INTEGER NOT NULL,
+    reason                 TEXT    NOT NULL DEFAULT '',
+    CHECK (
+        (action = '{create}' AND side IS NOT NULL AND volume IS NOT NULL
+         AND target_client_order_id IS NULL)
+        OR (action = '{cancel}' AND target_client_order_id IS NOT NULL
+            AND side IS NULL AND volume IS NULL AND price IS NULL)
+    )
+);
+
+CREATE TABLE IF NOT EXISTS broker_execution (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id    TEXT    NOT NULL UNIQUE,
+    client_order_id TEXT    NOT NULL,
+    volume          INTEGER NOT NULL CHECK (volume >= 1),
+    price           REAL    NOT NULL,
+    at              INTEGER NOT NULL,
+    commission      REAL
+);
+
+CREATE INDEX IF NOT EXISTS broker_execution_of_order
+    ON broker_execution (client_order_id, id);
+""".format(
+    actions=_sql_values(_COMMAND_ACTION_VALUES),
+    sides=_sql_values(_COMMAND_SIDE_VALUES),
+    create=CommandAction.CREATE.value,
+    cancel=CommandAction.CANCEL.value,
+)
+
 
 def _session_table(name: str) -> str:
     """Текст `CREATE TABLE` прогонов под нужным именем и с текущим `CHECK`."""
@@ -741,6 +862,8 @@ CREATE TABLE IF NOT EXISTS contract (
     CHECK (active_to IS NULL OR active_from IS NULL OR active_from <= active_to)
 ) WITHOUT ROWID;
 
+{broker_tables}
+
 -- Сторожа журнала вынесены в `_GUARDS` (ниже по файлу) и **пересоздаются
 -- при каждом открытии базы**: тело сторожа принадлежит коду, а не файлу.
 -- `CREATE TRIGGER IF NOT EXISTS` здесь стоял бы напрасно — обезвреженный
@@ -753,6 +876,7 @@ CREATE TABLE IF NOT EXISTS contract (
     order_kinds=_sql_values(_ORDER_KIND_VALUES),
     order_phase=_ORDER_PHASE_COLUMN,
     trade_identity=", ".join(_TRADE_IDENTITY),
+    broker_tables=_BROKER_TABLES,
 )
 
 
@@ -1055,6 +1179,66 @@ _GUARDS: dict[str, str] = {
             );
         END
     """.format(evidence=_sql_values(_EVIDENCE_ORIGINS)),
+    # -- журнал команд брокеру и исполнения (`market.commands`) --------------
+    #
+    # Команда и исполнение не удаляются **ничем** — ни поодиночке, ни вместе
+    # с прогоном (внешнего ключа на прогон нет, см. `_BROKER_TABLES`). Сторож
+    # на удалении ловит и `INSERT OR REPLACE` по ключу: замена в SQLite — это
+    # DELETE + INSERT, а `PRAGMA recursive_triggers` включён.
+    **{
+        f"{table}_is_kept": f"""
+        CREATE TRIGGER {table}_is_kept
+        BEFORE DELETE ON {table}
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                '{what} удалить нельзя: по ней сверяют заявки у брокера и деньги на счёте'
+            );
+        END
+    """
+        for table, what in (
+            ("broker_command", "команду брокеру"),
+            ("broker_execution", "строку исполнения"),
+        )
+    },
+    # Условия команды — то, что ушло брокеру, — после записи не меняются.
+    # Меняются статус, его время и причина (`_COMMAND_STATUS_COLUMNS`).
+    "broker_command_terms_are_final": """
+        CREATE TRIGGER broker_command_terms_are_final
+        BEFORE UPDATE OF {frozen} ON broker_command
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'условия команды брокеру не меняются после записи: только её статус'
+            );
+        END
+    """.format(frozen=", ".join(_FROZEN_COMMAND_COLUMNS)),
+    # Закрытая команда не открывается и не переписывается: у брокера по ней
+    # больше ничего не случится, и строка — свидетельство, а не состояние.
+    # Противоречие (закрытую объявили живой) — повод остановиться, а не тихо
+    # поправить строку.
+    "broker_command_closed_is_final": """
+        CREATE TRIGGER broker_command_closed_is_final
+        BEFORE UPDATE OF {status} ON broker_command
+        WHEN old.status IN ({closed})
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'команда брокеру закрыта: её статус и причина больше не меняются'
+            );
+        END
+    """.format(
+        status=", ".join(_COMMAND_STATUS_COLUMNS),
+        closed=_sql_values(_CLOSED_STATUS_VALUES),
+    ),
+    # Исполнение — факт биржи: не правится вовсе.
+    "broker_execution_is_append_only": """
+        CREATE TRIGGER broker_execution_is_append_only
+        BEFORE UPDATE ON broker_execution
+        BEGIN
+            SELECT RAISE(ABORT, 'строку исполнения переписать нельзя: это факт биржи');
+        END
+    """,
 }
 
 #: Сторожа, которых больше нет под этими именами. Перечислены, чтобы снять их
@@ -1226,6 +1410,56 @@ def _order_of(row: tuple[Any, ...]) -> StoredOrder:
         level=_maybe_number(named["level"]),
         limit_price=_maybe_number(named["limit_price"]),
         phase=DecisionPhase(str(named["phase"])),
+    )
+
+
+_COMMAND_SELECT = "SELECT id, " + ", ".join(_COMMAND_COLUMNS) + " FROM broker_command"
+
+
+def _command_of(row: tuple[Any, ...]) -> StoredCommand:
+    """Собрать команду из строки `_COMMAND_SELECT`: номер, затем колонки.
+
+    Команда собирается заново, а не берётся как лежит: `BrokerCommand`
+    проверяет форму, и строка, правленная снаружи в обход `CHECK`, роняет
+    чтение, а не уезжает в сверку с брокером. Незнакомый статус роняет
+    чтение тем же путём (`CommandStatus`).
+    """
+    named = dict(zip(_COMMAND_COLUMNS, row[1:], strict=True))
+    volume = named["volume"]
+    return StoredCommand(
+        id=int(row[0]),
+        session_id=int(named["session_id"]),
+        command=BrokerCommand(
+            client_order_id=str(named["client_order_id"]),
+            action=CommandAction(str(named["action"])),
+            order_id=str(named["order_id"]),
+            symbol=str(named["symbol"]),
+            side=None if named["side"] is None else CommandSide(str(named["side"])),
+            volume=None if volume is None else int(volume),
+            price=_maybe_number(named["price"]),
+            target_client_order_id=(
+                None
+                if named["target_client_order_id"] is None
+                else str(named["target_client_order_id"])
+            ),
+        ),
+        at=_from_ts(int(named["at"])),
+        status=CommandStatus(str(named["status"])),
+        status_at=_from_ts(int(named["status_at"])),
+        reason=str(named["reason"]),
+    )
+
+
+def _execution_of(row: tuple[Any, ...]) -> BrokerExecution:
+    """Собрать исполнение из строки в порядке `_EXECUTION_COLUMNS`."""
+    named = dict(zip(_EXECUTION_COLUMNS, row, strict=True))
+    return BrokerExecution(
+        execution_id=str(named["execution_id"]),
+        client_order_id=str(named["client_order_id"]),
+        volume=int(named["volume"]),
+        price=float(named["price"]),
+        at=_from_ts(int(named["at"])),
+        commission=_maybe_number(named["commission"]),
     )
 
 
@@ -3429,6 +3663,225 @@ class CandleStore:
                 "DELETE FROM robot_halt WHERE reason = ?", (self._clean(reason),)
             )
         return int(cursor.rowcount or 0) > 0
+
+    # -- журнал команд брокеру (`market.commands`) --------------------------
+
+    def record_broker_command(
+        self,
+        session_id: int,
+        command: BrokerCommand,
+        *,
+        reason: str = "",
+        now: datetime | None = None,
+    ) -> StoredCommand:
+        """Записать команду **до** отправки. Возврат — только после фиксации.
+
+        Отправку брокеру разрешает возврат отсюда, и ничто другое (план Э4,
+        С5). Поэтому метод не знает «тихих» исходов: не записалось — исключение
+        наружу, и заявка не уходит. Возврат происходит после `COMMIT`
+        (`_transaction`), а `synchronous = FULL` делает зафиксированное
+        долговечным: строку видит любое другое соединение с базой и она
+        переживает падение программы сразу после возврата.
+
+        Повтор ключа — **отказ**, а не замена и не пропуск. Заменённая строка —
+        заявка у брокера, о которой журнал забыл; пропущенная — то же самое,
+        только без следа. Последний рубеж — `UNIQUE` ключа и сторож
+        `broker_command_is_kept`, который не даёт `INSERT OR REPLACE`.
+
+        :param session_id: прогон, подающий команду. Строка его переживает
+            (`_BROKER_TABLES`), но записать команду несуществующему прогону
+            нельзя: номер, не выданный базой, ничего не связывает.
+        :param reason: причина, с которой команда записана; проходит чистку.
+        :param now: момент записи. `None` — сейчас, по московским часам.
+        :raises LookupError: прогона с таким номером нет.
+        :raises ValueError: команда с этим ключом уже записана.
+        :raises sqlite3.Error: база не приняла запись — диск, блокировка,
+            сторож. Не перехватывается здесь нигде.
+        """
+        at = _to_ts(ensure_msk(now) if now is not None else datetime.now(MSK))
+        values = self._command_values(session_id, command, reason, at)
+        with self._transaction():
+            self._refuse_missing_run(session_id)
+            if self._command_row(command.client_order_id) is not None:
+                raise ValueError(
+                    f"команда с ключом {command.client_order_id} уже записана: "
+                    "повтор ключа — отказ, а не замена. Новой заявке — новый ключ"
+                )
+            self._db.execute(
+                f"INSERT INTO broker_command ({', '.join(values)}) "
+                f"VALUES ({', '.join('?' * len(values))})",
+                tuple(values.values()),
+            )
+            stored = self._stored_command(command.client_order_id)
+        return stored
+
+    def _command_values(
+        self, session_id: int, command: BrokerCommand, reason: str, at: int
+    ) -> dict[str, object]:
+        """Команда по колонкам. Текст чистится списком `_COMMAND_TEXT_COLUMNS`."""
+        values: dict[str, object] = {
+            "session_id": int(session_id),
+            "client_order_id": command.client_order_id,
+            "action": CommandAction(command.action).value,
+            "side": None if command.side is None else CommandSide(command.side).value,
+            "volume": command.volume,
+            "price": None if command.price is None else float(command.price),
+            "target_client_order_id": command.target_client_order_id,
+            "at": at,
+            "status": CommandStatus.RECORDED.value,
+            "status_at": at,
+        }
+        texts = {"order_id": command.order_id, "symbol": command.symbol, "reason": reason}
+        for name in _COMMAND_TEXT_COLUMNS:
+            values[name] = self._clean(texts[name])
+        return values
+
+    def _refuse_missing_run(self, session_id: int) -> None:
+        if self._db.execute(
+            "SELECT 1 FROM journal_session WHERE id = ?", (session_id,)
+        ).fetchone() is None:
+            raise LookupError(
+                f"прогона {session_id} в журнале нет: команду брокеру не к чему привязать"
+            )
+
+    def _command_row(self, client_order_id: str) -> StoredCommand | None:
+        row = self._db.execute(
+            f"{_COMMAND_SELECT} WHERE client_order_id = ?", (client_order_id,)
+        ).fetchone()
+        return None if row is None else _command_of(row)
+
+    def _stored_command(self, client_order_id: str) -> StoredCommand:
+        stored = self._command_row(client_order_id)
+        if stored is None:
+            raise LookupError(f"команды с ключом {client_order_id} в журнале нет")
+        return stored
+
+    def broker_command(self, client_order_id: str) -> StoredCommand | None:
+        """Команда по её ключу. `None` — такой команды журнал не знает."""
+        return self._command_row(client_order_id)
+
+    def set_broker_command_status(
+        self,
+        client_order_id: str,
+        status: CommandStatus,
+        *,
+        reason: str = "",
+        now: datetime | None = None,
+    ) -> StoredCommand:
+        """Сменить статус команды. Возврат — после фиксации, как у записи.
+
+        * тот же статус — ничего не пишется, возвращается лежащая строка:
+          поток статусов повторяет события, и время статуса обязано остаться
+          временем, **когда** он наступил;
+        * закрытая команда (`CommandStatus.closed`) не меняется вовсе:
+          противоречие брокера и журнала — повод остановиться, а не тихо
+          переписать свидетельство. То же держит сторож
+          `broker_command_closed_is_final`;
+        * `recorded` ставит только запись: вернуть команду «в до отправки»
+          значило бы объявить, что брокер о ней не слышал.
+
+        :param reason: причина нового статуса — отказ брокера, текст
+            исключения. Проходит чистку: в теле ответа сервера бывает токен.
+        :raises LookupError: команды с таким ключом журнал не знает.
+        :raises ValueError: команда закрыта, или запрошен `recorded`.
+        """
+        wanted = CommandStatus(status)
+        if wanted is CommandStatus.RECORDED:
+            raise ValueError(
+                f"команда {client_order_id}: статус «записана» ставит только запись"
+            )
+        at = _to_ts(ensure_msk(now) if now is not None else datetime.now(MSK))
+        with self._transaction():
+            stored = self._stored_command(client_order_id)
+            if stored.status is not wanted:
+                if stored.status.closed:
+                    raise ValueError(
+                        f"команда {client_order_id} закрыта со статусом "
+                        f"{stored.status.value}: {wanted.value} поверх неё — "
+                        "противоречие с брокером, а не обновление"
+                    )
+                self._db.execute(
+                    "UPDATE broker_command SET status = ?, status_at = ?, reason = ? "
+                    "WHERE client_order_id = ?",
+                    (wanted.value, at, self._clean(reason), client_order_id),
+                )
+                stored = self._stored_command(client_order_id)
+        return stored
+
+    def open_broker_commands(self) -> tuple[StoredCommand, ...]:
+        """Незакрытые команды всех прогонов, в порядке записи.
+
+        Незакрытая — всё, что **не** в закрытом списке (`CommandStatus.closed`),
+        а не всё, что в открытом: статус, которого программа не знает
+        (записан новой сборкой или руками), попадает сюда и роняет чтение,
+        а не исчезает из сверки. Прогон не сужает выдачу: живая заявка
+        у брокера живёт поверх прогонов (план Э4, С4).
+        """
+        marks = ", ".join("?" * len(_CLOSED_STATUS_VALUES))
+        return tuple(
+            _command_of(row)
+            for row in self._db.execute(
+                f"{_COMMAND_SELECT} WHERE status NOT IN ({marks}) ORDER BY id",
+                _CLOSED_STATUS_VALUES,
+            )
+        )
+
+    def record_broker_execution(self, execution: BrokerExecution) -> bool:
+        """Записать исполнение. `True` — легло сейчас, `False` — уже лежало.
+
+        Повтор события с тем же `executionId` — не вторая сделка: строка одна
+        (план Э4 §2.10). Повтор с **другим** содержимым — отказ: какому из двух
+        верить, из базы не видно, а сделка, удвоенная или подменённая молча,
+        стоит денег. Последний рубеж — `UNIQUE` на ключе в самой таблице.
+
+        Возврат — после фиксации; сбой записи — исключение наружу.
+
+        :raises ValueError: исполнение с этим ключом лежит с другим содержимым.
+        """
+        values = self._execution_values(execution)
+        with self._transaction():
+            row = self._db.execute(
+                "SELECT " + ", ".join(_EXECUTION_COLUMNS)
+                + " FROM broker_execution WHERE execution_id = ?",
+                (values["execution_id"],),
+            ).fetchone()
+            if row is not None and tuple(row) != tuple(values.values()):
+                raise ValueError(
+                    f"исполнение {values['execution_id']} уже записано с другим "
+                    f"содержимым: {tuple(row)} против поданного {tuple(values.values())}"
+                )
+            if row is None:
+                self._db.execute(
+                    f"INSERT INTO broker_execution ({', '.join(values)}) "
+                    f"VALUES ({', '.join('?' * len(values))})",
+                    tuple(values.values()),
+                )
+        return row is None
+
+    def _execution_values(self, execution: BrokerExecution) -> dict[str, object]:
+        """Исполнение по колонкам, в порядке `_EXECUTION_COLUMNS`; текст чищен."""
+        values: dict[str, object] = {
+            "execution_id": execution.execution_id,
+            "client_order_id": execution.client_order_id,
+            "volume": int(execution.volume),
+            "price": float(execution.price),
+            "at": _to_ts(execution.at),
+            "commission": None if execution.commission is None else float(execution.commission),
+        }
+        for name in _EXECUTION_TEXT_COLUMNS:
+            values[name] = self._clean(str(values[name]))
+        return values
+
+    def broker_executions(self, client_order_id: str) -> tuple[BrokerExecution, ...]:
+        """Исполнения одной заявки, в порядке записи."""
+        return tuple(
+            _execution_of(row)
+            for row in self._db.execute(
+                "SELECT " + ", ".join(_EXECUTION_COLUMNS)
+                + " FROM broker_execution WHERE client_order_id = ? ORDER BY id",
+                (self._clean(client_order_id),),
+            )
+        )
 
     # -- объём и чистка -----------------------------------------------------
 

@@ -32,7 +32,7 @@ import pathlib
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Iterator
@@ -43,6 +43,8 @@ import websockets.exceptions
 
 from broker import stream
 from broker.errors import BrokerError, NoConnection, from_status
+from broker.order_stream import TokenDesk, order_events
+from broker.orders import NewOrder, OrderSide, OrderType
 from broker.redaction import (
     FOREIGN_LOGGERS,
     LOGGER_NAME,
@@ -59,6 +61,7 @@ from broker.session import AUTH_URL, PORTFOLIO_PATH, BrokerSession
 from broker.stream import StreamRejected, candle_stream, snapshot_of
 from broker.token_store import LEGACY_KEYS, TokenStore
 from broker.tokens import TokenScope
+from tests import test_broker_order_stream as order_stream_fakes
 
 # Приметные подделки. Ни одна из них не является токеном брокера: они
 # нарочно написаны так, чтобы их нельзя было принять за настоящий,
@@ -793,6 +796,340 @@ def test_no_access_token_in_frame_locals_of_a_non_httpx_failure(
     assert not offenders, f"{name}: значение рабочего токена в переменных кадра:\n  " + (
         "\n  ".join(offenders)
     )
+
+
+# --- команды брокеру (Э4, шаг 1): пишущий путь токен не выносит ---
+
+#: Заявка для проверок пишущего пути. Константа модуля по той же причине,
+#: что `CP1251_TOKEN_FILE`: в кадре теста она не должна быть единственной
+#: находкой поиска — хотя токена в ней и нет.
+COMMAND = NewOrder(
+    side=OrderSide.BUY,
+    order_type=OrderType.MARKET,
+    quantity=1,
+    ticker="MXZ6",
+    class_code="SPBFUT",
+)
+
+
+async def _record_nothing(key: object, request: object) -> None:
+    """Журнал команд, который записывает всё и ничего не помнит."""
+    return None
+
+
+class _CommandWire:
+    """Обмен токена проходит; команда получает `reply`. Помнит, ушёл ли токен.
+
+    Последнее — не украшение: проверка «токена нет в отказе» пуста, если
+    токен до заголовка команды не дошёл вовсе.
+    """
+
+    def __init__(self, reply: Callable[[httpx.Request], httpx.Response]) -> None:
+        self.reply = reply
+        self.carried_token = False
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return httpx.Response(200, json={"access_token": FAKE_ACCESS, "expires_in": 86400})
+        self.carried_token = request.headers.get("Authorization") == f"Bearer {FAKE_ACCESS}"
+        return self.reply(request)
+
+
+#: Отказы, на которых команда кончается: окончательный (401), неизвестный
+#: исход (503, 429, таймаут). Ответы заводятся по требованию, внутри обработчика.
+COMMAND_FAILURES: tuple[tuple[str, Callable[[httpx.Request], httpx.Response]], ...] = (
+    ("401", lambda request: httpx.Response(401, json={"type": "UNAUTHORIZED"})),
+    ("503", lambda request: httpx.Response(503, text=f"upstream {FAKE_ACCESS}")),
+    ("429", lambda request: httpx.Response(429, json={"type": "RESOURCE_EXHAUSTED"})),
+    ("таймаут", lambda request: _raise(httpx.ReadTimeout("долго", request=request))),
+)
+
+
+@pytest.mark.parametrize(("name", "reply"), COMMAND_FAILURES)
+def test_no_token_leaks_from_a_failed_command(
+    store: TokenStore,
+    journal: tuple[logging.Handler, io.StringIO],
+    name: str,
+    reply: Callable[[httpx.Request], httpx.Response],
+) -> None:
+    """Отказ команды не выносит токен ни в текст, ни в `repr`, ни в кадры, ни в лог.
+
+    Пишущий путь идёт через тот же `_authorized`, что чтение (находка С7),
+    и проверяется теми же поверхностями. У 503 тело нарочно содержит токен:
+    тело уходит в `details` и в лог уровня DEBUG — и там обязано быть чистым.
+
+    ⚠️ Кадры здесь проверяются для порядка, но стирание заголовка этот тест
+    **не стережёт**: на этих отказах кадр `_authorized` к моменту подъёма уже
+    закрыт (проверено мутацией 27.10.2026 — без `headers.clear()` все четыре
+    случая зелёные). Стирание стережёт соседний тест отмены посреди POST.
+    Этот — поверхности текста и лога пишущего пути: перенос заголовка или
+    тела в отказ мимо чистки.
+    """
+    handler, buffer = journal
+    wire = _CommandWire(reply)
+
+    async def scenario() -> BrokerError:
+        async with BrokerSession(
+            store, client=transport(wire), clock=moment, attempts=3, sleep=_no_sleep
+        ) as session:
+            with pytest.raises(BrokerError) as caught:
+                await session.create_order(COMMAND, record=_record_nothing)
+            return caught.value
+
+    error = run(scenario())
+    assert wire.carried_token, f"{name}: токен до заголовка команды не дошёл — проверка пуста"
+    surfaces = {
+        "str": str(error),
+        "repr": repr(error),
+        "args": repr(error.args),
+        "technical": error.technical,
+        "details": error.details,
+        "трассировка": "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        ),
+        "журнал": buffer.getvalue(),
+    }
+    for where, body in surfaces.items():
+        assert not leaked(body), f"{name}: утечка в {where}:\n{body}"
+    offenders = frames_with_secret(error)
+    assert not offenders, f"{name}: токен в переменных кадра:\n  " + "\n  ".join(offenders)
+
+
+def test_no_token_in_frames_when_a_command_is_cancelled_mid_flight(
+    store: TokenStore, journal: tuple[logging.Handler, io.StringIO]
+) -> None:
+    """Задачу отменили, пока команда ждала ответа: в кадрах отмены токена нет.
+
+    Это не редкий отказ, а обычный выход: владелец счёта закрыл окно, пока
+    заявка была в пути. asyncio печатает непойманную отмену задачи через
+    `loop.call_exception_handler`, то есть кадры уходят в лог. Мутация,
+    на которой проверен 27.10.2026: убрать `headers.clear()` из `finally`
+    в `_authorized` — тест падает.
+    """
+    handler, buffer = journal
+
+    async def scenario() -> BaseException:
+        in_flight = asyncio.Event()
+        carried: list[bool] = []
+
+        async def wire(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == AUTH_URL:
+                return httpx.Response(
+                    200, json={"access_token": FAKE_ACCESS, "expires_in": 86400}
+                )
+            carried.append(request.headers.get("Authorization") == f"Bearer {FAKE_ACCESS}")
+            in_flight.set()
+            await asyncio.Event().wait()
+            raise AssertionError("ответа быть не должно: задачу отменяют раньше")
+
+        async with BrokerSession(
+            store, client=transport(wire), clock=moment, attempts=1, sleep=_no_sleep
+        ) as session:
+            task = asyncio.create_task(session.create_order(COMMAND, record=_record_nothing))
+            await in_flight.wait()
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError as error:
+                assert carried == [True], "токен до заголовка команды не дошёл"
+                return error
+            raise AssertionError("отмена до задачи не долетела")
+
+    error = run(scenario())
+    offenders = frames_with_secret(error)
+    assert not offenders, "токен в переменных кадра отменённой команды:\n  " + (
+        "\n  ".join(offenders)
+    )
+    assert not leaked(buffer.getvalue()), buffer.getvalue()
+
+
+# --- поток статусов заявок (Э4, шаг 1, фаза 2) ---
+
+
+async def _cancel_order_events(desk: TokenDesk) -> None:
+    """Потребитель ждёт событие, задачу отменяют — как при закрытии окна."""
+    async with order_events(desk) as events:
+        waiting = asyncio.ensure_future(anext(events))
+        await asyncio.sleep(0)
+        waiting.cancel()
+        await waiting
+
+
+async def _read_order_events(desk: TokenDesk) -> None:
+    async with order_events(desk) as events:
+        async for _ in events:
+            pass
+
+
+#: Как кончается поток статусов: исход рукопожатия и что делает потребитель.
+ORDER_STREAM_ENDINGS: tuple[tuple[str, Callable[[], Any], Callable[[Any], Any]], ...] = (
+    ("рукопожатие 401", lambda: order_stream_fakes.rejected(401), _read_order_events),
+    ("рукопожатие 503", lambda: order_stream_fakes.rejected(503), _read_order_events),
+    (
+        "обрыв посреди чтения",
+        lambda: order_stream_fakes.FakeSocket(end=order_stream_fakes.dropped),
+        _read_order_events,
+    ),
+    ("отмена задачи", order_stream_fakes.FakeSocket, _cancel_order_events),
+)
+
+
+@pytest.mark.parametrize(("name", "outcome", "consumer"), ORDER_STREAM_ENDINGS)
+def test_no_token_leaks_from_the_order_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    journal: tuple[logging.Handler, io.StringIO],
+    name: str,
+    outcome: Callable[[], Any],
+    consumer: Callable[[Any], Any],
+) -> None:
+    """Поток статусов: токена нет ни в тексте отказа, ни в кадрах, ни в логе.
+
+    Рукопожатие подменено; токен — `FAKE_ACCESS`, тот же, что ищет `leaked`.
+    Что он дошёл до заголовка, проверяется: иначе проверка пуста. Мутация:
+    убрать `headers.clear()` в `broker/stream.py::authorized_socket`.
+    """
+    handler, buffer = journal
+    fake = order_stream_fakes.Handshakes(outcome)
+    monkeypatch.setattr(websockets, "connect", fake)
+    desk = order_stream_fakes.Desk(FAKE_ACCESS)
+
+    async def scenario() -> BaseException:
+        try:
+            await consumer(desk)
+        except BaseException as error:  # noqa: BLE001 — ловим любой, и отмену тоже
+            return error
+        raise AssertionError("поток кончился без отказа — проверять нечего")
+
+    error = run(scenario())
+    assert fake.calls[0]["at_handshake"] == {"Authorization": "Bearer " + FAKE_ACCESS}
+    surfaces = {
+        "str": str(error),
+        "repr": repr(error),
+        "args": repr(error.args),
+        "трассировка": "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        ),
+        "журнал": buffer.getvalue(),
+    }
+    for where, body in surfaces.items():
+        assert not leaked(body), f"{name}: утечка в {where}:\n{body}"
+    offenders = frames_with_secret(error)
+    assert not offenders, f"{name}: токен в переменных кадра:\n  " + "\n  ".join(offenders)
+
+
+class _StreamSocket:
+    """Сокет обоих потоков: подписку принимает молча, на чтении — обрыв."""
+
+    async def send(self, message: str) -> None:
+        return None
+
+    async def recv(self) -> str:
+        raise order_stream_fakes.dropped()
+
+
+class _StreamDial:
+    """Контекст рукопожатия: сокет или отказ на входе, как у библиотеки."""
+
+    def __init__(self, outcome: object) -> None:
+        self._outcome = outcome
+
+    async def __aenter__(self) -> object:
+        if isinstance(self._outcome, BaseException):
+            raise self._outcome
+        return self._outcome
+
+    async def __aexit__(self, *unused: object) -> bool:
+        return False
+
+
+class _StreamHandshakes:
+    """`websockets.connect` обоих потоков: keepalive потока заявок принимает и не читает."""
+
+    def __init__(self, outcome: Callable[[], object]) -> None:
+        self._outcome = outcome
+        self.sent: list[dict[str, str]] = []
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        additional_headers: dict[str, str],
+        logger: logging.Logger,
+        **options: float,
+    ) -> _StreamDial:
+        self.sent.append(dict(additional_headers))
+        return _StreamDial(self._outcome())
+
+
+async def _read_candles(desk: TokenDesk) -> None:
+    # Потоку свечей от сессии нужен тот же `access_token()`, что потоку заявок.
+    session: Any = desk
+    async with candle_stream(session, ticker="MXZ6", class_code="SPBFUT") as socket:
+        await socket.recv()
+
+
+#: Оба потока — общее рукопожатие `broker/stream.py::authorized_socket`.
+STREAMS: dict[str, Callable[[TokenDesk], Coroutine[Any, Any, None]]] = {
+    "свечи": _read_candles,
+    "заявки": _read_order_events,
+}
+
+#: Как поток кончается отказом: на входе (сеть, 401, 503) и в теле (обрыв).
+#: Исходы заводятся по требованию — готовое исключение копит трассировки.
+STREAM_REFUSALS: dict[str, Callable[[], object]] = {
+    "сети нет": lambda: OSError("нет маршрута до узла"),
+    "рукопожатие 401": lambda: order_stream_fakes.rejected(401),
+    "рукопожатие 503": lambda: order_stream_fakes.rejected(503),
+    "обрыв после подключения": _StreamSocket,
+}
+
+
+@pytest.mark.parametrize("stream_name", sorted(STREAMS))
+@pytest.mark.parametrize("refusal", sorted(STREAM_REFUSALS))
+def test_no_token_in_any_text_of_a_stream_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    journal: tuple[logging.Handler, io.StringIO],
+    stream_name: str,
+    refusal: str,
+) -> None:
+    """Отказ потока свечей и потока заявок: токена нет ни в одном тексте отказа.
+
+    Поверхности — все поля отказа слоя, включая `technical` и `details`:
+    их пишет в технический лог `app/`, а не этот тест. Соседний тест потока
+    заявок их не смотрел, и мутация «заголовок в технический текст сетевого
+    отказа мимо чистки» выживала (test-expert, 27.10.2026). Свечи — живой
+    путь владельца счёта: рукопожатие у них с 27.10.2026 общее.
+    """
+    handler, buffer = journal
+    fake = _StreamHandshakes(STREAM_REFUSALS[refusal])
+    monkeypatch.setattr(websockets, "connect", fake)
+    desk = order_stream_fakes.Desk(FAKE_ACCESS)
+
+    async def scenario() -> BrokerError:
+        with pytest.raises(BrokerError) as caught:
+            await STREAMS[stream_name](desk)
+        return caught.value
+
+    error = run(scenario())
+    assert fake.sent == [{"Authorization": "Bearer " + FAKE_ACCESS}], (
+        "токен до заголовка рукопожатия не дошёл — проверка пуста"
+    )
+    surfaces = {
+        "str": str(error),
+        "repr": repr(error),
+        "args": repr(error.args),
+        "human": error.human,
+        "technical": error.technical,
+        "details": error.details,
+        "трассировка": "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        ),
+        "журнал": buffer.getvalue(),
+    }
+    for where, body in surfaces.items():
+        assert not leaked(body), f"{stream_name}, {refusal}: утечка в {where}:\n{body}"
+    offenders = frames_with_secret(error)
+    assert not offenders, f"{stream_name}, {refusal}: токен в кадрах:\n  " + "\n  ".join(offenders)
 
 
 def test_bad_access_token_from_the_server_leaves_the_layer_as_broker_error(
