@@ -51,7 +51,7 @@ from broker.account import AccountSnapshot
 from broker.candles import HistoricalCandle, HistoryIncomplete
 from broker.clock import ClockWatch
 from broker.errors import BrokerError, NoConnection, OutcomeUnknown, TokenFileError
-from broker.session import READ_ENDPOINTS, REPEATABLE
+from broker.session import READ_ENDPOINTS, REPEATABLE, WRITE_ENDPOINTS
 from market import MSK, MarketWorker
 from ui.models import Connection, DecisionLevel
 
@@ -653,4 +653,29 @@ def test_no_reading_endpoint_of_the_broker_can_raise_an_unknown_outcome() -> Non
         "в `changes_the_account` с объяснением, и в `REPEATABLE` не вносите: "
         "повтор такой команды может подать её дважды. Только читает — "
         "тогда внесите его в `REPEATABLE`"
+    )
+
+
+def test_no_command_to_the_broker_is_ever_repeated() -> None:
+    """Пишущая пара не стоит в `REPEATABLE` — ни наша, ни названная документацией.
+
+    Обратная сторона храповика выше. Тот стережёт, чтобы чтение не
+    останавливало робота; этот — чтобы команда не уходила дважды: потеря
+    ответа на подаче должна поднять «исход неизвестен», а не повтор (`B-002`).
+
+    Две половины, и вторая не тавтология: пары подачи, изменения и отмены
+    взяты со страниц снимка документации (`ORDER_ENDPOINTS` сверяется
+    со снимком в `tests/test_broker_session.py`), а не из `broker/session.py`.
+    Мутация: внести `("POST", ORDERS_PATH)` в `REPEATABLE`.
+    """
+    from tests.test_broker_session import ORDER_ENDPOINTS
+
+    ours = set(WRITE_ENDPOINTS) & set(REPEATABLE)
+    assert not ours, f"пишущая пара {ours} повторяется: потерянный ответ — вторая заявка"
+    documented = set(ORDER_ENDPOINTS) & set(REPEATABLE)
+    assert not documented, (
+        f"торговый адрес брокера {documented} повторяется: потерянный ответ — вторая заявка"
+    )
+    assert set(WRITE_ENDPOINTS) <= set(ORDER_ENDPOINTS), (
+        "в пишущем списке пара, которой нет среди торговых адресов документации"
     )

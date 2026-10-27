@@ -15,10 +15,15 @@
 * исторические свечи — сервис ``trade-api-market-data-connector``
   (исправлено 05.09.2026, разбор — у `CANDLES_PATH`).
 
-**Этап 1 — только чтение.** Функций подачи, изменения и снятия заявки здесь
-нет. Мало того, публичный метод запроса отказывается обращаться к торговым
-адресам вообще: см. `READ_ENDPOINTS`. Заявки — этап 2, и появятся они отдельной
-задачей с отдельным ревью, а не по недосмотру.
+**Чтение и запись — два пути с двумя белыми списками** (Э4, шаг 1,
+27.10.2026; `.docs/plans/E4-live-orders.md` §11). `read()` ходит только
+по `READ_ENDPOINTS` и пишущий адрес не пропускает. Подача и снятие заявки —
+`create_order` и `cancel_order`, по `WRITE_ENDPOINTS`: права токена проверяются
+перед каждой командой, ключ `clientOrderId` создаётся здесь и записывается
+в журнал команд **до** отправки, команда уходит ровно один раз. Изменения
+заявки (`/orders/edit`) нет: план §2.8 — «своя пара, `edit` не заводить».
+Пока этот путь ничем в продукте не вызывается: его подключает боевой
+исполнитель в `app/` (шаг 2).
 
 **Повтор — свойство обращения, а не решение вызывающего** (`B-002`, закрыто
 06.09.2026). Повторяется только то, что перечислено в `REPEATABLE`: чтение
@@ -34,6 +39,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Callable, Final, Mapping
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -41,6 +47,7 @@ from broker.clock import ClockWatch
 from broker.connection import Backoff, ConnectionState
 from broker.errors import (
     HTTP_NOT_FOUND,
+    NOT_FOUND,
     AuthFailed,
     BrokerError,
     NoConnection,
@@ -55,6 +62,23 @@ from broker.errors import (
     code_of,
     describe_body,
     from_status,
+)
+from broker.orders import (
+    ORDER_ID_BY_CLIENT,
+    CancelOrder,
+    CommandAccepted,
+    NewOrder,
+    OrderCommand,
+    OrdersPage,
+    OrdersQuery,
+    OrderState,
+    RecordCommand,
+    TradesPage,
+    TradesQuery,
+    acceptance_doubt,
+    parse_order_state,
+    parse_orders_page,
+    parse_trades_page,
 )
 from broker.redaction import install as install_redaction
 from broker.redaction import log, scrub
@@ -141,6 +165,27 @@ TRADING_STATUS_PATH: Final[str] = (
     "/trade-api-information-service/api/v1/trading-schedule/status"
 )
 
+#: Заявки по нашему ключу. **Один адрес — два дела, разница только в глаголе:**
+#: `GET` отдаёт статус заявки (`.docs/broker-api/11-get-order-by-id.md`),
+#: `POST` создаёт новую (`13-create-order.md`). Поэтому допуск и повтор
+#: у слоя заданы парой «глагол и адрес», а не адресом.
+#:
+#: ⚠️ **Живьём не проверялось: токена с правами торговли в разработке нет.**
+ORDERS_PATH: Final[str] = "/trade-api-bff-operations/api/v1/orders"
+
+#: Отмена заявки — **другой сервис**, `bff-order-details`, а не `bff-operations`
+#: (`12-cancel-order.md`). Пишущий адрес. Живьём не проверялось.
+CANCEL_ORDER_PATH: Final[str] = "/trade-api-bff-order-details/api/v1/orders/cancel"
+
+#: Список заявок с 26.01.2026. ⚠️ По снимку живёт на сервисе **рыночных
+#: данных**, а не операций (`15-orders-search.md`) — так и написано; прецедент
+#: неверного имени сервиса уже был (`CANDLES_PATH`), поэтому адрес стоит
+#: в `ADDRESS_SENSITIVE`. Запрос читающий: `POST` с телом-фильтром.
+ORDERS_SEARCH_PATH: Final[str] = "/trade-api-market-data-connector/api/v1/orders/search"
+
+#: Список сделок с 26.01.2026 (`16-trades-search.md`). Читающий `POST`.
+TRADES_SEARCH_PATH: Final[str] = "/trade-api-bff-operations/api/v1/trades/search"
+
 
 def _bare(path: str) -> str:
     """Путь без строки запроса и без хвостового слэша.
@@ -160,8 +205,8 @@ def _bare(path: str) -> str:
     return path.split("?", 1)[0].rstrip("/")
 
 
-#: Что слою МОЖНО спросить у брокера на этапе 1: **пара «глагол и адрес»**.
-#: Всё остальное — отказ.
+#: Что слою МОЖНО **прочитать** у брокера: **пара «глагол и адрес»**.
+#: Всё остальное — отказ `read()`, в том числе обе пары `WRITE_ENDPOINTS`.
 #:
 #: Здесь стоял чёрный список кусков адреса ("/orders", "/order/", "/cancel",
 #: "/transaction"), и он пропускал 9 правдоподобных написаний адреса заявки
@@ -170,8 +215,8 @@ def _bare(path: str) -> str:
 #: оба содержали "/orders", то есть проверял список против самого себя.
 #:
 #: Белый список не требует угадывать, как брокер назовёт адрес заявки:
-#: незнакомая пара отвергается по умолчанию. Заявки — этап 2, и появятся
-#: они отдельной осознанной строкой здесь, а не по копипасте из документации.
+#: незнакомая пара отвергается по умолчанию. Заявки появились отдельным
+#: списком `WRITE_ENDPOINTS`, а не строкой здесь (Э4, 27.10.2026).
 #:
 #: ⚠️ **Почему пара, а не адрес** (правка 06.09.2026 по разбору `/risk`).
 #: Ни глагол, ни адрес по отдельности чтения от торговли не отделяют.
@@ -199,6 +244,26 @@ READ_ENDPOINTS: Final[frozenset[tuple[str, str]]] = frozenset(
         ("GET", CANDLES_PATH),
         ("GET", DAILY_SCHEDULE_PATH),
         ("GET", TRADING_STATUS_PATH),
+        # Заявки, но читающие (Э4, 27.10.2026): статус по ключу и оба списка.
+        # Ничего не меняют ни на счёте, ни у брокера — потому и повторяются.
+        ("GET", ORDERS_PATH),
+        ("POST", ORDERS_SEARCH_PATH),
+        ("POST", TRADES_SEARCH_PATH),
+    }
+)
+
+#: Что слой вправе **изменить** у брокера: создать заявку и снять её. Больше
+#: ничего — изменение заявки (`/orders/edit`) не заводится (план Э4 §2.8).
+#:
+#: Отдельный список, а не строки в `READ_ENDPOINTS`, и пересечься с ним не
+#: может: `read()` пускает только `READ_ENDPOINTS`, а пишущий путь
+#: (`_command`) — только этот. Ни одна пара отсюда **никогда** не стоит
+#: в `REPEATABLE`: таймаут значит «не пришёл ответ», а не «заявка не дошла»,
+#: и повтор здесь — вторая заявка на срочном рынке (`B-002`).
+WRITE_ENDPOINTS: Final[frozenset[tuple[str, str]]] = frozenset(
+    {
+        ("POST", ORDERS_PATH),
+        ("POST", CANCEL_ORDER_PATH),
     }
 )
 
@@ -287,8 +352,57 @@ REPEATABLE: Final[frozenset[tuple[str, str]]] = frozenset(
         ("GET", CANDLES_PATH),
         ("GET", DAILY_SCHEDULE_PATH),
         ("GET", TRADING_STATUS_PATH),
+        # Статус заявки по ключу и оба списка (Э4, 27.10.2026): чтение,
+        # повтор которого на счёте не меняет ничего. Подача по тому же
+        # адресу — `POST`, и её здесь нет (`WRITE_ENDPOINTS`).
+        ("GET", ORDERS_PATH),
+        ("POST", ORDERS_SEARCH_PATH),
+        ("POST", TRADES_SEARCH_PATH),
     }
 )
+
+#: Обращения, которые идут **своим ведром частоты**, а не общим (находка С6
+#: гейта Э4, план §10). Общее ведро — 5 запросов в секунду на всю сессию,
+#: и догрузка пропущенных свечей после обрыва ставит в его очередь десятки
+#: запросов разом (`broker/account.py`, `SNAPSHOT_INTERVAL`). Заявка, поданная
+#: в этот момент, ждала бы их всех — десятки секунд при рыночной заявке.
+#:
+#: Сюда входят обе команды, статус по ключу и оба списка — всё, что
+#: исполнитель заявок спрашивает, пока движок ждёт ответа (план §2.2 п. 8,
+#: §2.7), — и **обмен токена**: без рабочего токена команда не уходит,
+#: и стоять обмену за догрузкой значило бы задержать ту же заявку. Обмен
+#: случается раз в сутки и на старте, очереди он не создаёт.
+#:
+#: Предел брокера считается по сервисам (10 RPS на каждый, `29-restrictions.md`),
+#: и ведра в сумме его не превышают: по умолчанию каждое — половина предела.
+ORDER_LANE: Final[frozenset[tuple[str, str]]] = WRITE_ENDPOINTS | {
+    ("GET", ORDERS_PATH),
+    ("POST", ORDERS_SEARCH_PATH),
+    ("POST", TRADES_SEARCH_PATH),
+    ("POST", AUTH_EXCHANGE),
+}
+
+#: Пары, у которых 404 с кодом брокера `NOT_FOUND` — **ответ**, а не отказ:
+#: «заявки с таким ключом у брокера нет» (`11-get-order-by-id.md`: «при
+#: отсутствии заявки возвращается ошибка 404 NOT_FOUND»). Слой отдаёт его
+#: значением `ABSENT`, и `order_status` возвращает `None`.
+#:
+#: Другие 404 этого адреса остаются собой: без кода брокера — `WrongAddress`
+#: (ответил шлюз, адрес стоит в `ADDRESS_SENSITIVE`); с кодом `USER_NOT_FOUND`
+#: (13, 12, 11: «общая форма отказа плюс `USER_NOT_FOUND`») — обычный
+#: `NotFound`: это не «нет заявки», а «брокер не знает счёта».
+ABSENCE_ANSWERS: Final[frozenset[tuple[str, str]]] = frozenset({("GET", ORDERS_PATH)})
+
+
+class _Absent:
+    """Тип значения `ABSENT`: брокер ответил «такого нет»."""
+
+    def __repr__(self) -> str:
+        return "ABSENT"
+
+
+#: Ответ «такого нет» — одно значение на весь слой, сравнивается через `is`.
+ABSENT: Final[_Absent] = _Absent()
 
 #: Методы, у которых **404 двузначен**, и что говорить владельцу счёта, когда
 #: этот код означает неверный адрес. Ключ — путь; значение — две короткие
@@ -327,6 +441,21 @@ ADDRESS_SENSITIVE: Final[Mapping[str, tuple[str, str]]] = {
         "Брокер не отвечает, идут ли сейчас торги",
         "Программа не знает, открыта ли биржа, и работает как раньше.",
     ),
+    # Адреса заявок — по той же причине: имена сервисов взяты из снимка,
+    # живьём не проверены (Э4). Адрес подачи и статуса один, поэтому ответ
+    # шлюза на любой из двух гасит оба: заявки по нему не уйдут всё равно.
+    ORDERS_PATH: (
+        "Брокер не принимает заявки по адресу, который знает программа",
+        "Заявки не подаются и не проверяются.",
+    ),
+    ORDERS_SEARCH_PATH: (
+        "Брокер не отдаёт список заявок",
+        "Сверить живые заявки у брокера программа не может.",
+    ),
+    TRADES_SEARCH_PATH: (
+        "Брокер не отдаёт список сделок",
+        "Сверить сделки с брокером программа не может.",
+    ),
 }
 
 #: Сколько ждём ответа. Больше — робот молча висит и пропускает свечу;
@@ -344,9 +473,11 @@ OUTAGE: Final[tuple[type[BrokerError], ...]] = (NoConnection, Timeout, ServerFai
 class BrokerSession:
     """Одно подключение к брокеру: токен, транспорт, отказы, состояние связи.
 
-    Заявок не подаёт. Кэша нет намеренно: `DOMAIN.md` §5 требует видеть
-    свободные средства **до** заявки, а биржа пересматривает гарантийное
-    обеспечение внутри дня — значение получасовой давности здесь негодно.
+    Читает (`read` и обёртки над ним) и подаёт команды (`create_order`,
+    `cancel_order`) — двумя разными путями с двумя белыми списками. Кэша нет
+    намеренно: `DOMAIN.md` §5 требует видеть свободные средства **до** заявки,
+    а биржа пересматривает гарантийное обеспечение внутри дня — значение
+    получасовой давности здесь негодно.
     """
 
     def __init__(
@@ -360,6 +491,7 @@ class BrokerSession:
         throttle: Throttle | None = None,
         backoff: Backoff | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        order_throttle: Throttle | None = None,
     ) -> None:
         install_redaction()
         self._store = store
@@ -367,6 +499,8 @@ class BrokerSession:
         self._timeout = timeout
         self._attempts = max(1, attempts)
         self._throttle = throttle or Throttle()
+        #: Своё ведро для `ORDER_LANE`: заявка не стоит в очереди за догрузкой.
+        self._order_throttle = order_throttle or Throttle()
         self._backoff = backoff or Backoff()
         self._sleep = sleep
         self._owns_client = client is None
@@ -436,6 +570,10 @@ class BrokerSession:
         в нём незнаком. Ответ сервиса авторизации содержит поле `scope`,
         но состав его значений в документации не задан, поэтому решение
         на нём не строится.
+
+        Зовётся **перед каждой командой** пишущего пути (`_command`), а не один
+        раз при включении боя: токен заменяют на ходу, и замена на токен для
+        чтения не должна оставить робота с разрешением, выданным прежнему.
         """
         stored = self.stored()
         scope = stored.token.scope
@@ -451,6 +589,15 @@ class BrokerSession:
         переподключения: повтор того же токена без изменений даёт тот же отказ.
         """
         self._refused = None
+
+    def forget_access_token(self) -> None:
+        """Забыть рабочий токен: следующее обращение обменяет новый.
+
+        Для отказа 401 в рукопожатии сокета (`broker/order_stream.py`): тот
+        ответ приходит мимо `_interpret`, который делает то же самое для HTTP.
+        Без этого следующее подключение взяло бы тот же отвергнутый токен.
+        """
+        self._access = None
 
     async def access_token(self) -> AccessToken:
         """Действующий рабочий токен. Обменивает и обновляет сам.
@@ -648,6 +795,116 @@ class BrokerSession:
             lambda: self._authorized(verb, path, params=params, json=json),
         )
 
+    # --- заявки: чтение ---
+
+    async def order_status(self, key: UUID) -> OrderState | None:
+        """Статус заявки по нашему ключу (`11-get-order-by-id.md`).
+
+        `None` — брокер ответил 404 `NOT_FOUND`: заявки с этим ключом у него
+        нет (`ABSENCE_ANSWERS`). Что это значит — «не дошла» или «ещё
+        не появилась» — решает вызывающий по журналу команд (находка С1:
+        404 сразу после потери ответа не доказывает, что заявки не будет).
+        Чтение: повторяется (`REPEATABLE`), идёт своим ведром (`ORDER_LANE`).
+        """
+        payload = await self.read(
+            ORDERS_PATH,
+            params={"orderIdType": ORDER_ID_BY_CLIENT, "orderId": str(key)},
+        )
+        if payload is ABSENT:
+            return None
+        return parse_order_state(payload)
+
+    async def search_orders(self, query: OrdersQuery) -> OrdersPage:
+        """Одна страница списка заявок (`15-orders-search.md`). Чтение."""
+        payload = await self.read(
+            ORDERS_SEARCH_PATH, method="POST", params=query.params(), json=query.body()
+        )
+        return parse_orders_page(payload)
+
+    async def search_trades(self, query: TradesQuery) -> TradesPage:
+        """Одна страница списка сделок (`16-trades-search.md`). Чтение."""
+        payload = await self.read(
+            TRADES_SEARCH_PATH, method="POST", params=query.params(), json=query.body()
+        )
+        return parse_trades_page(payload)
+
+    # --- заявки: команды ---
+
+    async def create_order(
+        self, order: NewOrder, *, record: RecordCommand
+    ) -> CommandAccepted:
+        """Подать заявку (`13-create-order.md`). Порядок шагов — `_command`.
+
+        Возврат значит «брокер принял», а не «исполнена»: факт приходит
+        потоком статусов или запросом `order_status` по `CommandAccepted.key`.
+        """
+        return await self._command(ORDERS_PATH, order, record)
+
+    async def cancel_order(
+        self, target: UUID, *, record: RecordCommand
+    ) -> CommandAccepted:
+        """Снять заявку с ключом `target` (`12-cancel-order.md`).
+
+        У запроса на отмену **свой** ключ (`CommandAccepted.key`), отличный
+        от `target`. Возврат значит «запрос на отмену принят», а не «снята»:
+        снятой заявку делает событие `4` по исходной (план Э4 §2.7).
+        """
+        return await self._command(CANCEL_ORDER_PATH, CancelOrder(target), record)
+
+    async def _command(
+        self, path: str, request: OrderCommand, record: RecordCommand
+    ) -> CommandAccepted:
+        """Пишущий путь: **шаблон из шести шагов, порядок которых и есть защита.**
+
+        1. Пара в `WRITE_ENDPOINTS` — иначе отказ без единого запроса.
+        2. Права токена (`require_trade_rights`): токен для чтения — `ReadOnlyToken`.
+        3. Адрес, погашенный ответом шлюза в этом сеансе, — `WrongAddress`.
+        4. Рабочий токен — **до** записи журнала: отказ обмена не оставляет
+           в журнале команду, которая не уходила.
+        5. Новый ключ `uuid4` и запись `record(key, request)`. Исключение
+           записи идёт наружу, и команда не уходит (С5).
+        6. Один `POST` с тем же ключом. Потерянный, 5xx и 429 — `OutcomeUnknown`
+           без повтора (`_with_retries`, `REPEATABLE`); 200, не подтверждающий
+           приём **этого** ключа, — тоже `OutcomeUnknown`: команда могла быть
+           принята, и сказать «отказ» значило бы солгать.
+
+        Ключ создаётся здесь, а не у вызывающего: тогда обойти запись нельзя,
+        а старый ключ не подставить (`uuid5` от имени дал бы один ключ разным
+        перевооружениям тейка — план §2.9).
+        """
+        self._guard_write(path)
+        self.require_trade_rights()
+        if self.address_is_wrong(path):
+            raise self._wrong_address_error(_bare(path), repeated=True)
+        await self.access_token()
+        key = uuid4()
+        body = request.body(key)
+        await record(key, request)
+        log().info("команда брокеру %s: ключ %s записан, отправляется", path, key)
+        try:
+            payload = await self._with_retries(
+                "POST",
+                path,
+                lambda: self._authorized("POST", path, params=None, json=body),
+            )
+        except UnexpectedAnswer as error:
+            raise self._outcome_unknown(path, error) from error
+        doubt = acceptance_doubt(payload, key)
+        if doubt is not None:
+            raise self._outcome_unknown(path, UnexpectedAnswer(doubt, f"{path}: {doubt}"))
+        log().info("команда брокеру %s: ключ %s принят", path, key)
+        return CommandAccepted(key=key, request=request)
+
+    @staticmethod
+    def _guard_write(path: str) -> None:
+        """Пропустить только пару из `WRITE_ENDPOINTS`. Иначе отказ до сети."""
+        _refuse_absolute(path)
+        if ("POST", path) not in WRITE_ENDPOINTS:
+            raise RuntimeError(
+                f"адрес {path} не входит в список пишущих обращений: слой "
+                "подаёт и снимает заявки, и больше ничего не меняет"
+            )
+
     def address_is_wrong(self, path: str) -> bool:
         """Признан ли адрес неверным в этом сеансе: шлюз брокера его не знает.
 
@@ -695,16 +952,7 @@ class BrokerSession:
         именно** пара не подошла, живёт в `_refused_why`: он длиннее самого
         сторожа и к решению «пускать или нет» отношения не имеет.
         """
-        # Абсолютный URL проверяется первым: httpx игнорирует `base_url`,
-        # когда путь абсолютный, поэтому строка с полным адресом уводит
-        # запрос на боевой хост брокера мимо всех настроек транспорта —
-        # включая подставной хост в тестах.
-        if "://" in path or path.startswith("//"):
-            raise RuntimeError(
-                f"адрес {path} задан целиком. Слой broker/ принимает только "
-                "путь: полный адрес уходит мимо настроек транспорта, в том "
-                "числе мимо подставного хоста в тестах"
-            )
+        _refuse_absolute(path)
         if (method, path) not in READ_ENDPOINTS:
             raise RuntimeError(_refused_why(method, path))
 
@@ -729,9 +977,14 @@ class BrokerSession:
         # утечка случается не в редком отказе, а при обычном выходе программы.
         # Проверено прогоном 30.08.2026: до правки все три отказа выносили
         # заголовок целиком, отказ связи — нет.
-        headers = {"Authorization": f"Bearer {access.secret.reveal()}"}
+        #
+        # Строка заголовка собирается **внутри** `try`, а не перед ним (находка
+        # С7 гейта Э4): между сборкой и `try` не должно стоять ничего, что
+        # способно поднять исключение и унести словарь с секретом мимо `finally`.
+        headers: dict[str, str] = {}
         sent_at = self._clock()
         try:
+            headers["Authorization"] = f"Bearer {access.secret.reveal()}"
             response = await self._client.request(
                 method,
                 path,
@@ -775,11 +1028,16 @@ class BrokerSession:
         не получает: поднимается `OutcomeUnknown` — «исход неизвестен».
         Окончательный отказ (400, 401, 404) остаётся собой: брокер сказал,
         что запрос отвергнут, гадать не о чем и пугать человека нечем.
+
+        Ведро частоты выбирает тоже таблица, `ORDER_LANE`, а не вызывающий:
+        команды и запросы о заявках не стоят в очереди за догрузкой (С6).
         """
-        repeatable = (method.upper(), _bare(where)) in REPEATABLE
+        endpoint = (method.upper(), _bare(where))
+        repeatable = endpoint in REPEATABLE
+        bucket = self._order_throttle if endpoint in ORDER_LANE else self._throttle
         last: BrokerError | None = None
         for attempt in range(1, self._attempts + 1):
-            await self._throttle.acquire()
+            await bucket.acquire()
             try:
                 response = await send()
             except httpx.TimeoutException as error:
@@ -791,7 +1049,7 @@ class BrokerSession:
                 # текст не переносится — там бывает и адрес, и заголовки.
                 last = NoConnection(f"{where}: {type(error).__name__}")
             else:
-                outcome = self._interpret(where, response)
+                outcome = self._interpret(endpoint, where, response)
                 if isinstance(outcome, BrokerError):
                     last = outcome
                 else:
@@ -837,13 +1095,25 @@ class BrokerSession:
         log().warning("исход запроса неизвестен: %s", error.technical)
         return error
 
-    def _interpret(self, where: str, response: httpx.Response) -> Any:
+    def _interpret(
+        self, endpoint: tuple[str, str], where: str, response: httpx.Response
+    ) -> Any:
+        """Ответ → разобранное тело, `ABSENT` или отказ слоя для `_with_retries`.
+
+        404 разбирается в два шага: сначала «ответил шлюз» (`_wrong_address`),
+        затем «брокер говорит, что такого нет» — только для пар
+        `ABSENCE_ANSWERS`. Порядок значим: страница шлюза кода брокера
+        не несёт и «отсутствием заявки» стать не может.
+        """
         status = response.status_code
         if status >= 400:
             body = scrub(response.text)
-            gone = self._wrong_address(where, body) if status == HTTP_NOT_FOUND else None
-            if gone is not None:
-                return gone
+            if status == HTTP_NOT_FOUND:
+                gone = self._wrong_address(where, body)
+                if gone is not None:
+                    return gone
+                if endpoint in ABSENCE_ANSWERS and _says_absent(body):
+                    return ABSENT
             error = from_status(status, where=where, body=body)
             if isinstance(error, AuthFailed):
                 # Рабочий токен мог протухнуть раньше срока: токен личного
@@ -951,22 +1221,55 @@ class BrokerSession:
 
 
 
+def _refuse_absolute(path: str) -> None:
+    """Полный адрес — отказ: и для чтения, и для команды.
+
+    httpx игнорирует `base_url`, когда путь абсолютный, поэтому строка
+    с полным адресом уводит запрос на боевой хост брокера мимо всех настроек
+    транспорта — включая подставной хост в тестах.
+    """
+    if "://" in path or path.startswith("//"):
+        raise RuntimeError(
+            f"адрес {path} задан целиком. Слой broker/ принимает только "
+            "путь: полный адрес уходит мимо настроек транспорта, в том "
+            "числе мимо подставного хоста в тестах"
+        )
+
+
+def _says_absent(body: str) -> bool:
+    """Тело 404 говорит «такого нет»: код брокера `NOT_FOUND`, и только он.
+
+    `USER_NOT_FOUND` где угодно в теле — не «нет заявки», а «брокер не знает
+    счёта»; документация называет его рядом с общей формой отказа (11, 12,
+    13), но не говорит, каким полем. Поэтому он ищется по всему телу: ошибка
+    в эту сторону даёт остановку, а не ложное «заявки нет».
+    """
+    return code_of(body) == NOT_FOUND and "USER_NOT_FOUND" not in body
+
+
 def _refused_why(method: str, path: str) -> str:
     """Почему слой не отправил этот запрос — словами и с разбором промаха.
 
-    Три разных промаха и три разных ответа: не тот глагол по знакомому
-    адресу; знакомый адрес с лишним хвостом или строкой запроса; вовсе
-    незнакомый адрес. Порядок веток — от самого частого промаха к самому
-    общему; последняя ветка отвечает всегда.
+    Четыре разных промаха и четыре разных ответа: команда, поданная через
+    `read()`; не тот глагол по знакомому адресу; знакомый адрес с лишним
+    хвостом или строкой запроса; вовсе незнакомый адрес. Порядок веток —
+    от самого опасного промаха к самому общему; последняя отвечает всегда.
 
     Отдельной функцией, а не ветками внутри `_guard`: сторож обязан читаться
     как «пара разрешена — пропускаем, иначе отказ», и разбор промаха туда
-    не относится. Ветвление здесь не таблица нарочно — три случая дают три
-    непохожих текста и опираются на разные множества, общей формы у них нет.
+    не относится. Ветвление здесь не таблица нарочно — случаи дают непохожие
+    тексты и опираются на разные множества, общей формы у них нет.
 
     Молчаливый отказ здесь стоил бы часа отладки: путь виден только в тексте
     исключения (правило 13 `CLAUDE.md`).
     """
+    if (method, path) in WRITE_ENDPOINTS:
+        return (
+            f"{method} {path} — команда, меняющая счёт, и `read()` её не "
+            "пропускает. Команды идут пишущим путём сессии (`create_order`, "
+            "`cancel_order`): там проверяются права токена, а ключ заявки "
+            "записывается в журнал до отправки"
+        )
     verbs = sorted(verb for verb, address in READ_ENDPOINTS if address == path)
     if verbs:
         return (
@@ -981,10 +1284,11 @@ def _refused_why(method: str, path: str) -> str:
             "параметры запроса передаются через `params`, а не в пути"
         )
     return (
-        f"адрес {path} не входит в список адресов чтения. На этапе 1 слой "
-        "broker/ читает портфель, лимиты, справочник инструментов, "
-        "исторические свечи и расписание торгов, и больше ничего. Подача, "
-        "изменение и снятие заявок — этап 2"
+        f"адрес {path} не входит в список адресов чтения. Слой broker/ читает "
+        "портфель, лимиты, справочник инструментов, исторические свечи, "
+        "расписание торгов, статус заявки и списки заявок и сделок, и больше "
+        "ничего. Подача и снятие заявки идут пишущим путём сессии, изменения "
+        "заявки нет вовсе"
     )
 
 

@@ -330,13 +330,16 @@ def test_trade_token_passes_the_gate(store: TokenStore) -> None:
         "/api/v1/deal",
         "/api/v1/trade",
         "/api/v1/OrDeR",
-        "/trade-api-bff-operations/api/v1/orders",
+        # `GET /trade-api-bff-operations/api/v1/orders` отсюда убран 27.10.2026:
+        # это статус заявки по ключу (11), чтение. Что `read()` не пропускает
+        # подачу `POST` по тому же адресу и отмену — стережёт
+        # `tests/test_broker_orders.py::test_read_does_not_let_a_command_through`.
         "/x/orders/12/cancel",
         "/trade-api-bff-portfolio/api/v1/portfolio/../order",
     ],
 )
 def test_order_paths_are_refused(store: TokenStore, path: str) -> None:
-    """Этап 1 к торговым адресам не обращается — и это проверка, а не обещание."""
+    """`read()` к незнакомым торговым адресам не обращается — проверка, а не обещание."""
     recorder = Recorder(json_reply(200, good_auth()))
     clock = Clock()
 
@@ -344,21 +347,33 @@ def test_order_paths_are_refused(store: TokenStore, path: str) -> None:
         async with session(store, recorder, clock) as broker:
             with pytest.raises(RuntimeError) as caught:
                 await broker.read(path)
-            assert "этап 2" in str(caught.value)
+            assert "пишущим путём" in str(caught.value)
 
     run(scenario())
     assert recorder.requests == [], "запрос к торговому адресу всё-таки ушёл"
 
 
 def test_no_order_functions_exist() -> None:
-    """В слое нет ни одного метода, похожего на подачу заявки."""
+    """Фасад слоя не выставляет наружу ни одного торгового имени.
+
+    С 27.10.2026 команды у слоя есть (`BrokerSession.create_order`,
+    `cancel_order`, модуль `broker.orders`), но фасадом не выставлены:
+    их подключает боевой исполнитель прямым импортом, а не всякий, кто
+    написал `import broker`. Подмодули из проверки исключены: Python кладёт
+    импортированный подмодуль атрибутом пакета, и `broker.orders` появлялся
+    бы в `dir(broker)` от одного импорта в соседнем тесте.
+    """
+    import types
+
     import broker
 
     forbidden = ("order", "заявк", "buy", "sell", "cancel", "submit")
     offenders = [
         name
         for name in dir(broker)
-        if not name.startswith("_") and any(word in name.lower() for word in forbidden)
+        if not name.startswith("_")
+        and not isinstance(getattr(broker, name), types.ModuleType)
+        and any(word in name.lower() for word in forbidden)
     ]
     assert not offenders, f"в фасаде слоя появилось торговое имя: {offenders}"
     assert READ_ENDPOINTS, "белый список обращений опустел"
@@ -367,7 +382,10 @@ def test_no_order_functions_exist() -> None:
     # Пятым и шестым 05.09.2026 — расписание торгов на день и статус торгов
     # (`DAILY_SCHEDULE_PATH`, `TRADING_STATUS_PATH`): программа не знала,
     # работает ли биржа, и ночью пробовала подключиться до утра. Оба читающие.
-    assert len(READ_ENDPOINTS) == 6, (
+    # Седьмым — девятым 27.10.2026 (Э4, шаг 1) — статус заявки по ключу
+    # (`GET` по адресу подачи) и списки заявок и сделок. Все три читающие;
+    # подача и отмена — отдельным списком `WRITE_ENDPOINTS`, не здесь.
+    assert len(READ_ENDPOINTS) == 9, (
         "в белый список добавили обращение: это осознанное действие, и его "
         "надо подтвердить здесь. ⚠️ Повтор при этом НЕ включается: таблица "
         "`REPEATABLE` отдельная и выписана руками. Если новое обращение "
@@ -691,6 +709,12 @@ EXPECTED_REPEATABLE = {
     ("GET", CANDLES_PATH),
     ("GET", DAILY_SCHEDULE_PATH),
     ("GET", TRADING_STATUS_PATH),
+    # Э4, 27.10.2026: читающие адреса вокруг заявок — пары переписаны
+    # со страниц снимка 11, 15, 16 (`READING_AROUND_ORDERS` ниже), а не
+    # взяты из `broker/session.py`. Подачи и отмены здесь нет и не будет.
+    ("GET", "/trade-api-bff-operations/api/v1/orders"),
+    ("POST", "/trade-api-market-data-connector/api/v1/orders/search"),
+    ("POST", "/trade-api-bff-operations/api/v1/trades/search"),
 }
 
 

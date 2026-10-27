@@ -56,6 +56,14 @@ from market.chain import (
     roll_day,
     stitch,
 )
+from market.commands import (
+    BrokerCommand,
+    BrokerExecution,
+    CommandAction,
+    CommandSide,
+    CommandStatus,
+    StoredCommand,
+)
 from market.contracts import (
     WARMUP_LOOK_BACK_DAYS,
     AdoptReport,
@@ -314,6 +322,12 @@ __all__ = [
     "PaperRows",
     "PaperWritten",
     "PaperRun",
+    "BrokerCommand",
+    "BrokerExecution",
+    "CommandAction",
+    "CommandSide",
+    "CommandStatus",
+    "StoredCommand",
     "BACKTEST_SESSIONS_KEPT",
     "SECRET_MASK",
     "redact",
