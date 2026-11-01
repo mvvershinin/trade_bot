@@ -65,6 +65,12 @@ EDITS: dict[str, tuple[Callable[[SettingsDialog], None], str]] = {
         lambda dialog: dialog.volume.setValue(dialog.volume.value() + 1),
         "Объём",
     ),
+    "Бой": (
+        lambda dialog: dialog.live_fill_wait_sec.setValue(
+            dialog.live_fill_wait_sec.value() + 5
+        ),
+        FIELD_CAPTIONS["live_fill_wait_sec"],
+    ),
     "Программа": (
         lambda dialog: dialog.log_directory.setText("/tmp/логи-проверки"),
         "Каталог",

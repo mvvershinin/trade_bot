@@ -248,6 +248,11 @@ class FakeBroker:
         self.on_create: Callable[[BookOrder], None] | None = None
         #: Поток молчит: кадры уходят в `lost`, сокет при этом жив.
         self.muted = False
+        #: Время транзакции событий. `None` — часы подделки (`_EPOCH` плюс
+        #: секунда на кадр); ход по ряду (2в) ставит сюда часы ряда.
+        self.clock: Callable[[], datetime] | None = None
+        #: Номер договора в портфеле (04, `agreementId`).
+        self.account = "FAKE-ACCOUNT-1"
         self._numbers = itertools.count(1)
         self._routes: dict[tuple[str, str], Callable[[httpx.Request], httpx.Response]] = {
             CREATE: self._create,
@@ -329,16 +334,23 @@ class FakeBroker:
     def _portfolio(self, request: httpx.Request) -> httpx.Response:
         """Портфель (04): денежная запись и позиция по каждому тикеру книги."""
         rows: list[dict[str, object]] = [
-            {"type": "moneyLimit", "ticker": "RUB", "quantity": 1_000_000.0}
+            {
+                "type": "moneyLimit", "ticker": "RUB", "quantity": 1_000_000.0,
+                "agreementId": self.account,
+            }
         ]
         tickers = {order.ticker for order in self.orders} or {"MXZ6"}
         for ticker in sorted(tickers):
             quantity = self.position(ticker)
             if quantity:
-                rows.append({
+                row: dict[str, object] = {
                     "type": "futuresHolding", "ticker": ticker, "board": "SPBFUT",
                     "quantity": quantity,
-                })
+                }
+                average = self.average_price(ticker)
+                if average is not None:
+                    row["averagePrice"] = average  # 04: средняя цена позиции
+                rows.append(row)
         return httpx.Response(200, json=rows)
 
     # --- поток статусов ---
@@ -435,6 +447,30 @@ class FakeBroker:
         )
         return signed + self.outside
 
+    def average_price(self, ticker: str = "MXZ6") -> float | None:
+        """Средняя цена открытой позиции по книге: лоты «первым вошёл — первым вышел».
+
+        Позиция мимо книги (`outside`) цены не имеет — тогда `None`.
+        """
+        if self.outside:
+            return None
+        lots: list[list[float]] = []  # [объём со знаком, цена]
+        for order in self.orders:
+            if order.ticker != ticker or not order.executed:
+                continue
+            left: float = order.executed if order.side == "1" else -order.executed
+            price = order.turnover / order.executed
+            while left and lots and lots[0][0] * left < 0:
+                take = min(abs(left), abs(lots[0][0]))
+                lots[0][0] += take if lots[0][0] < 0 else -take
+                left += take if left < 0 else -take
+                if not lots[0][0]:
+                    lots.pop(0)
+            if left:
+                lots.append([left, price])
+        volume = sum(abs(lot[0]) for lot in lots)
+        return None if not volume else sum(abs(lot[0]) * lot[1] for lot in lots) / volume
+
     def _living(self, key: str) -> BookOrder:
         order = self.order(key)
         if order is None or not order.live:
@@ -469,7 +505,10 @@ class FakeBroker:
         extra: dict[str, object] | None = None,
     ) -> None:
         """Сообщение о заявке (11, 24): в историю статуса и кадром в поток."""
-        moment = _EPOCH + timedelta(seconds=len(self.frames) + 1)
+        moment = (
+            self.clock() if self.clock is not None
+            else _EPOCH + timedelta(seconds=len(self.frames) + 1)
+        )
         data: dict[str, object] = {
             "messageType": "8",
             "orderStatus": order.status,
@@ -482,7 +521,7 @@ class FakeBroker:
             "orderQuantity": order.quantity,
             "executedQuantity": order.executed,
             "remainedQuantity": order.quantity - order.executed,
-            "transactionTime": moment.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "transactionTime": moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
         if order.price is not None:
             data["price"] = order.price

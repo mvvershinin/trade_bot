@@ -47,7 +47,14 @@ from dataclasses import dataclass
 from datetime import date, time
 from typing import Final
 
-from ui.models import FIELD_CAPTIONS, CalendarDay, Settings
+from ui.models import (
+    FIELD_CAPTIONS,
+    LIVE_LIMITS_BOUNDS,
+    CalendarDay,
+    Settings,
+    live_limit_fits,
+    live_limit_rule,
+)
 
 __all__ = [
     "BadValue",
@@ -177,6 +184,29 @@ def _dump_calendar(value: object) -> object:
     }
 
 
+def _as_whole_list(raw: object) -> tuple[int, ...]:
+    """Список целых чисел из файла: `[1, 2, 5]` → `(1, 2, 5)`.
+
+    Паузы переподключения (`Settings.live_reconnect_pauses_sec`). Годны ли
+    сами числа, решает проверка при «Применить» (`app/convert.py::live_limits`);
+    здесь — только то, что в файле действительно список целых. Один негодный
+    элемент отвергает весь список: пропуск элемента молча поменял бы порядок
+    пауз.
+    """
+    if not isinstance(raw, list):
+        raise BadValue(f"ожидался список целых чисел, а записано {shown(raw)}")
+    return tuple(_as_int(item) for item in raw)
+
+
+def _dump_whole_list(value: object) -> object:
+    """Список целых наружу — списком JSON. Не кортеж целых — поломка таблицы."""
+    if not isinstance(value, tuple) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in value
+    ):
+        raise TypeError(f"поле объявлено списком целых, а хранит {value!r}")
+    return list(value)
+
+
 def _dump_time(value: object) -> object:
     """Время наружу строкой `10:05`. Не время — поломка таблицы, а не данных."""
     if not isinstance(value, time):
@@ -206,6 +236,7 @@ _CODECS: Final[dict[object, Codec]] = {
     time: Codec(dump=_dump_time, load=_as_time),
     float | None: Codec(dump=_as_is, load=_as_money),
     tuple[CalendarDay, ...]: Codec(dump=_dump_calendar, load=_as_calendar),
+    tuple[int, ...]: Codec(dump=_dump_whole_list, load=_as_whole_list),
 }
 
 
@@ -278,7 +309,7 @@ def read_fields(
             missing.append(name)
             continue
         try:
-            changes[name] = codec.load(raw[name])
+            changes[name] = _within_bounds(name, codec.load(raw[name]), raw[name])
         except BadValue as error:
             refused.append(
                 f"Настройка «{caption_of(name)}» в файле негодная: {error}. "
@@ -288,6 +319,19 @@ def read_fields(
     return changes, refused, missing
 
 
+def _within_bounds(name: str, value: object, raw: object) -> object:
+    """Пределы боя — ещё и по границам, а не только по типу (`B-078`).
+
+    Тип годный, а число вне границ (`live_fill_wait_sec: 0`) — отказ поля
+    тем же путём, что у негодного типа: поле берётся прежним значением,
+    и это сказано строкой с подписью окна. Пропущенный молча, такой предел
+    ронял бы каждое следующее «Применить» с чужой причиной.
+    """
+    if name in LIVE_LIMITS_BOUNDS and not live_limit_fits(name, value):
+        raise BadValue(f"нужно {live_limit_rule(name)}, а записано {shown(raw)}")
+    return value
+
+
 def caption_of(name: str) -> str:
     """Подпись поля из окна настроек; имя поля — только если подписи нет.
 
@@ -295,6 +339,17 @@ def caption_of(name: str) -> str:
     которого нет в `FIELD_CAPTIONS`, а полноту таблицы стережёт тест.
     """
     return FIELD_CAPTIONS.get(name, name)
+
+
+def _tuple_shown(value: tuple[object, ...]) -> str:
+    """Список словами: целые — как есть через запятую, прочее — числом штук.
+
+    Паузы переподключения читаются числами («1, 2, 5»), календарь — счётом
+    отметок: дат в одной строке отказа может быть сотня.
+    """
+    if value and all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        return ", ".join(str(item) for item in value)
+    return f"{len(value)} шт."
 
 
 def human_value(value: object) -> str:
@@ -307,7 +362,7 @@ def human_value(value: object) -> str:
     if isinstance(value, time):
         return value.strftime("%H:%M")
     if isinstance(value, tuple):
-        return f"{len(value)} шт."
+        return _tuple_shown(value)
     if isinstance(value, float):
         return f"{value:g}".replace(".", ",")
     return str(value) if value != "" else "пусто"

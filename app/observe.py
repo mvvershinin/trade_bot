@@ -37,6 +37,18 @@
 с той же комиссией и тем же правилом «заявка исполняется по открытию
 следующей свечи».
 
+Пара движков: «факт» и «прогноз» (Э4 2в)
+----------------------------------------
+Включённый бой — это тот же ход с **вторым** движком: «факт» с исполнителем,
+пришедшим **параметром** (`FactLeg.executor`, порт `engine.OrderExecutor`),
+и прежний движок с тенью — «прогноз». Разница между ними **только**
+в исполнителе (план §7): один прогрев — оба в режиме «Выключен» на одних
+барах, одно включение — сменой режима на одной свече (`_arm_pair`), один
+цикл подачи свечей — `_walk` отдаёт каждую свечу обоим. Модуль по-прежнему
+не импортирует `broker/`: собирает боевой исполнитель `app/live_trading.py`,
+а сюда он приходит значением порта. Сторож — тот же тест по импортам,
+теперь и транзитивный.
+
 Почему бары приходят снаружи, а не читаются здесь
 -------------------------------------------------
 `LiveSource.offer` принимает **готовый** список баров. Читает базу и решает,
@@ -56,31 +68,44 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import AsyncGenerator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from typing import Protocol
 
 from app import convert, debug_feed
+from app.fact import FactPosition
 from app.paper_log import PaperLog, PaperSource
 from backtest import (
     BREATHE_EVERY,
     Costs,
+    Deal,
     HistoryExecutor,
     HistoryRun,
     Plan,
     summarise,
 )
 from engine import (
+    DayRecord,
     Engine,
     EngineSettings,
+    ExecutionHalted,
+    ExitReason,
+    Fill,
     JournalEntry,
+    Mode,
+    OrderAction,
+    OrderExecutor,
     OrderRequest,
+    PriceSeen,
     close_time,
     in_moscow,
 )
+from engine import MarketCandle as PortCandle
 from market import (
     DEFAULT_WARMUP_BARS,
     DecisionPhase,
@@ -94,6 +119,7 @@ from ui.models import DecisionLevel
 
 __all__ = [
     "RECHECK_BARS",
+    "FactLeg",
     "LiveObserver",
     "LiveSource",
     "RunRecording",
@@ -441,6 +467,142 @@ class ShadowExecutor(HistoryExecutor):
         await super().submit(order)
 
 
+# ------------------------------------------------------------------- «факт»
+
+
+@dataclass(frozen=True, slots=True)
+class FactLeg:
+    """«Факт» пары: второй движок того же хода и его исполнитель — снаружи.
+
+    :param strategy: **свой** экземпляр того же алгоритма с теми же
+        настройками: у модуля ряд — состояние, и общий экземпляр получал бы
+        каждую свечу дважды.
+    :param executor: исполнитель «факта» — значение порта движка. Каким он
+        будет, решает сборка (`app/port.py`, `app/live_trading.py`); здесь
+        его не создают и не различают.
+    :param day: день до запуска (решение 0066, Р7) — **обоим** движкам пары
+        на включении: перезапуск в день с тейком не снимает «стоп после
+        тейка» ни у «факта», ни у «прогноза».
+    :param session_id: прогон «факта» в журнале прогонов — строки его
+        решений, заявок и сделок пишутся туда. `None` — не писать.
+    """
+
+    strategy: Strategy
+    executor: OrderExecutor
+    day: DayRecord | None = None
+    session_id: int | None = None
+
+
+class _FactBook:
+    """Исполнитель «факта», через которого видно поданное и исполненное.
+
+    Обёртка, а не наследник: исполнитель приходит готовым и любым. Тень
+    знает свои сделки сама (`HistoryExecutor.deals`); у «факта» их знает
+    только движок, а снимок для окна обязан быть тем же `HistoryRun`. Поэтому
+    поданное и отданное движку записывается на пути туда и обратно — ничего
+    не меняя: заявка уходит, сделки возвращаются, исключения проходят насквозь.
+
+    Сделка складывается из пары «вход — выход» той же стороны. Деньги считает
+    `backtest.Deal` (пункты, валовое, чистое); здесь только комиссия обеих
+    сторон — сумма двух чисел брокера, `None`, если хоть одно не названо
+    (ноль объявил бы сделку окупившей комиссию, правило 4).
+    """
+
+    def __init__(self, inner: OrderExecutor, *, ruble_per_point: float) -> None:
+        self._inner = inner
+        self._ruble_per_point = ruble_per_point
+        self.orders: list[OrderRequest] = []
+        self.fills: list[Fill] = []
+        self.deals: list[Deal] = []
+        self.level_plans: list[Plan] = []
+        #: Рыночные заявки, поданные и ещё не ставшие сделкой, — по ним порт
+        #: ставит проход на открытии бара (`LiveObserver.awaits_open`).
+        self.waiting: set[str] = set()
+        self._named: dict[str, OrderRequest] = {}
+        self._open: Fill | None = None
+
+    async def submit(self, order: OrderRequest) -> None:
+        try:
+            await self._inner.submit(order)
+        except ExecutionHalted as halted:
+            # Заявка могла дойти до брокера: в строках она есть.
+            self._sent(order)
+            self._take(halted.fills, None)
+            raise
+        self._sent(order)
+
+    async def fills_at(self, candle: PortCandle) -> Sequence[Fill | PriceSeen]:
+        try:
+            items = await self._inner.fills_at(candle)
+        except ExecutionHalted as halted:
+            self._take(halted.fills, candle)
+            raise
+        self._take([item for item in items if isinstance(item, Fill)], candle)
+        return items
+
+    def named(self, order_id: str) -> OrderRequest | None:
+        """Поданная заявка по имени; `None` — такой не подавали."""
+        return self._named.get(order_id)
+
+    def _sent(self, order: OrderRequest) -> None:
+        self.orders.append(order)
+        self._named[order.order_id] = order
+        if order.action in (OrderAction.OPEN, OrderAction.CLOSE):
+            self.waiting.add(order.order_id)
+
+    def _take(self, fills: Sequence[Fill], candle: PortCandle | None) -> None:
+        for fill in fills:
+            self.fills.append(fill)
+            self.waiting.discard(fill.order_id)
+            order = self._named.get(fill.order_id)
+            if fill.action is OrderAction.OPEN:
+                self._open = fill
+                continue
+            if order is not None and order.action is OrderAction.ARM_TAKE_PROFIT:
+                self.level_plans.append(Plan(
+                    order_id=order.order_id,
+                    decided_at=close_time(candle) if candle is not None else fill.at,
+                    price=order.price if order.price is not None else fill.price,
+                    side=order.side, action=OrderAction.CLOSE, exit_reason=order.exit_reason,
+                ))
+            self._close(fill, order)
+
+    def _close(self, fill: Fill, order: OrderRequest | None) -> None:
+        entry, self._open = self._open, None
+        if entry is None:
+            return
+        both = (entry.commission, fill.commission)
+        reason = order.exit_reason if order is not None else None
+        self.deals.append(Deal(
+            side=entry.side, volume=entry.volume,
+            entry_time=entry.at, entry_price=entry.price, entry_order_id=entry.order_id,
+            exit_time=fill.at, exit_price=fill.price, exit_order_id=fill.order_id,
+            exit_reason=reason or ExitReason.SIGNAL,
+            commission=None if None in both else sum(one or 0.0 for one in both),
+            ruble_per_point=self._ruble_per_point,
+        ))
+
+
+@dataclass(slots=True)
+class _FactSide:
+    """Накопленное «фактом» за ход — то же, что `_Tally` у «прогноза».
+
+    Общее у пары — бары, средняя и фаза (`_Tally`): ряд один. Своё у «факта» —
+    движок, исполнитель, журнал, расчётные цены заявок и строки для базы.
+    """
+
+    engine: Engine
+    book: _FactBook
+    journal: list[JournalEntry] = field(default_factory=list)
+    plans: list[Plan] = field(default_factory=list)
+    orders: list[OrderRecord] = field(default_factory=list)
+    seen_orders: int = 0
+    seen_levels: int = 0
+    volumes: dict[str, float] = field(default_factory=dict)
+    #: Прогрев пройден и режим включён (`LiveObserver._arm_pair`).
+    armed: bool = False
+
+
 # ---------------------------------------------------------------- наблюдение
 
 
@@ -547,6 +709,14 @@ class LiveObserver:
             costs=self._costs, ruble_per_point=settings.ruble_per_point
         )
         self._source = LiveSource()
+        #: «Факт» пары (`pair_with`); `None` — одиночный ход, наблюдение.
+        self._fact: _FactSide | None = None
+        self._day: DayRecord | None = None
+        self._fact_id: int | None = None
+        #: Писатель строк «факта» — в его прогон (`FactLeg.session_id`).
+        self._fact_log: PaperLog | None = None
+        #: Что из строк «факта» не легло в базу при закрытии — словами.
+        self.fact_lost = ""
         #: Открытая запись в журнале прогонов и то, чем её закрывают. `None` —
         #: записывать не просили либо ход уже закрыт.
         self._record: AbstractAsyncContextManager[object] | None = None
@@ -563,6 +733,32 @@ class LiveObserver:
         self._mark: RunRowsMark | None = None
 
     # -------------------------------------------------------------- команды
+
+    def pair_with(self, fact: FactLeg) -> None:
+        """Сделать ход парой: «факт» рядом с «прогнозом». Звать до первой свечи.
+
+        Отдельным вызовом, а не доводом конструктора, — тем же приёмом, что
+        `LiveLink.deliver_funds_to`: строка сборки, дающая ходу настоящий
+        исполнитель, обязана быть видна отдельно, а не умолчанием параметра.
+
+        Оба движка рождаются в режиме «Выключен» на одних настройках:
+        прогрев — без заявок и без позиций, включение — одной сменой режима
+        на одной свече (`_arm_pair`). «Прогноз» пересоздаётся здесь же:
+        свечей он ещё не видел, и прежний движок с рабочим режимом прогрел бы
+        тень иначе, чем «факт».
+        """
+        if self._tally.bars or self._fact is not None or self._record is not None:
+            raise RuntimeError("пару собирают до первой свечи и до записи хода")
+        start = replace(self._settings, mode=Mode.OFF)
+        self._engine = Engine(self._strategy, start, journal=self._tally.journal.append)
+        said: list[JournalEntry] = []
+        self._fact = _FactSide(
+            engine=Engine(fact.strategy, start, journal=said.append),
+            book=_FactBook(fact.executor, ruble_per_point=self._settings.ruble_per_point),
+            journal=said,
+        )
+        self._day = fact.day
+        self._fact_id = fact.session_id
 
     async def start(self) -> None:
         """Открыть запись о ходе в журнале прогонов. Повторный вызов молчит.
@@ -592,6 +788,17 @@ class LiveObserver:
                     journal=self._tally.journal,
                     orders=self._tally.orders,
                     deals=self._executor.deals,
+                    symbol=recording.symbol,
+                ),
+                self._say,
+            )
+        fact = self._fact
+        if recording.store is not None and fact is not None and self._fact_id is not None:
+            self._fact_log = PaperLog(
+                recording.store,
+                self._fact_id,
+                PaperSource(
+                    journal=fact.journal, orders=fact.orders, deals=fact.book.deals,
                     symbol=recording.symbol,
                 ),
                 self._say,
@@ -635,9 +842,11 @@ class LiveObserver:
         if not self._stopped and not self._failure:
             await self._ride()
             self._tally.recounted = self._tally.recounted or self._tally.bars > 0
+        self._arm_pair()
         self._say_warmup()
-        if self._log is not None:
-            await self._log.flush(self._bounds())
+        for writer in (self._log, self._fact_log):
+            if writer is not None:
+                await writer.flush(self._bounds())
         run = self.run
         if recounting and self._tally.recounted:
             # Пересчёт в ленте — одна строка итога, а не строка на каждый
@@ -668,6 +877,9 @@ class LiveObserver:
         if record is None:
             return
         debug_feed.run_closed(self.run)
+        fact_log, self._fact_log = self._fact_log, None
+        if fact_log is not None:
+            self.fact_lost = await fact_log.close(self._bounds())
         log_, self._log = self._log, None
         lost = "" if log_ is None else await log_.close(self._bounds())
         if self._entry is not None:
@@ -716,8 +928,99 @@ class LiveObserver:
         )
 
     @property
+    def fact_run(self) -> HistoryRun | None:
+        """Снимок «факта» в том же виде, что `run`. `None` — ход без пары.
+
+        Сделки, заявки и журнал — свои, ряд и средняя — общие с «прогнозом»:
+        бары у пары одни. Счёта выходов с пределом и «ждёт открытия» здесь
+        нет: у боевого исполнителя их знает брокер, а не модель.
+        """
+        fact = self._fact
+        if fact is None:
+            return None
+        plans = [*fact.plans, *fact.book.level_plans]
+        plans.sort(key=lambda plan: plan.decided_at)
+        return HistoryRun(
+            deals=tuple(fact.book.deals),
+            plans=tuple(plans),
+            fills=tuple(fact.book.fills),
+            average=tuple(self._tally.average),
+            journal=tuple(fact.journal),
+            summary=summarise(fact.book.deals),
+            position=fact.engine.position,
+            halted=fact.engine.halted or self._failure,
+            bars=self._tally.bars,
+            costs=self._costs,
+        )
+
+    @property
+    def paired(self) -> bool:
+        """Ход идёт парой: «факт» с исполнителем снаружи и «прогноз» с тенью."""
+        return self._fact is not None
+
+    @property
+    def armed(self) -> bool:
+        """Пара прогрета и включена: решения «факта» уходят исполнителю."""
+        return self._fact is not None and self._fact.armed
+
+    @property
+    def fact_position(self) -> FactPosition | None:
+        """Позиция «факта» и уровень, который сейчас сторожится. `None` — нет."""
+        position = None if self._fact is None else self._fact.engine.position
+        if position is None:
+            return None
+        return FactPosition(
+            side=position.side, volume=position.volume,
+            entry_price=position.entry_price, take_level=position.take.level,
+        )
+
+    def fact_position_after(self, names: Sequence[str]) -> FactPosition | None:
+        """Позиция «факта» с исполненным у брокера, но не отданным движку (`/risk` 2в Н2).
+
+        `names` — имена заявок, чьи сделки исполнитель ещё не отдал движку.
+        Вход по такой заявке позицию открывает, выход и тейк — закрывают;
+        цена неотданного входа — расчётная (закрытие свечи решения): своей
+        цены брокер ещё не сказал движку. Это догадка по своим заявкам,
+        а не позиция у брокера, — и так её называет тот, кто показывает.
+        """
+        position = self.fact_position
+        fact = self._fact
+        if fact is None:
+            return position
+        planned = {plan.order_id: plan.price for plan in fact.plans}
+        for name in names:
+            order = fact.book.named(name)
+            if order is None:
+                continue
+            if order.action is OrderAction.OPEN:
+                position = FactPosition(
+                    side=order.side, volume=order.volume,
+                    entry_price=planned.get(name, math.nan),
+                )
+            else:
+                position = None
+        return position
+
+    def retarget(self, settings: EngineSettings) -> None:
+        """Новые настройки движка — обоим движкам пары на ходу, без пересборки.
+
+        Только для пары и только для настроек **движка** (режим, объём, тейк,
+        окно): они действуют со следующей сделки и открытую позицию не трогают
+        (`Engine.apply_settings`). Пересборка здесь стоила бы позиции «факта»
+        (С4). До включения пара ещё в «Выключен» — новое значение запоминается
+        и встанет на включении.
+        """
+        self._settings = settings
+        fact = self._fact
+        if fact is None or not fact.armed:
+            return
+        moment = self._tally.last_close
+        for engine in (fact.engine, self._engine):
+            engine.apply_settings(settings, at=moment)
+
+    @property
     def submitted(self) -> int:
-        """Сколько заявок подано исполнителю. К брокеру не ушла ни одна."""
+        """Сколько заявок подано исполнителю-тени. К брокеру тень не подаёт ни одной."""
         return self._executor.submitted
 
     @property
@@ -726,9 +1029,14 @@ class LiveObserver:
 
         По нему порт ставит один проход на первой минуте бара (решение 0065).
         Ход остановлен, закрыт или упал — ждать нечего: заявка не исполнится.
+        У пары ждёт и «факт»: его рыночная заявка, ещё не отданная движку
+        сделкой, дойдёт до него только с показом бара исполнения.
         """
-        stopped = self._stopped or self._failure or self._engine.halted
-        return not stopped and bool(self._executor.pending)
+        if self._stopped or self._failure:
+            return False
+        fact = self._fact
+        waits = fact is not None and not fact.engine.halted and bool(fact.book.waiting)
+        return waits or (not self._engine.halted and bool(self._executor.pending))
 
     # ---------------------------------------------------------- внутреннее
 
@@ -777,26 +1085,27 @@ class LiveObserver:
                 self._tally.bars += 1
                 self._source.delivered += 1
                 phase = self._phase()
+                # «Факт» — первым: его решение уходит к брокеру, и ждать расчёта
+                # тени ему незачем. Порядок внутри свечи сделок не меняет:
+                # движки пары друг о друге не знают.
+                fact = self._fact
+                fact_orders = (
+                    () if fact is None
+                    else (await fact.engine.on_market_candle(candle, fact.book)).orders
+                )
                 outcome = await self._engine.on_market_candle(candle, self._executor)
-                for order in outcome.orders:
-                    if not order.action.is_market:
-                        continue
-                    self._tally.plans.append(Plan(
-                        order_id=order.order_id,
-                        decided_at=order.submitted_at,
-                        price=candle.close,
-                        side=order.side,
-                        action=order.action,
-                        exit_reason=order.exit_reason,
-                    ))
+                self._tally.plans.extend(_market_plans(outcome.orders, candle))
                 value = getattr(self._strategy, "average", None)
                 average = None if value is None or outcome.skipped else float(value)
                 if average is not None:
                     self._tally.average.append((close_time(candle), average))
-                records = self._note_orders(candle, average, phase)
+                if fact is not None:
+                    fact.plans.extend(_market_plans(fact_orders, candle))
+                    self._order_rows(fact.book, fact, candle, average, phase)
+                records = self._order_rows(self._executor, self._tally, candle, average, phase)
                 self._tell(phase, records, debug_feed.BarSeen(candle, outcome, average, phase))
                 self._tally.last_close = close_time(candle)
-                if self._engine.halted:
+                if self._engine.halted and (fact is None or fact.engine.halted):
                     return
         finally:
             # ⚠️ Лента закрывается **явно**. `async for` брошенный генератор
@@ -816,13 +1125,18 @@ class LiveObserver:
         только открытие (`ExecutionModel.fills_at`). Поэтому ни счёта бара,
         ни точки средней, ни строк заявок с огрызком закрытия здесь нет:
         вооружение, рождённое сделкой, уходит в строки на закрытии этого бара
-        (`_note_orders`) — с его закрытием и средней, как без показа.
+        (`_order_rows`) — с его закрытием и средней, как без показа.
 
         Исполнение и слова движка о нём уходят в ленту «Отладка» здесь же,
         а не на закрытии: в ленте сделка стоит тогда, когда случилась.
         """
         forming = self._source.take_forming()
-        if forming is None or self._stopped or self._engine.halted:
+        if forming is None or self._stopped:
+            return
+        fact = self._fact
+        if fact is not None:
+            await fact.engine.on_market_candle(forming, fact.book)
+        if self._engine.halted:
             return
         await self._engine.on_market_candle(forming, self._executor)
         self._tell(self._phase())
@@ -861,10 +1175,18 @@ class LiveObserver:
             )
         return self._mark
 
-    def _note_orders(
-        self, candle: MarketCandle, average: float | None, phase: DecisionPhase
+    def _order_rows(
+        self,
+        sent: _Sent,
+        rows: _Rows,
+        candle: MarketCandle,
+        average: float | None,
+        phase: DecisionPhase,
     ) -> list[OrderRecord]:
         """Заявки и касания уровней этого бара — в строки для базы, с фазой бара.
+
+        Одна процедура на оба движка пары: строки «факта» и «прогноза» обязаны
+        читаться одинаково, иначе сравнить их глазами нельзя.
 
         Порядок — порядок событий бара: заявка, рождённая исполнением
         на открытии (вооружение тейка), раньше касания; касание раньше
@@ -872,25 +1194,26 @@ class LiveObserver:
         бара, — и при равенстве касание идёт первым: уровень задет внутри
         бара, решение принято после.
 
+        Объём касания, вооружения которого не видно, — из настроек хода.
+
         :return: новые строки — их же показывает лента (`_tell`).
         """
-        executor, tally = self._executor, self._tally
         fresh: list[tuple[datetime, int, OrderRecord]] = []
-        for order in executor.orders[tally.seen_orders:]:
-            tally.volumes[order.order_id] = order.volume
+        for order in sent.orders[rows.seen_orders:]:
+            rows.volumes[order.order_id] = order.volume
             fresh.append((order.submitted_at, 1, convert.order_record(
                 order, close=candle.close, average=average, phase=phase
             )))
-        for plan in executor.level_plans[tally.seen_levels:]:
-            volume = tally.volumes.get(plan.order_id, self._settings.volume)
+        for plan in sent.level_plans[rows.seen_levels:]:
+            volume = rows.volumes.get(plan.order_id, self._settings.volume)
             fresh.append((plan.decided_at, 0, convert.level_hit_record(
                 plan, volume=volume, close=candle.close, average=average, phase=phase
             )))
-        tally.seen_orders = len(executor.orders)
-        tally.seen_levels = len(executor.level_plans)
+        rows.seen_orders = len(sent.orders)
+        rows.seen_levels = len(sent.level_plans)
         fresh.sort(key=lambda item: (item[0], item[1]))
         records = [record for _, _, record in fresh]
-        tally.orders.extend(records)
+        rows.orders.extend(records)
         return records
 
     def _tell(
@@ -966,11 +1289,47 @@ class LiveObserver:
                 DecisionLevel.WARNING,
             )
 
+    def _arm_pair(self) -> None:
+        """Включить пару: оба движка из «Выключен» в настройки хода — на одной свече.
+
+        Один раз, в конце первого прохода, давшего хоть один бар: этот проход
+        и был прогревом. Включение — сменой режима (`Engine.apply_settings`),
+        а не новым движком: средняя и ряд модуля прогреты и остаются. Рядом —
+        день до запуска (Р7), тоже обоим и тем же моментом: «стоп после тейка»
+        после перезапуска должен остановить и «факт», и «прогноз».
+
+        Модуль входит по стороне закрытия относительно средней, значит первая
+        заявка «факта» — на первой закрытой свече **после** этой.
+        """
+        fact, moment = self._fact, self._tally.last_close
+        if fact is None or fact.armed or moment is None or self._stopped or self._failure:
+            return
+        fact.armed = True
+        for engine in (fact.engine, self._engine):
+            if self._day is not None:
+                engine.on_day(self._day, at=moment)
+            engine.apply_settings(self._settings, at=moment)
+        self._say(
+            "Бой включён",
+            f"Прогрев: {self._tally.bars} закрытых баров из базы, оба движка пары — "
+            f"в режиме «Выключен». Включение на свече, закрывшейся {_moment(moment)}: "
+            f"режим «{self._settings.mode.label}». С этой свечи решения «факта» уходят "
+            "к брокеру настоящими заявками, «прогноз» считает те же решения моделью "
+            "исполнения — расхождение между ними видно сделками.",
+            DecisionLevel.WARNING,
+        )
+
     def _say_warmup(self) -> None:
-        """Сказать про прогрев — один раз, после первого отрезка."""
+        """Сказать про прогрев — один раз, после первого отрезка.
+
+        У пары о прогреве говорит включение (`_arm_pair`) — здесь только
+        предупреждение о коротком.
+        """
         if self._warmed or self._tally.bars == 0:
             return
         self._warmed = True
+        if self._tally.bars >= WARMUP_BARS and self._fact is not None:
+            return
         if self._tally.bars >= WARMUP_BARS:
             self._say(
                 "Движок работает на живом ряду",
@@ -990,6 +1349,37 @@ class LiveObserver:
             "дал бы другой список сделок.",
             DecisionLevel.WARNING,
         )
+
+
+class _Sent(Protocol):
+    """Исполнитель глазами строк для базы: поданное и касания уровней."""
+
+    @property
+    def orders(self) -> Sequence[OrderRequest]: ...
+
+    @property
+    def level_plans(self) -> Sequence[Plan]: ...
+
+
+class _Rows(Protocol):
+    """Курсоры строк заявок одного движка пары и сами строки."""
+
+    seen_orders: int
+    seen_levels: int
+    volumes: dict[str, float]
+    orders: list[OrderRecord]
+
+
+def _market_plans(orders: Sequence[OrderRequest], candle: MarketCandle) -> list[Plan]:
+    """Расчётные цены рыночных заявок свечи — закрытие, на котором решено."""
+    return [
+        Plan(
+            order_id=order.order_id, decided_at=order.submitted_at, price=candle.close,
+            side=order.side, action=order.action, exit_reason=order.exit_reason,
+        )
+        for order in orders
+        if order.action.is_market
+    ]
 
 
 def _note_result(entry: object, run: HistoryRun, lost: str = "") -> None:

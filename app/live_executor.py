@@ -45,12 +45,13 @@
 * Не спрашивает брокера на каждом `fills_at` (порт требует дешёвого вызова,
   `engine/ports.py`): сделки приходят потоком статусов, `fills_at` отдаёт
   накопленное. Минутки сторожа читаются из базы — и только пока он вооружён.
-* С окном не связан и `app/observe.py` им не пользуется: подключение — 2в.
+* С окном не связан и `app/observe.py` его не импортирует: исполнитель
+  приходит к ходу параметром, собирает его `app/live_trading.py` (2в).
 
-Ожидания и пороги — `LiveLimits`; по правилу 16 каждое из них обязано стать
-полем окна, это подключение 2в. Живьём не проверено ничего: токена с правами
-торговли в разработке нет, всё — по снимку документации и подставному брокеру
-`tests/fake_broker.py`.
+Ожидания и пороги — `LiveLimits` (`app/fact.py`: значения без брокера,
+их собирает окно); `limit_exit_bars` кладёт сборка из движка (2в).
+Живьём не проверено ничего: токена с правами торговли в разработке нет,
+всё — по снимку документации и подставному брокеру `tests/fake_broker.py`.
 """
 
 from __future__ import annotations
@@ -59,7 +60,6 @@ import asyncio
 import contextlib
 import enum
 import logging
-import math
 import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
@@ -69,6 +69,7 @@ from datetime import datetime, timedelta
 from typing import Final, Protocol
 from uuid import UUID
 
+from app.fact import LiveLimits, position_words, signed_position
 from app.halt import halt_reason
 from broker.account import parse_positions
 from broker.errors import (
@@ -167,58 +168,24 @@ _HALT_TAIL: Final[str] = (
 
 #: Чужой текст (причина отказа биржи) — без управляющих знаков и не длиннее этого.
 _FOREIGN_TEXT_LIMIT: Final[int] = 200
+
+#: Связь с потоком статусов считается восстановленной, если она продержалась
+#: столько секунд — или сверка после неё прошла, а прошлый сброс был не
+#: ближе этого (З1 `/risk`): тогда пауза переподключения снова первая.
+#: Иначе растёт, и вместе с ней редеют сверки с чтением портфеля.
+#:
+#: ⚠️ Число техническое, не торговое: не цена, не объём и не окно, а «когда
+#: обрыв считать новым, а не продолжением прежнего». 10 с выбраны так: при
+#: обрывах раз в 50 с поток лежит ~2 % времени (пауза 1 с); при обрывах раз
+#: в секунду пауза растёт до потолка, и сверок — не больше одной на паузу.
+#: Чтение портфеля при этом настоящее каждый раз: «прошлая сверка была
+#: недавно» правдой о брокере не является. В окно не выведено; если владелец
+#: захочет крутить — одно поле `LiveLimits` (`app/fact.py`).
+_LINK_SETTLE: Final[float] = 10.0
 _CONTROL: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]+")
 
 
 # --------------------------------------------------------------- настройки
-
-
-@dataclass(frozen=True, slots=True)
-class LiveLimits:
-    """Пределы ожидания боевого исполнителя, в секундах и свечах.
-
-    ⚠️ Правило 16: каждое число — поле настроек окна. Здесь — значения
-    и проверка; поле, подпись, строка журнала и снимок прогона — подключение
-    2в. Живьём не замерено ни одно: сколько брокер молчит после заявки,
-    неизвестно (план §10, «Что не закрыто»).
-
-    :param stale_after: заявка, решённая раньше «сейчас − размер свечи − это»,
-        к брокеру не подаётся (план §2.2 п. 1): догрузка после обрыва
-        прогнала бы через «факт» старые бары с настоящими заявками.
-    :param event_wait: сколько ждать первого события по заявке, прежде чем
-        спросить статус по ключу (§2.2 п. 7–8).
-    :param fill_wait: сколько ждать конца рыночной заявки (`2` или `8`).
-        Частичная без конца к этому сроку — остаток снимается (0066, Р6).
-    :param cancel_wait: сколько ждать `4` после запроса на снятие.
-    :param limit_exit_bars: сколько закрытых свечей ждать исполнения выхода
-        по времени с пределом (Р3). ⚠️ 2в обязан класть сюда `close_wait_bars`
-        движка: иначе остановку раньше назовёт движок, и текст не скажет
-        о живой заявке у брокера (С9).
-    :param position_settle: пауза перед вторым чтением позиции, прежде чем
-        объявить расхождение: портфель брокера может отставать от потока
-        сделок, и «закрыть всё» по отставшему портфелю продало бы дважды.
-    :param reconnect_pauses: паузы между попытками открыть поток статусов —
-        по нарастающей, последняя повторяется.
-    """
-
-    stale_after: float = 60.0
-    event_wait: float = 10.0
-    fill_wait: float = 30.0
-    cancel_wait: float = 10.0
-    limit_exit_bars: int = 3
-    position_settle: float = 1.0
-    reconnect_pauses: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
-
-    def __post_init__(self) -> None:
-        waits = (self.stale_after, self.event_wait, self.fill_wait, self.cancel_wait)
-        pauses = (self.position_settle, *self.reconnect_pauses)
-        if any(not _finite(value) or value <= 0 for value in waits):
-            raise ValueError(f"пределы ожидания — положительные секунды: {waits}")
-        if not self.reconnect_pauses or any(not _finite(value) or value < 0 for value in pauses):
-            raise ValueError(f"паузы — неотрицательные секунды, хотя бы одна: {pauses}")
-        bars = self.limit_exit_bars
-        if isinstance(bars, bool) or not isinstance(bars, int) or bars < 1:
-            raise ValueError(f"свечей ожидания выхода с пределом — целое от 1: {bars!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,10 +202,6 @@ class Instrument:
     class_code: str
     bar_minutes: int
     account: str
-
-
-def _finite(value: object) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
 class _JournalDown(Exception):
@@ -398,6 +361,9 @@ class _Ticket:
     #: Сколько исполнено к концу сверки — исполнение сверх этого у заявки
     #: из журнала есть сделка без движка (С1).
     known_volume: int = 0
+    #: О каком состоянии заявки (статус, исполнено) сверка уже сказала
+    #: человеку: то же состояние на следующем переоткрытии не повторяется (Н5).
+    told_state: tuple[OrderStatus | None, int] | None = None
     note: str = ""
     journaled: CommandStatus | None = None
     executions: dict[str, BrokerExecution] = field(default_factory=dict)
@@ -514,22 +480,6 @@ class _LimitExit:
 
 
 # --------------------------------------------------------------- слова
-
-
-def signed_position(side: Side | None, volume: float) -> int:
-    """Позиция движка числом со знаком: лонг — плюс, шорт — минус, нет — ноль."""
-    if side is None or not volume:
-        return 0
-    return int(volume) if side is Side.LONG else -int(volume)
-
-
-def position_words(signed: int) -> str:
-    """Позиция словами для журнала: «лонг 2», «шорт 1», «позиции нет»."""
-    if signed > 0:
-        return f"лонг {signed}"
-    if signed < 0:
-        return f"шорт {-signed}"
-    return "позиции нет"
 
 
 def _order_words(order: OrderRequest) -> str:
@@ -679,6 +629,12 @@ class LiveExecutor:
         #: Подача после остановки разрешена: идёт сверка из 2в или «закрыть всё».
         #: Только эти два пути, и только пока они идут (`_permitted`, `B-077`).
         self._permit = False
+        #: Сколько раз поток статусов открывался: по росту 2в узнаёт «связь
+        #: вернулась» и сверяет позицию до следующей заявки (0017, 0020).
+        self._links = 0
+        #: Номер открытия потока, после которого сверка прошла (`compare_position`):
+        #: по нему сбрасывается пауза переподключения (З1).
+        self._confirmed_link = 0
 
     # -- жизнь -----------------------------------------------------------------
 
@@ -729,6 +685,21 @@ class LiveExecutor:
     def halted(self) -> str | None:
         """Почему торговать нельзя — словами; `None` — можно."""
         return self._halt
+
+    @property
+    def undelivered(self) -> tuple[str, ...]:
+        """Сделки исполнителя, ещё не отданные движку, — именами заявок движка.
+
+        Вход исполнился у брокера, а движок узнает о нём только с показом бара
+        исполнения: в это окно позиция у брокера уже есть, а у движка ещё нет
+        (`/risk` 2в, замечание к С4).
+        """
+        return tuple(deal.name for deal in self._deals)
+
+    @property
+    def links(self) -> int:
+        """Сколько раз поток статусов открылся. Рост после первого — связь вернулась."""
+        return self._links
 
     async def wait_connected(self, timeout: float) -> bool:
         """Дождаться открытого потока статусов; `False` — не открылся за `timeout`."""
@@ -795,6 +766,43 @@ class LiveExecutor:
         async with self._lock:
             return await self._position_now()
 
+    def _undelivered(self) -> int:
+        """На сколько контрактов (со знаком) позицию сдвинуло исполненное, чего движок не видел.
+
+        Сверка после связи сравнивает брокера с движком, а движок узнаёт
+        о сделке, только когда заявка кончилась (Р6). Учитывается **всё
+        исполненное**: законченные, но не отданные сделки (тейк за обрыв)
+        и исполненная часть незаконченных — тейка на 2, исполненного на 1,
+        выхода с пределом, сработавшего сторожа (`B-080`). Без этого сверка
+        объявила бы расхождение и закрыла бы всё на штатном частичном тейке.
+
+        Зовётся только под замком исполнителя (`compare_position`): сторож,
+        продавший между подсчётом и чтением портфеля, дал бы ложное
+        «закрыть всё» (R2 `/risk` 01.11.2026).
+        """
+        self._collect_takes()
+        shift = 0
+        counted: set[int] = set()
+        for deal in self._deals:
+            done = deal.volume if deal.complete else sum(t.done_volume for t in deal.tickets)
+            counted.update(id(ticket) for ticket in deal.tickets)
+            shift += self._shift(deal.action, deal.side, done)
+        for take in self._takes.values():
+            ticket = take.ticket
+            if ticket is not None and id(ticket) not in counted:
+                shift += self._shift(OrderAction.CLOSE, take.order.side, ticket.done_volume)
+        return shift
+
+    @staticmethod
+    def _shift(action: OrderAction, side: Side, volume: int) -> int:
+        """Сдвиг позиции сделкой движка: вход прибавляет сторону, выход вычитает."""
+        signed = signed_position(side, volume)
+        return signed if action is OrderAction.OPEN else -signed
+
+    def tell(self, text: str) -> None:
+        """Сказать человеку без остановки — через `Wiring.notice` и строкой WARNING."""
+        self._tell(text)
+
     @property
     def unsettled(self) -> bool:
         """Последняя сверка журнала не выяснила судьбу хоть одной команды."""
@@ -807,6 +815,32 @@ class LiveExecutor:
             if actual == expected:
                 self._ledger = actual
             return actual
+
+    async def compare_position(self, expected: int) -> tuple[int, int, str | None]:
+        """Сверка позиции после связи — ОДНОЙ операцией под замком (R2, решение 0020).
+
+        Позиция робота — `expected` движка плюс исполненное, чего движок ещё
+        не видел (`_undelivered`), и считается она в тот же миг, что читается
+        портфель: сторож трейлинга, продавший по догруженной минутке, не
+        вклинится между подсчётом и чтением. Совпало — основа позиции по
+        сделкам. Не совпало — «закрыть всё» тут же, под тем же замком.
+
+        :returns: позиция у брокера, позиция робота, текст остановки или `None`.
+        :raises BrokerError: портфель не прочитан.
+        """
+        async with self._lock:
+            robot = expected + self._undelivered()
+            actual = await self._position_now()
+            if actual == robot:
+                self._ledger = actual
+                self._confirmed_link = self._links
+                return actual, robot, None
+            why = (
+                f"Сверка с брокером: у брокера {position_words(actual)}, "
+                f"у робота {position_words(robot)}."
+            )
+            with self._permitted():
+                return actual, robot, await self._flatten(why)
 
     async def close_everything(self, why: str) -> str:
         """Решение 0020 (0066): снять заявки, закрыть позицию по рынку, остановиться.
@@ -836,7 +870,9 @@ class LiveExecutor:
             with self._permitted():
                 for row in stored:
                     if row.command.action is CommandAction.CREATE:
-                        notes.append(await self._settle_create(row))
+                        note = await self._settle_create(row)
+                        if note is not None:
+                            notes.append(note)
             for row in stored:
                 if row.command.action is CommandAction.CANCEL:
                     self._settle_cancel(row)
@@ -895,8 +931,9 @@ class LiveExecutor:
                 return
             same = take.ticket is not None and at_broker and take.order.price == order.price
             if same and take.ticket is not None and not take.ticket.final:
-                # Тот же уровень и заявка у брокера жива. Снятая (сверкой 0017,
-                # нами) — не «то же состояние»: её надо поставить заново.
+                # Тот же уровень и заявка у брокера жива. Кончившаяся без
+                # исполнения — не «то же состояние»: после `B-079` так бывает
+                # только при снятии не нами, а оно уже остановило робота.
                 return
             # Проверки — ДО снятия прежнего: снятый уровень плюс отказ в новом
             # оставили бы позицию без тейка, а движок считал бы прежний живым.
@@ -1281,21 +1318,25 @@ class LiveExecutor:
                     await self._ask(ticket)
         return True
 
-    async def _ask(self, ticket: _Ticket) -> None:
-        """Статус по ключу (§2.2 п. 8): всё, что брокер помнит о заявке, — в билет."""
+    async def _ask(self, ticket: _Ticket) -> bool:
+        """Статус по ключу (§2.2 п. 8): всё, что брокер помнит о заявке, — в билет.
+
+        `False` — брокер не ответил (сбой, связь); 404 — ответ: заявки нет.
+        """
         try:
             state = await self._session.order_status(ticket.key)
         except BrokerError as error:
             log.warning("статус заявки %s не получен: %s", ticket.key, error.technical)
-            return
+            return False
         if state is None:
             ticket.missing = True
-            return
+            return True
         for report in state.reports:
             self._apply(ticket, report)
         if not ticket.final:
             ticket.status = state.latest.status
         self._after_change(ticket)
+        return True
 
     async def _fill_market(self, ticket: _Ticket) -> None:
         """Рыночная: ждать `2` или `8`. Без конца к пределу — снять остаток и стоп (Р6)."""
@@ -1715,14 +1756,71 @@ class LiveExecutor:
 
     # -- сверка журнала (решение 0017) -----------------------------------------
 
-    async def _settle_create(self, row: StoredCommand) -> str:
-        """Одна команда создания: судьба — по брокеру. Не выяснилась — остановка (С1)."""
-        ticket = self._tickets.get(row.command.client_order_id) or self._adopt(row)
+    async def _settle_create(self, row: StoredCommand) -> str | None:
+        """Одна команда создания: судьба — по брокеру. Не выяснилась — остановка (С1).
+
+        Заявку, которую исполнитель **сам ведёт** в этом запуске и считает
+        живой (тейк у брокера, выход по времени с пределом), сверка не снимает
+        (`B-079`): решение 0017 — про заявки с неизвестной судьбой и заявки
+        прошлого запуска, а не про стоящий тейк. Для неё — только статус.
+        """
+        known = self._tickets.get(row.command.client_order_id)
+        if known is not None and self._managed(known):
+            return await self._refresh(known)
+        ticket = known or self._adopt(row)
         try:
             return await self._settle_ticket(ticket)
         finally:
             # Что исполнено к концу сверки, учтено позицией; сверх этого — сделка без движка.
             ticket.known_volume = ticket.done_volume
+
+    def _managed(self, ticket: _Ticket) -> bool:
+        """Заявка этого запуска, которую исполнитель ведёт как живую: тейк или выход с пределом."""
+        if ticket.answer is not _Answer.ACCEPTED or ticket.final or not ticket.bound:
+            return False
+        return any(take.ticket is ticket for take in self._takes.values()) or any(
+            waiting.ticket is ticket for waiting in self._limit_exits
+        )
+
+    async def _refresh(self, ticket: _Ticket) -> str | None:
+        """Статус своей живой заявки после связи — добор пропущенного, без снятия (`B-079`).
+
+        Исполнилась за обрыв — сделка уйдёт движку обычным путём (`fills_at`);
+        снята не нами — остановка словами (`_ended`); жива — ничего, а частично
+        исполненная названа частично исполненной (`B-080`).
+        """
+        if not await self._ask(ticket):
+            return self._unfinished(
+                f"Сверка не закончена: статус заявки ({ticket.what}, ключ {ticket.key}) "
+                f"брокер не сообщил, а программа ведёт её как живую. {_HALT_TAIL}"
+            )
+        if ticket.missing:
+            return self._unfinished(
+                f"Брокер не находит заявку ({ticket.what}, ключ {ticket.key}), которую "
+                f"программа ведёт как живую. {_HALT_TAIL}"
+            )
+        if ticket.status is OrderStatus.FILLED:
+            return (
+                f"Заявка ({ticket.what}) исполнилась, пока связи не было: сделка уйдёт "
+                "движку."
+            )
+        if ticket.final:
+            return self._end_words(ticket)
+        # Живая заявка: сказать один раз на состояние, а не на каждое
+        # переоткрытие потока (Н5) — при частых обрывах это строка в секунду.
+        state = (ticket.status, ticket.done_volume)
+        if ticket.told_state == state:
+            return None
+        ticket.told_state = state
+        part = (
+            f" исполнена на {ticket.done_volume} из {ticket.order.quantity}, остаток"
+            if ticket.done_volume
+            else ""
+        )
+        return (
+            f"Заявка ({ticket.what}) у брокера{part} жива — после связи её не трогали; "
+            "движок получит одну сделку, когда заявка кончится."
+        )
 
     async def _settle_ticket(self, ticket: _Ticket) -> str:
         await self._ask(ticket)
@@ -1792,19 +1890,29 @@ class LiveExecutor:
 
     async def _supervise(self) -> None:
         """Держать поток открытым. Обрыв — пауза по нарастающей и снова (`DOMAIN.md` §7)."""
+        loop = asyncio.get_running_loop()
         failures = 0
+        reset_at: float | None = None
         while True:
+            opened_at: float | None = None
             try:
                 async with self._open_events() as stream:
                     await self._recover()
                     self._stream = stream
-                    failures = 0
+                    self._links += 1
+                    opened_at, opened_link = loop.time(), self._links
                     self._notify()
-                    if any(
+                    waiting = any(
                         take.deal is not None and not take.deal.tickets
                         for take in self._takes.values()
-                    ):
-                        # Выход сработавшего сторожа ждёт связи: пусть 2в позовёт `watch`.
+                    )
+                    if self._links > 1 or waiting:
+                        # Связь вернулась: сверка (0017, 0020) — сразу, проходом
+                        # по событию, а не на закрытии бара через 15 минут (Z1
+                        # `/risk`): принудительное закрытие брокером за обрыв
+                        # иначе узнали бы с опозданием до бара, а окно всё это
+                        # время писало бы «заявки уходят брокеру». Тот же
+                        # проход подаёт выход сторожа, ждавший связи (`watch`).
                         self._news()
                     async for event in stream:
                         self._on_event(event)
@@ -1813,6 +1921,22 @@ class LiveExecutor:
             finally:
                 self._stream = None
                 self._notify()
+            # Пауза сбрасывается на первую, если связь восстановилась по-настоящему
+            # (`_LINK_SETTLE`, З1): продержалась, или сверка после неё прошла,
+            # а прошлый сброс был не ближе порога. Иначе растёт: обрыв сразу
+            # после открытия — продолжение прежнего, и сверок с чтением портфеля
+            # не больше одной на паузу. Порог свежести (60 с) здесь не годился:
+            # при обрывах раз в 50 с поток лежал бы треть времени.
+            now = loop.time()
+            held = opened_at is not None and now - opened_at >= _LINK_SETTLE
+            confirmed = (
+                opened_at is not None
+                and self._confirmed_link == opened_link
+                and (reset_at is None or now - reset_at >= _LINK_SETTLE)
+            )
+            if held or confirmed:
+                failures = 0
+                reset_at = now
             pauses = self._limits.reconnect_pauses
             await self._sleep(pauses[min(failures, len(pauses) - 1)])
             failures += 1

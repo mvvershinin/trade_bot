@@ -41,12 +41,14 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import math
 import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Final
 
+from app.fact import LiveLimits
 from backtest import Costs, Deal, HistoryRun, MinuteOrder, Pair, Plan, headline
 from engine import (
     DayMarks,
@@ -95,6 +97,7 @@ from ui.formatting import (
 )
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
+    FIELD_CAPTIONS,
     AfterTakeProfit,
     AlgorithmDemand,
     AlgorithmOption,
@@ -120,6 +123,8 @@ from ui.models import (
     TradePath,
     TradeRow,
     TradesSummary,
+    live_limit_fits,
+    live_limit_rule,
 )
 from ui.trade_story import OrderStep, Phase, TradeStory
 
@@ -146,6 +151,7 @@ __all__ = [
     "run_costs",
     "minute_order_of",
     "minute_bar_limit_of",
+    "live_limits",
     "window_changes",
     "guard_changes",
     "all_changes",
@@ -1198,6 +1204,88 @@ def minute_bar_limit_of(values: Settings) -> int:
     return values.minute_bar_limit.minutes
 
 
+#: Поле `LiveLimits` → поле окна, из которого оно берётся. Таблица плюс один
+#: цикл, а не шесть строк конструктора: поле, заведённое исполнителю завтра
+#: и здесь не названное, ловит тест полноты
+#: (`tests/test_live_limits_settings.py`), а не память.
+#:
+#: ⚠️ `limit_exit_bars` здесь нет намеренно: сколько свечей ждать выхода
+#: с пределом — это `time_exit_wait_bars` движка, одно число на движок
+#: и исполнитель (находка проверки 2а/2б). Своего поля в окне у него нет
+#: и не будет; связывает его тот, кто собирает исполнитель.
+_LIVE_FROM_WINDOW: Final[dict[str, str]] = {
+    "stale_after": "live_stale_after_sec",
+    "event_wait": "live_event_wait_sec",
+    "fill_wait": "live_fill_wait_sec",
+    "cancel_wait": "live_cancel_wait_sec",
+    "position_settle": "live_position_settle_sec",
+    "reconnect_pauses": "live_reconnect_pauses_sec",
+}
+
+
+def _plain(value: float) -> str:
+    """Число секунд по-русски, без хвостовых нулей: `60`, `0,5`."""
+    return f"{value:g}".replace(".", ",")
+
+
+def _live_refused(field: str, said: str) -> SettingsRefused:
+    """Отказ поля «Бой»: подпись окна, граница словами, что стоит сейчас."""
+    return SettingsRefused(
+        f"«{FIELD_CAPTIONS[field]}» — {live_limit_rule(field)}, а стоит «{said}». "
+        "Прежние настройки остались в силе.",
+        field=field,
+    )
+
+
+def _live_pauses(values: Settings, field: str) -> tuple[float, ...]:
+    """Паузы переподключения в секундах — или отказ с подписью поля."""
+    value = getattr(values, field)
+    if live_limit_fits(field, value):
+        return tuple(float(item) for item in value)
+    raise _live_refused(field, _as_pauses(value))
+
+
+def _live_seconds(values: Settings, field: str) -> float:
+    """Одно ожидание в секундах — или отказ с подписью поля."""
+    value = getattr(values, field)
+    if live_limit_fits(field, value):
+        return float(value)
+    raise _live_refused(field, _as_seconds(value))
+
+
+def live_limits(values: Settings) -> LiveLimits:
+    """Настройки окна → пределы ожидания боевого исполнителя. Или отказ вслух.
+
+    Одна функция перевода на все пути: проверка при «Применить» и сборка
+    исполнителя зовут её же, поэтому граница, проверенная в окне, — ровно
+    та, что дойдёт до брокера (решение 0066, правило 16).
+
+    ⚠️ Проверка здесь, а не только в `LiveLimits.__post_init__`: там
+    граница «больше нуля», а окно держит разумные пределы
+    (`LIVE_LIMITS_BOUNDS`), и отказ обязан назвать поле подписью окна —
+    `SettingsRefused.field` открывает вкладку с ним.
+
+    ⚠️ `limit_exit_bars` остаётся умолчанием `LiveLimits` — см.
+    `_LIVE_FROM_WINDOW`. Его кладёт тот, кто собирает исполнитель, из
+    `time_exit_wait_bars` движка.
+
+    Класс — из `app/fact.py`, шва без `broker/`: этот модуль импортирует
+    наблюдение (`app/observe.py`), которому брокер не положен по устройству.
+
+    :raises SettingsRefused: число вне границ, NaN, пустой или длинный список
+        пауз; `field` — имя поля окна.
+    """
+    pauses = _LIVE_FROM_WINDOW["reconnect_pauses"]
+    # `Any`: имена полей приходят из таблицы, и тип каждого сверяет не mypy,
+    # а `LiveLimits.__post_init__` и тест полноты таблицы.
+    seconds: dict[str, Any] = {
+        inner: _live_seconds(values, outer)
+        for inner, outer in _LIVE_FROM_WINDOW.items()
+        if outer != pauses
+    }
+    return LiveLimits(reconnect_pauses=_live_pauses(values, pauses), **seconds)
+
+
 # ---------------------------------------------------------------------------
 # Строки журнала об изменении настроек, о которых не расскажет никто другой
 # ---------------------------------------------------------------------------
@@ -1247,6 +1335,24 @@ def _as_load_days(value: object) -> str:
     «скачаем всё», которого никто не давал.
     """
     return f"{value} дн."
+
+
+def _as_seconds(value: object) -> str:
+    """Ожидание боевого исполнителя: число и единица, дробь — по-русски.
+
+    NaN и бесконечность — словами: JSON-разбор Питона пропускает `NaN`
+    из файла настроек, и «nan с» в отказе человеку ничего не скажет.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{_plain(value)} с" if math.isfinite(value) else "не число"
+    return str(value)
+
+
+def _as_pauses(value: object) -> str:
+    """Паузы переподключения: «1, 2, 5, 10, 30 с». Пустой список — словами."""
+    if not isinstance(value, tuple) or not value:
+        return "не заданы"
+    return ", ".join(str(item) for item in value) + " с"
 
 
 def _as_source(value: object) -> str:
@@ -1320,6 +1426,19 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # в прогоне двигается только на закрытии свечи (`B-058`).
     "minute_bar_limit": _Told("Наибольшая свеча для проверки по минуткам", _as_label),
     "log_directory": _Told("Каталог технического журнала", _as_text),
+    # Ожидания боевого исполнителя (вкладка «Бой», правило 16).
+    # Подпись — та же, что у строки окна: человек ищет поле по ней.
+    # Движок и алгоритм их не знают — рассказать больше некому.
+    **{
+        name: _Told(FIELD_CAPTIONS[name], _as_seconds)
+        for name in (
+            "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
+            "live_cancel_wait_sec", "live_position_settle_sec",
+        )
+    },
+    "live_reconnect_pauses_sec": _Told(
+        FIELD_CAPTIONS["live_reconnect_pauses_sec"], _as_pauses
+    ),
     # Три предохранителя: у каждого галочка и число, и в журнал идут оба.
     # Одна галочка без числа читалась бы как «включил и всё» — а включение
     # без числа не значит ничего; одно число без галочки читалось бы как

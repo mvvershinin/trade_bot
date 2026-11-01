@@ -73,7 +73,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Final, TextIO
+from typing import Any, Final, TextIO, TypeGuard
 
 from app import convert
 from app.invocation import how_to_fetch
@@ -93,7 +93,7 @@ from strategies import StrategySettings, registry
 from ui import backend
 from ui.backend import RunStats, TemplateRun
 from ui.formatting import fmt_datetime, fmt_money, fmt_share
-from ui.models import MinuteBarLimit, MinutePriceOrder, Mode, Settings
+from ui.models import FIELD_CAPTIONS, MinuteBarLimit, MinutePriceOrder, Mode, Settings
 
 __all__ = [
     "RUNS_KEPT",
@@ -182,6 +182,25 @@ _SCALARS: Mapping[type, Callable[[Any], str]] = {
 }
 
 
+def _numbers(value: object) -> TypeGuard[tuple[int | float, ...]]:
+    """Непустой кортеж чисел (не «да/нет») — паузы переподключения.
+
+    ⚠️ Только числа. Кортеж кортежей — отметки календаря (`DayMarks.items`) —
+    печатается как прежде: снимок сличается с прогонами прежних сборок
+    по тексту строк, и новая запись календаря отняла бы у шаблонов их прогоны.
+    """
+    return (
+        isinstance(value, tuple)
+        and bool(value)
+        and all(type(item) in (int, float) for item in value)
+    )
+
+
+def _number_list(value: tuple[int | float, ...]) -> str:
+    """Список чисел — как в окне: «3, 11», а не кортеж Питона «(3, 11)»."""
+    return ", ".join(_text(item) for item in value)
+
+
 def _text(value: object) -> str:
     """Значение любого поля настроек человеческим текстом.
 
@@ -199,6 +218,8 @@ def _text(value: object) -> str:
     if value is None:
         return "не задано"
     render = _SCALARS.get(type(value))
+    if render is None and _numbers(value):
+        render = _number_list
     if render is not None:
         return render(value)
     if isinstance(value, enum.Enum):
@@ -287,6 +308,10 @@ _COSTS_TITLES: Mapping[str, str] = {
 }
 
 
+#: Умолчания окна — для полей снимка, которых в прогонах прежних сборок нет.
+_DEFAULTS = Settings()
+
+
 @dataclass(frozen=True, slots=True)
 class ProgramFields:
     """Числа программы, которые меняют прогон, но не живут в настройках движка.
@@ -317,6 +342,15 @@ class ProgramFields:
     #: выше порога скользящий уровень двигается только на закрытии свечи.
     #: Поэтому, как и порядок, в сличении участвует.
     minute_bar_limit: MinuteBarLimit = MinuteBarLimit.FIVE
+    #: Ожидания боевого исполнителя (Э4 2в, `app/fact.py::LiveLimits`, правило 16).
+    #: В снимке — чтобы боевой прогон помнил, с какими пределами подавал заявки.
+    #: Сделок прогона тестера не меняют: в сличении не участвуют.
+    live_stale_after_sec: int = _DEFAULTS.live_stale_after_sec
+    live_event_wait_sec: int = _DEFAULTS.live_event_wait_sec
+    live_fill_wait_sec: int = _DEFAULTS.live_fill_wait_sec
+    live_cancel_wait_sec: int = _DEFAULTS.live_cancel_wait_sec
+    live_position_settle_sec: float = _DEFAULTS.live_position_settle_sec
+    live_reconnect_pauses_sec: tuple[int, ...] = _DEFAULTS.live_reconnect_pauses_sec
 
     @classmethod
     def of(cls, values: Settings) -> ProgramFields:
@@ -333,6 +367,16 @@ _PROGRAM_TITLES: Mapping[str, str] = {
     "history_depth_days": "Глубина загрузки истории, дней",
     "minute_order": "Порядок цен внутри минуты",
     "minute_bar_limit": "Наибольшая свеча для проверки по минуткам",
+    # Пределы боя — подписью окна (`FIELD_CAPTIONS`) и единицей: одна подпись
+    # поля в окне, в журнале «Настройки изменены» и в снимке прогона.
+    **{
+        name: f"{FIELD_CAPTIONS[name]}, с"
+        for name in (
+            "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
+            "live_cancel_wait_sec", "live_position_settle_sec",
+            "live_reconnect_pauses_sec",
+        )
+    },
 }
 
 
@@ -668,6 +712,14 @@ _UNCONTROLLED_TITLES: frozenset[str] = frozenset(
         # по ней — значит отнять у шаблона его прогоны за то, что в окне
         # стоит другое число дней.
         "expiry_halt_days",
+        # Ожидания боевого исполнителя (Э4 2в): тестер заявок брокеру
+        # не подаёт, и сделки его прогона от них не зависят.
+        "live_stale_after_sec",
+        "live_event_wait_sec",
+        "live_fill_wait_sec",
+        "live_cancel_wait_sec",
+        "live_position_settle_sec",
+        "live_reconnect_pauses_sec",
         # ⚠️ Порядка цен минутки здесь нет намеренно (Ф5 задачи З9): прогон
         # окна идёт по минуткам, и сделки от порядка зависят. Пропущенный
         # здесь, он молча засчитал бы шаблону прогоны при другом порядке.

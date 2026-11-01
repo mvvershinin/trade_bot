@@ -78,6 +78,7 @@ from ui.formatting import (
     to_msk,
 )
 from ui.legend import (
+    FACT_MEANING,
     LegendItem,
     LineSample,
     MarkerSample,
@@ -94,12 +95,19 @@ from ui.models import (
     LinePoint,
     Marker,
     PriceLevel,
+    RunOrigin,
     Shade,
     TradePath,
     TradeRow,
 )
 from ui.theme import Theme
 from ui.theme import current as current_theme
+
+#: Подсказка галочки «Факт». Откуда исполнения — дописывает `set_fact_origin`.
+FACT_HINT = (
+    "Где сделка произошла на самом деле: цена исполнения\n"
+    "и фактическое время."
+)
 
 BAR_HINT = (
     "Сведения о свече: цена открытия, наибольшая и наименьшая цены за свечу,\n"
@@ -401,6 +409,8 @@ class LegendPanel(QWidget):
         self._surface = surface
         self._theme = theme
         self._plan = False
+        #: Откуда данные залитых меток (`D-172`). `None` — не названо.
+        self._fact_origin: RunOrigin | None = None
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(10, 2, 10, 4)
         self._grid.setHorizontalSpacing(14)
@@ -421,6 +431,13 @@ class LegendPanel(QWidget):
         self._plan = visible
         self.rebuild()
 
+    def set_fact_origin(self, origin: RunOrigin | None) -> None:
+        """Откуда данные «факта» — из снимка боя. Легенда идёт следом."""
+        if origin == self._fact_origin:
+            return
+        self._fact_origin = origin
+        self.rebuild()
+
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
         paint_background(self, theme)
@@ -438,7 +455,8 @@ class LegendPanel(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self.rows = []
-        for number, item in enumerate(legend_items(plan=self._plan)):
+        shown = legend_items(plan=self._plan, fact_origin=self._fact_origin)
+        for number, item in enumerate(shown):
             row, column = divmod(number, LEGEND_COLUMNS)
             icon = QLabel()
             icon.setPixmap(swatch(item, self._theme, self._surface, self))
@@ -1038,12 +1056,9 @@ class ChartPanel(QWidget):
             "разошлось с расчётом.\n"
             "Снимите галочку, если хотите видеть только то, что произошло."
         )
-        self.fact_box = QCheckBox("Факт")
+        self.fact_box = QCheckBox(Layer.FACT.label)
         self.fact_box.setChecked(True)
-        self.fact_box.setToolTip(
-            "Где сделка произошла на самом деле: цена исполнения у брокера\n"
-            "и фактическое время."
-        )
+        self.fact_box.setToolTip(FACT_HINT)
         self.plan_box.toggled.connect(self._toggle_plan)
         self.fact_box.toggled.connect(lambda on: self._surface.set_layer_visible(Layer.FACT, on))
 
@@ -1227,6 +1242,21 @@ class ChartPanel(QWidget):
             label.setStyleSheet(f"color: {self._theme.text_dim};")
         for box in (self.plan_box, self.fact_box):
             box.setStyleSheet(f"color: {self._theme.text};")
+
+    def set_fact_origin(self, origin: RunOrigin | None) -> None:
+        """Откуда данные залитых меток — подпись галочки «Факт» и легенда.
+
+        Из данных снимка боя (`LiveView.fact_origin`), а не из режима окна
+        (`D-172`): окно не решает, чьи исполнения на графике, — ему сказали.
+        `None` — не сказали, и подпись прежняя, без утверждения о деньгах.
+        """
+        if origin is None:
+            self.fact_box.setText(Layer.FACT.label)
+            self.fact_box.setToolTip(FACT_HINT)
+        else:
+            self.fact_box.setText(f"{Layer.FACT.label} · {origin.label}")
+            self.fact_box.setToolTip(f"{FACT_HINT}\nСейчас это {FACT_MEANING[origin]}.")
+        self.legend.set_fact_origin(origin)
 
     def _toggle_plan(self, on: bool) -> None:
         """Слой «Прогноз» включили или выключили: график и легенда идут вместе."""

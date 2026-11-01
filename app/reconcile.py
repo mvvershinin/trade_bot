@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.live_executor import LiveExecutor, position_words
+from app.live_executor import LiveExecutor
 from broker.errors import BrokerError
 
 __all__ = ["Reconciliation", "reconcile"]
@@ -57,23 +57,24 @@ async def reconcile(executor: LiveExecutor, expected: int) -> Reconciliation:
       брокера с роботом могла сойтись, а торговать этим исполнителем всё
       равно нельзя («Возобновить» — пересборка, С3).
 
-    :param expected: позиция робота со знаком (`live_executor.signed_position`).
+    :param expected: позиция робота со знаком (`app.fact.signed_position`), как её
+        знает движок; сделки, ещё не отданные ему исполнителем, сверка учтёт сама.
     """
     notes = await executor.settle_open_commands()
+    # Заметки сверки — человеку (правило 13): вызывающий возвращает только остановку.
+    for note in notes:
+        executor.tell(f"Сверка с брокером: {note}")
     if executor.unsettled:
         return Reconciliation(notes, None, expected, executor.halted)
     try:
-        actual = await executor.check_position(expected)
+        # Неотданные движку сделки и портфель — одной операцией под замком
+        # исполнителя (R2): сторож, продавший между ними, дал бы ложное
+        # «закрыть всё».
+        actual, robot, flattened = await executor.compare_position(expected)
     except BrokerError as error:
         return Reconciliation(
             notes, None, expected,
             f"Позицию у брокера прочитать не удалось: {error.human} Сверка не прошла — "
             "робот не торгует.",
         )
-    if actual == expected:
-        return Reconciliation(notes, actual, expected, executor.halted)
-    why = (
-        f"Сверка с брокером: у брокера {position_words(actual)}, "
-        f"у робота {position_words(expected)}."
-    )
-    return Reconciliation(notes, actual, expected, await executor.close_everything(why))
+    return Reconciliation(notes, actual, robot, flattened or executor.halted)

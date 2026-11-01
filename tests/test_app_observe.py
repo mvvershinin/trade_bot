@@ -507,25 +507,168 @@ def test_no_order_ever_leaves_for_the_broker(drive) -> None:
     assert run.deals, "исполнитель-тень не дал ни одной расчётной сделки"
 
 
+#: Модули пишущего пути: боевой исполнитель, сверка, сборка боевой стороны,
+#: поток статусов и создание заявок брокера. Ни один не должен быть достижим
+#: из живого хода — ни прямым импортом, ни через соседей (Э4 2в).
+WRITING_PATH = frozenset({
+    "app.live_executor", "app.reconcile", "app.live_trading", "app.live_feed",
+    "broker.session", "broker.orders", "broker.order_stream",
+})
+
+#: Модули брокера, которые живому ходу достижимы — с причиной. Чистка текста
+#: секретов для ленты «Отладка» (`app/debug_feed.py`): ни сети, ни сессии.
+#: ⚠️ В памяти процесса при этом окажется весь `broker/`: пакет поднимает
+#: свой `__init__`, а тот — сессию. Сторож ниже — про **имена**, которыми
+#: ход может дотянуться до пишущего пути, а не про память процесса;
+#: память процесса стережёт `test_importing_the_module_loads_no_writing_path`.
+BROKER_ALLOWED = frozenset({"broker.redaction"})
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+PROJECT = ("app", "engine", "market", "backtest", "strategies", "ui")
+
+
+def _source_of(module: str) -> pathlib.Path | None:
+    base = ROOT.joinpath(*module.split("."))
+    for path in (base.with_suffix(".py"), base / "__init__.py"):
+        if path.is_file():
+            return path
+    return None
+
+
+def _at_import(tree: ast.Module) -> list[str]:
+    """Имена модулей, которые файл импортирует **при загрузке**.
+
+    Тело модуля и ветки `if` в нём, кроме `if TYPE_CHECKING:` — их не
+    исполняет никто. Импорт внутри функции — не путь живого хода при
+    загрузке; свой такой импорт у `app/observe.py` ловит соседний сторож
+    (`test_the_module_cannot_reach_the_broker`) по всему дереву.
+    """
+    found: list[str] = []
+    pending: list[ast.stmt] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.Import):
+            found += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            found.append(node.module)
+            found += [f"{node.module}.{alias.name}" for alias in node.names]
+        elif isinstance(node, ast.If) and "TYPE_CHECKING" not in ast.unparse(node.test):
+            pending += [*node.body, *node.orelse]
+        elif isinstance(node, ast.Try):
+            pending += [*node.body, *node.orelse, *node.finalbody]
+    return found
+
+
+def _reach(start: str, source: str | None = None) -> set[str]:
+    """Транзитивное замыкание импортов при загрузке, от модуля `start`.
+
+    Внутрь проекта — по файлам; модули `broker/` и прочие — листья.
+    `source` подменяет исходник стартового модуля (проверка самого сторожа).
+    """
+    seen: set[str] = set()
+    queue = [(start, source)]
+    while queue:
+        module, text = queue.pop()
+        if module in seen:
+            continue
+        seen.add(module)
+        path = _source_of(module)
+        if module.split(".")[0] not in PROJECT or (text is None and path is None):
+            continue
+        if text is None and path is not None:
+            text = path.read_text(encoding="utf-8")
+        for name in _at_import(ast.parse(text or "")):
+            parts = name.split(".")
+            # Импорт подмодуля исполняет и пакеты над ним; имя, взятое
+            # из модуля (`from X import y`), модулем становится, только если
+            # такой файл есть. Чужие библиотеки — вне `ROOT`, их здесь нет.
+            queue += [
+                (prefix, None)
+                for prefix in (".".join(parts[:depth]) for depth in range(1, len(parts) + 1))
+                if _source_of(prefix) is not None
+            ]
+    return seen
+
+
+def _writing_reach(reached: set[str]) -> list[str]:
+    broker = {name for name in reached if name.split(".")[0] == "broker" and name != "broker"}
+    return sorted((reached & WRITING_PATH) | (broker - BROKER_ALLOWED))
+
+
 def test_the_module_cannot_reach_the_broker() -> None:
-    """Стережёт: `app/observe.py` не импортирует `broker/` ни одним именем.
+    """Стережёт: `app/observe.py` не импортирует `broker/` и пишущий путь ни одним именем.
 
     Проверка по разбору исходника, а не по поведению: поведенческий тест
     заметит поход в сеть только на той ветке, которую он выполнил, а импорт
     видно всегда. Ветка подачи боевой заявки не должна существовать вовсе.
+    Исполнитель «факта» приходит к ходу параметром (`FactLeg.executor`).
     """
-    source = pathlib.Path(__file__).resolve().parent.parent / "app" / "observe.py"
+    source = ROOT / "app" / "observe.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     reached: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            reached += [alias.name for alias in node.names if alias.name.startswith("broker")]
-        elif isinstance(node, ast.ImportFrom) and (node.module or "").startswith("broker"):
-            reached.append(node.module or "")
-    assert not reached, (
-        f"живой ход получил доступ к брокеру: {reached}. Наблюдение обязано "
+            reached += [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            reached.append(node.module)
+    wrong = [
+        name for name in reached
+        if name.startswith("broker") or name in WRITING_PATH
+    ]
+    assert not wrong, (
+        f"живой ход получил доступ к брокеру: {wrong}. Наблюдение обязано "
         "быть неспособным подать заявку по устройству, а не по проверке"
     )
+
+
+def test_the_module_cannot_reach_the_writing_path_through_its_neighbours() -> None:
+    """Транзитивно (Э4 2в): ни один модуль, поднятый живым ходом, не ведёт к заявке.
+
+    Импорт через соседа — та же дверь, что прямой: `app/observe.py` берёт
+    `app/convert.py`, тот — ещё два десятка модулей, и любой из них, взявший
+    боевой исполнитель или сессию брокера, отдал бы ходу путь к счёту.
+    Допустима одна дверь брокера, названная с причиной (`BROKER_ALLOWED`).
+    """
+    reached = _reach("app.observe")
+    assert "app.convert" in reached and "app.fact" in reached, "замыкание не обошло соседей"
+    wrong = _writing_reach(reached)
+    assert not wrong, (
+        f"живой ход дотягивается до пишущего пути через соседей: {wrong}. "
+        "Боевой исполнитель приходит к ходу параметром, и только так"
+    )
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        "from app.live_executor import LiveExecutor",
+        "import broker.session",
+        "from app import reconcile",
+    ],
+)
+def test_the_neighbour_guard_catches_a_planted_import(planted: str) -> None:
+    """Сторож сторожа: подсаженный импорт пишущего пути замыкание видит."""
+    reached = _reach("app.probe", f"from app import convert\n{planted}\n")
+    assert _writing_reach(reached), planted
+
+
+def test_importing_the_module_loads_no_writing_path() -> None:
+    """Память процесса: `import app.observe` не поднимает исполнитель и поток статусов.
+
+    Отдельный процесс — чистый: в процессе тестов модули уже подняты соседями.
+    ⚠️ `broker.session` и `broker.orders` в памяти будут: их поднимает
+    `broker/__init__.py` ради чистки текста (`BROKER_ALLOWED`). Имени сессии
+    живой ход при этом не получает — это стережёт сторож по импортам выше.
+    """
+    import subprocess
+    import sys
+
+    loaded = subprocess.run(
+        [sys.executable, "-c", "import sys, app.observe; print(' '.join(sorted(sys.modules)))"],
+        cwd=ROOT, capture_output=True, text=True, check=True, timeout=60,
+    ).stdout.split()
+    forbidden = {"app.live_executor", "app.reconcile", "app.live_trading", "broker.order_stream"}
+    assert not forbidden & set(loaded), sorted(forbidden & set(loaded))
 
 
 # --------------------------------------------------------------- беда и конец

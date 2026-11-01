@@ -689,6 +689,9 @@ _ANOTHER_VALUE = {
     "instrument": "RIU6",
     "timeframe": "15 минут",
     "after_take_profit": AfterTakeProfit.WAIT_FOR_SIGNAL,
+    # Список целых, а не календарь: «другой кортеж» по типу дал бы паузам
+    # переподключения отметки календаря, и строка журнала вышла бы о мусоре.
+    "live_reconnect_pauses_sec": (3, 7),
 }
 
 

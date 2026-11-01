@@ -1215,6 +1215,10 @@ def _live_feed(
     # тикер задавался при сборке, `apply_settings` его не трогал, и после смены
     # инструмента поток продолжал писать старый, молча.
     port.attach_stream(link.switch, retarget=link.retarget)
+    # Бой (Э4 2в): чем собирать боевой исполнитель. Собирается он только
+    # по команде окна «Включить бой» (`HistoryPort.set_live`), на сессии
+    # этого же звена, — до неё к брокеру не уходит ни одной заявки.
+    port.attach_live(link.desks())
     if args.stream:
         port.stream(True)
     return link

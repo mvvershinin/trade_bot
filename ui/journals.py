@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 from PySide6.QtCore import (
@@ -60,6 +60,26 @@ from ui.fit_scroll import FitScrollArea
 from ui.theme import Theme, current as current_theme
 
 SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+
+#: Вкладки журналов: подпись и подсказка в обычном виде.
+_TAB_TITLES: tuple[tuple[str, str], ...] = (
+    ("Сделки", "Что реально произошло: цены, объём, результат, комиссия."),
+    ("Решения робота", "Почему робот поступил именно так. Каждая строка — причина."),
+)
+
+#: Хвост подписи вкладки, среди строк которой есть боевой режим. По данным
+#: строк (`origin`), а не по режиму окна (`D-172`): журнал называет деньги
+#: настоящими только тогда, когда так сказано о самой строке.
+REAL_MONEY_MARK = " · бой"
+REAL_MONEY_HINT = (
+    "Среди строк — боевой режим: заявки уходили брокеру на ваш счёт, "
+    "сделки настоящие."
+)
+
+
+def _any_real_money(rows: Iterable[TradeRow | DecisionRow]) -> bool:
+    """Есть ли среди строк хоть одна боевого режима — по её `origin`."""
+    return any(row.origin is not None and row.origin.real_money for row in rows)
 
 #: Самая длинная причина выхода движка (`engine.ExitReason.label`) —
 #: по ней меряется ширина колонки «Причина выхода» (`_hold_reason_width`).
@@ -663,10 +683,9 @@ class JournalTabs(QWidget):
         decisions_layout.addWidget(self.decisions_table)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(trades_tab, "Сделки")
-        self.tabs.addTab(decisions_tab, "Решения робота")
-        self.tabs.setTabToolTip(0, "Что реально произошло: цены, объём, результат, комиссия.")
-        self.tabs.setTabToolTip(1, "Почему робот поступил именно так. Каждая строка — причина.")
+        self.tabs.addTab(trades_tab, _TAB_TITLES[0][0])
+        self.tabs.addTab(decisions_tab, _TAB_TITLES[1][0])
+        self._mark_real_money()
 
         self.export_button = QPushButton("Выгрузить оба журнала…")
         self.export_button.setToolTip(
@@ -705,13 +724,37 @@ class JournalTabs(QWidget):
     def set_trades(self, rows: Sequence[TradeRow], summary: TradesSummary | None = None) -> None:
         self.trades_model.set_rows(rows)
         self.set_summary(summary)
+        self._mark_real_money()
 
     def append_trade(self, row: TradeRow) -> None:
         self.trades_model.append_row(row)
+        if _any_real_money((row,)):
+            self._mark_tab(0, real=True)
 
     def set_decisions(self, rows: Sequence[DecisionRow]) -> None:
         self.decisions_model.set_rows(rows)
         self.decisions_table.scrollToBottom()
+        self._mark_real_money()
+
+    def _mark_real_money(self) -> None:
+        """Вкладка, где есть строки боевого режима, говорит это подписью и цветом.
+
+        Окно показывает журнал одного прогона за раз, колонки происхождения
+        на экране нет (решение 0011). Строка боя среди строк симуляции
+        выглядела бы так же — а это настоящие деньги.
+        """
+        self._mark_tab(0, real=_any_real_money(self.trades_model.rows()))
+        self._mark_tab(1, real=_any_real_money(self.decisions_model.rows()))
+
+    def _mark_tab(self, index: int, *, real: bool) -> None:
+        """Подпись, подсказка и цвет одной вкладки. Без боя — как были."""
+        title, hint = _TAB_TITLES[index]
+        self.tabs.setTabText(index, title + (REAL_MONEY_MARK if real else ""))
+        self.tabs.setTabToolTip(index, f"{hint}\n{REAL_MONEY_HINT}" if real else hint)
+        # Пустой цвет — цвет оформления по умолчанию, а не «чёрный».
+        self.tabs.tabBar().setTabTextColor(
+            index, QColor(self._theme.danger) if real else QColor()
+        )
 
     def append_decision(self, row: DecisionRow) -> None:
         at_bottom = not self.decisions_table.verticalScrollBar().isVisible() or (
@@ -719,6 +762,8 @@ class JournalTabs(QWidget):
             >= self.decisions_table.verticalScrollBar().maximum() - 2
         )
         self.decisions_model.append_row(row)
+        if _any_real_money((row,)):
+            self._mark_tab(1, real=True)
         # Прокрутка вниз — только если пользователь и так смотрел на конец списка.
         # Иначе строка, приехавшая в разгар чтения журнала, утаскивала бы экран.
         if at_bottom:
@@ -777,6 +822,7 @@ class JournalTabs(QWidget):
         self._theme = theme
         self.trades_model.set_theme(theme)
         self.decisions_model.set_theme(theme)
+        self._mark_real_money()
         # ⚠️ Итоговая строка перекрашивается пересчётом, а не сама: её цвет
         # прописан в таблице стилей в момент показа. Без этой строки после
         # смены темы под таблицей оставался цвет прежней — зелёный светлой

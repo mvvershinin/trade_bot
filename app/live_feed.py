@@ -176,6 +176,7 @@ from typing import TYPE_CHECKING, Final, Protocol
 from app import debug_feed
 from app.backfill import Backfiller
 from app.halt import halt_on_unknown_outcome
+from app.live_trading import LiveDesks
 from broker.account import SNAPSHOT_INTERVAL, Account, AccountSnapshot
 from broker.candles import History
 from broker.clock import Verdict
@@ -2036,6 +2037,24 @@ class LiveLink:
         """
         self._funds_to = receiver
         self._exchange = exchange
+
+    @property
+    def session(self) -> BrokerSession | None:
+        """Сессия брокера, если поток хоть раз включали; `None` — ещё нет.
+
+        Нужна боевой стороне пары (`app/live_trading.py`): сессия одна
+        на запуск, и вторая, своя, меняла бы токен отдельно — обмен одной
+        сделал бы негодным токен другой.
+        """
+        return self._session
+
+    def desks(self) -> LiveDesks:
+        """Чем порт собирает боевую сторону пары — на сессии этого звена (Э4 2в).
+
+        Сборка исполнителя — только по команде «Включить бой»
+        (`HistoryPort.set_live`); здесь ничего не строится и токен не читается.
+        """
+        return LiveDesks(lambda: self._session, self._worker, class_code=self._class_code)
 
     def switch(self, on: bool) -> str | None:
         """Команда окна: включить или выключить поток. Причина — если нельзя.

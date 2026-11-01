@@ -19,8 +19,9 @@ import json
 import logging
 import pathlib
 import sqlite3
+from collections import Counter
 from collections.abc import AsyncIterator, Callable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta
 from typing import TypeVar
 
@@ -28,6 +29,7 @@ import httpx
 import pytest
 import websockets
 
+from app import live_executor
 from app.live_executor import Instrument, LiveExecutor, LiveLimits, StoreBook, Wiring
 from app.reconcile import reconcile
 from broker.secret import Secret
@@ -290,6 +292,7 @@ async def make_rig(
     client: httpx.AsyncClient | None = None,
     sleep: Callable[[float], Coroutine[object, object, None]] | None = None,
     on_news: Callable[[], None] | None = None,
+    limits: LiveLimits = FAST,
 ) -> AsyncIterator[Rig]:
     worker = MarketWorker(tmp_path / "candles.sqlite3")
     await worker.open()
@@ -322,7 +325,7 @@ async def make_rig(
         session, book, source, clock=clock, sleep=sleep or asyncio.sleep,
         notice=notices.append, on_news=on_news,
     )
-    executor = LiveExecutor(wiring, Instrument(TICKER, "SPBFUT", 5, ACCOUNT), FAST)
+    executor = LiveExecutor(wiring, Instrument(TICKER, "SPBFUT", 5, ACCOUNT), limits)
     exchange = Exchange(broker)
     await executor.start()
     try:
@@ -2756,15 +2759,16 @@ def test_the_link_back_calls_for_a_pass_when_a_trailing_exit_waits(
     run(scenario())
 
 
-def test_rearming_the_level_a_reconcile_took_off_places_the_take_again(
+def test_rearming_the_level_after_a_reconcile_keeps_the_one_take(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Тот же уровень после снятия у брокера — не «то же состояние»: тейк ставится заново.
+    """После сверки тот же уровень — то же состояние: тейк у брокера один и тот же.
 
-    Сверка после связи снимает живые заявки журнала, тейк в том числе
-    (решение 0017), — робот при этом не стоит. Движок вооружает тот же
-    уровень: пустая операция оставила бы позицию без тейка, а движок
-    считал бы его живым.
+    До `B-079` сверка снимала свой живой тейк, и этот тест стерёг, что
+    повторное вооружение ставит его заново. Теперь сверка тейк не трогает
+    (только статус), и стережётся обратное: повторное вооружение того же
+    уровня не ставит второй лимитной заявки, а исполнение единственного
+    тейка доходит движку одной сделкой.
     """
 
     async def scenario() -> None:
@@ -2773,14 +2777,13 @@ def test_rearming_the_level_a_reconcile_took_off_places_the_take_again(
             await rig.executor.submit(arm(110.0, LevelTouch.RISE))
             result = await reconcile(rig.executor, expected=1)
             assert result.halted is None, result.halted
-            assert rig.broker.live() == [], "сверка не сняла тейк — сценарий не тот"
+            [take] = rig.broker.live()
             rig.clock.now = BAR1 + timedelta(seconds=5)
             await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
             limits = [body for body in rig.creates() if body["orderType"] == "2"]
-            assert [(body["side"], body["price"]) for body in limits] == [("2", 110.0)] * 2
-            [again] = rig.broker.live()
-            assert again.key == limits[1]["clientOrderId"]
-            rig.broker.execute(again.key, 1, 110.0)
+            assert [(body["side"], body["price"]) for body in limits] == [("2", 110.0)]
+            assert [order.key for order in rig.broker.live()] == [take.key]
+            rig.broker.execute(take.key, 1, 110.0)
             await heard()
             fill = only_fill(await rig.executor.fills_at(bar(BAR1)))
             assert (fill.order_id, fill.price) == (take_name(), 110.0)
@@ -2847,3 +2850,759 @@ def test_a_close_all_that_closed_still_names_the_take_it_could_not_cancel(
             assert rig.broker.position(TICKER) == 0
 
     run(scenario())
+
+
+# --- B-079: сверка после связи не снимает свой живой тейк ---
+
+
+async def _reconnect(rig: Rig, gate: asyncio.Event, while_down: Callable[[], None]) -> None:
+    """Оборвать поток статусов, сделать `while_down` без связи и переоткрыть поток."""
+    rig.broker.drop_stream()
+    for _ in range(100):
+        if not rig.executor.connected:
+            break
+        await asyncio.sleep(0.01)
+    assert not rig.executor.connected, "поток не оборвался — проверка пуста"
+    while_down()
+    gate.set()
+    assert await rig.executor.wait_connected(2.0), "поток не переоткрылся"
+
+
+def test_reconcile_after_a_reconnect_keeps_the_live_take_at_the_broker(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: после связи сверка тейк у брокера НЕ снимает — только спрашивает его статус.
+
+    Лонг 1 с тейком 110 у брокера, поток статусов оборван и переоткрыт,
+    позиция та же. Команд снятия ноль, тейк жив, сверка прошла, заметка
+    сверки дошла до человека.
+    """
+
+    async def scenario() -> None:
+        gate = asyncio.Event()
+
+        async def gated(seconds: float) -> None:
+            await gate.wait()
+
+        async with make_rig(tmp_path, store, broker, sleep=gated) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            await _reconnect(rig, gate, lambda: None)
+            result = await reconcile(rig.executor, expected=1)
+            assert result.halted is None, result.halted
+            assert rig.broker.keys_sent("cancel") == Counter(), "после связи тейк снят"
+            assert [order.key for order in rig.broker.live()] == [take.key]
+            await heard()
+            assert any("жива" in note for note in rig.notices), rig.notices
+
+    run(scenario())
+
+
+def test_a_take_filled_during_the_outage_reaches_the_engine_once(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: тейк исполнился без потока — после связи одна сделка движку, не «закрыть всё».
+
+    Событие исполнения потеряно (сокета нет); после связи статус по ключу
+    его добирает. Сверка учитывает ещё не отданную сделку: у брокера ноль,
+    у робота лонг 1 минус тейк — сошлось, снятий и продаж по рынку нет.
+    Движок получает выход по тейку ровно один раз.
+    """
+
+    async def scenario() -> None:
+        gate = asyncio.Event()
+
+        async def gated(seconds: float) -> None:
+            await gate.wait()
+
+        async with make_rig(tmp_path, store, broker, sleep=gated) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            await _reconnect(rig, gate, lambda: rig.broker.execute(take.key, 1, 110.0))
+            assert rig.broker.lost, "исполнение не потерялось — проверка пуста"
+            result = await reconcile(rig.executor, expected=1)
+            assert result.halted is None, result.halted
+            assert rig.broker.keys_sent("cancel") == Counter()
+            assert [body for body in rig.sells() if body["orderType"] == "1"] == []
+            fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
+            assert (fill.action, fill.order_id) == (OrderAction.CLOSE, take_name())
+            assert fill.price == 110.0
+            assert await rig.executor.fills_at(bar(BAR1)) == []
+            assert rig.broker.position(TICKER) == 0
+
+    run(scenario())
+
+
+# --- B-079: проход test-expert по правке — ветки сверки своей живой заявки ---
+
+
+class _StatusDown:
+    """Статус по ключу у брокера не отвечает (`replace_route(STATUS, ...)`): 503 или 404.
+
+    Считает вызовы: проверка, где статус «не получен», без единого вопроса
+    к брокеру пуста.
+    """
+
+    def __init__(self, code: int) -> None:
+        self.code = code
+        self.calls = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.calls += 1
+        if self.code == 404:
+            return httpx.Response(404, json={"type": "NOT_FOUND", "traceId": "fake-trace"})
+        return httpx.Response(self.code, text="Service Unavailable")
+
+
+def _gated() -> tuple[asyncio.Event, Callable[[float], Coroutine[object, object, None]]]:
+    """Пауза переподключения, которую отпускает тест: поток стоит, пока он не скажет."""
+    gate = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        await gate.wait()
+
+    return gate, sleep
+
+
+def test_reconcile_after_a_reconnect_keeps_the_limit_exit_waiting_at_the_broker(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: выход по времени с пределом, ждущий исполнения, сверка после связи не снимает.
+
+    Лонг 1, выход с пределом 99 стоит у брокера (Р3), поток статусов оборван
+    и переоткрыт. Снятий ноль, заявка жива, сверка прошла; её исполнение
+    доходит до движка одной сделкой по 99.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await rig.executor.submit(leave(limit=99.0))
+            [waiting] = rig.broker.live()
+            await _reconnect(rig, gate, lambda: None)
+            result = await reconcile(rig.executor, expected=1)
+            assert result.halted is None, result.halted
+            assert rig.broker.keys_sent("cancel") == Counter(), "после связи выход с пределом снят"
+            assert [order.key for order in rig.broker.live()] == [waiting.key]
+            rig.broker.execute(waiting.key, 1, 99.0)
+            await heard()
+            fill = only_fill(await rig.executor.fills_at(bar(BAR1)))
+            assert (fill.action, fill.price) == (OrderAction.CLOSE, 99.0)
+
+    run(scenario())
+
+
+def test_reconcile_that_gets_no_status_of_the_live_take_does_not_pass_and_names_its_key(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: статус своего тейка на сверке не получен — «Сверка не закончена» с ключом.
+
+    Тейк у брокера, поток переоткрыт, а на сверке брокер статус не отдаёт
+    (503). Судьба тейка неизвестна: позиция не сравнивается и не закрывается,
+    тейк не снимается, робот стоит словами с ключом заявки — и эти слова
+    дошли до человека заметкой сверки.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            await _reconnect(rig, gate, lambda: None)
+            down = _StatusDown(503)
+            rig.broker.replace_route(STATUS, down)
+            result = await reconcile(rig.executor, expected=1)
+            assert down.calls, "статус на сверке не спрашивался — проверка пуста"
+            text = result.halted or ""
+            assert "Сверка не закончена" in text and take.key in text, text
+            assert rig.executor.unsettled
+            assert result.broker is None, "позиция сравнивалась при невыясненном тейке"
+            assert rig.broker.keys_sent("cancel") == Counter()
+            assert _market_sells(rig) == []
+            await heard()
+            assert any("Сверка не закончена" in note and take.key in note for note in rig.notices)
+
+    run(scenario())
+
+
+def test_reconcile_when_the_broker_no_longer_finds_the_live_take_does_not_pass(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: брокер по ключу не находит тейк, который программа ведёт, — сверка не прошла.
+
+    404 на заявку, принятую и подтверждённую статусом, — не «не подана»:
+    где тейк, неизвестно. Робот стоит словами с ключом, позиция не
+    сравнивается, «закрыть всё» нет.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            await _reconnect(rig, gate, lambda: None)
+            down = _StatusDown(404)
+            rig.broker.replace_route(STATUS, down)
+            result = await reconcile(rig.executor, expected=1)
+            assert down.calls, "статус на сверке не спрашивался — проверка пуста"
+            text = result.halted or ""
+            assert "не находит" in text and take.key in text, text
+            assert rig.executor.unsettled
+            assert result.broker is None
+            assert rig.broker.keys_sent("cancel") == Counter()
+            assert _market_sells(rig) == []
+
+    run(scenario())
+
+
+def test_a_take_filled_in_the_outage_and_missed_on_the_link_reaches_the_engine_once(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: тейк исполнился без потока, а при переподключении статус не получен.
+
+    Добирает исполнение уже сверка: заметка «исполнилась, пока связи не было»,
+    сверка прошла (у брокера ноль, у робота лонг 1 минус тейк), снятий
+    и продаж по рынку нет, движок получает выход по тейку ровно один раз.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            down = _StatusDown(503)
+            book = rig.broker.replace_route(STATUS, down)
+            await _reconnect(rig, gate, lambda: rig.broker.execute(take.key, 1, 110.0))
+            rig.broker.replace_route(STATUS, book)
+            assert rig.broker.lost and down.calls, "исполнение добрано при связи — проверка пуста"
+            result = await reconcile(rig.executor, expected=1)
+            assert result.halted is None, result.halted
+            assert rig.broker.keys_sent("cancel") == Counter()
+            assert _market_sells(rig) == []
+            await heard()
+            assert any("исполнилась, пока связи не было" in note for note in rig.notices), (
+                rig.notices
+            )
+            fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
+            assert (fill.order_id, fill.price) == (take_name(), 110.0)
+            assert await rig.executor.fills_at(bar(BAR1)) == []
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "asked_on_link", [True, False], ids=["статус при связи получен", "статус при связи не получен"]
+)
+def test_a_take_cancelled_outside_during_the_outage_halts_in_words_after_the_link(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, asked_on_link: bool
+) -> None:
+    """B-079: тейк сняли не мы, пока связи не было, — после связи остановка словами.
+
+    Событие снятия потеряно; статус по ключу добирает его при переподключении
+    или, если тогда брокер не ответил, на сверке. Робот стоит с причиной
+    «снята не программой»; ни одна заметка сверки не называет тейк живым.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            down = _StatusDown(503)
+            book = None if asked_on_link else rig.broker.replace_route(STATUS, down)
+            await _reconnect(rig, gate, lambda: rig.broker.cancel_outside(take.key))
+            if book is not None:
+                rig.broker.replace_route(STATUS, book)
+                assert down.calls, "статус при связи не спрашивался — проверка пуста"
+            assert rig.broker.lost, "снятие пришло потоком — проверка пуста"
+            result = await reconcile(rig.executor, expected=1)
+            text = result.halted or ""
+            assert "снята не программой" in text, text
+            await heard()
+            assert not [note for note in rig.notices if "жива" in note], rig.notices
+
+    run(scenario())
+
+
+def test_a_trailing_exit_still_waiting_for_the_link_is_not_counted_by_the_reconcile(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: сторож сработал без связи, выход ещё не подан — сверка не считает его сделкой.
+
+    Лонг 1, уровень трейлинга 95 у программы, поток оборван, минутка 94 его
+    задела: выход ждёт связи (С2). После связи у брокера всё ещё лонг 1 —
+    сверка проходит без «закрыть всё»; следующий проход сторожа подаёт один
+    выход, движку — одна сделка по уровню.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(95.0, LevelTouch.FALL))
+            rig.broker.drop_stream()
+            await _wait_disconnected(rig)
+            rig.minutes.append(minute(BAR0 + timedelta(minutes=1), low=94.0))
+            await rig.executor.watch()
+            assert _market_sells(rig) == [], "выход подан без связи — проверка пуста"
+            gate.set()
+            assert await rig.executor.wait_connected(2.0), "поток не переоткрылся"
+            result = await reconcile(rig.executor, expected=1)
+            assert result.halted is None, result.halted
+            assert _market_sells(rig) == [], "сверка закрыла позицию вместо выхода сторожа"
+            rig.exchange.plans.append(filled((1, 94.0)))
+            await rig.executor.watch()
+            assert _market_sells(rig) == [1]
+            fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
+            assert (fill.action, fill.order_id) == (OrderAction.CLOSE, take_name())
+
+    run(scenario())
+
+
+def test_an_entry_not_yet_given_to_the_engine_is_counted_by_the_reconcile(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: вход исполнился, движку ещё не отдан, — сверка считает его позицией робота.
+
+    Вход по рынку исполнен, сделка ждёт свечи (`fills_at` ещё не звался),
+    и связь переоткрылась. Движок знает «позиции нет», у брокера лонг 1:
+    без поправки сверка закрыла бы всё на штатной сделке. Ожидаемое: сверка
+    прошла, продаж нет, движок получает вход одной сделкой.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            rig.exchange.plans.append(filled((1, 100.0)))
+            await rig.executor.submit(entry())
+            await _reconnect(rig, gate, lambda: None)
+            result = await reconcile(rig.executor, expected=0)
+            assert result.halted is None, result.halted
+            assert rig.sells() == []
+            fill = only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
+            assert (fill.action, fill.volume) == (OrderAction.OPEN, 1.0)
+
+    run(scenario())
+
+
+def test_a_take_partly_filled_before_the_link_returned_is_not_a_mismatch_to_close(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Тейк на 2 исполнен на 1, остаток жив у брокера; связь переоткрылась — «закрыть всё» нет.
+
+    Частичное исполнение тейка штатное (Р1, Р6): движок узнает о нём одной
+    сделкой, когда тейк кончится. Позиция робота для сверки — лонг 2 движка
+    минус контракт, уже исполненный тейком, то есть лонг 1, как у брокера.
+    До правки `B-080` сверка объявляла расхождение, снимала тейк и закрывала
+    позицию по рынку.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig, volume=2)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE, volume=2))
+            [take] = rig.broker.live()
+            rig.broker.execute(take.key, 1, 110.0)
+            await heard()
+            await _reconnect(rig, gate, lambda: None)
+            result = await reconcile(rig.executor, expected=2)
+            assert result.halted is None, result.halted
+            assert _market_sells(rig) == []
+            assert [order.key for order in rig.broker.live()] == [take.key]
+
+    run(scenario())
+
+
+def test_rearming_the_same_level_after_the_broker_cancelled_the_take_is_a_halt(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Тейк снят не нами (клиринг, срок, руками), движок вооружает тот же уровень — стоп.
+
+    Ответ «уже стоит» на мёртвый тейк оставил бы позицию без защиты молча.
+    Ожидаемое: остановка с причиной «снята не программой», второй лимитной
+    заявки нет — робот стоит, решает человек (`B-077`).
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            rig.broker.cancel_outside(take.key)
+            await heard()
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            with pytest.raises(ExecutionHalted) as halted:
+                await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
+            assert "снята не программой" in halted.value.human
+            limits = [body for body in rig.creates() if body["orderType"] == "2"]
+            assert len(limits) == 1, "снятый брокером тейк поставлен заново после остановки"
+
+    run(scenario())
+
+
+def test_reconcile_of_an_unconfirmed_take_the_broker_does_not_find_does_not_pass(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-079: тейк без единого статуса, а после связи брокер его по ключу не находит.
+
+    Тейк принят ответом 200, но ни события, ни статуса по нему не было —
+    робот уже стоит «брокер ничего не сообщил» (§2.2 п. 8). После связи
+    статус — 404. Где заявка, неизвестно: сверка не прошла, позиция
+    не сравнивается, в причине остановки — «не находит» и ключ.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            rig.broker.muted = True
+            rig.broker.replace_route(STATUS, _StatusDown(503))
+            with pytest.raises(ExecutionHalted):
+                await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            rig.broker.muted = False
+            await _reconnect(rig, gate, lambda: None)
+            down = _StatusDown(404)
+            rig.broker.replace_route(STATUS, down)
+            result = await reconcile(rig.executor, expected=1)
+            assert down.calls, "статус на сверке не спрашивался — проверка пуста"
+            text = result.halted or ""
+            assert "не находит" in text and take.key in text, text
+            assert rig.executor.unsettled
+            assert result.broker is None, "позиция сравнивалась при невыясненном тейке"
+            assert rig.broker.keys_sent("cancel") == Counter()
+
+    run(scenario())
+
+
+# --- R2 и B-080: сверка после связи и неотданное движку ---
+
+
+def test_a_trailing_exit_during_the_relink_reconcile_is_not_a_mismatch(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """R2: сторож продаёт по догруженной минутке в ту же минуту, что идёт сверка после связи.
+
+    Сверка и `watch` идут одновременно. Позиция робота с неотданной сделкой
+    и портфель считаются одной операцией под замком исполнителя, поэтому
+    продажа сторожа не вклинивается между ними: «закрыть всё» нет, робот
+    не стоит (решение владельца «выйти и работать дальше», 0066), продажа
+    одна, позиция у брокера ноль, движок получает выход по трейлингу.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(95.0, LevelTouch.FALL))
+
+            def outage() -> None:
+                rig.minutes.append(minute(BAR0 + timedelta(minutes=1), low=94.0))
+
+            await _reconnect(rig, gate, outage)
+            rig.exchange.plans.append(filled((1, 94.0)))
+            result, _ = await asyncio.gather(
+                reconcile(rig.executor, expected=1), rig.executor.watch()
+            )
+            await heard()
+            assert result.halted is None, result.halted
+            assert rig.executor.halted is None, rig.executor.halted
+            assert _market_sells(rig) == [1]
+            assert rig.broker.position(TICKER) == 0
+            fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
+            assert (fill.action, fill.order_id, fill.price) == (
+                OrderAction.CLOSE, take_name(), 94.0,
+            )
+
+    run(scenario())
+
+
+def test_a_limit_exit_partly_filled_before_the_link_returned_is_not_a_mismatch_to_close(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-080: выход с пределом на 2 исполнен на 1 за обрыв — сверка без «закрыть всё».
+
+    Позиция робота для сверки — лонг 2 движка минус исполненная часть
+    выхода, то есть лонг 1, как у брокера. Заявка не снимается, рыночных
+    продаж нет, заметка сверки называет частичное исполнение, а не «жива».
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig, volume=2)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await rig.executor.submit(leave(volume=2, limit=99.0))
+            [limit] = rig.broker.live()
+            await _reconnect(rig, gate, lambda: rig.broker.execute(limit.key, 1, 99.0))
+            result = await reconcile(rig.executor, expected=2)
+            assert result.halted is None, result.halted
+            assert (result.broker, result.expected) == (1, 1)
+            assert _market_sells(rig) == []
+            assert rig.broker.keys_sent("cancel") == Counter()
+            assert [order.key for order in rig.broker.live()] == [limit.key]
+            await heard()
+            assert any("исполнена на 1 из 2" in note for note in rig.notices), rig.notices
+
+    run(scenario())
+
+
+def test_a_reopened_status_stream_asks_for_a_pass_at_once(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Z1: поток статусов переоткрылся — исполнитель сразу просит проход (сверку), не ждёт бара.
+
+    Первое открытие прохода не просит: сверку при старте делает сборка.
+    Каждое следующее — просит (`Wiring.on_news`), даже без ждущего выхода
+    сторожа, и порт запускает сверку в момент связи, а не на закрытии бара.
+    """
+
+    async def scenario() -> None:
+        gate, sleep = _gated()
+        news: list[int] = []
+        async with make_rig(
+            tmp_path, store, broker, sleep=sleep, on_news=lambda: news.append(1)
+        ) as rig:
+            await heard()
+            assert news == [], "первое открытие потока просит проход"
+            await _reconnect(rig, gate, lambda: None)
+            await heard()
+            assert news, "связь вернулась, а проход (сверку) никто не попросил"
+
+    run(scenario())
+
+
+# --- Н5: частые обрывы — ни строки, ни чтения портфеля раз в секунду ---
+
+
+async def _drop_and_wait(rig: Rig) -> None:
+    """Оборвать поток статусов и дождаться, пока исполнитель откроет его снова.
+
+    Ждётся рост счёта открытий, а не «поток закрыт»: с нулевой паузой
+    исполнитель переоткрывает поток быстрее, чем тест успевает увидеть обрыв.
+    """
+    links = rig.executor.links
+    rig.broker.drop_stream()
+    for _ in range(400):
+        if rig.executor.links > links and rig.executor.connected:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("поток не переоткрылся")
+
+
+def _reads(rig: Rig, route: tuple[str, str]) -> int:
+    """Сколько запросов к подделке ушло по этому адресу."""
+    return sum(
+        1 for request in rig.broker.requests if (request.method, request.url.path) == route
+    )
+
+
+def test_five_reconnects_with_a_live_take_say_alive_once_and_reconcile_each_time(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Н5, З1: пять обрывов подряд, тейк жив — заметка «жива» одна, сверка — каждый раз.
+
+    Заметка о живой заявке говорится при смене её состояния, а не на каждое
+    переоткрытие. Сверка не пропускается и не подделывается: статус тейка
+    спрошен и портфель прочитан на каждом переоткрытии — «прошлая сверка была
+    недавно» правдой о брокере не является. Робот не стоит, тейк у брокера
+    тот же, снятий ноль.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            portfolio, status = _reads(rig, ("GET", PORTFOLIO_PATH)), _reads(rig, STATUS)
+            for _ in range(5):
+                await _drop_and_wait(rig)
+                result = await reconcile(rig.executor, expected=1)
+                assert result.halted is None, result.halted
+            await heard()
+            assert _reads(rig, STATUS) - status >= 5, "сверка пропущена на переоткрытии"
+            read = _reads(rig, ("GET", PORTFOLIO_PATH)) - portfolio
+            assert read == 5, "сверка без чтения портфеля"
+            alive = [note for note in rig.notices if "жива" in note]
+            assert len(alive) == 1, alive
+            assert [order.key for order in rig.broker.live()] == [take.key]
+            assert rig.broker.keys_sent("cancel") == Counter()
+
+    run(scenario())
+
+
+def test_a_link_that_neither_held_nor_was_reconciled_grows_the_pause(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З1: обрыв сразу после открытия, без сверки — продолжение прежнего, пауза растёт.
+
+    Три таких обрыва — паузы 0, 0,02, 0,04 с. Связь, продержавшаяся
+    `_LINK_SETTLE` (здесь 0,3 с), — следующая пауза снова первая.
+    """
+    monkeypatch.setattr(live_executor, "_LINK_SETTLE", 0.3)
+    limits = replace(FAST, reconnect_pauses=(0.0, 0.02, 0.04))
+
+    async def scenario() -> list[float]:
+        asked: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            asked.append(seconds)
+            await asyncio.sleep(seconds)
+
+        async with make_rig(tmp_path, store, broker, sleep=sleep, limits=limits) as rig:
+            for _ in range(3):
+                await _drop_and_wait(rig)
+            await asyncio.sleep(0.4)
+            await _drop_and_wait(rig)
+            return asked
+
+    asked = run(scenario())
+    assert asked == [0.0, 0.02, 0.04, 0.0], asked
+
+
+def test_reconnects_that_held_keep_the_first_pause(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З1: обрывы раз в 50 с (здесь — связь держится дольше `_LINK_SETTLE`) — пауза не растёт.
+
+    Каждая связь продержалась порог, сверка после неё прошла: пауза каждый
+    раз первая (0 с), поток не лежит треть времени, как при сбросе по порогу
+    свежести. Портфель прочитан каждой сверкой — по разу на переоткрытие.
+    """
+    monkeypatch.setattr(live_executor, "_LINK_SETTLE", 0.1)
+    limits = replace(FAST, reconnect_pauses=(0.0, 0.5, 1.0))
+
+    async def scenario() -> tuple[list[float], int]:
+        asked: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            asked.append(seconds)
+            await asyncio.sleep(seconds)
+
+        async with make_rig(tmp_path, store, broker, sleep=sleep, limits=limits) as rig:
+            await long_open(rig)
+            portfolio = _reads(rig, ("GET", PORTFOLIO_PATH))
+            for _ in range(4):
+                await asyncio.sleep(0.15)
+                await _drop_and_wait(rig)
+                result = await reconcile(rig.executor, expected=1)
+                assert result.halted is None, result.halted
+            return asked, _reads(rig, ("GET", PORTFOLIO_PATH)) - portfolio
+
+    asked, reads = run(scenario())
+    assert asked == [0.0] * 4, f"пауза растёт при связи, державшейся порог: {asked}"
+    assert reads == 4, reads
+
+
+def test_a_storm_of_reconnects_grows_the_pause_even_when_each_reconcile_passes(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З1, Н5: обрывы раз в секунду (здесь — чаще `_LINK_SETTLE`) — пауза растёт до потолка.
+
+    Сверка после каждого обрыва проходит, но сброс паузы по ней — не чаще
+    раза в порог: иначе шторм обрывов давал бы сверку с чтением портфеля
+    на каждом. Пауза растёт до потолка, чтений портфеля — ровно по одному
+    на сверку, ни одного лишнего.
+    """
+    monkeypatch.setattr(live_executor, "_LINK_SETTLE", 5.0)
+    limits = replace(FAST, reconnect_pauses=(0.0, 0.02, 0.04))
+
+    async def scenario() -> tuple[list[float], int]:
+        asked: list[float] = []
+
+        async def sleep(seconds: float) -> None:
+            asked.append(seconds)
+            await asyncio.sleep(seconds)
+
+        async with make_rig(tmp_path, store, broker, sleep=sleep, limits=limits) as rig:
+            await long_open(rig)
+            portfolio = _reads(rig, ("GET", PORTFOLIO_PATH))
+            for _ in range(5):
+                await _drop_and_wait(rig)
+                result = await reconcile(rig.executor, expected=1)
+                assert result.halted is None, result.halted
+            return asked, _reads(rig, ("GET", PORTFOLIO_PATH)) - portfolio
+
+    asked, reads = run(scenario())
+    # Первый обрыв — пауза первая (счёт с нуля), второй — сброс по прошедшей
+    # сверке (прошлого сброса не было), дальше сброс не чаще порога: рост.
+    assert asked == [0.0, 0.0, 0.02, 0.04, 0.04], f"пауза в шторм обрывов не растёт: {asked}"
+    assert reads == 5, reads
+
+
+async def _outage(rig: Rig, gate: asyncio.Event, while_down: Callable[[], None]) -> str | None:
+    """Обрыв, `while_down` без связи, переоткрытие и сверка. Возврат — причина остановки.
+
+    Пауза закрывается снова: следующий обрыв опять ждёт теста.
+    """
+    await _reconnect(rig, gate, while_down)
+    gate.clear()
+    result = await reconcile(rig.executor, expected=3)
+    await heard()
+    return result.halted
+
+
+def test_a_live_take_that_changed_between_reconnects_is_told_again(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Н5: заметка «жива» — одна на **состояние** заявки, а не одна на всю жизнь заявки.
+
+    Тейк на 3: за первый обрыв исполнен на 1, за второй — на 2, за третий
+    ничего. Статус «исполнена частично» у брокера одинаков у первых двух —
+    отличает их только исполненное. Стережёт: две заметки с «1 из 3»
+    и «2 из 3», третьей нет; робот не стоит.
+    """
+
+    async def scenario() -> list[str]:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig, volume=3)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE, volume=3))
+            [take] = rig.broker.live()
+            for done in (1, 1, 0):
+
+                def fill(done: int = done) -> None:
+                    if done:
+                        rig.broker.execute(take.key, done, 110.0)
+
+                halted = await _outage(rig, gate, fill)
+                assert halted is None, halted
+            return [note for note in rig.notices if "жива" in note]
+
+    alive = run(scenario())
+    assert len(alive) == 2, alive
+    assert "1 из 3" in alive[0] and "2 из 3" in alive[1], alive
+
+
+def test_a_take_cancelled_outside_after_it_was_told_alive_still_halts(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Н5: «уже сказано, что жива» не отменяет сверку — снятый не нами тейк останавливает робота.
+
+    Первый обрыв — тейк жив, заметка сказана. За второй тейк сняли
+    в приложении брокера. Стережёт: после второй связи робот стоит словами
+    «снята не программой».
+    """
+
+    async def scenario() -> tuple[str | None, str | None]:
+        gate, sleep = _gated()
+        async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
+            await long_open(rig, volume=3)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE, volume=3))
+            [take] = rig.broker.live()
+            first = await _outage(rig, gate, lambda: None)
+            assert [note for note in rig.notices if "жива" in note], "заметки «жива» не было"
+            return first, await _outage(rig, gate, lambda: rig.broker.cancel_outside(take.key))
+
+    first, second = run(scenario())
+    assert first is None, first
+    assert second is not None and "снята не программой" in second, second
