@@ -41,7 +41,7 @@ from __future__ import annotations
 import math
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -223,6 +223,11 @@ class BrokerCommand:
     :param price: цена лимитной заявки. Пусто — заявка по рынку; у отмены
         пусто всегда.
     :param target_client_order_id: ключ отменяемой заявки — только у отмены.
+    :param account: счёт, которому команда подана (`agreementId`). Обязателен
+        и только по имени: в `userdata/` бывает два токена на два счёта
+        (находка `/risk`, Э4 шаг 1), и сверка, спросившая не тот счёт, нашла бы
+        «чужую» позицию или не нашла бы своей заявки. По нему же день счёта
+        отбирает свои исполнения (`market.day`).
     """
 
     client_order_id: str
@@ -233,6 +238,7 @@ class BrokerCommand:
     volume: int | None = None
     price: float | None = None
     target_client_order_id: str | None = None
+    account: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         _canonical_uuid(self.client_order_id, "ключ команды")
@@ -243,6 +249,11 @@ class BrokerCommand:
             raise ValueError("у команды нет имени заявки движка: связать её будет не с чем")
         if not self.symbol.strip():
             raise ValueError("у команды нет тикера")
+        if not self.account.strip():
+            raise ValueError(
+                f"команда {self.client_order_id}: не назван счёт — сверка спросила бы "
+                "брокера о другом счёте"
+            )
         if not _finite_or_none(self.price):
             raise ValueError(f"цена {self.price!r} — не конечное число")
         problem = _SHAPE_PROBLEM[action](self)

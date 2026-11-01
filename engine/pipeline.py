@@ -90,7 +90,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import Decimal
 
 from strategies import Decision, Intent, check_bar
 
@@ -121,7 +121,7 @@ from engine.contracts import (
 from engine.guards import entry_size
 from engine.ports import Refusal
 from engine.settings import EngineSettings, Mode, Reversal, TimeExitOrder
-from engine.take_profit import covers_commission, target_profit
+from engine.take_profit import covers_commission, target_profit, to_grid
 from engine.window import DayVerdict, day_verdict, in_moscow, minutes_of_day, verdict_of_day
 
 __all__ = [
@@ -139,6 +139,7 @@ __all__ = [
     "percent",
     "plural",
     "take_order_id",
+    "is_take_order",
 ]
 
 
@@ -835,7 +836,15 @@ def apply_fill(
         ), halt=True)
     wrong = _fill_against_order(order, fill)
     if wrong is not None:
-        return _refuse(state, fill, "Сделка противоречит своей заявке", wrong)
+        # ⚠️ Остановка, а не строка и дальше (решение 0066, Р6). Сделка
+        # не на объём своей заявки — это частичное исполнение: на счёте
+        # объём, которого движок не видит, а заявка в полёте ждёт сделку,
+        # которой в таком виде не будет. Следующая заявка ушла бы
+        # на неизвестную позицию.
+        return _refuse(
+            state, fill, "Сделка противоречит своей заявке", wrong + _PARTIAL_HALT,
+            halt=True,
+        )
 
     pending = _without_order(state.pending, order.order_id)
     if order.action is OrderAction.OPEN:
@@ -1046,8 +1055,8 @@ def _closed(
             f"а в позиции {_volume(position.volume)}. Частичное исполнение "
             "движок не разбирает: закрыть позицию целиком по неполной сделке "
             "значит потерять из виду остаток на счёте. Состояние не изменено, "
-            "расхождение разбирается сверкой позиции"
-        ))
+            "расхождение разбирается сверкой позиции" + _PARTIAL_HALT
+        ), halt=True)
 
     # Признак «вышли по уровню» — по действию заявки, а не по причине: на нём
     # путь Б «стопа после тейка». Причина — из заявки, вид уровня назван
@@ -1121,6 +1130,14 @@ def _stop_after_take_note(state: EngineState) -> str:
     )
 
 
+#: Хвост строки о сделке, не совпавшей со своей заявкой: почему робот стоит.
+_PARTIAL_HALT = (
+    ". Робот остановлен: на счёте объём, которого движок не видит, и любая "
+    "следующая заявка ушла бы на неизвестную позицию. Проверьте позицию "
+    "и список заявок в приложении брокера"
+)
+
+
 def _fill_against_order(order: OrderRequest, fill: Fill) -> str | None:
     """Сделка не совпала со своей заявкой — объяснение или `None`."""
     if order.action is OrderAction.ARM_TAKE_PROFIT:
@@ -1152,7 +1169,8 @@ def _refuse(
 
     `halt` — движок обязан остановиться **до подачи любой следующей заявки**.
     Ставится там, где движок перестал понимать, что на счёте: сделка
-    не сопоставилась ни с одной заявкой в полёте.
+    не сопоставилась ни с одной заявкой в полёте или пришла не на объём
+    своей заявки (частичное исполнение, решение 0066).
 
     ⚠️ Самый дорогой случай выглядит невинно. Снятие тейка подано, брокер его
     принял (снимать нечего — уровень уже задет), движок уровень погасил;
@@ -1203,7 +1221,27 @@ def take_order_id(position: Position) -> str:
 
     Имя ещё и воспроизводимо: прогон по истории обязан повторяться до строки.
     """
-    return f"take:{position.side.value}:{position.entry_time.isoformat()}"
+    return f"{_TAKE_PREFIX}{position.side.value}:{position.entry_time.isoformat()}"
+
+
+#: Начало имени заявки вооружения. Одно место на сборку имени
+#: (`take_order_id`) и его узнавание (`is_take_order`): две копии формата
+#: разошлись бы молча, и выход по тейку в базе стал бы «выходом по сигналу».
+_TAKE_PREFIX = "take:"
+
+
+def is_take_order(order_id: str) -> bool:
+    """Имя принадлежит заявке вооружения тейка — той, что строит `take_order_id`.
+
+    Нужна тем, кто восстанавливает день по журналу исполнений (решение 0066,
+    Р7): сделка по такой заявке — выход по тейку, и от неё зависит «стоп
+    после тейка» после перезапуска. Формат имени знает только движок;
+    `market/` получает предикат от сборки и формат не повторяет.
+
+    ⚠️ Снятие тейка (`cancel:take:…`) — не тейк: сделок по снятию не бывает,
+    и имя начинается не с приставки тейка.
+    """
+    return isinstance(order_id, str) and order_id.startswith(_TAKE_PREFIX)
 
 
 #: С какой стороны цена доходит до сторожимого уровня — **таблица**, а не
@@ -1457,7 +1495,9 @@ def _time_exit_limit(
     не оказывается ближе к рынку, чем названо в настройке.
 
     Счёт в `Decimal` от строкового вида чисел: `Decimal(0.1)` тащит двоичный
-    хвост, и цена, лежащая ровно на сетке, уехала бы на шаг.
+    хвост, и цена, лежащая ровно на сетке, уехала бы на шаг. Округление
+    к сетке — общее с уровнем неподвижного тейка (`to_grid`): там то же
+    правило «от рынка», и копии у него нет.
 
     ⚠️ Предел продажи не опускается ниже одного шага: нулевая или
     отрицательная цена — не предел. Достижимо только на заведомо негодном
@@ -1469,10 +1509,7 @@ def _time_exit_limit(
     steps = settings.time_exit_limit_steps
     selling = side is Side.LONG
     raw = Decimal(str(close)) + (-1 if selling else 1) * steps * step
-    grid = (raw / step).to_integral_value(
-        rounding=ROUND_FLOOR if selling else ROUND_CEILING
-    )
-    limit = float(max(grid * step, step))
+    limit = float(max(to_grid(raw, step, up=not selling), step))
     words = (
         f". Заявка с предельной ценой {_price(limit)}: закрытие "
         f"{_price(close)} {'−' if selling else '+'} {steps} × шаг "
@@ -1501,7 +1538,7 @@ def _take_event(
                 if position.take.moving
                 else f" = цена входа {_price(position.entry_price)} "
                 f"{'+' if position.side is Side.LONG else '−'} "
-                f"{percent(position.take.percent)}%"
+                f"{percent(position.take.percent)}%{_grid_words(position)}"
             )
         )
     else:
@@ -1559,6 +1596,20 @@ def _take_event(
         "чем маленькая цель, — но процент тейка стоит поднять (ТЗ §4.4 В)",
         JournalLevel.WARNING,
     )
+
+
+def _grid_words(position: Position) -> str:
+    """Хвост строки про неподвижный уровень: как он лёг на сетку шага.
+
+    Без него строка «уровень 217 200 = цена входа 216 100 + 0,5%» была бы
+    неправдой на 20 пунктов: 0,5% от 216 100 — это 217 180,5, а на сетку
+    шага 25 уровень поднят от рынка (решение 0066, Р1).
+    """
+    step = position.take.price_step
+    if not step > 0:
+        return ""
+    way = "вверх" if position.side is Side.LONG else "вниз"
+    return f", к сетке шага {_price(step)} {way} — от рынка"
 
 
 def _take_line(

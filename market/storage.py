@@ -163,6 +163,14 @@ from market.commands import (
     CommandStatus,
     StoredCommand,
 )
+from market.day import (
+    AttributedExecution,
+    OpeningFunds,
+    TradingDay,
+    day_of,
+    execution_events,
+    trade_events,
+)
 from market.gaps import Gap, count_missing_minutes, find_gaps
 from market.journal import (
     BACKTEST_SESSIONS_KEPT,
@@ -264,7 +272,7 @@ __all__ = ["Source", "Coverage", "ContractRow", "WriteStats", "CandleStore", "SC
 #: ни предохранителя, ни строки — новых таблиц она просто не читает. Поднятая
 #: версия отняла бы откат на 0.2.4 без копии `userdata/`, ничего не защитив.
 #: Фаза заявки (`journal_order.phase`, 12.10.2026) — тоже без подъёма:
-#: таблица не выпускалась, колонку дописывает открытие (`_add_order_phase`).
+#: таблица не выпускалась, колонку дописывает открытие (`_add_late_columns`).
 #:
 #: 7 без подъёма (27.10.2026). В базе поселился журнал команд брокеру
 #: и таблица исполнений (`broker_command`, `broker_execution`,
@@ -276,6 +284,27 @@ __all__ = ["Source", "Coverage", "ContractRow", "WriteStats", "CandleStore", "SC
 #: (шаг 2 Э4: запрет пересборки «факта» при незакрытой команде, сверка
 #: при старте): тогда откат на сборку, которая подаёт заявки и журнала
 #: не читает, станет обходом предохранителя — ровно случай 5 → 6.
+#:
+#: 7 без подъёма (28.10.2026, Э4 шаг 2, `D-176`). У команды появился счёт
+#: (`broker_command.account`), в базе поселился счёт на утро
+#: (`account_opening`, `market.day`). Вопрос выше встал и решён так же:
+#: **сборки, которая подаёт заявки и журнала не читает, не существует.**
+#: 0.2.5 заявок не подаёт вовсе (пишущий путь появился после неё, шаг 1),
+#: сборка шага 1 — тоже (путь ничем не вызывается). Откат на любую из них
+#: оставляет робота без боевого режима, а не боевой режим без журнала;
+#: позиция у брокера на это время остаётся без присмотра — как при
+#: закрытой программе (0066, Р10), не хуже. Поднятая версия отняла бы
+#: откат на 0.2.5 без копии `userdata/`, ничего не защитив. Цена принята:
+#: 0.2.5 таблиц шага 2 не знает и не трогает (`_install_guards` пересоздаёт
+#: только своих), а вернувшись, эта сборка застаёт их как оставила.
+#:
+#: Колонка дописывается открытием по наличию (`_add_late_columns`), а не
+#: цепочкой версий: `CREATE TABLE IF NOT EXISTS` таблицу шага 1 не трогает,
+#: и без этого правка `_BROKER_TABLES` молча не доехала бы до базы владельца.
+#: Прежнее тело сторожа `broker_command_terms_are_final` — в `_SUPERSEDED_GUARDS`.
+#: ⚠️ Следующая сборка, которая сама подаёт заявки, обязана задать этот
+#: вопрос заново: откат **на неё** с базы, где журнал держит больше, чем
+#: она читает, — уже случай 5 → 6.
 SCHEMA_VERSION = 7
 
 #: Начиная с этой версии ключ `ts` — гарантированно начало минуты. База
@@ -433,7 +462,7 @@ _ORDER_KIND_VALUES: tuple[str, ...] = tuple(kind.value for kind in OrderKind)
 _DECISION_PHASE_VALUES: tuple[str, ...] = tuple(phase.value for phase in DecisionPhase)
 
 #: Колонка фазы заявки — **одним** определением на два места: `_SCHEMA`
-#: создаёт с ней новую таблицу, `_add_order_phase` дописывает её в таблицу,
+#: создаёт с ней новую таблицу, `_add_late_columns` дописывает её в таблицу,
 #: заведённую отладочной сборкой без фазы. Два текста разошлись бы молча:
 #: у новой базы `CHECK` один, у дописанной — другой, и отказ записи
 #: зависел бы от того, какой сборкой база создана.
@@ -558,6 +587,7 @@ _ORDER_NUMBERS: tuple[str, ...] = ("close_price", "average", "level", "limit_pri
 _COMMAND_COLUMNS: tuple[str, ...] = (
     "session_id", "client_order_id", "action", "order_id", "symbol", "side",
     "volume", "price", "target_client_order_id", "at", "status", "status_at", "reason",
+    "account",
 )
 
 #: Что у команды меняется после записи: статус, его время и его причина.
@@ -574,7 +604,7 @@ _FROZEN_COMMAND_COLUMNS: tuple[str, ...] = ("id",) + tuple(
 #: намеренно: они **проверяются** форматом (`market.commands`), а не чистятся —
 #: чистка, изменившая ключ, развела бы строку и заявку у брокера. Полноту
 #: списка сверяет тест с `PRAGMA table_info(broker_command)`.
-_COMMAND_TEXT_COLUMNS: tuple[str, ...] = ("order_id", "symbol", "reason")
+_COMMAND_TEXT_COLUMNS: tuple[str, ...] = ("order_id", "symbol", "reason", "account")
 _COMMAND_KEY_COLUMNS: tuple[str, ...] = ("client_order_id", "target_client_order_id")
 _COMMAND_CHECKED_COLUMNS: tuple[str, ...] = ("action", "side", "status")
 
@@ -612,6 +642,16 @@ _CLOSED_STATUS_VALUES: tuple[str, ...] = tuple(
 #: Ключ команды — `UNIQUE` в самой таблице. Оговорка у `journal_trade_identity`
 #: («уникальный индекс на базе с дублем не открывается») здесь не действует:
 #: таблица новая, дублей в ней быть не может.
+#:
+#: Колонка счёта стоит **последней** и одним определением на два места
+#: (`_COMMAND_ACCOUNT_COLUMN`): новая база заводит её здесь, база шага 1 —
+#: `_add_late_columns`, и порядок колонок у обеих один. `CHECK` на непустоту
+#: нет намеренно: `ADD COLUMN` сверяет его с лежащими строками, и база шага 1
+#: со строками без счёта не открылась бы. Непустоту держит `BrokerCommand`
+#: на записи и на чтении — строка без счёта роняет чтение, а не уходит
+#: в сверку чужим счётом.
+_COMMAND_ACCOUNT_COLUMN = "account TEXT NOT NULL DEFAULT ''"
+
 _BROKER_TABLES = """
 CREATE TABLE IF NOT EXISTS broker_command (
     id                     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -628,6 +668,7 @@ CREATE TABLE IF NOT EXISTS broker_command (
     status                 TEXT    NOT NULL,
     status_at              INTEGER NOT NULL,
     reason                 TEXT    NOT NULL DEFAULT '',
+    {account},
     CHECK (
         (action = '{create}' AND side IS NOT NULL AND volume IS NOT NULL
          AND target_client_order_id IS NULL)
@@ -648,13 +689,45 @@ CREATE TABLE IF NOT EXISTS broker_execution (
 
 CREATE INDEX IF NOT EXISTS broker_execution_of_order
     ON broker_execution (client_order_id, id);
+
+-- Счёт на утро: первый снимок счёта календарной даты МСК (`market.day`).
+-- Строка на счёт и дату, пишется один раз — следующий снимок той же даты
+-- её не заменяет (`record_opening_funds`, сторожа `account_opening_*`).
+-- Остальное о дне (результат, даты тейка и выхода) не хранится, а считается
+-- из исполнений: разбор — в шапке `market.day`.
+CREATE TABLE IF NOT EXISTS account_opening (
+    account             TEXT    NOT NULL,
+    day                 TEXT    NOT NULL,
+    at                  INTEGER NOT NULL,
+    equity              REAL    NOT NULL,
+    free                REAL    NOT NULL,
+    margin_per_contract REAL,
+    PRIMARY KEY (account, day)
+) WITHOUT ROWID;
 """.format(
     actions=_sql_values(_COMMAND_ACTION_VALUES),
     sides=_sql_values(_COMMAND_SIDE_VALUES),
     create=CommandAction.CREATE.value,
     cancel=CommandAction.CANCEL.value,
+    account=_COMMAND_ACCOUNT_COLUMN,
 )
 
+
+#: Колонки, дописанные к уже выпущенной таблице: таблица, колонка, определение.
+#: Определение — то же, по которому новую таблицу заводит `_SCHEMA`, одной
+#: константой на два места: два текста разошлись бы молча, и отказ записи
+#: зависел бы от того, какой сборкой база создана.
+#:
+#: * фаза заявки (12.10.2026) — таблица заявок не выпускалась, откат на 0.2.4
+#:   обязан остаться целым; строки прежней сборки получают пересчёт —
+#:   безопасную сторону (`_ORDER_PHASE_COLUMN`);
+#: * счёт команды (28.10.2026, `D-176`) — журнал команд шага 1 уже стоит
+#:   в базе владельца; строки прежней сборки получают пустой счёт и роняют
+#:   чтение (`BrokerCommand`), а не уходят в сверку чужим счётом.
+_LATE_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("journal_order", "phase", _ORDER_PHASE_COLUMN),
+    ("broker_command", "account", _COMMAND_ACCOUNT_COLUMN),
+)
 
 def _session_table(name: str) -> str:
     """Текст `CREATE TABLE` прогонов под нужным именем и с текущим `CHECK`."""
@@ -1239,6 +1312,23 @@ _GUARDS: dict[str, str] = {
             SELECT RAISE(ABORT, 'строку исполнения переписать нельзя: это факт биржи');
         END
     """,
+    # Счёт на утро пишется один раз. Заменённый — правкой или парой
+    # DELETE + INSERT (`INSERT OR REPLACE`) — сдвинул бы базу дня на снимок
+    # после убытка, и после перезапуска день начинался бы с меньших денег.
+    "account_opening_is_final": """
+        CREATE TRIGGER account_opening_is_final
+        BEFORE UPDATE ON account_opening
+        BEGIN
+            SELECT RAISE(ABORT, 'счёт на утро не переписывается: первый снимок даты один');
+        END
+    """,
+    "account_opening_is_kept": """
+        CREATE TRIGGER account_opening_is_kept
+        BEFORE DELETE ON account_opening
+        BEGIN
+            SELECT RAISE(ABORT, 'счёт на утро не удаляется: первый снимок даты один');
+        END
+    """,
 }
 
 #: Сторожа, которых больше нет под этими именами. Перечислены, чтобы снять их
@@ -1295,6 +1385,23 @@ _SUPERSEDED_GUARDS: dict[str, tuple[str, ...]] = {
         END
     """,
     ),
+    # Условия команды без счёта: колонка `account` появилась на шаге 2
+    # (`D-176`). Тело — дословно из базы владельца счёта, созданной сборкой
+    # шага 1 (`547346c`), снято с её копии 28.10.2026.
+    "broker_command_terms_are_final": (
+        """
+        CREATE TRIGGER broker_command_terms_are_final
+        BEFORE UPDATE OF id, session_id, client_order_id, action, order_id,
+                         symbol, side, volume, price, target_client_order_id,
+                         at ON broker_command
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'условия команды брокеру не меняются после записи: только её статус'
+            );
+        END
+    """,
+    ),
 }
 
 
@@ -1333,6 +1440,11 @@ def _minute_ts(moment: datetime) -> int:
 
 def _from_ts(ts: int) -> datetime:
     return datetime.fromtimestamp(ts, timezone.utc).astimezone(MSK)
+
+
+def _day_end(day: date) -> datetime:
+    """Полночь МСК после календарной даты: первый момент, которого в ней нет."""
+    return datetime.combine(day + timedelta(days=1), datetime.min.time(), MSK)
 
 
 #: Прогоны по истории, кроме последних `?` штук. Подзапрос, а не список
@@ -1442,6 +1554,7 @@ def _command_of(row: tuple[Any, ...]) -> StoredCommand:
                 if named["target_client_order_id"] is None
                 else str(named["target_client_order_id"])
             ),
+            account=str(named["account"]),
         ),
         at=_from_ts(int(named["at"])),
         status=CommandStatus(str(named["status"])),
@@ -1609,7 +1722,7 @@ class CandleStore:
             # триггеры; поставленные до неё сторожа исчезли бы молча, и база
             # осталась бы открытой без охраны до следующего запуска.
             taken_down = self._check_version()
-            self._add_order_phase()
+            self._add_late_columns()
             #: Сторожа, чьё тело в базе разошлось с телом в коде и было заменено
             #: при открытии. Пусто — норма. Не пусто означает, что базу правили
             #: мимо программы: сторожа вернули, данные — нет.
@@ -1736,22 +1849,28 @@ class CandleStore:
                     "INTEGER NOT NULL DEFAULT 0"
                 )
 
-    def _add_order_phase(self) -> None:
-        """Дописать фазу в таблицу заявок, заведённую отладочной сборкой без неё.
+    def _add_late_columns(self) -> None:
+        """Дописать колонки, появившиеся у таблицы после её выпуска (`_LATE_COLUMNS`).
 
         Вне цепочки версий, при **каждом** открытии и по наличию колонки:
-        номер схемы не поднят (шапка `SCHEMA_VERSION`, «7 без подъёма») —
-        таблица заявок не выпускалась, а откат на 0.2.4 обязан остаться
-        целым. `ADD COLUMN` не пересобирает таблицу: строки, сторожа и индекс
-        остаются на месте, `CHECK` SQLite сверяет с лежащими строками
-        сама, и умолчание его проходит. Строки прежней сборки получают
-        пересчёт — безопасную сторону (`_ORDER_PHASE_COLUMN`).
+        номер схемы не поднят (шапка `SCHEMA_VERSION`, «7 без подъёма»),
+        а `CREATE TABLE IF NOT EXISTS` таблицу прежней сборки не трогает —
+        без этого колонка молча не доехала бы до базы владельца (`D-176`).
+        `ADD COLUMN` не пересобирает таблицу: строки, сторожа и индексы
+        остаются на месте, `CHECK` SQLite сверяет с лежащими строками сама,
+        и умолчание его проходит. Повторное открытие колонку уже застаёт
+        и ничего не делает.
+
+        ⚠️ Индекс по дописанной колонке в `_SCHEMA` ставить нельзя: схема
+        исполняется **до** этого метода, и на базе прежней сборки индекс
+        упал бы на отсутствующей колонке — программа не открыла бы базу.
         """
-        columns = {
-            str(row[1]) for row in self._db.execute("PRAGMA table_info(journal_order)")
-        }
-        if "phase" not in columns:
-            self._db.execute(f"ALTER TABLE journal_order ADD COLUMN {_ORDER_PHASE_COLUMN}")
+        for table, column, definition in _LATE_COLUMNS:
+            present = {
+                str(row[1]) for row in self._db.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in present:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
     def _drop_provisional_minutes(self) -> int:
         """Снять минуты догрузки у брокера: в них оборот, а не контракты.
@@ -3731,7 +3850,12 @@ class CandleStore:
             "status": CommandStatus.RECORDED.value,
             "status_at": at,
         }
-        texts = {"order_id": command.order_id, "symbol": command.symbol, "reason": reason}
+        texts = {
+            "order_id": command.order_id,
+            "symbol": command.symbol,
+            "reason": reason,
+            "account": command.account,
+        }
         for name in _COMMAND_TEXT_COLUMNS:
             values[name] = self._clean(texts[name])
         return values
@@ -3881,6 +4005,163 @@ class CandleStore:
                 + " FROM broker_execution WHERE client_order_id = ? ORDER BY id",
                 (self._clean(client_order_id),),
             )
+        )
+
+    # -- день счёта (`market.day`, решение 0066 Р7) -------------------------
+
+    def record_opening_funds(self, funds: OpeningFunds) -> OpeningFunds:
+        """Записать снимок счёта, если он первый в своей дате. Возврат — счёт на утро.
+
+        Снимки приходят опросом портфеля каждые полминуты. Ложится только
+        первый в дате МСК; следующие ничего не меняют, и возвращается лежащий —
+        тот, от которого считается день. Перезапуск посреди дня поэтому
+        не делает базой дня деньги после утреннего убытка. Так же устроен
+        `Engine.on_funds`: база даты — первый снимок, внутри дня она
+        не пересчитывается (DOMAIN.md §4).
+
+        Возврат — после фиксации; сбой записи — исключение наружу.
+        """
+        account = self._clean(funds.account)
+        day = funds.day.isoformat()
+        margin = funds.margin_per_contract
+        with self._transaction():
+            self._db.execute(
+                "INSERT INTO account_opening "
+                "(account, day, at, equity, free, margin_per_contract) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (account, day) DO NOTHING",
+                (
+                    account, day, _to_ts(funds.at), float(funds.equity),
+                    float(funds.free), None if margin is None else float(margin),
+                ),
+            )
+            stored = self._opening_row(account, day)
+        if stored is None:
+            raise LookupError(f"счёт на утро {account} за {day} не лёг и не нашёлся")
+        return stored
+
+    def opening_funds(self, account: str, day: date) -> OpeningFunds | None:
+        """Счёт на утро этой даты. `None` — снимка в эту дату не было."""
+        return self._opening_row(self._clean(account), day.isoformat())
+
+    def _opening_row(self, account: str, day: str) -> OpeningFunds | None:
+        row = self._db.execute(
+            "SELECT account, at, equity, free, margin_per_contract "
+            "FROM account_opening WHERE account = ? AND day = ?",
+            (account, day),
+        ).fetchone()
+        if row is None:
+            return None
+        return OpeningFunds(
+            account=str(row[0]),
+            at=_from_ts(int(row[1])),
+            equity=float(row[2]),
+            free=float(row[3]),
+            margin_per_contract=_maybe_number(row[4]),
+        )
+
+    def executions_day(
+        self,
+        account: str,
+        day: date,
+        *,
+        ruble_per_point: Mapping[str, float],
+        is_take: Callable[[str], bool],
+    ) -> TradingDay:
+        """День счёта по исполнениям брокера — для боевого движка («факт»).
+
+        Берутся все исполнения счёта до конца `day`: позиция, открытая
+        вчера и закрытая сегодня, даёт результат сегодня, и цену входа
+        проход находит во вчерашних строках. Сделки «закрыть всё» (сверка
+        0020) входят наравне с прочими: у них такие же команда и исполнения.
+        Счёт исполнения — счёт его команды. Исполнение без команды или
+        по команде без счёта не учитывается и названо в `foreign`.
+
+        Разбор и соответствие счёту движка — шапка `market.day`.
+
+        :param ruble_per_point: рублей за пункт по тикеру.
+        :param is_take: имя заявки движка → это выход по уровню тейка.
+        :raises ValueError: у тикера с выходом не назван вес пункта.
+        """
+        mine = self._clean(account)
+        attributed: list[AttributedExecution] = []
+        foreign: list[str] = []
+        for row in self._db.execute(
+            "SELECT " + ", ".join(f"e.{name}" for name in _EXECUTION_COLUMNS)
+            + ", c.side, c.symbol, c.order_id, c.account "
+            "FROM broker_execution AS e "
+            "LEFT JOIN broker_command AS c ON c.client_order_id = e.client_order_id "
+            "WHERE e.at < ? ORDER BY e.at, e.id",
+            (_to_ts(_day_end(day)),),
+        ):
+            execution = _execution_of(row[: len(_EXECUTION_COLUMNS)])
+            side, symbol, order_id, owner = row[len(_EXECUTION_COLUMNS):]
+            if side is None or not owner:
+                if ensure_msk(execution.at).date() == day:
+                    foreign.append(execution.execution_id)
+            elif owner == mine:
+                attributed.append(AttributedExecution(
+                    execution, CommandSide(str(side)), str(symbol), str(order_id)
+                ))
+        events = execution_events(attributed, ruble_per_point=ruble_per_point, is_take=is_take)
+        return day_of(
+            events, account=account, day=day,
+            opening=self.opening_funds(account, day), foreign=tuple(foreign),
+        )
+
+    def journal_day(
+        self,
+        session_id: int,
+        day: date,
+        *,
+        account: str | None,
+        is_take: Callable[[str], bool],
+    ) -> TradingDay:
+        """День по журналу сделок прогона — для симуляции («прогноз»).
+
+        Путь тот же, что у `executions_day` (`market.day.day_of`), источник —
+        закрытые сделки прогона. Какой прогон спросить, решает `app/`: после
+        перезапуска это прежний прогон симуляции, в его журнале и пересчёт
+        утра, и живые сделки до закрытия.
+
+        ⚠️ Чего журнал не знает: позиция, открытая и не закрытая к концу
+        прогона, сделкой не записана, и комиссии её входа в результате нет.
+
+        :param account: чей счёт на утро приложить; `None` — без него.
+        :raises LookupError: прогона с таким номером нет — пустой день вместо
+            отказа выдал бы ошибку в номере за «сделок не было».
+        """
+        if self._db.execute(
+            "SELECT 1 FROM journal_session WHERE id = ?", (session_id,)
+        ).fetchone() is None:
+            raise LookupError(f"прогона {session_id} в журнале нет: дня по нему не собрать")
+        trades = [
+            TradeRecord(
+                symbol=str(row[0]),
+                side=TradeSide(str(row[1])),
+                volume=float(row[2]),
+                entry_time=_from_ts(int(row[3])),
+                entry_price=float(row[4]),
+                entry_order_id=str(row[5]),
+                exit_time=_from_ts(int(row[6])),
+                exit_price=float(row[7]),
+                exit_order_id=str(row[8]),
+                exit_reason=str(row[9]),
+                gross=float(row[10]),
+                commission=_maybe_number(row[11]),
+                net=_maybe_number(row[12]),
+                ruble_per_point=float(row[13]),
+            )
+            for row in self._db.execute(
+                "SELECT symbol, side, volume, entry_ts, entry_price, entry_order_id, "
+                "exit_ts, exit_price, exit_order_id, exit_reason, gross, commission, "
+                "net, ruble_per_point FROM journal_trade "
+                "WHERE session_id = ? AND entry_ts < ? ORDER BY id",
+                (session_id, _to_ts(_day_end(day))),
+            )
+        ]
+        opening = None if account is None else self.opening_funds(account, day)
+        return day_of(
+            trade_events(trades, is_take=is_take), account=account, day=day, opening=opening
         )
 
     # -- объём и чистка -----------------------------------------------------

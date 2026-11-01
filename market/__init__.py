@@ -88,6 +88,7 @@ from market.contracts import (
     refresh_contracts,
     rows_of_asset,
 )
+from market.day import OpeningFunds, TradingDay
 from market.depth import Depth, declared_depth, measured_depth
 from market.fee import Commission, read_commission
 from market.gaps import Gap, count_missing_minutes, find_gaps
@@ -328,6 +329,8 @@ __all__ = [
     "CommandSide",
     "CommandStatus",
     "StoredCommand",
+    "OpeningFunds",
+    "TradingDay",
     "BACKTEST_SESSIONS_KEPT",
     "SECRET_MASK",
     "redact",

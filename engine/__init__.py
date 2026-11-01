@@ -78,6 +78,7 @@ from engine.bars import Intake, check_market_candle, close_time, intake, to_bar
 from engine.contracts import (
     AccountFunds,
     DayMoney,
+    DayRecord,
     EngineState,
     ExitReason,
     Fill,
@@ -115,6 +116,7 @@ from engine.pipeline import (
     apply_fill,
     apply_price,
     exit_signal,
+    is_take_order,
     money,
     order_words,
     percent,
@@ -123,6 +125,7 @@ from engine.pipeline import (
 )
 from engine.ports import (
     CandleSource,
+    ExecutionHalted,
     ExecutionRefused,
     MarketCandle,
     OrderExecutor,
@@ -194,6 +197,7 @@ __all__ = [
     "EngineState",
     "AccountFunds",
     "DayMoney",
+    "DayRecord",
     # предохранители по деньгам
     "FUNDS_MAX_AGE",
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
@@ -214,6 +218,7 @@ __all__ = [
     "target_profit",
     "covers_commission",
     "take_order_id",
+    "is_take_order",
     # свечи
     "Intake",
     "intake",
@@ -237,6 +242,7 @@ __all__ = [
     "CandleSource",
     "OrderExecutor",
     "ExecutionRefused",
+    "ExecutionHalted",
     "Refusal",
     "MarketCandle",
     "Timeframe",

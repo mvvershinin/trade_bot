@@ -163,7 +163,12 @@ KNOWN_RUFF_FINDINGS: Final[int] = 531
 #: ⚠️ **184 с 05.10.2026:** убран «Реверс по скользящей средней» (решение
 #: 0063) вместе с `tests/test_ui_unused_fields.py` и его `from helpers`.
 #: Возврат предохранителей — к 189.
-KNOWN_MYPY_FINDINGS: Final[int] = 184
+#: ⚠️ **149 с 28.10.2026 (Э4 шаг 2а):** подпись `RecordingExecutor.fills_at`
+#: в `tests/engine_helpers.py` приведена к порту (`candle: MarketCandle`) —
+#: подставка перестала быть «не исполнителем» для `mypy`: −8 в
+#: `tests/test_engine_runner.py`, −27 в `tests/test_engine_take_profit.py`.
+#: Ни одной находки не подавлено. Возврат предохранителей — к 154.
+KNOWN_MYPY_FINDINGS: Final[int] = 149
 
 
 def _tool_is_installed(module: str) -> bool:
