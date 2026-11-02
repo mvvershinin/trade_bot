@@ -40,7 +40,7 @@ from datetime import datetime
 
 import pytest
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QDialog, QMessageBox, QProgressDialog, QWidget
 
 from app.fact import FactPosition, LiveStatus
 from engine import Side as EngineSide
@@ -68,6 +68,9 @@ from ui.models import (
     FIELD_CAPTIONS,
     DecisionLevel,
     DecisionRow,
+    HistoryFacts,
+    HistoryLoadOutcome,
+    HistoryLoadRequest,
     LiveView,
     MarkerKind,
     Mode,
@@ -103,6 +106,7 @@ class LivePort(TerminalPort):
         self.stops = 0
         self.backtests = 0
         self.histories: list[str] = []
+        self.loads: list[HistoryLoadRequest] = []
 
     def set_live(self, on: bool) -> None:
         self.live.append(on)
@@ -118,6 +122,22 @@ class LivePort(TerminalPort):
 
     def request_history_facts(self, symbol: str) -> None:
         self.histories.append(symbol)
+
+    def load_history(self, request: HistoryLoadRequest) -> None:
+        self.loads.append(request)
+
+
+class AgreedHistory(QDialog):
+    """Окно загрузки, которое человек сразу подтвердил: модальное ждало бы его."""
+
+    def __init__(self, _facts: object, _settings: object, parent: QWidget) -> None:
+        super().__init__(parent)
+
+    def exec(self) -> int:
+        return QDialog.DialogCode.Accepted.value
+
+    def request(self) -> HistoryLoadRequest:
+        return HistoryLoadRequest(symbol="MXZ6")
 
 
 class Asked:
@@ -724,6 +744,87 @@ def test_history_loading_is_back_when_combat_is_off(setup) -> None:
     assert window.history_action.toolTip() == HISTORY_HINT
     window.open_history()
     assert len(port.histories) == 1
+
+
+def test_the_end_of_a_load_does_not_light_history_loading_in_combat(
+    setup, qapp, monkeypatch
+) -> None:
+    """Н8: загрузка кончилась (здесь — отказом порта «выключите бой»), а бой идёт.
+
+    Полоска загрузки поставлена до снимка боя: окно ещё не знало, что бой
+    включается. Конец загрузки гасит полоску — и пункт обязан остаться
+    погашенным с подсказкой боя, а не вернуться в строй посреди боя.
+    """
+    window, port, _asked = setup
+    monkeypatch.setattr(QMessageBox, "exec", lambda _box: 0)
+    monkeypatch.setattr("ui.main_window.HistoryDialog", AgreedHistory)
+    _show(window, LiveStatus(available=True))
+    # Путь человека: пункт меню → опись базы от порта → окно загрузки → «Загрузить».
+    window.history_action.trigger()
+    window.show_history_dialog(HistoryFacts(symbol="MXZ6"))
+    qapp.processEvents()  # окно загрузки открывается следующим оборотом цикла
+    assert port.loads, "загрузка не началась — проверять нечего"
+    assert _bars_on_screen(window), "полоски загрузки нет — проверять нечего"
+
+    _show(window, _combat())
+    window.show_history_result(HistoryLoadOutcome(
+        symbol="MXZ6", headline="Загрузка не начата",
+        trouble="Загрузка истории в бою недоступна: выключите бой.",
+    ))
+    qapp.processEvents()
+    assert not _bars_on_screen(window), "полоска загрузки осталась на экране"
+    assert not window.history_action.isEnabled(), "конец загрузки зажёг пункт посреди боя"
+    assert window.history_action.toolTip() == HISTORY_IN_COMBAT
+
+
+def _bars_on_screen(window: MainWindow) -> list[QProgressDialog]:
+    """Видимые полоски хода окна — то, что видит человек."""
+    return [bar for bar in window.findChildren(QProgressDialog) if bar.isVisible()]
+
+
+def test_history_loading_pressed_in_combat_says_why_in_the_status_line(setup) -> None:
+    """Н8: пункт нажат в бою — отказ словами, а не тишина.
+
+    Погашенный пункт — не единственная дорога к действию: оно зовётся
+    и в обход меню (сочетание клавиш, снимок боя, пришедший после нажатия).
+    Стережёт: опись базы не запрошена, строка состояния говорит «выключите бой».
+    """
+    window, port, _asked = setup
+    _show(window, _combat())
+    window.open_history()
+    assert port.histories == [], "опись базы запрошена в бою"
+    assert window.statusBar().currentMessage() == HISTORY_IN_COMBAT
+
+
+class AgreedWhileCombatStarts(AgreedHistory):
+    """Окно загрузки подтверждено, а пока оно было открыто, бой включился."""
+
+    def exec(self) -> int:
+        window = self.parent()
+        assert isinstance(window, MainWindow)
+        window.show_live(_combat())
+        return super().exec()
+
+
+def test_combat_turned_on_while_the_load_dialog_was_open_starts_no_load(
+    setup, qapp, monkeypatch
+) -> None:
+    """Н8: бой включился, пока окно загрузки было открыто, — «Загрузить» загрузку не начинает.
+
+    Пункт меню проверен при нажатии, но окно загрузки модальное и висит,
+    сколько человек думает: снимок боя приходит за это время. Стережёт:
+    загрузка порту не ушла, полоски хода нет, отказ словами в строке состояния.
+    """
+    window, port, _asked = setup
+    monkeypatch.setattr("ui.main_window.HistoryDialog", AgreedWhileCombatStarts)
+    _show(window, LiveStatus(available=True))
+    window.history_action.trigger()
+    window.show_history_dialog(HistoryFacts(symbol="MXZ6"))
+    qapp.processEvents()  # окно загрузки открывается следующим оборотом цикла
+    assert port.histories, "опись базы не запрошена — проверять нечего"
+    assert port.loads == [], "загрузка ушла порту, хотя бой включился"
+    assert not _bars_on_screen(window), "полоска загрузки на экране, хотя загрузки нет"
+    assert window.statusBar().currentMessage() == HISTORY_IN_COMBAT
 
 
 # ------------------------------------------------------------- цена не названа (З6)

@@ -34,14 +34,14 @@ import dataclasses
 import pathlib
 import sqlite3
 from collections.abc import Awaitable, Callable, Coroutine
-from datetime import timedelta
+from datetime import time, timedelta
 
 import httpx
 import pytest
 import websockets
 
 from app import live_trading
-from app.fact import LiveStatus
+from app.fact import FactRequest, LiveStatus
 from app.port import HistoryPort
 from app.reconcile import Reconciliation, reconcile
 from broker.session import PORTFOLIO_PATH
@@ -79,6 +79,7 @@ from tests.test_app_live_pair import (
     NO_TAKE,
     OWNER,
     SMALL,
+    STEP,
     SYMBOL,
     Bench,
     _bench,
@@ -90,7 +91,7 @@ from tests.test_app_live_pair import (
 )
 from tests.test_app_live_ride import _fast_reconnect, _relink
 from tests.test_app_live_trading import _desk, _Executor
-from ui.models import FIELD_CAPTIONS, MinuteBarLimit, Mode
+from ui.models import FIELD_CAPTIONS, HistoryLoadRequest, MinuteBarLimit, Mode
 from ui.models import Settings as UiSettings
 
 #: Ответ подделки на один адрес (`FakeBroker.replace_route`).
@@ -928,10 +929,21 @@ def test_apply_in_combat_checks_the_held_series_at_both_minute_limits(
 
 #: Чем держится пересборка в случаях ниже: незакрытая команда, а не позиция.
 UNCLOSED = "в журнале команд незакрытых 1: проба"
+#: Что не дошло до боя, словами журнала изменений (`EngineSettings.changes_from`).
+TRAILING_ON = "Скользящий тейк-профит: нет → да"
 
 
 async def _held_by_a_command(_self: object, _observer: object) -> str:
     return UNCLOSED
+
+
+def _no_apply_gate(_self: object, _settings: object) -> None:
+    """Проверка «Применить» в бою снята: дорога в обход неё (`_fits_live`).
+
+    С пятого раунда `/risk` (Н9) «Применить» проверяет прежний ряд при любой
+    смене ряда в бою — до запасного рубежа такая смена через него не доходит;
+    рубеж проверяется дорогой в обход.
+    """
 
 
 def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_force(
@@ -953,6 +965,7 @@ def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_forc
             await _connect(bench)
             await _ride(bench, LIVE_FROM + timedelta(minutes=20))
             monkeypatch.setattr(HistoryPort, "_fact_busy", _held_by_a_command)
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
             bench.port.apply_settings(
                 dataclasses.replace(SMALL, timeframe="30 минут", trailing_enabled=True)
             )
@@ -971,10 +984,6 @@ def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_forc
     assert takes, "у входа нет неподвижного тейка у брокера: «факт» пошёл скользящим на 15 минутах"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="B-084: запасной рубеж `_held_frame` держит прежние настройки движка молча",
-)
 def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_the_live(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -986,7 +995,9 @@ def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_t
     остаётся на действующих настройках движка — это верно. Но строка
     «Пересборка боя отложена» говорит «тейк уже действует для „факта“»,
     а окно показывает скользящий уровень включённым. Стережёт: человеку
-    сказано, что новые настройки движка до боя не дошли и почему (D-141).
+    сказано, что новые настройки движка до боя не дошли — какие («было →
+    стало») и почему (D-141), — а строка отложенной пересборки не обещает,
+    что они «уже действуют».
     """
     async def go() -> list[tuple[str, str]]:
         bench, session = await _bench(tmp_path, broker, SMALL)
@@ -996,6 +1007,7 @@ def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_t
             assert bench.port.live_status().position is None, "позиция есть — не тот случай"
             said = len(bench.notes)
             monkeypatch.setattr(HistoryPort, "_fact_busy", _held_by_a_command)
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
             bench.port.apply_settings(
                 dataclasses.replace(SMALL, timeframe="30 минут", trailing_enabled=True)
             )
@@ -1008,3 +1020,582 @@ def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_t
     notes = loop.run_until_complete(go())
     told = [reason for _event, reason in notes if "D-141" in reason]
     assert told, f"что скользящий уровень до боя не дошёл, не сказано: {notes}"
+    # Что именно не дошло — «было → стало», и почему, — строкой «Настройки
+    # не дошли до боя», а не догадкой по причине (B-084).
+    kept = [reason for event, reason in notes if event == "Настройки не дошли до боя"]
+    assert kept, f"строки «Настройки не дошли до боя» нет: {notes}"
+    assert TRAILING_ON in kept[-1] and "D-141" in kept[-1], kept[-1]
+    # Строка отложенной пересборки не обещает, что новое уже действует.
+    held = [reason for event, reason in notes if event == "Пересборка боя отложена"]
+    assert held, f"строки «Пересборка боя отложена» нет: {notes}"
+    assert "уже действуют" not in held[-1], held[-1]
+    assert TRAILING_ON in held[-1], held[-1]
+
+
+# --------------------------------------------- четвёртый /risk 2в: мутации Н6–Н8
+
+
+def test_an_engine_change_past_apply_does_not_reach_the_live_and_is_said_once(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н6, рубеж на ходу: настройки движка, нарушающие запрет боя, «факту» не идут.
+
+    «Применить» в бою скользящий уровень на 15 минутах при пороге 15 отвергает
+    (D-141), но за ним стоит рубеж `_engine_for_fact` — для дороги в обход; здесь
+    проверка «Применить» снята подменой, и принятое доходит до прохода.
+    Стережёт: «факт» остаётся на действующих настройках — вход 09:45 получает
+    неподвижный тейк у брокера, а не скользящий уровень; строка «Настройки
+    не дошли до боя» с причиной сказана один раз за тридцать проходов.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[UiSettings, LiveStatus, list[tuple[str, float | None]], list[str]]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            assert bench.port.live_status().position is None, "позиция есть — не тот случай"
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
+            said = len(bench.notes)
+            bench.port.apply_settings(dataclasses.replace(SMALL, trailing_enabled=True))
+            await bench.port.wait()
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=50), since=LIVE_FROM + timedelta(minutes=21)
+            )
+            kept = [
+                why for event, why in bench.notes[said:] if event == "Настройки не дошли до боя"
+            ]
+            return bench.port.values, bench.port.live_status(), _takes(broker), kept
+        finally:
+            await _close(bench, session)
+
+    values, status, takes, kept = loop.run_until_complete(go())
+    assert values.trailing_enabled, "«Применить» отказало — рубеж не проверяется"
+    assert status.on and status.position is not None and status.position.signed == 1
+    assert takes, "у входа нет неподвижного тейка у брокера: скользящий уровень дошёл до «факта»"
+    assert len(kept) == 1, kept
+    assert "D-141" in kept[0], kept
+
+
+def test_a_command_seen_only_on_the_second_read_keeps_the_engine_change_out_of_the_live(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н6, рубеж отложенной пересборки: занятость «факта» прочитана дважды и по-разному.
+
+    Журнал команд за проход читается дважды — `_held_frame` и `_keep_or_retire`.
+    Первое чтение: свободен, рамка новая (30 минут и скользящий уровень);
+    второе: незакрытая команда, пересборка отложена, «факт» идёт прежним рядом
+    15 минут при пороге 15 — скользящий уровень на нём нарушает D-141.
+    Стережёт: настройки движка «факту» не идут и тогда — вход 09:45 получает
+    неподвижный тейк у брокера; сказано «Настройки не дошли до боя».
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+    reads: list[int] = []
+
+    async def busy_from_the_second_read(_self: object, _observer: object) -> str:
+        reads.append(1)
+        return "" if len(reads) == 1 else UNCLOSED
+
+    async def go() -> tuple[LiveStatus, list[tuple[str, float | None]], str]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            assert bench.port.live_status().position is None, "позиция есть — не тот случай"
+            monkeypatch.setattr(HistoryPort, "_fact_busy", busy_from_the_second_read)
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
+            bench.port.apply_settings(
+                dataclasses.replace(SMALL, timeframe="30 минут", trailing_enabled=True)
+            )
+            await bench.port.wait()
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=50), since=LIVE_FROM + timedelta(minutes=21)
+            )
+            return bench.port.live_status(), _takes(broker), bench.said("Настройки не дошли до боя")
+        finally:
+            await _close(bench, session)
+
+    status, takes, kept = loop.run_until_complete(go())
+    assert len(reads) > 1, "журнал прочитан однажды — не тот случай"
+    assert UNCLOSED in status.held, "пересборка не отложена — рубеж не проверяется"
+    assert status.position is not None and status.position.signed == 1, status.position
+    assert takes, "у входа нет неподвижного тейка у брокера: скользящий уровень дошёл до «факта»"
+    assert "D-141" in kept, kept
+
+
+def test_turning_the_live_off_names_the_take_alive_at_the_broker(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н7, вариант «тейк жив»: брокер прочитан, позиция совпала с роботом, тейк в журнале жив.
+
+    Здесь программа может поручиться — и говорит прямо, с ценой и советом
+    снять тейк перед закрытием руками, а не «возможно, это тейк».
+    Стережёт: `take_note` окна и строка «Бой выключен» называют живой тейк.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[list[tuple[str, float | None]], LiveStatus, str]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            takes = _takes(broker)
+            bench.port.set_live(False)
+            await bench.port.wait()
+            return takes, bench.port.live_status(), bench.said("Бой выключен")
+        finally:
+            await _close(bench, session)
+
+    takes, status, off = loop.run_until_complete(go())
+    assert len(takes) == 1 and takes[0][1] is not None, takes
+    alive = f"тейк у брокера по {takes[0][1]:g} жив"
+    assert status.position is not None and status.position.take_level == takes[0][1]
+    assert alive in status.take_note and "снимите" in status.take_note, status.take_note
+    assert alive in off, off
+
+
+async def _no_exchange(_self: object, *_args: object) -> object:
+    raise RuntimeError("проба: биржа не спрошена")
+
+
+def test_history_load_is_refused_while_the_live_side_is_still_up_after_off(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н8: «Выключить» нажато, а проход боевую сторону ещё не закрыл — загрузка в бою.
+
+    Пока боевая сторона собрана, бой не кончился: его закроет ближайший проход,
+    а загрузка этот проход отложила бы. Стережёт: отказ словами «выключите бой»,
+    загрузка не начата.
+    """
+    monkeypatch.setattr(HistoryPort, "_refresh_chain", _no_exchange)
+    outcomes: list[object] = []
+
+    async def go() -> list[str]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        bench.port.history_finished.connect(outcomes.append)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            bench.port.set_live(False)
+            bench.port.load_history(HistoryLoadRequest(symbol=SYMBOL))
+            await bench.port.wait()
+            return bench.events()
+        finally:
+            await _close(bench, session)
+
+    events = loop.run_until_complete(go())
+    assert outcomes and "выключите бой" in getattr(outcomes[-1], "trouble", ""), outcomes
+    assert "Загрузка истории начата" not in events, events
+
+
+def test_a_load_still_asking_the_exchange_keeps_the_live_off_until_it_ends(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н8: идущая загрузка — вся задача, а не только запись минут в базу.
+
+    Загрузка по контракту сначала уточняет у биржи сроки контрактов и лишь
+    потом занимает поток данных записью минут. Бой, включённый в первом шаге,
+    застал бы второй. Стережёт: пока задача идёт — бой недоступен и не
+    включается, с причиной словами; кончилась — доступен снова.
+    """
+    gate, reached = asyncio.Event(), asyncio.Event()
+
+    async def slow_exchange(_self: object, *_args: object) -> object:
+        reached.set()
+        await gate.wait()
+        raise RuntimeError("проба: биржа не ответила")
+
+    monkeypatch.setattr(HistoryPort, "_refresh_chain", slow_exchange)
+
+    async def go() -> tuple[LiveStatus, LiveStatus, LiveStatus, str]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench, live=False)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=5))
+            bench.port.load_history(HistoryLoadRequest(symbol=SYMBOL))
+            await asyncio.wait_for(reached.wait(), 5)
+            during = bench.port.live_status()
+            bench.port.set_live(True)
+            pressed = bench.port.live_status()
+            gate.set()
+            await bench.port.wait()
+            return during, pressed, bench.port.live_status(), bench.said("Бой не включён")
+        finally:
+            await _close(bench, session)
+
+    during, pressed, after, refused = loop.run_until_complete(go())
+    assert not during.available, "загрузка идёт, а бой доступен"
+    assert any("выключите бой" in why for why in during.why_not), during.why_not
+    assert not pressed.wanted and "выключите бой" in refused, refused
+    assert after.available, after.why_not
+
+
+def test_off_during_the_enable_check_says_the_check_first_and_closes_the_live_side(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З2: «Выключить» во время сверки, а сверка сняла тейк прошлого запуска.
+
+    Снятие — команда брокеру, и о ней сказано строкой «Сверка с брокером»;
+    итог включения («Бой выключен») — после неё, а не раньше: строка, что бой
+    выключен, перед строкой о снятой заявке читается как «сняли уже после».
+    Стережёт: порядок строк, бой не включён, исполнитель закрыт — поток
+    статусов у брокера не висит открытым.
+    """
+    gate, reached = asyncio.Event(), asyncio.Event()
+    real_open = live_trading.LiveDesks.open
+
+    async def slow_open(
+        self: live_trading.LiveDesks, request: FactRequest
+    ) -> live_trading.LiveDesk:
+        reached.set()
+        await gate.wait()
+        return await real_open(self, request)
+
+    monkeypatch.setattr(live_trading.LiveDesks, "open", slow_open)
+
+    async def go() -> tuple[LiveStatus, list[str]]:
+        await _old_take_at_the_broker(broker)
+        bench, session = await _bench(
+            tmp_path, broker, FIXED_TAKE, before=_plant(broker, After(""))
+        )
+        try:
+            await _connect(bench, live=False)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=10))
+            bench.port.set_live(True)
+            await asyncio.wait_for(reached.wait(), 5)
+            bench.port.set_live(False)
+            gate.set()
+            await bench.port.wait()
+            assert not any(socket.open for socket in broker.sockets), (
+                "«Выключить» во время сверки: поток статусов исполнителя остался открытым"
+            )
+            return bench.port.live_status(), bench.events()
+        finally:
+            await _close(bench, session)
+
+    status, events = loop.run_until_complete(go())
+    assert any(kind == "cancel" for kind, _ in broker.commands), "сверка ничего не снимала"
+    assert not status.on and not status.wanted, status
+    assert "Сверка с брокером" in events and "Бой выключен" in events, events
+    assert events.index("Сверка с брокером") < events.index("Бой выключен"), events
+
+
+def test_turning_on_while_the_live_side_closes_is_a_new_enable_not_a_cancelled_off(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З3: «Включить», пока проход уже закрывает боевую сторону, — новое включение.
+
+    Отмена выключения честна, только пока боевая сторона цела. Здесь проход
+    её уже снимает (исполнитель закрывается), и «Бой не выключался» было бы
+    неправдой. Стережёт: «Выключение боя отменено» не сказано, включение
+    пошло своим путём — «Бой включается», сверка, бой включён.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+    gate, reached = asyncio.Event(), asyncio.Event()
+    real_close = live_trading.LiveDesk.aclose
+
+    async def slow_close(self: live_trading.LiveDesk) -> None:
+        reached.set()
+        await gate.wait()
+        await real_close(self)
+
+    monkeypatch.setattr(live_trading.LiveDesk, "aclose", slow_close)
+
+    async def go() -> tuple[LiveStatus, list[str]]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            said = len(bench.notes)
+            bench.port.set_live(False)
+            await asyncio.wait_for(reached.wait(), 5)
+            bench.port.set_live(True)
+            gate.set()
+            await bench.port.wait()
+            return bench.port.live_status(), [event for event, _ in bench.notes[said:]]
+        finally:
+            await _close(bench, session)
+
+    status, events = loop.run_until_complete(go())
+    assert "Выключение боя отменено" not in events, events
+    assert "Бой включается" in events, events
+    assert status.on and status.wanted, status
+
+
+def test_apply_while_a_rebuild_is_already_held_checks_the_held_series(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З4: пересборка уже отложена командой, позиции нет — «Применить» судит прежний ряд.
+
+    Отложенная пересборка отложится и дальше: «факт» идёт прежним рядом
+    15 минут, и скользящий уровень на нём при пороге 15 нарушает D-141.
+    Стережёт: «свеча 30 + скользящий уровень» отвергнуто под полем скользящего
+    уровня со словами о прежнем ряде; скользящий уровень не включён.
+    """
+    refused: list[tuple[str, str]] = []
+
+    async def go() -> tuple[UiSettings, str]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        bench.port.settings_refused.connect(
+            lambda _values, reason, name: refused.append((reason, name))
+        )
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            assert bench.port.live_status().position is None, "позиция есть — не тот случай"
+            monkeypatch.setattr(HistoryPort, "_fact_busy", _held_by_a_command)
+            bench.port.apply_settings(dataclasses.replace(SMALL, timeframe="30 минут"))
+            await bench.port.wait()
+            held = bench.port.live_status().held
+            bench.port.apply_settings(
+                dataclasses.replace(SMALL, timeframe="30 минут", trailing_enabled=True)
+            )
+            await bench.port.wait()
+            return bench.port.values, held
+        finally:
+            await _close(bench, session)
+
+    values, held = loop.run_until_complete(go())
+    assert UNCLOSED in held, "пересборка не отложена — не тот случай"
+    assert refused, "пересборка отложена, а «Применить» прежний ряд не проверило"
+    reason, name = refused[-1]
+    assert name == "trailing_enabled" and "прежним рядом" in reason, (name, reason)
+    assert not values.trailing_enabled
+
+
+# ------------------------------------------- пятый /risk 2в: мутации Н9, З8
+
+#: Поле, пришедшее «мимо „Применить“» вместе со скользящим уровнем, который
+#: на 15-минутках при пороге 15 запрещён (D-141): (поле окна, значение,
+#: подпись в журнале изменений). Решение владельца 01.11.2026 (0066) — такие
+#: поля «факту» идут сразу, прежним остаётся только запрещённое.
+_REACHES: tuple[tuple[str, object, str], ...] = (
+    ("volume", 2, "Объём"),
+    ("take_profit_pct", 1.0, "Тейк-профит, %"),
+    ("window_start", time(10, 0), "Торговое окно"),
+)
+
+
+def _not_reached(name: str, status: LiveStatus, takes: list[tuple[str, float | None]]) -> str:
+    """Пусто — новое значение поля `name` у «факта» в силе; иначе — что видно вместо."""
+    position = status.position
+    if name == "window_start":
+        # Окно с 10:00: на закрытии 09:45 входа нет.
+        return "" if position is None else f"вход до начала окна: {position}"
+    if position is None:
+        return "входа в 09:45 нет"
+    if name == "volume":
+        return "" if position.signed == 2 else f"вход объёмом {position.signed}, а не 2"
+    level = takes[0][1] if takes else None
+    wanted = position.entry_price * 1.01
+    if level is None or abs(level - wanted) >= STEP:
+        return f"тейк у брокера по {level}, а 1 % от входа {position.entry_price:g} — {wanted:g}"
+    return ""
+
+
+@pytest.mark.parametrize("case", _REACHES, ids=[name for name, *_ in _REACHES])
+def test_a_forbidden_trailing_holds_back_only_itself_the_rest_reaches_the_fact(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, object, str],
+) -> None:
+    """Н9: запрет D-141 держит прежним **только** скользящий уровень — объём, тейк, окно идут.
+
+    Ряд прежний (15 минут при пороге 15), позиции нет; мимо «Применить»
+    пришли скользящий уровень и ещё одно поле. Стережёт: «факт» работает
+    по новому значению поля (вход объёмом 2; тейк 1 % от входа; окно с 10:00 —
+    входа в 09:45 нет), у брокера неподвижный тейк, а не скользящий уровень;
+    строка «Настройки не дошли до боя» называет скользящий уровень и не
+    называет поле, которое дошло.
+    """
+    name, value, caption = case
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[UiSettings, LiveStatus, list[tuple[str, float | None]], list[str]]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            assert bench.port.live_status().position is None, "позиция есть — не тот случай"
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
+            said = len(bench.notes)
+            bench.port.apply_settings(SMALL.replace(trailing_enabled=True, **{name: value}))
+            await bench.port.wait()
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=50), since=LIVE_FROM + timedelta(minutes=21)
+            )
+            kept = [
+                why for event, why in bench.notes[said:] if event == "Настройки не дошли до боя"
+            ]
+            return bench.port.values, bench.port.live_status(), _takes(broker), kept
+        finally:
+            await _close(bench, session)
+
+    values, status, takes, kept = loop.run_until_complete(go())
+    assert values.trailing_enabled and getattr(values, name) == value, "«Применить» отказало"
+    assert status.on, status
+    problem = _not_reached(name, status, takes)
+    assert not problem, f"«{caption}» не дошло до «факта»: {problem}"
+    if status.position is not None:
+        assert takes, "у входа нет неподвижного тейка у брокера: скользящий уровень дошёл"
+    assert kept and all(TRAILING_ON in why for why in kept), kept
+    assert all(f"{caption}:" not in why for why in kept), f"дошедшее названо недошедшим: {kept}"
+
+
+def test_a_fractional_volume_past_apply_stays_out_of_the_live_and_is_said(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н9: нецелый объём мимо «Применить» «факту» не идёт — прежний объём, и сказано почему.
+
+    Ряд прежний, позиции нет; пришёл объём 1,5 — боевой заявки такой не бывает.
+    Стережёт: вход 09:45 — один контракт; строка «Настройки не дошли до боя»
+    называет объём и причину.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[UiSettings, LiveStatus, str]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            assert bench.port.live_status().position is None, "позиция есть — не тот случай"
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
+            bench.port.apply_settings(SMALL.replace(volume=1.5))
+            await bench.port.wait()
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=50), since=LIVE_FROM + timedelta(minutes=21)
+            )
+            kept = bench.said("Настройки не дошли до боя")
+            return bench.port.values, bench.port.live_status(), kept
+        finally:
+            await _close(bench, session)
+
+    values, status, kept = loop.run_until_complete(go())
+    assert values.volume == 1.5, "«Применить» отказало — рубеж не проверяется"
+    assert status.position is not None and status.position.volume == 1.0, status.position
+    assert "Объём:" in kept and "не целое число контрактов" in kept, kept
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(("15 минут", 1), id="same-series"),
+        pytest.param(("15 минут", 2), id="same-series-with-volume"),
+        pytest.param(("30 минут", 1), id="held-rebuild"),
+    ],
+)
+def test_the_trailing_forbidden_again_after_it_was_dropped_is_said_again(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, int],
+) -> None:
+    """З8: «не дошло» пересчитывается — снятый и снова включённый запрет сказан снова.
+
+    Мимо «Применить»: скользящий уровень (запрет D-141 на 15 минутах) →
+    снят (с ним — объём `volume`) → снова включён. Ряд прежний или пересборка
+    отложена командой (свеча 30). Стережёт: строка «Настройки не дошли до боя»
+    сказана оба раза: второе включение — новое действие человека, и молчание
+    о нём — та же поломка, что первое (правило 13).
+    """
+    timeframe, volume = case
+    held = timeframe != SMALL.timeframe
+    steps = ((True, 1), (False, volume), (True, volume))
+
+    async def go() -> list[str]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
+            if held:
+                monkeypatch.setattr(HistoryPort, "_fact_busy", _held_by_a_command)
+            said = len(bench.notes)
+            for trailing, contracts in steps:
+                bench.port.apply_settings(
+                    SMALL.replace(timeframe=timeframe, trailing_enabled=trailing, volume=contracts)
+                )
+                await bench.port.wait()
+            return [
+                why for event, why in bench.notes[said:] if event == "Настройки не дошли до боя"
+            ]
+        finally:
+            await _close(bench, session)
+
+    kept = loop.run_until_complete(go())
+    assert len(kept) == 2 and all(TRAILING_ON in why for why in kept), kept
+
+
+def test_the_held_line_clears_when_the_fact_is_flat_and_the_rebuild_goes(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker
+) -> None:
+    """З8: «факт» вышел из позиции — пересборка пошла, строка «отложена» в окне не держится.
+
+    Лонг; период средней сменён — пересборка отложена позицией. Выход по концу
+    окна 11:00 — «факт» свободен. Стережёт: бой идёт, позиции нет, снимок боя
+    говорит, что ждать нечего (`held` пуст).
+    """
+
+    async def go() -> tuple[str, LiveStatus]:
+        bench, session = await _bench(tmp_path, broker, NO_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            bench.port.apply_settings(NO_TAKE.replace(average_period=20))
+            await bench.port.wait()
+            held = bench.port.live_status().held
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=140), since=LIVE_FROM + timedelta(minutes=51)
+            )
+            return held, bench.port.live_status()
+        finally:
+            await _close(bench, session)
+
+    held, after = loop.run_until_complete(go())
+    assert "Период средней: 15 → 20" in held, "пересборка не отложена — не тот случай"
+    assert after.on and after.position is None, after
+    assert after.held == "", after.held
+
+
+def _no_step(_self: object, _instrument: str) -> float:
+    """Биржа шага цены не сообщила: ноль (`HistoryPort._step_of`)."""
+    return 0.0
+
+
+def test_a_lost_price_step_past_apply_keeps_the_fact_on_the_step_grid(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н9: шаг цены 0 мимо «Применить» «факту» не идёт — прежний шаг, и сказано почему.
+
+    Лонг с неподвижным тейком у брокера; шаг цены пропал (0), и настройки
+    с ним пришли в обход «Применить» — без шага тейк на сетку не поставить
+    (D-147). Стережёт: тейк шорта после переворота 10:00 стоит на сетке
+    шага 25; строка «Настройки не дошли до боя» называет шаг цены и причину.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[UiSettings, LiveStatus, list[tuple[str, float | None]], str]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            position = bench.port.live_status().position
+            assert position is not None and position.signed == 1, "нет лонга — не тот случай"
+            monkeypatch.setattr(HistoryPort, "_fits_live", _no_apply_gate)
+            monkeypatch.setattr(HistoryPort, "_step_of", _no_step)
+            bench.port.apply_settings(SMALL)
+            await bench.port.wait()
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=62), since=LIVE_FROM + timedelta(minutes=51)
+            )
+            kept = bench.said("Настройки не дошли до боя")
+            return bench.port.values, bench.port.live_status(), _takes(broker), kept
+        finally:
+            await _close(bench, session)
+
+    values, status, takes, kept = loop.run_until_complete(go())
+    assert values.price_step == 0, "шаг не пропал — рубеж не проверяется"
+    assert status.position is not None and status.position.signed == -1, status.position
+    shorts = [price for side, price in takes if side == "1"]
+    assert shorts, f"у шорта нет тейка у брокера: {takes}"
+    assert all(price is not None and price % STEP == 0 for price in shorts), (
+        f"тейк шорта не на сетке шага {STEP:g}: {shorts} — шаг 0 дошёл до «факта»"
+    )
+    assert "Шаг цены инструмента:" in kept and "D-147" in kept, kept

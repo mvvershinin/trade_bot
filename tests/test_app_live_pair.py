@@ -1602,6 +1602,8 @@ def test_a_refusal_with_a_fresh_position_updates_the_remembered_one(
     assert status.position is not None and status.position.signed == 2, status.position
     assert status.position.take_level is None
     assert "при попытке включить бой" in status.position_note, status.position_note
+    # Слова о тейке — тоже не от прежней позиции: за лонг 2 тейк не известен.
+    assert "неизвестно" in status.take_note and "жив —" not in status.take_note, status.take_note
 
 
 def test_cancelling_an_off_passes_the_same_gates_as_turning_on(
@@ -1631,3 +1633,151 @@ def test_cancelling_an_off_passes_the_same_gates_as_turning_on(
     assert not status.on and not status.wanted
     assert "Выключение боя отменено" not in events, events
     assert "выключите бой" in refused, refused
+    # Выключение доведено до конца и сказано: отказ отмены не съел его строку.
+    assert "Бой выключен" in events, events
+
+
+# ------------------------------------------- пятый /risk 2в: Н9, Н10, З8
+
+
+def _past_apply(_self: object, _settings: object) -> None:
+    """Проверка «Применить» в бою снята — дорога в обход неё, к запасному рубежу."""
+
+
+def test_a_forbidden_trailing_keeps_only_itself_and_mode_off_still_reaches_the_fact(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н9: запрет на прежнем ряду держит прежним **только** скользящий уровень.
+
+    Лонг на 15-минутках; мимо «Применить» пришли «свеча 30 + скользящий
+    уровень» — пересборку держит позиция, на прежнем ряду D-141. Затем
+    «Выключен». Стережёт: режим доходит до «факта» — в 10:00 переворота
+    к брокеру нет; строка «Настройки не дошли до боя» называет только
+    скользящий уровень, не режим.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[int, list[str], list[str]]:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=46))
+            monkeypatch.setattr(HistoryPort, "_fits_live", _past_apply)
+            said = len(bench.notes)
+            bench.port.apply_settings(
+                dataclasses.replace(SMALL, timeframe="30 минут", trailing_enabled=True)
+            )
+            await bench.port.wait()
+            bench.port.set_mode(Mode.OFF)
+            await bench.port.wait()
+            sent = len(broker.commands)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=62), since=LIVE_FROM + timedelta(minutes=47)
+            )
+            kept = [
+                why for event, why in bench.notes[said:] if event == "Настройки не дошли до боя"
+            ]
+            return len(broker.commands) - sent, kept, bench.events()
+        finally:
+            await _close(bench, session)
+
+    sent, kept, events = loop.run_until_complete(go())
+    assert sent == 0, "«Выключен» не дошёл до «факта»: в 10:00 ушли заявки"
+    assert kept, "что скользящий уровень не дошёл, не сказано"
+    assert all("Скользящ" in why and "Режим" not in why for why in kept), kept
+    assert "Позиция без управления" in events, events
+
+
+def test_apply_in_live_checks_the_old_series_even_when_the_fact_is_flat(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker
+) -> None:
+    """Н9: «Применить» в бою проверяет прежний ряд при **любой** смене ряда.
+
+    «Факт» без позиции, но вход может исполниться, пока «Применить» думает,
+    и пересборка отложится — «факт» пошёл бы прежним рядом со скользящим
+    уровнем (D-141). Стережёт: отказ под полем с прежним рядом в словах.
+    """
+    refused: list[tuple[str, str]] = []
+
+    async def go() -> UiSettings:
+        bench, session = await _bench(tmp_path, broker, SMALL)
+        bench.port.settings_refused.connect(
+            lambda _values, reason, name: refused.append((reason, name))
+        )
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=20))
+            assert bench.port.live_status().position is None
+            bench.port.apply_settings(
+                dataclasses.replace(SMALL, timeframe="30 минут", trailing_enabled=True)
+            )
+            await bench.port.wait()
+            return bench.port.values
+        finally:
+            await _close(bench, session)
+
+    values = loop.run_until_complete(go())
+    assert refused and refused[-1][1] == "trailing_enabled", refused
+    assert "прежним рядом" in refused[-1][0], refused[-1][0]
+    assert not values.trailing_enabled and values.timeframe == "15 минут"
+
+
+def test_a_refused_enable_does_not_vouch_for_a_take_from_the_time_of_off(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Н10: отказ включения со свежей позицией за тейк не ручается.
+
+    Лонг с тейком; бой выключен; тейк сняли не мы; «Включить» — отказ
+    (позиция не ноль). Стережёт: уровня у позиции нет, слова о тейке —
+    «неизвестно — проверьте», а не «жив» с момента выключения.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> LiveStatus:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            bench.port.set_live(False)
+            await bench.port.wait()
+            for order in broker.live():
+                broker.cancel_outside(order.key)
+            bench.exchange.now = LIVE_FROM + timedelta(minutes=80)
+            bench.port.set_live(True)
+            await bench.port.wait()
+            return bench.port.live_status()
+        finally:
+            await _close(bench, session)
+
+    status = loop.run_until_complete(go())
+    assert not status.on and status.position is not None and status.position.signed == 1
+    assert status.position.take_level is None, "окно ручается за тейк с момента выключения"
+    assert "неизвестно" in status.take_note and "жив —" not in status.take_note, status.take_note
+
+
+def test_returning_the_settings_clears_the_held_line(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker
+) -> None:
+    """З8: вернул прежние настройки — «пересборка отложена» в окне не держится.
+
+    Стережёт: после возврата периода средней снимок боя говорит, что ждать
+    нечего (`held` пуст).
+    """
+
+    async def go() -> tuple[str, str]:
+        bench, session = await _bench(tmp_path, broker, NO_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            bench.port.apply_settings(dataclasses.replace(NO_TAKE, average_period=20))
+            await bench.port.wait()
+            held = bench.port.live_status().held
+            bench.port.apply_settings(NO_TAKE)
+            await bench.port.wait()
+            return held, bench.port.live_status().held
+        finally:
+            await _close(bench, session)
+
+    held, after = loop.run_until_complete(go())
+    assert "Период средней: 15 → 20" in held, held
+    assert after == "", after

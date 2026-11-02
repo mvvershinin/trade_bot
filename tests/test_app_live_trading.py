@@ -129,6 +129,12 @@ Read = int | BrokerError
 UNREAD = NoConnection("проба: портфель не прочитан")
 
 
+def _answer(answer: Read) -> int:
+    if isinstance(answer, BrokerError):
+        raise answer
+    return answer
+
+
 @dataclass
 class _Preparing:
     """Исполнитель на сборке: поток, чтения позиции по порядку, итог разбора журнала."""
@@ -138,15 +144,17 @@ class _Preparing:
     notes: tuple[str, ...] = ()
     unsettled: bool = False
     halted: str | None = None
+    #: Чтения позиции для отказа после разбора журнала (`broker_position`), по порядку.
+    fresh: list[Read] = field(default_factory=list)
 
     async def wait_connected(self, timeout: float) -> bool:
         return self.connected
 
     async def check_position(self, expected: int) -> int:
-        answer = self.reads.pop(0)
-        if isinstance(answer, BrokerError):
-            raise answer
-        return answer
+        return _answer(self.reads.pop(0))
+
+    async def broker_position(self) -> int:
+        return _answer(self.fresh.pop(0))
 
     async def settle_open_commands(self) -> tuple[str, ...]:
         return self.notes
@@ -186,6 +194,12 @@ SNIPPED = ("Заявка (из журнала: take:long:прошлый) был�
         pytest.param(_Preparing([0, UNREAD], notes=SNIPPED), [], None,
                      id="second-read-failed-after-a-cancel"),
         pytest.param(_Preparing([0, -1], notes=SNIPPED), [], -1, id="second-read-short"),
+        # Разбор журнала снял заявку, и отказ пришёл раньше второго чтения:
+        # ноль первого чтения уже не свеж — позиция читается заново (З5).
+        pytest.param(_Preparing([0], notes=SNIPPED, unsettled=True, fresh=[-1]), [], -1,
+                     id="fate-unknown-after-a-cancel"),
+        pytest.param(_Preparing([0], notes=SNIPPED, halted="Исполнитель стоит.", fresh=[UNREAD]),
+                     [], None, id="halted-after-a-cancel-fresh-read-failed"),
     ],
 )
 def test_a_refusal_to_turn_live_on_carries_the_position_only_when_it_was_freshly_read(

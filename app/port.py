@@ -45,7 +45,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
 
 from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
@@ -230,6 +230,15 @@ _TRAILING_ON_MINUTES = (
 _LOAD_IN_LIVE = (
     "Загрузка истории в бою недоступна: выключите бой. Загрузка занимает поток данных "
     "и откладывает решения робота — заявка ушла бы к брокеру с опозданием на всю загрузку."
+)
+
+#: Как в бою сменить свечу и включить скользящий уровень (`/risk` 2в З10, D-141).
+_TWO_STEPS = (
+    "В бою размер свечи и скользящий уровень меняйте в два шага: сначала свечу "
+    "({now}) — бой пересоберётся на ней, затем скользящий уровень. Пока бой не "
+    "пересобран (его держат открытая позиция или незакрытая заявка, если они есть), "
+    "«факт» идёт прежним рядом — свечой {was}, а на ней скользящий уровень при пороге "
+    "проверки по минуткам {limit} мин запрещён (D-141). Бой идёт по прежним настройкам."
 )
 
 #: Почему бой не включается без шага цены (`D-147`, `D-148`).
@@ -551,6 +560,9 @@ class _History:
 
     facts: asyncio.Task[None] | None = None
     load: asyncio.Task[None] | None = None
+    #: Загрузка истории по просьбе человека (`load_history`) — не уточнение
+    #: контрактов в том же слоте: бой с ней не включается (З7).
+    user: asyncio.Task[None] | None = None
     #: Прогон, отложенный на время загрузки: пойдёт, когда она кончится.
     after_load: str = ""
     #: Идёт загрузка минут в базу (не уточнение контрактов): прогон ждёт.
@@ -2269,6 +2281,7 @@ class HistoryPort(TerminalPort):
             self._load_contract(request, chain) if chain
             else self._load_history(request),
         )
+        self._history.user = self._history.load
 
     def cancel_history_load(self) -> None:
         """Остановить идущую загрузку. Скачанное остаётся в базе.
@@ -4039,10 +4052,10 @@ class HistoryPort(TerminalPort):
             await self._retire()
             return
         if key.same_but_engine(self._watch.key):
-            if self._engine_fits(frame):
-                observer.retarget(frame.engine)
-                self._watch.key = key
-                self._say_unmanaged(observer, frame)
+            engine = self._engine_for_fact(frame)
+            observer.retarget(engine)
+            self._watch.key = key._replace(engine=engine)
+            self._say_unmanaged(observer, frame)
             return
         busy = await self._fact_busy(observer)
         if not busy:
@@ -4052,12 +4065,10 @@ class HistoryPort(TerminalPort):
         # пересборке (решение владельца 01.11.2026, `/risk` 2в БЛОК 2):
         # откладывается только то, что требует пересчёта ряда.
         current = self._watch.key
-        if (
-            isinstance(current, _WatchKey) and current.engine != frame.engine
-            and self._engine_fits(frame)
-        ):
-            observer.retarget(frame.engine)
-            self._watch.key = current._replace(engine=frame.engine)
+        if isinstance(current, _WatchKey) and current.engine != frame.engine:
+            engine = self._engine_for_fact(frame)
+            observer.retarget(engine)
+            self._watch.key = current._replace(engine=engine)
             self._say_unmanaged(observer, frame)
         self._say_held(busy)
 
@@ -4080,6 +4091,17 @@ class HistoryPort(TerminalPort):
         """
         observer, built = self._watch.observer, self._watch.frame
         self._live.frozen = None
+        if built is not None and _rest_of(built) == _rest_of(frame):
+            # Ряд тот же — ждать нечего: строка в окне не держит прошлое (З8).
+            self._live.held = ""
+        if built is not None and observer is not None and observer.paired:
+            series = frame.values.replace(
+                timeframe=built.values.timeframe, instrument=built.values.instrument
+            )
+            if not _settings_blocks(series, series):
+                # Нарушения нет — «не дошло» не держится: снова включённый запрет
+                # будет сказан снова, а не замолчит (B-085).
+                self._live.kept = ""
         if (
             observer is None or not observer.paired or built is None
             or not self._live.wanted or self._halt.reason
@@ -4089,20 +4111,22 @@ class HistoryPort(TerminalPort):
             return frame
         busy = await self._fact_busy(observer)
         if not busy:
+            self._live.held = ""
             return frame
         self._live.frozen = built.values
-        self._say_held(busy, _waiting(built.values, frame.values))
         mixed = frame.values.replace(
             timeframe=built.values.timeframe, instrument=built.values.instrument
         )
-        if _settings_blocks(mixed, built.values):
-            # Запрет включения на прежнем ряду (D-141 и др.) — новые настройки
-            # движка «факту» не идут, пока ряд прежний: остаются те, что в силе.
-            # «Применить» такое отвергает (`_fits_live`); здесь — последний
-            # рубеж, если пересборку держит незакрытая команда, а не позиция.
-            key = self._watch.key
-            return _Frame(built.values, key.engine if isinstance(key, _WatchKey) else built.engine)
-        return _Frame(built.values, frame.engine)
+        if not _settings_blocks(mixed, built.values):
+            self._live.kept = ""
+            self._say_held(busy, _waiting(built.values, frame.values))
+            return _Frame(built.values, frame.engine)
+        # Запрет включения на прежнем ряду (D-141 и др.): запрещённое «факту»
+        # не идёт, пока ряд прежний, — только оно; прочие настройки движка
+        # идут сразу (Н9). Вслух — что не дошло и почему (B-084, правило 13).
+        engine = self._engine_for_fact(frame)
+        self._say_held(busy, _waiting(built.values, frame.values), kept=self._live.kept)
+        return _Frame(built.values, engine)
 
     def _frame_now(self) -> _Frame:
         """Настройки живой свечи: те, по которым идёт ход, — отложенные тоже (N1)."""
@@ -4120,12 +4144,14 @@ class HistoryPort(TerminalPort):
             busy.append(f"в журнале команд незакрытых {len(unclosed)}: {'; '.join(unclosed)}")
         return "; ".join(busy)
 
-    def _engine_fits(self, frame: _Frame) -> bool:
-        """Настройки движка — бою только после запретов включения (`/risk` 2в Н6).
+    def _engine_for_fact(self, frame: _Frame) -> EngineSettings:
+        """Настройки движка, которые «факту» можно, — на ряду, по которому он идёт.
 
-        «Применить» их уже проверил (`_fits_live`); здесь последний рубеж
-        для дороги в обход — нарушающее запрет «факту» не идёт, бой остаётся
-        на действующих настройках, и это сказано однажды.
+        Запреты включения (`/risk` 2в Н6, Н9): «Применить» их проверил
+        (`_fits_live`); здесь последний рубеж для дорог в обход. Нарушающее
+        запрет остаётся прежним — **только оно** (скользящий уровень, нецелый
+        объём, шаг): режим, объём, окно и процент тейка идут «факту» сразу
+        (решение владельца 01.11.2026, 0066). Что не дошло — сказано однажды.
         """
         built = self._watch.frame
         values = frame.values if built is None else frame.values.replace(
@@ -4133,16 +4159,37 @@ class HistoryPort(TerminalPort):
         )
         blocks = _settings_blocks(values, values)
         if not blocks:
-            return True
-        words = blocks[0][1]
-        if words != self._live.kept:
-            self._live.kept = words
+            self._live.kept = ""
+            return frame.engine
+        key = self._watch.key
+        current = key.engine if isinstance(key, _WatchKey) else frame.engine
+        kept = {name for field, _ in blocks for name in _ENGINE_OF_BLOCK.get(field, ())}
+        try:
+            engine = dataclasses.replace(
+                frame.engine, **{name: getattr(current, name) for name in kept}
+            )
+        except (ValueError, TypeError):  # сочетание не собирается — прежние целиком
+            engine = current
+        self._say_kept(frame.engine, engine, blocks[0][1])
+        return engine
+
+    def _say_kept(self, wanted: EngineSettings, current: EngineSettings, why: str) -> str:
+        """Новые настройки движка до боя не дошли — что именно и почему; однажды (B-084).
+
+        Возврат — те же слова короче: их называет и строка отложенной пересборки,
+        чтобы она не обещала того, что не действует.
+        """
+        changes = "; ".join(wanted.changes_from(current)) or "новые настройки движка"
+        kept = f"не дошли до боя: {changes} — {why}"
+        if kept != self._live.kept:
+            self._live.kept = kept
             self.note(
                 "Настройки не дошли до боя",
-                f"Бой идёт по прежним настройкам движка: {words}",
+                f"Бой идёт по прежним настройкам движка. Не дошло: {changes}. "
+                f"Почему: {why}",
                 DecisionLevel.WARNING,
             )
-        return False
+        return kept
 
     def _say_unmanaged(self, observer: LiveObserver, frame: _Frame) -> None:
         """Режим «Выключен» при позиции «факта» — крупно: позиция осталась без робота.
@@ -4161,24 +4208,35 @@ class HistoryPort(TerminalPort):
             DecisionLevel.WARNING,
         )
 
-    def _say_held(self, busy: str, waiting: str = "") -> None:
-        """Пересборка «факта» отложена (С4) — однажды на каждую новую причину."""
+    def _say_held(self, busy: str, waiting: str = "", *, kept: str = "") -> None:
+        """Пересборка «факта» отложена (С4) — однажды на каждую новую причину.
+
+        `kept` — новые настройки движка, до боя не дошедшие (B-084): тогда строка
+        не обещает, что они действуют, а называет, что не дошло.
+        """
         what = waiting or (
             "настройки, требующие пересчёта ряда (период средней, алгоритм, "
             "инструмент, размер свечи, издержки)"
         )
         held = f"Ждёт пересборки боя: {what}. Отложена, потому что {busy}."
+        if kept:
+            held += f" Настройки движка {kept}."
         if held == self._live.held:
             return
         self._live.held = held
+        engine = (
+            f"Новые настройки движка {kept}; «факт» и «прогноз» идут по действующим."
+            if kept else
+            "Режим, объём, тейк и торговое окно уже действуют для «факта» и «прогноза» — "
+            "со следующей сделки."
+        )
         self.note(
             "Пересборка боя отложена",
             f"Ждёт пересборки боя: {what}. Отложена, потому что {busy}: пересобрать "
             "«факт» сейчас значило бы родить движок без позиции — настоящая позиция "
             "у брокера осталась бы без робота. До пересборки бой идёт прежним ходом — "
             "его свечами и его средней. Пересборка — сама, на первом проходе после "
-            "выхода из позиции и закрытия команд. Режим, объём, тейк и торговое окно "
-            "уже действуют для «факта» и «прогноза» — со следующей сделки.",
+            f"выхода из позиции и закрытия команд. {engine}",
             DecisionLevel.WARNING,
         )
         self._publish_live()
@@ -4313,6 +4371,9 @@ class HistoryPort(TerminalPort):
             (self._live.desks is None,
              "Подача заявок в этой сборке программы не подключена."),
             (self._loading(), _LOAD_IN_LIVE),
+            (self._history.term.holding,
+             "Идёт первое уточнение контрактов у биржи: решения робота ждут его ответа. "
+             "Включите бой после него."),
         )
         reasons = [words for failed, words in checks if failed]
         try:
@@ -4326,9 +4387,13 @@ class HistoryPort(TerminalPort):
         return tuple(reasons)
 
     def _loading(self) -> bool:
-        """Идёт загрузка истории — бой с ней не уживается (решение владельца, 0066)."""
-        load = self._history.load
-        return self._history.filling or (load is not None and not load.done())
+        """Идёт загрузка истории — бой с ней не уживается (решение владельца, 0066).
+
+        Только загрузка истории (`load_history`) и скачивание минут: слот загрузки
+        занимает и уточнение контрактов, а это другая причина и другие слова (З7).
+        """
+        user = self._history.user
+        return self._history.filling or (user is not None and not user.done())
 
     def _fits_live(self, settings: Settings) -> None:
         """В бою «Применить» проверяет те же запреты, что включение (0066, `/risk` 2в R1).
@@ -4345,7 +4410,6 @@ class HistoryPort(TerminalPort):
             built is not None and observer is not None and observer.paired
             and (built.values.timeframe, built.values.instrument)
             != (settings.timeframe, settings.instrument)
-            and self._may_hold(observer)
         ):
             # Пересборка может отложиться (позиция): тогда «факт» пойдёт прежним
             # рядом с новыми настройками движка — и запреты обязаны пройти и на нём
@@ -4353,10 +4417,12 @@ class HistoryPort(TerminalPort):
             series = settings.replace(
                 timeframe=built.values.timeframe, instrument=built.values.instrument
             )
-            hint = (
-                " Пересборка боя отложится — у «факта» позиция или заявка в работе, — "
-                f"и до неё «факт» идёт прежним рядом: {built.values.timeframe}, "
-                f"{built.values.instrument}."
+            # Отказ и при пустом «факте»: незакрытую команду, которая отложит
+            # пересборку, из окна не видно (B-084). Слова — без выдуманной причины:
+            # что делать в два шага и почему (`/risk` 2в З10).
+            hint = _TWO_STEPS.format(
+                now=settings.timeframe, was=built.values.timeframe,
+                limit=convert.minute_bar_limit_of(built.values),
             )
             variants += [
                 (series, hint),
@@ -4367,17 +4433,9 @@ class HistoryPort(TerminalPort):
             if blocks:
                 field, words = blocks[0]
                 raise convert.SettingsRefused(
-                    f"В бою так нельзя: {words}{hint} Бой идёт по прежним настройкам.",
+                    hint or f"В бою так нельзя: {words} Бой идёт по прежним настройкам.",
                     field=field,
                 )
-
-    def _may_hold(self, observer: LiveObserver) -> bool:
-        """Пересборка «факта» может отложиться: позиция, заявка в работе, неотданное."""
-        desk = self._live.desk
-        return (
-            observer.fact_position is not None or observer.awaits_open
-            or bool(self._live.held) or (desk is not None and bool(desk.undelivered))
-        )
 
     def _publish_live(self) -> None:
         """Снимок боя — в окно, тем же рубежом чистки (`_send`)."""
@@ -4985,7 +5043,11 @@ class HistoryPort(TerminalPort):
                 volume=float(abs(position)), entry_price=math.nan,
             )
             note += "; цену входа брокер не назвал"
-            self._live.left_take = _take_words(None, None, sure=False)
+        else:
+            # Позиция свежая, а тейк — нет: отказ заявок у брокера не читал,
+            # и уровень с момента выключения обещал бы то, чего могло не стать (Н10).
+            left = dataclasses.replace(left, take_level=None)
+        self._live.left_take = _take_words(None, None, sure=False)
         self._live.left, self._live.left_note = left, note
 
     async def _open_live_run(
@@ -6222,6 +6284,22 @@ def _live_overlay(
         for path in shadow if path.layer is Layer.FACT
     )
     return markers, tuple(path for path in paths if path.layer is Layer.FACT) + planned
+
+
+_TRAILING_FIELDS: Final[tuple[str, ...]] = (
+    "trailing_take_profit", "trailing_start_percent", "trailing_offset_percent",
+    "trailing_step_percent",
+)
+
+#: Поле окна, нарушившее запрет боя (`_settings_blocks`) → поля движка, которые
+#: остаются у «факта» прежними (Н9). Прочие настройки движка идут сразу.
+_ENGINE_OF_BLOCK: Final[dict[str, tuple[str, ...]]] = {
+    "trailing_enabled": _TRAILING_FIELDS,
+    "minute_bar_limit": _TRAILING_FIELDS,
+    "timeframe": _TRAILING_FIELDS,
+    "volume": ("volume",),
+    "instrument": ("price_step",),
+}
 
 
 def _settings_blocks(values: Settings, was: Settings) -> tuple[tuple[str, str], ...]:

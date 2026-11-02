@@ -3506,15 +3506,18 @@ def test_reconnects_that_held_keep_the_first_pause(
 def test_a_storm_of_reconnects_grows_the_pause_even_when_each_reconcile_passes(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """З1, Н5: обрывы раз в секунду (здесь — чаще `_LINK_SETTLE`) — пауза растёт до потолка.
+    """З9: шторм обрывов, каждая связь короче `_LINK_SETTLE` — пауза доходит до потолка.
 
-    Сверка после каждого обрыва проходит, но сброс паузы по ней — не чаще
-    раза в порог: иначе шторм обрывов давал бы сверку с чтением портфеля
-    на каждом. Пауза растёт до потолка, чтений портфеля — ровно по одному
-    на сверку, ни одного лишнего.
+    Сверка после каждого обрыва проходит, но паузу она не сбрасывает: сброс
+    по сверке водил паузу по кругу 1 → 2 → 5 с, и сверка с чтением портфеля
+    шла раз в несколько секунд весь шторм. Пауза растёт до потолка и стоит
+    на нём, чтений портфеля — ровно по одному на сверку.
     """
-    monkeypatch.setattr(live_executor, "_LINK_SETTLE", 5.0)
-    limits = replace(FAST, reconnect_pauses=(0.0, 0.02, 0.04))
+    # Порог 0,1 с, а шторм длится несколько порогов (8 обрывов с паузами
+    # до 0,06 с): ровно тот случай, где сброс по сверке ходил по кругу.
+    monkeypatch.setattr(live_executor, "_LINK_SETTLE", 0.1)
+    limits = replace(FAST, reconnect_pauses=(0.0, 0.03, 0.06))
+    cycles = 8
 
     async def scenario() -> tuple[list[float], int]:
         asked: list[float] = []
@@ -3526,17 +3529,17 @@ def test_a_storm_of_reconnects_grows_the_pause_even_when_each_reconcile_passes(
         async with make_rig(tmp_path, store, broker, sleep=sleep, limits=limits) as rig:
             await long_open(rig)
             portfolio = _reads(rig, ("GET", PORTFOLIO_PATH))
-            for _ in range(5):
+            for _ in range(cycles):
                 await _drop_and_wait(rig)
                 result = await reconcile(rig.executor, expected=1)
                 assert result.halted is None, result.halted
             return asked, _reads(rig, ("GET", PORTFOLIO_PATH)) - portfolio
 
     asked, reads = run(scenario())
-    # Первый обрыв — пауза первая (счёт с нуля), второй — сброс по прошедшей
-    # сверке (прошлого сброса не было), дальше сброс не чаще порога: рост.
-    assert asked == [0.0, 0.0, 0.02, 0.04, 0.04], f"пауза в шторм обрывов не растёт: {asked}"
-    assert reads == 5, reads
+    assert asked == [0.0, 0.03] + [0.06] * (cycles - 2), (
+        f"пауза в шторм обрывов не дошла до потолка или сбросилась: {asked}"
+    )
+    assert reads == cycles, reads
 
 
 async def _outage(rig: Rig, gate: asyncio.Event, while_down: Callable[[], None]) -> str | None:
