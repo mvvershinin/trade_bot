@@ -46,6 +46,7 @@ from tests.test_market_journal import FAKE_JWT, past_the_front_door
 
 AT = msk(2026, 10, 27, 10, 5)
 LATER = AT + timedelta(minutes=1)
+ACCOUNT = "A-1"
 
 
 def key(number: int) -> str:
@@ -63,6 +64,7 @@ def create(
         symbol=symbol,
         side=CommandSide.BUY,
         volume=volume,
+        account=ACCOUNT,
     )
 
 
@@ -532,6 +534,7 @@ def test_status_change_refusals(
         pytest.param({"volume": 0}, id="zero-volume"),
         pytest.param({"volume": True}, id="bool-volume"),
         pytest.param({"order_id": " "}, id="no-engine-name"),
+        pytest.param({"account": " "}, id="no-account"),
         pytest.param(
             {"action": CommandAction.CANCEL, "target_client_order_id": key(2)},
             id="cancel-with-side-and-volume",
@@ -556,6 +559,7 @@ def test_a_malformed_command_is_refused_before_the_base(change: dict[str, Any]) 
         "symbol": "MXZ6",
         "side": CommandSide.BUY,
         "volume": 1,
+        "account": ACCOUNT,
     } | change
     with pytest.raises(ValueError):
         BrokerCommand(**fields)
@@ -600,6 +604,7 @@ def test_a_cancel_command_round_trips(tmp_path: pathlib.Path) -> None:
         order_id="take:1",
         symbol="MXZ6",
         target_client_order_id=key(1),
+        account=ACCOUNT,
     )
     with CandleStore(tmp_path / "commands.sqlite3") as store:
         stored = store.record_broker_command(open_run(store), cancel, now=AT)
@@ -616,18 +621,21 @@ def test_a_base_of_the_previous_build_opens_without_alarm_and_keeps_its_number(
     """База сборки 0.2.5 (без журнала команд) открывается молча, номер схемы прежний.
 
     Поднятый номер отнял бы откат на 0.2.5 без копии `userdata/`, ничего
-    не защитив: настоящих заявок та сборка не подаёт.
+    не защитив: настоящих заявок та сборка не подаёт. Таблиц шага 2 (счёт
+    у команды, счёт на утро) у неё тоже нет — открытие заводит их сами.
     """
     path = tmp_path / "previous.sqlite3"
     with CandleStore(path):
         pass
     connection = sqlite3.connect(path)
     for (name,) in list(connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'broker_%'"
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+        "AND (name LIKE 'broker_%' OR name LIKE 'account_opening_%')"
     )):
         connection.execute(f"DROP TRIGGER {name}")
     connection.execute("DROP TABLE broker_command")
     connection.execute("DROP TABLE broker_execution")
+    connection.execute("DROP TABLE account_opening")
     connection.commit()
     connection.close()
 
@@ -639,8 +647,11 @@ def test_a_base_of_the_previous_build_opens_without_alarm_and_keeps_its_number(
             )
         }
         ((version,),) = past_the_front_door(store, "PRAGMA user_version")
-        store.record_broker_command(open_run(store), create(), now=AT)
+        stored = store.record_broker_command(open_run(store), create(), now=AT)
+        opening = past_the_front_door(store, "SELECT COUNT(*) FROM account_opening")
 
     assert store.replaced_guards == ()
     assert [name for name, body in _GUARDS.items() if not _same_sql(found.get(name), body)] == []
     assert version == SCHEMA_VERSION == 7
+    assert stored.command.account == ACCOUNT
+    assert opening == [(0,)]

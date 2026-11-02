@@ -130,7 +130,9 @@ THRESHOLD_FILE: Final[str] = "tests/test_lint_ratchet.py"
 #: ⚠️ **532 с 05.10.2026:** убран «Реверс по скользящей средней» (решение
 #: 0063) — его модуль, фильтр против пилы в окне и проверки №1; заодно
 #: `ruff --fix` по порядку импортов в пяти тронутых тестах.
-KNOWN_RUFF_FINDINGS: Final[int] = 531
+#: **530 с 01.11.2026:** у `HistoryPort.stop` появился докстринг (Э4 2в).
+#: **529 в тот же день:** докстринг у `HistoryPort.close_position` (`/risk` 2в).
+KNOWN_RUFF_FINDINGS: Final[int] = 529
 
 #: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 57 files`.
 #: Было 191 (замер 08.09.2026): число подняли под находку «Cannot find
@@ -163,7 +165,12 @@ KNOWN_RUFF_FINDINGS: Final[int] = 531
 #: ⚠️ **184 с 05.10.2026:** убран «Реверс по скользящей средней» (решение
 #: 0063) вместе с `tests/test_ui_unused_fields.py` и его `from helpers`.
 #: Возврат предохранителей — к 189.
-KNOWN_MYPY_FINDINGS: Final[int] = 184
+#: ⚠️ **149 с 28.10.2026 (Э4 шаг 2а):** подпись `RecordingExecutor.fills_at`
+#: в `tests/engine_helpers.py` приведена к порту (`candle: MarketCandle`) —
+#: подставка перестала быть «не исполнителем» для `mypy`: −8 в
+#: `tests/test_engine_runner.py`, −27 в `tests/test_engine_take_profit.py`.
+#: Ни одной находки не подавлено. Возврат предохранителей — к 154.
+KNOWN_MYPY_FINDINGS: Final[int] = 149
 
 
 def _tool_is_installed(module: str) -> bool:

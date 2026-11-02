@@ -80,11 +80,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 
 __all__ = [
     "TakeProfit",
     "round_level",
+    "to_grid",
     "fixed_level",
     "target_profit",
     "covers_commission",
@@ -123,6 +124,12 @@ def round_level(value: float) -> float:
 
     ⚠️ Проверено только для инструмента с целой ценой. Поведение при ненулевом
     числе знаков после запятой прототипом не воспроизводилось.
+
+    ⚠️ **Таблица выше — про сверку с прототипом, а не про бой.** С известным
+    шагом цены неподвижный уровень идёт на сетку шага от рынка (`fixed_level`,
+    решение 0066, Р1): в бою тейк — лимитная заявка у брокера, и цена вне
+    сетки биржей не принимается. Сверка с прототипом идёт с шагом ноль —
+    и по-прежнему этим округлением.
     """
     return float(Decimal(repr(float(value))).quantize(Decimal(1), rounding=ROUND_HALF_EVEN))
 
@@ -136,7 +143,26 @@ def _percent_of(price: float, percent: float) -> float:
     return float(Decimal(repr(float(price))) * Decimal(repr(float(percent))) / Decimal(100))
 
 
-def fixed_level(entry_price: float, side_sign: int, percent: float) -> float | None:
+def to_grid(value: Decimal, step: Decimal, *, up: bool) -> Decimal:
+    """Цена к сетке шага: вверх или вниз. Шаг больше нуля — забота вызывающего.
+
+    Одно место на два потребителя: предел выхода по времени
+    (`engine/pipeline.py::_time_exit_limit`) и неподвижный уровень тейка
+    (`fixed_level`). Две копии округления к сетке разошлись бы молча — первой
+    же правкой направления.
+
+    Счёт в `Decimal` от строкового вида чисел: `Decimal(0.1)` тащит двоичный
+    хвост, и цена, лежащая ровно на сетке, уехала бы на шаг.
+    """
+    grid = (value / step).to_integral_value(
+        rounding=ROUND_CEILING if up else ROUND_FLOOR
+    )
+    return grid * step
+
+
+def fixed_level(
+    entry_price: float, side_sign: int, percent: float, step: float = 0.0
+) -> float | None:
     """Неподвижный уровень от цены входа. `None` — тейка нет.
 
     ::
@@ -145,6 +171,15 @@ def fixed_level(entry_price: float, side_sign: int, percent: float) -> float | N
         процент <= 0 → тейка нет
 
     :param side_sign: `+1` для лонга, `−1` для шорта.
+    :param step: шаг цены инструмента. Больше нуля — уровень кладётся
+        на сетку шага **от рынка**: у лонга вверх, у шорта вниз (решение 0066,
+        Р1). Тейк в бою — лимитная заявка у брокера, а цена вне сетки шага
+        биржей не принимается; округлив к рынку, уровень оказался бы ближе,
+        чем названо в настройке. Округляется точное значение, а не целое:
+        иначе уровень, лежащий на полпункта за узлом сетки, встал бы на узел
+        ближе к рынку. Ноль — шаг неизвестен: уровень **целым**, половина
+        к чётному, как у прототипа (`round_level`), и проверка-образец
+        считается именно так.
 
     Процент, равный нулю, — не вырожденный случай, а рабочая конфигурация:
     два прогона эталонного архива сделаны именно так, и без неё воспроизводить
@@ -153,7 +188,10 @@ def fixed_level(entry_price: float, side_sign: int, percent: float) -> float | N
     """
     if not math.isfinite(percent) or percent <= 0:
         return None
-    return round_level(entry_price + side_sign * _percent_of(entry_price, percent))
+    exact = entry_price + side_sign * _percent_of(entry_price, percent)
+    if not step > 0:
+        return round_level(exact)
+    return float(to_grid(Decimal(repr(float(exact))), Decimal(repr(float(step))), up=side_sign > 0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +219,12 @@ class TakeProfit:
     step_percent: float = 0.0
     level: float | None = None
     peak: float | None = None
+    #: Шаг цены инструмента на момент входа: неподвижный уровень кладётся
+    #: на его сетку (`fixed_level`). Замораживается вместе с остальным
+    #: планом — смена шага на ходу открытую позицию не трогает (ТЗ §4.4 А).
+    #: ⚠️ Скользящий уровень к сетке не приводится: его сторожит программа
+    #: и выходит по рынку (решение 0066, Р2), цена на бирже от него не зависит.
+    price_step: float = 0.0
 
     @property
     def armed(self) -> bool:
@@ -201,7 +245,9 @@ class TakeProfit:
         """
         if self.trailing:
             return replace(self, level=None, peak=None)
-        return replace(self, level=fixed_level(entry_price, side_sign, self.percent))
+        return replace(
+            self, level=fixed_level(entry_price, side_sign, self.percent, self.price_step)
+        )
 
     def advance(
         self, entry_price: float, side_sign: int, close: float
@@ -221,7 +267,10 @@ class TakeProfit:
             наблюдённая внутри бара.
         """
         if not self.trailing:
-            return replace(self, level=fixed_level(entry_price, side_sign, self.percent))
+            return replace(
+                self,
+                level=fixed_level(entry_price, side_sign, self.percent, self.price_step),
+            )
         if not math.isfinite(close):
             return self
 

@@ -76,7 +76,7 @@ import concurrent.futures
 import pathlib
 import queue
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from types import TracebackType
 from typing import Any, TypeVar, cast
@@ -92,6 +92,7 @@ from market.contracts import (
     load_contract_minutes,
     refresh_contracts,
 )
+from market.day import OpeningFunds, TradingDay
 from market.gaps import Gap
 from market.history import HistoryOutcome, HistoryRequest, load_history
 from market.inventory import Inventory, take_inventory
@@ -1030,6 +1031,53 @@ class MarketWorker:
         и заводить его здесь обёрткой нельзя: разбор — в `CandleStore.lift_halt`.
         """
         return await self.call(lambda store: store.lift_halt(reason))
+
+    # -- день счёта (`market.day`, решение 0066 Р7) -------------------------
+
+    async def record_opening_funds(self, funds: OpeningFunds) -> OpeningFunds:
+        """Снимок счёта; ложится первый в дате. Возврат — счёт на утро.
+
+        Разбор — `CandleStore.record_opening_funds`.
+        """
+        return await self.call(lambda store: store.record_opening_funds(funds))
+
+    async def executions_day(
+        self,
+        account: str,
+        day: date,
+        *,
+        ruble_per_point: Mapping[str, float],
+        is_take: Callable[[str], bool],
+    ) -> TradingDay:
+        """День счёта по исполнениям — боевому движку при старте.
+
+        ⚠️ `is_take` исполняется **в потоке базы**: он обязан быть чистой
+        функцией имени, без обращений к окну и к циклу событий.
+        Разбор — `CandleStore.executions_day`.
+        """
+        return await self.call(
+            lambda store: store.executions_day(
+                account, day, ruble_per_point=ruble_per_point, is_take=is_take
+            )
+        )
+
+    async def journal_day(
+        self,
+        session_id: int,
+        day: date,
+        *,
+        account: str | None,
+        is_take: Callable[[str], bool],
+    ) -> TradingDay:
+        """День по журналу сделок прогона — симуляции при старте.
+
+        Разбор — `CandleStore.journal_day`; про `is_take` — `executions_day`.
+        """
+        return await self.call(
+            lambda store: store.journal_day(
+                session_id, day, account=account, is_take=is_take
+            )
+        )
 
     async def journal_sessions(
         self, *, origin: RunOrigin | None = None, limit: int = 50

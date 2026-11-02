@@ -91,6 +91,13 @@ DIFFERENT = Settings(
     time_exit_order=TimeExitKind.LIMIT,
     time_exit_limit_steps=7,
     time_exit_wait_bars=3,
+    # Ожидания боевого исполнителя (вкладка «Бой»).
+    live_stale_after_sec=90,
+    live_event_wait_sec=5,
+    live_fill_wait_sec=45,
+    live_cancel_wait_sec=20,
+    live_position_settle_sec=2.5,
+    live_reconnect_pauses_sec=(2, 4, 8),
     log_directory="/tmp/терминал-логи",
     # Оба вида отметки сразу: «не торгуем» на будний день и «торгуем»
     # на субботу. Один вид проверял бы половину: перевод «да/нет» в файл
@@ -511,7 +518,8 @@ def test_the_written_file_is_readable_text() -> None:
 #:
 #: ⚠️ Поля, заведённые **после** снимка, дописываются сюда с умолчанием
 #: (`strategy_id` — 08.09.2026, `minute_order` и `minute_bar_limit` —
-#: 03.10.2026). Иначе проверка
+#: 03.10.2026, шесть ожиданий боевого исполнителя `live_*` — 01.11.2026).
+#: Иначе проверка
 #: «перезапись не портит файл»
 #: падала бы на каждом новом поле и сообщала бы не о формате, а о том, что
 #: полей стало больше, — а это и так видно по другим сторожам.
@@ -538,6 +546,18 @@ OWNER_FILE = """{
     "free_funds_reserve_pct": 30.0,
     "history_depth_days": 90,
     "instrument": "MXU6",
+    "live_cancel_wait_sec": 10,
+    "live_event_wait_sec": 10,
+    "live_fill_wait_sec": 30,
+    "live_position_settle_sec": 1.0,
+    "live_reconnect_pauses_sec": [
+      1,
+      2,
+      5,
+      10,
+      30
+    ],
+    "live_stale_after_sec": 60,
     "log_directory": "",
     "minute_bar_limit": 5,
     "minute_order": "near_first",

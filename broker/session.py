@@ -556,7 +556,7 @@ class BrokerSession:
     def can_trade(self) -> bool:
         return self.cabinet_token().scope.can_trade
 
-    def require_trade_rights(self) -> None:
+    def require_trade_rights(self, *, reread: bool = False) -> None:
         """Предохранитель боевого режима: на токене для чтения он не включается.
 
         Пункт приёмки Э1-4 (`/risk`): «тип токена определяется, боевой режим
@@ -574,8 +574,15 @@ class BrokerSession:
         Зовётся **перед каждой командой** пишущего пути (`_command`), а не один
         раз при включении боя: токен заменяют на ходу, и замена на токен для
         чтения не должна оставить робота с разрешением, выданным прежнему.
+
+        :param reread: прочитать файл токена заново, а не взять прочитанное
+            однажды за сеанс (`D-175`). Пишущий путь перечитывает всегда:
+            подмена файла на токен для чтения отнимает торговлю на следующей
+            же команде, а не после перезапуска. Перечитанное **не заменяет**
+            токен сеанса: обмен идёт прежним до перезапуска, проверка прав —
+            по тому, что лежит в файле сейчас.
         """
-        stored = self.stored()
+        stored = self._store.load() if reread else self.stored()
         scope = stored.token.scope
         if not scope.can_trade:
             source = "по самому токену" if stored.scope_from_token else "по файлу настроек"
@@ -857,7 +864,8 @@ class BrokerSession:
         """Пишущий путь: **шаблон из шести шагов, порядок которых и есть защита.**
 
         1. Пара в `WRITE_ENDPOINTS` — иначе отказ без единого запроса.
-        2. Права токена (`require_trade_rights`): токен для чтения — `ReadOnlyToken`.
+        2. Права токена (`require_trade_rights`), файл перечитан (`D-175`):
+           токен для чтения — `ReadOnlyToken`.
         3. Адрес, погашенный ответом шлюза в этом сеансе, — `WrongAddress`.
         4. Рабочий токен — **до** записи журнала: отказ обмена не оставляет
            в журнале команду, которая не уходила.
@@ -873,7 +881,7 @@ class BrokerSession:
         перевооружениям тейка — план §2.9).
         """
         self._guard_write(path)
-        self.require_trade_rights()
+        self.require_trade_rights(reread=True)
         if self.address_is_wrong(path):
             raise self._wrong_address_error(_bare(path), repeated=True)
         await self.access_token()

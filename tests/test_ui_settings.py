@@ -2219,6 +2219,13 @@ SAMPLE = Settings(
     time_exit_order=TimeExitKind.MARKET,
     time_exit_limit_steps=7,
     time_exit_wait_bars=3,
+    # Ожидания боевого исполнителя (вкладка «Бой»).
+    live_stale_after_sec=90,
+    live_event_wait_sec=5,
+    live_fill_wait_sec=45,
+    live_cancel_wait_sec=20,
+    live_position_settle_sec=2.5,
+    live_reconnect_pauses_sec=(2, 4, 8),
     log_directory="/tmp/терминал-логи",
     # ⚠️ Поля календаря в этом окне нет: его правят в своём окне, из меню
     # «Настройки». Но пронести его через обмен окно обязано — иначе «Применить»

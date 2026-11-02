@@ -114,6 +114,10 @@ class TerminalPort(QObject):
     history_finished = Signal(object)     # HistoryLoadOutcome — чем кончилась
     contract_checked = Signal(object)     # ContractNotice — действующий контракт по таблице
     paper_report_ready = Signal(object)   # PaperReport — сделки симуляции из базы
+    #: Снимок боя (`ui.models.LiveView`): доступен ли и почему нет, включён ли,
+    #: позиция «факта», происхождение данных. Окно зеркалит его кнопкой «Бой»
+    #: и строкой рядом — как кнопку связи по `RobotState.connection`.
+    live_changed = Signal(object)         # LiveView
 
     # ⚠️ Два отказа — своими сигналами, а не одним `failed`, и это правило
     # 13 `CLAUDE.md`. `failed` — фраза в строку состояния на 15 секунд; окно
@@ -189,6 +193,15 @@ class TerminalPort(QObject):
         а чем её дать — забота сборки программы (`app/main.py`).
         """
         self._not_connected("Подключение к брокеру" if on else "Отключение от брокера")
+
+    def set_live(self, on: bool) -> None:
+        """Включить или выключить бой: заявки «факта» уходят брокеру на счёт.
+
+        Окно не решает, можно ли: доступность и причины приходят снимком
+        (`live_changed`), и итог команды — тоже снимком, а не нажатием.
+        Подтверждение у человека окно спрашивает **до** команды.
+        """
+        self._not_connected("Включение боя" if on else "Выключение боя")
 
     def apply_settings(self, settings: Settings) -> None:
         """Отдать новые настройки.

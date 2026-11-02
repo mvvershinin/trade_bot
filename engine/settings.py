@@ -452,6 +452,12 @@ class EngineSettings:
             start_percent=self.trailing_start_percent,
             offset_percent=self.trailing_offset_percent,
             step_percent=self.trailing_step_percent,
+            # Уровень неподвижного тейка — на сетке шага, от рынка (0066, Р1):
+            # иначе боевой тейк лимитной заявкой биржа не примет, а прогон
+            # судил бы касание не тем уровнем, что стоит у брокера. Включено
+            # владельцем счёта 01.11.2026; 4 образца из 8 (неподвижный тейк)
+            # переписаны `tools/golden_deals.py --rewrite --reason`.
+            price_step=self.price_step,
         )
 
     def __post_init__(self) -> None:

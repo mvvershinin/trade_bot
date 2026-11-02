@@ -63,9 +63,18 @@ from ui.confirm_changes import confirm_changes
 from ui.contract_banner import ContractBar
 from ui.debug_panel import DebugPanel
 from ui.export import decisions_table, trades_table, write_csv
-from ui.formatting import MSK, fmt_time
+from ui.formatting import MSK, fmt_time, fmt_volume
 from ui.history_dialog import HistoryDialog
 from ui.journals import JournalTabs
+from ui.live_control import (
+    LIVE_OFF_LABEL,
+    LIVE_ON_LABEL,
+    live_look,
+    live_mode_off_question,
+    live_off_question,
+    live_on_question,
+    unguarded_question,
+)
 from ui.models import (
     AlgorithmOption,
     BacktestOptions,
@@ -78,6 +87,7 @@ from ui.models import (
     HistoryFacts,
     HistoryLoadOutcome,
     Layer,
+    LiveView,
     Marker,
     Mode,
     PriceLevel,
@@ -114,6 +124,36 @@ UNPIN_HINT = (
     "То же самое делает кнопка «Вернуться к текущим данным»."
 )
 TOKEN_WARNING_DAYS = 10
+
+#: Подсказка пункта «Загрузить историю…» в обычном виде.
+HISTORY_HINT = (
+    "Скачать свечи с Московской биржи и положить их в базу программы. "
+    "Заявки при этом никуда не уходят, токен брокера не нужен. "
+    "Перед загрузкой окно покажет, что уже есть в базе и что "
+    "изменится."
+)
+#: Почему загрузка истории недоступна, пока бой включён или включается.
+#: Решение владельца 01.11.2026 (0066, аудит /risk Н8): загрузка пишет в ту же
+#: базу минуток, по которой сторож боя судит касание уровня.
+HISTORY_IN_COMBAT = (
+    "Загрузка истории в бою недоступна: выключите бой. Бой этим пунктом "
+    "не прерывается."
+)
+
+#: Подсказка пункта «Прогон на истории…» в обычном виде.
+BACKTEST_HINT = (
+    "Прогнать робота по прошлым свечам из базы и получить отчёт: "
+    "список сделок, итог по деньгам, метки входов и выходов "
+    "на графике. Заявки при этом никуда не уходят."
+)
+#: Почему прогон на отрезке истории недоступен, пока бой включён или
+#: включается. Решение владельца 01.11.2026 (0066, аудит /risk R5): прогон
+#: закрепляет показ на прошлом отрезке, а бой идёт по текущим барам —
+#: вместе их не бывает, и прерывать ради прогона бой окно не станет.
+BACKTEST_IN_COMBAT = (
+    "Прогон на истории недоступен в бою: выключите бой, чтобы прогнать "
+    "отрезок истории. Бой этим пунктом не прерывается."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +467,9 @@ class MainWindow(QMainWindow):
     #: по тому же доводу, что `_loading`: строка неизменяемая, а сборка окна
     #: стоит на пределе длины.
     _missing_data: str = ""
+    #: Последний снимок боя (`TerminalPort.live_changed`). `None` — порт ещё
+    #: не ответил. У класса — по тому же доводу, что `_loading`.
+    _live: LiveView | None = None
 
     def __init__(
         self,
@@ -597,6 +640,7 @@ class MainWindow(QMainWindow):
         bar.addSeparator()
         bar.addWidget(QLabel("  Режим:  "))
         bar.addWidget(self.mode_box)
+        self._build_live_action(bar)
         bar.addSeparator()
         bar.addAction(self.settings_action)
         bar.addAction(self.recent_action)
@@ -651,6 +695,24 @@ class MainWindow(QMainWindow):
         self.stream_action.setCheckable(True)
         self.stream_action.setToolTip(look.tooltip)
         self.stream_action.toggled.connect(self.port.stream)
+
+    def _build_live_action(self, bar: QToolBar) -> None:
+        """Кнопка «Бой» рядом с режимом и строка о её состоянии справа.
+
+        Рядом с режимом, а не со «Стартом»: режим говорит, **что** робот
+        делает, бой — **куда** уходят его заявки. Строка рядом нужна потому,
+        что подсказку читают, наведя мышь, а причину погасшей кнопки человек
+        обязан видеть сразу (правило 13).
+        """
+        self.live_action = QAction(LIVE_ON_LABEL, self)
+        self.live_action.setCheckable(True)
+        self.live_action.triggered.connect(self.request_live)
+        self.live_note = QLabel()
+        self.live_note.setTextFormat(Qt.TextFormat.PlainText)
+        bar.addSeparator()
+        bar.addAction(self.live_action)
+        bar.addWidget(self.live_note)
+        self._mirror_live(None)
 
     def _build_view_actions(self) -> None:
         """Настройки, календарь, возврат к текущим данным и выбор режима.
@@ -724,14 +786,11 @@ class MainWindow(QMainWindow):
         #: это можно было только командой в консоли, которой на его машине
         #: нет (`B-024`).
         self.history_action = QAction("Загрузить историю…", self)
-        self.history_action.setToolTip(
-            "Скачать свечи с Московской биржи и положить их в базу программы. "
-            "Заявки при этом никуда не уходят, токен брокера не нужен. "
-            "Перед загрузкой окно покажет, что уже есть в базе и что "
-            "изменится."
-        )
+        self.history_action.setToolTip(HISTORY_HINT)
         self.history_action.triggered.connect(self.open_history)
         program.addAction(self.history_action)
+        # Подсказка погашенного пункта говорит почему (в бою, `_gate_history`).
+        program.setToolTipsVisible(True)
         program.addSeparator()
         export_action = QAction("Выгрузить журналы…", self)
         export_action.triggered.connect(self.export_journals)
@@ -770,13 +829,13 @@ class MainWindow(QMainWindow):
         #: предупреждение внутри диалога.
         settings_menu.addSeparator()
         self.backtest_action = QAction("Прогон на истории…", self)
-        self.backtest_action.setToolTip(
-            "Прогнать робота по прошлым свечам из базы и получить отчёт: "
-            "список сделок, итог по деньгам, метки входов и выходов "
-            "на графике. Заявки при этом никуда не уходят."
-        )
+        self.backtest_action.setToolTip(BACKTEST_HINT)
         self.backtest_action.triggered.connect(self.open_backtest)
         settings_menu.addAction(self.backtest_action)
+        # Подсказка погашенного пункта — единственное место, где сказано,
+        # почему он погашен (в бою, `_gate_backtest`); меню её по умолчанию
+        # не показывает.
+        settings_menu.setToolTipsVisible(True)
 
 
         self.help_menu = self.menuBar().addMenu("Справка")
@@ -815,6 +874,7 @@ class MainWindow(QMainWindow):
         port.history_progress.connect(self._on_history_progress)
         port.history_finished.connect(self.show_history_result)
         port.paper_report_ready.connect(self.show_paper_report)
+        port.live_changed.connect(self.show_live)
 
     # ---------------------------------------------------------------- показ
 
@@ -857,6 +917,7 @@ class MainWindow(QMainWindow):
         self.status_panel.apply_state(self._state)
         self._update_banners(self._state)
         self._paint_missing_data()
+        self._mirror_live(self._live)
 
     def show_missing_data(self, text: str) -> None:
         """Плашка «данных нет» над графиком: текст готовый, окно его не сочиняет.
@@ -1153,7 +1214,20 @@ class MainWindow(QMainWindow):
         mode = self.mode_box.itemData(index)
         if mode is None:
             return
-        if mode is Mode.OFF and self._state.position is not None:
+        live = self._live
+        # ⚠️ Только в идущем бою: текст говорит, что программа продолжает
+        # сторожить застывший уровень, а это верно, лишь пока бой собран.
+        if mode is Mode.OFF and live is not None and live.on and live.position is not None:
+            # В бою — про позицию у брокера и про то, чем её уровни живут
+            # без управления робота (решение 0066), а не общий текст.
+            if not self.ask(
+                "Позиция у брокера останется без управления",
+                live_mode_off_question(live),
+                "Выключить робота",
+            ):
+                self.apply_state(self._state)  # вернуть список к прежнему режиму
+                return
+        elif mode is Mode.OFF and self._state.position is not None:
             agreed = self._confirm_unattended(
                 "Позиция останется без присмотра",
                 "Режим «Выключен» её не закрывает — это сделано намеренно, чтобы "
@@ -1166,6 +1240,130 @@ class MainWindow(QMainWindow):
                 return
         self.port.set_mode(mode)
 
+    # ------------------------------------------------------------------- бой
+
+    def _fact_concern(self) -> LiveView | None:
+        """Снимок, по которому надо спросить о позиции у брокера; `None` — не о чем.
+
+        Спросить есть о чём, когда позиция открыта **или не прочитана**:
+        позиции нет, а оговорка есть — портфель при остановке боя
+        не прочитался, позиции может и не быть, но проверить её надо, и вопрос
+        перед «Выключить бой», «Стопом» и закрытием окна это говорит.
+        """
+        live = self._live
+        if live is None or (live.position is None and not live.position_note):
+            return None
+        return live
+
+    def _live_busy(self) -> bool:
+        """Бой включён или включается — прогону на отрезке истории не время (R5)."""
+        live = self._live
+        return live is not None and (live.on or live.wanted)
+
+    def _gate_history(self) -> None:
+        """«Загрузить историю…» гаснет на время загрузки и в бою (Н8) — одним правилом.
+
+        Одно место решает доступность: врозь «загрузка кончилась» включала бы
+        пункт обратно посреди боя.
+        """
+        busy = self._live_busy()
+        self.history_action.setEnabled(self._loading is None and not busy)
+        self.history_action.setToolTip(HISTORY_IN_COMBAT if busy else HISTORY_HINT)
+        self.history_action.setStatusTip(HISTORY_IN_COMBAT if busy else "")
+
+    def _gate_backtest(self) -> None:
+        """Пункт «Прогон на истории…» гаснет в бою, и подсказка говорит почему."""
+        busy = self._live_busy()
+        self.backtest_action.setEnabled(not busy)
+        hint = BACKTEST_IN_COMBAT if busy else BACKTEST_HINT
+        self.backtest_action.setToolTip(hint)
+        self.backtest_action.setStatusTip(BACKTEST_IN_COMBAT if busy else "")
+
+    def show_live(self, view: LiveView) -> None:
+        """Снимок боя: кнопка, строка рядом, позиция «факта», подпись слоя.
+
+        Подпись слоя «Факт» — из данных снимка (`fact_origin`), пока «факт»
+        собран (`on`); режим окна здесь не спрашивается (`D-172`).
+        """
+        self._live = view
+        self._mirror_live(view)
+        self._gate_backtest()
+        self._gate_history()
+        self.status_panel.apply_live(view)
+        self.chart.set_fact_origin(view.fact_origin if view.on else None)
+
+    def _mirror_live(self, view: LiveView | None) -> None:
+        """Кнопка и строка — по снимку, а не по нажатию (как `_mirror_stream`).
+
+        ⚠️ Без блокировки `setChecked()` поднял бы `toggled`; кнопка слушает
+        `triggered` — только руку человека, — но блокировка оставлена: снимок
+        показывается, а не исполняется. Отказ включить разжимает кнопку
+        следующим снимком (`wanted` остаётся ложным).
+        """
+        wanted = view is not None and view.wanted
+        with QSignalBlocker(self.live_action):
+            self.live_action.setChecked(wanted)
+        self.live_action.setText(LIVE_OFF_LABEL if wanted else LIVE_ON_LABEL)
+        # Выключить можно всегда, когда просили включить; включить — только
+        # когда порт сказал «доступен».
+        self.live_action.setEnabled(view is not None and (view.available or wanted))
+        look = live_look(view)
+        self.live_action.setToolTip(look.tooltip)
+        # Строка в панели — одна и не длиннее шестидесяти знаков шрифта
+        # панели: длинная раздвинула бы панель за край окна. Целиком — в подсказке.
+        metrics = self.live_note.fontMetrics()
+        self.live_note.setText(metrics.elidedText(
+            look.text, Qt.TextElideMode.ElideRight, metrics.averageCharWidth() * 60
+        ))
+        self.live_note.setToolTip(look.tooltip)
+        self.live_note.setVisible(bool(look.text))
+        self.live_note.setStyleSheet(
+            f"color: {getattr(self.theme, look.colour)}; padding-left: 6px;"
+            + (" font-weight: 600;" if look.colour == "danger" else "")
+        )
+
+    def request_live(self, checked: bool) -> None:
+        """Человек нажал «Бой». Включение — только после вопроса.
+
+        Кнопка сразу возвращается к последнему снимку: нажатие — просьба,
+        а не состояние. Состояние приедет снимком порта.
+        """
+        view = self._live
+        self._mirror_live(view)
+        if checked:
+            if view is None or not view.available:
+                return
+            question = live_on_question(
+                fmt_volume(float(self._settings.volume)) + " контр.",
+                self._state.instrument,
+            )
+            if self.ask("Включить бой", question, "Включить бой"):
+                self.port.set_live(True)
+            return
+        concern = self._fact_concern()
+        if concern is not None and not self.ask(
+            "Выключить бой: позиция робота у брокера",
+            live_off_question(concern),
+            "Выключить бой",
+        ):
+            return
+        self.port.set_live(False)
+
+    def ask(self, title: str, text: str, yes: str) -> bool:
+        """Вопрос с двумя кнопками: «{yes}» и «Отмена». По умолчанию — отмена.
+
+        Своими словами на кнопках, а не «Да»/«Нет»: человек видит на кнопке
+        то, что случится. Отдельным методом — чтобы проверки подменяли его,
+        а не модальное окно, которое ждало бы человека вечно.
+        """
+        box = QMessageBox(QMessageBox.Icon.Warning, title, text, parent=self)
+        agree = box.addButton(yes, QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        return box.clickedButton() is agree
+
     def request_stop(self) -> None:
         """«Стоп» при открытой позиции — с тем же вопросом, что и «Выключен».
 
@@ -1175,6 +1373,18 @@ class MainWindow(QMainWindow):
         окна не закрывает. Разная громкость у одинаковых последствий читается
         как «здесь опасно, а здесь нет».
         """
+        # В бою «Стоп» выключает бой (решение владельца 01.11.2026, 0066:
+        # `HistoryPort.stop` = `set_live(False)`), и вопрос — тот же, что
+        # у выключения боя: кнопка называет то, что случится.
+        concern = self._fact_concern()
+        if concern is not None:
+            if self.ask(
+                "Выключить бой: позиция робота у брокера",
+                live_off_question(concern, by_stop=True),
+                "Выключить бой",
+            ):
+                self.port.stop()
+            return
         if self._state.position is not None and not self._confirm_unattended(
             "Позиция останется без присмотра",
             "Остановка робота позицию не закрывает — это сделано намеренно, чтобы "
@@ -1363,6 +1573,9 @@ class MainWindow(QMainWindow):
         Qt — то есть замереть на открытии меню, и тем дольше, чем больше
         накоплено истории.
         """
+        if self._live_busy():
+            self.show_error(BACKTEST_IN_COMBAT)
+            return
         self.statusBar().showMessage("Читаю, что есть в базе…", 3000)
         self.port.request_backtest_options()
 
@@ -1438,6 +1651,11 @@ class MainWindow(QMainWindow):
             # пережил бы закрытие и остался в памяти вместе с полями.
             dialog.deleteLater()
         if request is None:
+            return
+        # Бой мог включиться, пока окно прогона было открыто: прогон
+        # не запускается, бой не трогается (R5).
+        if self._live_busy():
+            self.show_error(BACKTEST_IN_COMBAT)
             return
         # ⚠️ Настройки прогона здесь НЕ запоминаются как действующие: их
         # принимает порт, и принятые придут эхом `settings_applied`. До
@@ -1620,6 +1838,9 @@ class MainWindow(QMainWindow):
         синхронно значило бы замереть на открытии меню, и тем дольше, чем
         больше накоплено истории.
         """
+        if self._live_busy():
+            self.show_error(HISTORY_IN_COMBAT)
+            return
         self.statusBar().showMessage("Смотрю, что уже есть в базе…", 3000)
         self.port.request_history_facts(self._settings.instrument)
 
@@ -1654,6 +1875,11 @@ class MainWindow(QMainWindow):
                 "например, MXZ6. Загружать нечего."
             )
             return
+        # Бой мог включиться, пока окно загрузки было открыто: загрузка
+        # не запускается, бой не трогается (Н8).
+        if self._live_busy():
+            self.show_error(HISTORY_IN_COMBAT)
+            return
         self._start_loading(request.symbol)
         self.port.load_history(request)
 
@@ -1676,7 +1902,6 @@ class MainWindow(QMainWindow):
         минуту назад.
         """
         self._close_loading()
-        self.history_action.setEnabled(False)
         # Ноль в `_bar`: полоска показывается сразу, а не через штатные
         # 4 секунды Qt. Первый запрос к бирже идёт секунды, и всё это время
         # окно выглядело бы просто замершим.
@@ -1686,6 +1911,7 @@ class MainWindow(QMainWindow):
             self.port.cancel_history_load,
         )
         self._loading = dialog
+        self._gate_history()
         dialog.show()
 
     def _on_history_progress(self, percent: int, what: str) -> None:
@@ -1735,8 +1961,8 @@ class MainWindow(QMainWindow):
 
     def _close_loading(self) -> None:
         """Убрать полоску загрузки, если она была. Повторный вызов безвреден."""
-        self.history_action.setEnabled(True)
         dialog, self._loading = self._loading, None
+        self._gate_history()
         if dialog is None:
             return
         # ⚠️ Отключение сигнала обязательно и стоит **до** закрытия: `close()`
@@ -1950,10 +2176,31 @@ class MainWindow(QMainWindow):
         Тихий выход недопустим: закрытая программа не делает переворот
         и не закрывает позицию по концу окна, а позиция на счёте остаётся.
 
+        В бою вопрос — про позицию **«факта»** из снимка боя (план §12, С8):
+        это позиция у брокера на настоящем счёте, и скользящий уровень у неё
+        сторожит программа, которую сейчас закрывают. Вопрос один — второй
+        про ту же позицию был бы повтором.
+
         ⚠️ Чего закрытие программы **не** отменяет — вооружённого тейка:
         это заявка у брокера, она переживает и выключение робота, и выход
         из программы (решение 0008). Прежний текст обещал обратное.
         """
+        concern = self._fact_concern()
+        if concern is not None:
+            if self.ask(
+                "Закрыть окно: позиция робота у брокера",
+                unguarded_question(
+                    concern,
+                    "Закрытие программы позицию не закрывает и бой не выключает "
+                    "у брокера: заявки просто перестанут подаваться.",
+                    "Закрыть окно?",
+                ),
+                "Закрыть окно",
+            ):
+                event.accept()
+            else:
+                event.ignore()
+            return
         if self._state.position is not None and not self._confirm_unattended(
             "Открыта позиция",
             "Закрытие программы позицию не закрывает — это сделано намеренно, "

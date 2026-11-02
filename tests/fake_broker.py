@@ -26,6 +26,20 @@ HTTP — `httpx.MockTransport` (вызов объекта — обработчи
 состояние для `GET` статуса. Пока открытого сокета нет, события теряются
 (`lost`): повтора после переподключения в документации нет (план §5).
 
+**Портфель** (шаг 2, 28.10.2026) — позиция по книге: исполненное купленное
+минус проданное, плюс `outside` — то, что сделано мимо программы (руками
+из приложения брокера, принудительное закрытие). Форма — массив записей
+страницы 04 (`futuresHolding`). ⚠️ Адрес — из `broker/session.py`, а не со
+страницы снимка: страница 04 называет сервис `trade-api-bff-limit`, код —
+`trade-api-bff-portfolio` (`BACKLOG.md`); подделка ходит туда, куда ходит
+сессия, и расхождение не проверяет.
+
+Что ещё умеет тест: исполнить заявку сразу при создании (`on_create`),
+отклонить принятую (`reject`, `orderStatus 8`), снять не по нашей команде
+(`cancel_outside`), заглушить поток (`muted`: события теряются, как при
+обрыве, а сокет жив), прислать сделку по заявке, поданной не программой
+(`foreign_trade`).
+
 Пример (сессия — `BrokerSession` с `client=broker.client()`)::
 
     broker = FakeBroker()
@@ -48,7 +62,7 @@ from uuid import UUID
 import httpx
 import websockets
 
-from broker.session import AUTH_URL
+from broker.session import AUTH_URL, PORTFOLIO_PATH
 from tests.test_broker_session import ORDER_ENDPOINTS, READING_AROUND_ORDERS, good_auth
 
 #: Пары — со страниц снимка (через проверенные литералы `tests/test_broker_session.py`).
@@ -228,11 +242,23 @@ class FakeBroker:
         self.lost: list[str] = []
         #: Наибольшее число живых заявок за всё время — «в любой момент» плана §8 №4.
         self.peak_live = 0
+        #: Позиция, изменённая мимо программы: со знаком, по всем тикерам книги.
+        self.outside = 0
+        #: Что сделать с заявкой сразу после приёма (исполнить, отклонить).
+        self.on_create: Callable[[BookOrder], None] | None = None
+        #: Поток молчит: кадры уходят в `lost`, сокет при этом жив.
+        self.muted = False
+        #: Время транзакции событий. `None` — часы подделки (`_EPOCH` плюс
+        #: секунда на кадр); ход по ряду (2в) ставит сюда часы ряда.
+        self.clock: Callable[[], datetime] | None = None
+        #: Номер договора в портфеле (04, `agreementId`).
+        self.account = "FAKE-ACCOUNT-1"
         self._numbers = itertools.count(1)
         self._routes: dict[tuple[str, str], Callable[[httpx.Request], httpx.Response]] = {
             CREATE: self._create,
             CANCEL: self._cancel,
             STATUS: self._status,
+            ("GET", PORTFOLIO_PATH): self._portfolio,
         }
 
     # --- HTTP ---
@@ -276,6 +302,8 @@ class FakeBroker:
             self.orders.append(order)
             self._note_live()
             self._emit(order, execution_type="0")
+            if self.on_create is not None:
+                self.on_create(order)
         return answer.reply(request, key)
 
     def _cancel(self, request: httpx.Request) -> httpx.Response:
@@ -302,6 +330,28 @@ class FakeBroker:
             200,
             json={"clientOrderId": key, "originalClientOrderId": key, "data": order.reports},
         )
+
+    def _portfolio(self, request: httpx.Request) -> httpx.Response:
+        """Портфель (04): денежная запись и позиция по каждому тикеру книги."""
+        rows: list[dict[str, object]] = [
+            {
+                "type": "moneyLimit", "ticker": "RUB", "quantity": 1_000_000.0,
+                "agreementId": self.account,
+            }
+        ]
+        tickers = {order.ticker for order in self.orders} or {"MXZ6"}
+        for ticker in sorted(tickers):
+            quantity = self.position(ticker)
+            if quantity:
+                row: dict[str, object] = {
+                    "type": "futuresHolding", "ticker": ticker, "board": "SPBFUT",
+                    "quantity": quantity,
+                }
+                average = self.average_price(ticker)
+                if average is not None:
+                    row["averagePrice"] = average  # 04: средняя цена позиции
+                rows.append(row)
+        return httpx.Response(200, json=rows)
 
     # --- поток статусов ---
 
@@ -330,6 +380,20 @@ class FakeBroker:
         """Прислать последнее событие ещё раз: поток вправе повторять (план §2.10)."""
         self._deliver(self.frames[-1])
 
+    def send_frame(self, frame: str) -> None:
+        """Прислать в поток кадр, которого книга сама не шлёт (поле пропущено, статус без цены)."""
+        self._deliver(frame)
+
+    def replace_route(
+        self,
+        route: tuple[str, str],
+        handler: Callable[[httpx.Request], httpx.Response],
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        """Подменить ответ на один адрес (портфель отстал, пришёл негодным). Возврат — прежний."""
+        previous = self._routes[route]
+        self._routes[route] = handler
+        return previous
+
     # --- что делает тест ---
 
     def execute(self, key: str, quantity: int, price: float) -> None:
@@ -349,6 +413,69 @@ class FakeBroker:
             execution={"executionId": f"FAKE-EXEC-{next(self._numbers)}", "lastQuantity": quantity},
         )
         self._note_live()
+
+    def reject(self, key: str, reason: str) -> None:
+        """Биржа отклонила уже принятую заявку (`orderStatus 8`) с причиной словами."""
+        order = self._living(key)
+        order.status = "8"
+        self._emit(order, execution_type="8", extra={"rejectReason": reason})
+        self._note_live()
+
+    def cancel_outside(self, key: str) -> None:
+        """Заявку сняли не мы: биржа, брокер, руками из приложения (`orderStatus 4`)."""
+        order = self._living(key)
+        order.status = "4"
+        self._emit(order, execution_type="4")
+
+    def foreign_trade(self, side: str, quantity: int, price: float, ticker: str = "MXZ6") -> str:
+        """Сделка по заявке, поданной не программой: ключа программа не знает."""
+        key = f"{next(self._numbers):08d}-0000-4000-8000-000000000000"
+        order = BookOrder(
+            key=key, side=side, order_type="1", quantity=quantity, ticker=ticker,
+            class_code="SPBFUT", price=None, exchange_id=f"FAKE-EXCH-{next(self._numbers)}",
+        )
+        self.orders.append(order)
+        self.execute(key, quantity, price)
+        return key
+
+    def position(self, ticker: str = "MXZ6") -> int:
+        """Позиция у брокера: купленное минус проданное по книге плюс `outside`."""
+        signed = sum(
+            order.executed if order.side == "1" else -order.executed
+            for order in self.orders
+            if order.ticker == ticker
+        )
+        return signed + self.outside
+
+    def average_price(self, ticker: str = "MXZ6") -> float | None:
+        """Средняя цена открытой позиции по книге: лоты «первым вошёл — первым вышел».
+
+        Позиция мимо книги (`outside`) цены не имеет — тогда `None`.
+        """
+        if self.outside:
+            return None
+        lots: list[list[float]] = []  # [объём со знаком, цена]
+        for order in self.orders:
+            if order.ticker != ticker or not order.executed:
+                continue
+            left: float = order.executed if order.side == "1" else -order.executed
+            price = order.turnover / order.executed
+            while left and lots and lots[0][0] * left < 0:
+                take = min(abs(left), abs(lots[0][0]))
+                lots[0][0] += take if lots[0][0] < 0 else -take
+                left += take if left < 0 else -take
+                if not lots[0][0]:
+                    lots.pop(0)
+            if left:
+                lots.append([left, price])
+        volume = sum(abs(lot[0]) for lot in lots)
+        return None if not volume else sum(abs(lot[0]) * lot[1] for lot in lots) / volume
+
+    def _living(self, key: str) -> BookOrder:
+        order = self.order(key)
+        if order is None or not order.live:
+            raise AssertionError(f"заявка {key} не жива в книге")
+        return order
 
     # --- что видит тест ---
 
@@ -375,9 +502,13 @@ class FakeBroker:
         *,
         execution_type: str,
         execution: dict[str, object] | None = None,
+        extra: dict[str, object] | None = None,
     ) -> None:
         """Сообщение о заявке (11, 24): в историю статуса и кадром в поток."""
-        moment = _EPOCH + timedelta(seconds=len(self.frames) + 1)
+        moment = (
+            self.clock() if self.clock is not None
+            else _EPOCH + timedelta(seconds=len(self.frames) + 1)
+        )
         data: dict[str, object] = {
             "messageType": "8",
             "orderStatus": order.status,
@@ -390,13 +521,15 @@ class FakeBroker:
             "orderQuantity": order.quantity,
             "executedQuantity": order.executed,
             "remainedQuantity": order.quantity - order.executed,
-            "transactionTime": moment.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "transactionTime": moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
         if order.price is not None:
             data["price"] = order.price
         if execution is not None:
             data.update(execution)
             data["averagePrice"] = order.turnover / order.executed
+        if extra is not None:
+            data.update(extra)
         order.reports.append(data)
         # Форма кадра — пример страницы 24: ключ в `originalClientOrderId`,
         # `clientOrderId` пуст.
@@ -405,7 +538,7 @@ class FakeBroker:
         self._deliver(frame)
 
     def _deliver(self, frame: str) -> None:
-        listening = [socket for socket in self.sockets if socket.open]
+        listening = [socket for socket in self.sockets if socket.open and not self.muted]
         if not listening:
             self.lost.append(frame)
         for socket in listening:

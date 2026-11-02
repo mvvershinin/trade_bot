@@ -53,6 +53,7 @@ from engine import (
     Mode,
     OrderAction,
     OrderRequest,
+    PriceSeen,
     Refusal,
     Reversal,
     Side,
@@ -422,32 +423,24 @@ def test_an_executor_that_never_stops_talking_halts_the_robot() -> None:
     и потому добавляют круги — порог выбран с запасом и на них
     (`engine/runner.py::_MAX_ROUNDS`).
 
-    ⚠️ Сделка здесь **сопоставляется** со своей заявкой и отвергается
-    по содержанию — сторона другая. Такая сделка заявку в полёте не гасит
-    и робота не останавливает, поэтому поток и получается бесконечным.
-    Сделка вообще без заявки остановила бы движок на первом же круге,
-    и до предохранителя дело бы не дошло.
+    ⚠️ Бесконечный поток здесь — **наблюдения цены**, а не сделки. Раньше
+    это была сделка, сопоставленная со своей заявкой и отвергнутая
+    по содержанию (сторона другая): она робота не останавливала. С решения
+    0066 (Р6) такая сделка — частичное или чужое исполнение — останавливает
+    робота на первом же круге (`engine/pipeline.py::apply_fill`), и до
+    предохранителя дело бы не дошло. Наблюдение цены без позиции не меняет
+    ничего и не останавливает ничего — поток из них и есть «исполнитель
+    не замолкает» в чистом виде.
     """
-    entry = OrderRequest(
-        action=OrderAction.OPEN, side=Side.LONG, volume=1.0,
-        submitted_at=bar(10, 5).closes_at, reason="вход", order_id="open:long:тест",
-    )
-
     class Endless:
         async def submit(self, order: OrderRequest) -> None:
             return None
 
-        async def fills_at(self, market_candle) -> list[Fill]:
-            return [Fill(
-                action=OrderAction.OPEN, side=Side.SHORT, volume=1.0, price=PRICE,
-                at=market_candle.time, order_id=entry.order_id,
-            )]
+        async def fills_at(self, market_candle) -> list[PriceSeen]:
+            return [PriceSeen(at=market_candle.time, price=PRICE)]
 
     lines: list = []
-    engine = Engine(
-        ScriptedStrategy([]), WORKING,
-        state=EngineState(pending=(entry,)), journal=lines.append,
-    )
+    engine = Engine(ScriptedStrategy([]), WORKING, journal=lines.append)
     asyncio.run(engine.on_market_candle(candle(10, 10, close=PRICE), Endless()))
     assert engine.halted
     assert "не сошёлся" in engine.halted

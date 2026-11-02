@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from ui.formatting import EMPTY, fmt_money, fmt_percent, fmt_price, fmt_volume
-from ui.models import Connection, RobotState
+from ui.models import Connection, LivePositionView, LiveView, RobotState, Side
 from ui.notices import Context, guard_note
 from ui.theme import Theme, current as current_theme, text_on
 
@@ -85,6 +87,21 @@ class StatusPanel(QFrame):
         self.position = _Cell("Позиция")
         self.profit = _Cell("Прибыль за день")
         self.commission = _Cell("Комиссия за день")
+        #: Позиция «факта» — то, что робот считает открытым у брокера. Видна
+        #: только в бою (`apply_live`): в симуляции у брокера робот ничего
+        #: не открывает, и пустая ячейка читалась бы как «позиции нет».
+        self.fact = _Cell("Позиция у брокера")
+        self.fact.setVisible(False)
+        #: Оговорка под позицией: позиция не свежая — запомнена на момент
+        #: остановки, прочитана у брокера иначе, чем считал робот, или
+        #: не прочитана вовсе. Коротко, предупреждающим цветом; целиком —
+        #: в подсказке. Пусто — позиция живая, строки нет.
+        self.fact_note = QLabel()
+        self.fact_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.fact_note.setVisible(False)
+        fact_layout = self.fact.layout()
+        if fact_layout is not None:
+            fact_layout.addWidget(self.fact_note)
 
         self.regime = QLabel("СИМУЛЯЦИЯ")
         self.regime.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -97,7 +114,7 @@ class StatusPanel(QFrame):
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(0)
         for cell in (self.instrument, self.connection, self.mode,
-                     self.position, self.profit, self.commission):
+                     self.position, self.fact, self.profit, self.commission):
             layout.addWidget(cell)
         layout.addStretch(1)
         layout.addWidget(self.regime)
@@ -107,7 +124,7 @@ class StatusPanel(QFrame):
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
         for cell in (self.instrument, self.connection, self.mode,
-                     self.position, self.profit, self.commission):
+                     self.position, self.fact, self.profit, self.commission):
             cell.caption.setStyleSheet(f"color: {theme.text_dim};")
 
     def apply_state(self, state: RobotState) -> None:
@@ -190,3 +207,97 @@ class StatusPanel(QFrame):
                 " border-radius: 3px; padding: 4px 10px;"
             )
             self.regime.setToolTip("Заявки уходят на биржу. Сделки настоящие.")
+
+    def apply_live(self, view: LiveView) -> None:
+        """Позиция «факта» из снимка боя: сторона, объём, цена входа, уровень.
+
+        Только показ: ни одно число здесь не считается. Ячейка видна, пока
+        бой включён **или у брокера есть позиция робота** — в том числе после
+        остановки боя (аудит /risk 01.11.2026, R4): остановленный бой с лонгом
+        у брокера, показанный пустым местом, читался бы как «позиции нет».
+        """
+        position = view.position
+        note = view.position_note
+        # Позиции нет, а оговорка есть — портфель у брокера не прочитан при
+        # остановке: ячейка видна, позиция «не прочитана», оговорка под ней.
+        self.fact.setVisible(view.on or position is not None or bool(note))
+        self._show_note(note)
+        if position is None and note:
+            self.fact.set("не прочитана", self._theme.warning)
+            self.fact.value.setToolTip(f"{note}\n\n{FACT_POSITION_HINT}")
+            return
+        if position is None:
+            self.fact.set("Нет позиции", self._theme.text_dim)
+            self.fact.value.setToolTip(
+                "Бой включён, позиции у робота у брокера нет."
+            )
+            return
+        side = fact_side(position)
+        full = fact_position_words(position, view.take_note)
+        # Строка позиции — одна и не длиннее ~60 знаков: слова о тейке бывают
+        # длинными. Целиком — в подсказке, первой строкой.
+        metrics = self.fact.value.fontMetrics()
+        self.fact.set(
+            metrics.elidedText(full, Qt.TextElideMode.ElideRight, metrics.averageCharWidth() * 60),
+            self._theme.long if side is Side.LONG else self._theme.short,
+        )
+        self.fact.value.setToolTip("\n\n".join(
+            part for part in (full, view.position_note, FACT_POSITION_HINT) if part
+        ))
+
+    def _show_note(self, note: str) -> None:
+        """Оговорка под позицией: одна строка, обрезанная по ширине; целиком — в подсказке."""
+        self.fact_note.setVisible(bool(note))
+        if not note:
+            return
+        metrics = self.fact_note.fontMetrics()
+        self.fact_note.setText(metrics.elidedText(
+            note, Qt.TextElideMode.ElideRight, metrics.averageCharWidth() * 34
+        ))
+        self.fact_note.setToolTip(note)
+        self.fact_note.setStyleSheet(f"color: {self._theme.warning};")
+
+
+#: Подсказка ячейки «Позиция у брокера».
+FACT_POSITION_HINT = (
+    "Позиция боевого режима — то, что робот считает открытым у брокера "
+    "на вашем счёте. Уровень — неподвижный тейк (лимитная заявка у брокера) "
+    "или скользящий уровень, который сторожит сама программа: пока она "
+    "закрыта или без связи, скользящий уровень не сторожит никто."
+)
+
+
+def fact_side(position: LivePositionView) -> Side:
+    """Сторона по знаку объёма: плюс — лонг, минус — шорт."""
+    return Side.LONG if position.signed > 0 else Side.SHORT
+
+
+#: Что писать вместо цены входа, когда брокер её не назвал: порт отдаёт
+#: `NaN` (аудит /risk, З6), и «по nan» человеку не говорит ничего.
+PRICE_UNNAMED = "цена не названа"
+
+
+def position_head(position: LivePositionView) -> str:
+    """«Лонг 1 по 2 850,00» — сторона, объём, цена входа; без слов о тейке.
+
+    Цены нет (`NaN`, `None`) — «цена не названа», а не число: одно место
+    на шапку и на первую строку вопросов.
+    """
+    price = position.entry_price
+    known = isinstance(price, int | float) and math.isfinite(price)
+    at = f"по {fmt_price(price)}" if known else PRICE_UNNAMED
+    return f"{fact_side(position).label} {fmt_volume(position.volume)} {at}"
+
+
+def fact_position_words(position: LivePositionView, take_note: str = "") -> str:
+    """«Лонг 1 по 2 850,0 · уровень 2 864,0» — одной строкой, для шапки и вопросов.
+
+    `take_note` — слова порта о тейке оставшейся позиции. Непуста — стоит
+    вместо уровня: «уровня нет» по пустому `take_level` здесь было бы
+    неправдой, когда тейк не прочитан или жив по журналу (Н7).
+    """
+    if take_note:
+        return f"{position_head(position)} · {take_note}"
+    if position.take_level is None:
+        return f"{position_head(position)} · уровня нет"
+    return f"{position_head(position)} · уровень {fmt_price(position.take_level)}"

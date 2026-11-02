@@ -1352,6 +1352,8 @@ class FakePort:
         self.halts: list[tuple[str, str]] = []
         #: Границы полноты, подтверждённые догрузкой (`HistoryPort.history_confirmed`).
         self.confirmed: list[tuple[str, datetime]] = []
+        #: Чем собирать боевую сторону (`HistoryPort.attach_live`, Э4 2в).
+        self.desks: object | None = None
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))
@@ -1387,6 +1389,9 @@ class FakePort:
 
     def stream_leads(self, symbol: str, minute: datetime) -> None:
         self.leads.append((symbol, minute))
+
+    def attach_live(self, desks: object) -> None:
+        self.desks = desks
 
     def stream(self, on: bool) -> None:
         """Как настоящий порт: команду передал, причину отказа наружу **не** вернул.
@@ -3588,6 +3593,27 @@ def test_the_assembly_wires_both_the_switch_and_the_retarget(
         "смена инструмента до звена не доходит: поток останется на инструменте, "
         "выбранном при сборке"
     )
+
+
+def test_the_assembly_wires_the_live_desks_without_building_anything(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Бой (Э4 2в): сборка даёт порту, чем собирать исполнитель, — и только это.
+
+    Исполнитель собирается по команде «Включить бой», а не при запуске:
+    при сборке сессии нет, токен не прочитан, и бой честно недоступен
+    словами «подключения нет» — не заявкой и не трассировкой.
+    """
+    from app.live_trading import LiveDesks
+
+    spy = token_store_spy(monkeypatch)
+    port: Any = FakePort()
+    worker: Any = FakeWorker()
+    _live_feed(port, worker, tmp_path / "userdata", Settings(), _arguments([]))
+    assert isinstance(port.desks, LiveDesks), "боевая сторона порту не проведена"
+    refusal = port.desks.refusal()
+    assert refusal is not None and "Подключения к брокеру нет" in refusal, refusal
+    assert not spy, "сборка тронула токен до команды"
 
 
 def _connection_callers() -> set[str]:

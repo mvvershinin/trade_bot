@@ -41,12 +41,13 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import fields
 from typing import cast
 
 from PySide6.QtCore import QEvent, QRect, QSignalBlocker, Qt, QTime, QTimer, Signal
-from PySide6.QtGui import QStandardItemModel
+from PySide6.QtGui import QRegularExpressionValidator, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QButtonGroup,
@@ -76,6 +77,9 @@ from ui.algorithm_dialog import AlgorithmDialog
 from ui.confirm_changes import confirm_changes
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
+    FIELD_CAPTIONS,
+    LIVE_LIMITS_BOUNDS,
+    LIVE_PAUSES_MAX,
     MAX_TIME_EXIT_WAIT_BARS,
     STEP_WAIT,
     AfterTakeProfit,
@@ -171,6 +175,13 @@ _TAB_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Вход и выход", ("_entry_group", "_take_group")),
     ("Торговое окно", ("_time_group",)),
     ("Деньги", ("_volume_group", "_risk_group", "_commission_group")),
+    # Ожидания боевого исполнителя (правило 16, решение 0066). Отдельной
+    # вкладкой, а не на «Программе»: от этих чисел зависит, какие сигналы
+    # пропускаются и когда робот встаёт, — это торговля, а не настройка
+    # программы. Название короткое намеренно: семь вкладок на ширине 720
+    # с «Связью и заявками» не помещались, и «Программа» уезжала за стрелки
+    # (снимок 02.11.2026). Читают эти числа только в бою.
+    ("Бой", ("_live_group",)),
     ("Программа", ("_program_group",)),
 )
 
@@ -238,8 +249,108 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("slippage_steps", "Деньги", "slippage_steps"),
     ("minute_order", "Деньги", "minute_order"),
     ("minute_bar_limit", "Деньги", "minute_bar_limit"),
+    ("live_stale_after_sec", "Бой", "live_stale_after_sec"),
+    ("live_event_wait_sec", "Бой", "live_event_wait_sec"),
+    ("live_fill_wait_sec", "Бой", "live_fill_wait_sec"),
+    ("live_cancel_wait_sec", "Бой", "live_cancel_wait_sec"),
+    ("live_position_settle_sec", "Бой", "live_position_settle_sec"),
+    ("live_reconnect_pauses_sec", "Бой", "live_reconnect_pauses_sec"),
     ("log_directory", "Программа", "log_directory"),
 )
+
+#: Поля «Бой», задаваемые целыми секундами: имя поля `Settings`
+#: равно имени поля окна. Таблица на сборку (`_build_live_fields`), показ
+#: и обмен (`set_values`, `values`): четыре поля одной формы, и пятое,
+#: забытое в одном из трёх мест, вернулось бы к умолчанию на «Применить».
+_LIVE_WHOLE: tuple[str, ...] = (
+    "live_stale_after_sec",
+    "live_event_wait_sec",
+    "live_fill_wait_sec",
+    "live_cancel_wait_sec",
+)
+
+#: С какого момента действует новое значение поля «Бой» — хвост
+#: каждой подсказки. Исполнитель берёт пределы при сборке и на ходу их
+#: не перечитывает (`app/fact.py::LiveLimits`); сборка — включение боя,
+#: «Возобновить работу» и пересборка хода робота. Одной строкой на шесть
+#: полей, а не своей в каждой: шесть копий одного утверждения разошлись бы.
+LIVE_WHEN = (
+    "Новое значение действует не сразу, а с включения боя, с «Возобновить "
+    "работу» или с перезапуска хода робота; идущий бой доживает со старым."
+)
+
+#: Подсказки полей «Бой». Подписи — `FIELD_CAPTIONS`: журнал
+#: «Настройки изменены» называет поле той же подписью, что строка окна.
+#: Хвост `LIVE_WHEN` дописывается при сборке группы (`_live_group`).
+_LIVE_HINTS: dict[str, str] = {
+    "live_stale_after_sec":
+        "Заявка подаётся брокеру, только если с решения робота прошло не больше "
+        "одной свечи и ещё вот столько секунд. Опоздала — заявка не подаётся, "
+        "сигнал пропускается, причина пишется в журнал решений. Так бывает после "
+        "обрыва связи: программа догружает пропущенные свечи, и без этого "
+        "предела подала бы настоящие заявки по прошедшим ценам. Меньше "
+        "значение — строже: при медленной связи пропускается больше сигналов.",
+    "live_event_wait_sec":
+        "Сколько секунд ждать от брокера первого известия о поданной заявке, "
+        "прежде чем спросить о ней самому. Меньше значение — программа раньше "
+        "узнаёт об исполнении, когда известия задерживаются; больше — реже "
+        "спрашивает брокера. Это же время программа ждёт при закрытии, пока "
+        "допишется журнал команд брокеру.",
+    "live_fill_wait_sec":
+        "Сколько секунд ждать, пока рыночная заявка исполнится целиком. "
+        "Не исполнилась — остаток снимается, робот останавливается и зовёт вас: "
+        "позиция у брокера может отличаться от той, что считает робот. Столько "
+        "же робот ждёт, пока биржа примет заявку с предельной ценой (тейк, выход "
+        "по концу окна); не приняла — тоже остановка.",
+    "live_cancel_wait_sec":
+        "Сколько секунд ждать от брокера подтверждения, что заявка снята. "
+        "Не подтвердил — робот останавливается: заявка у брокера, возможно, "
+        "ещё жива, и её надо проверить в приложении брокера.",
+    "live_position_settle_sec":
+        "Брокер иногда показывает позицию с опозданием. Если позиция у брокера "
+        "не совпала с той, что считает робот, программа ждёт столько секунд "
+        "и спрашивает ещё раз. Совпало — работа идёт дальше. Не совпало — робот "
+        "снимает заявки, закрывает позицию по рынку и останавливается. Та же "
+        "пауза — между двумя чтениями позиции перед таким закрытием. Слишком "
+        "малая пауза — риск закрыть позицию из-за опоздания брокера, а не из-за "
+        "настоящего расхождения.",
+    "live_reconnect_pauses_sec":
+        "Через сколько секунд программа снова пробует открыть поток известий "
+        "о заявках после обрыва — по очереди, последнее число повторяется, пока "
+        "связь не вернётся. Пока связи нет, заявки не подаются и сигналы "
+        "пропускаются, причина пишется в журнал решений. Целые секунды через "
+        f"запятую, от 1 до {LIVE_PAUSES_MAX} чисел.",
+}
+
+#: Разделители чисел в поле пауз переподключения: запятая, точка с запятой,
+#: пробелы. Дробей в поле нет — паузы целые, и запятая не спутается
+#: с десятичной.
+_PAUSES_SPLIT = re.compile(r"[\s,;]+")
+
+
+def _live_whole(name: str) -> QSpinBox:
+    """Поле целых секунд «Бой» с границами из `LIVE_LIMITS_BOUNDS`."""
+    low, high = LIVE_LIMITS_BOUNDS[name]
+    return _whole(int(low), int(high), " с")
+
+
+def _pauses_of(text: str) -> tuple[int, ...]:
+    """Паузы переподключения из поля ввода. Не разобралось — пустой набор.
+
+    Пустой набор, а не прежнее значение: подмена на «ОК» была бы изменением,
+    которого человек не делал. Пустой набор не пропускает ни окно
+    (`SettingsDialog.live_error` гасит кнопки), ни проверка при «Применить»
+    (`app/convert.py::live_limits`) — отказ вслух с подписью поля.
+    """
+    parts = [part for part in _PAUSES_SPLIT.split(text.strip()) if part]
+    if not parts or not all(part.isdigit() for part in parts):
+        return ()
+    return tuple(int(part) for part in parts)
+
+
+def _pauses_text(pauses: tuple[int, ...]) -> str:
+    """Паузы переподключения в поле ввода: «1, 2, 5, 10, 30»."""
+    return ", ".join(str(pause) for pause in pauses)
 
 #: Поля-списки: имя поля `Settings` равно имени списка в окне. Одна таблица
 #: на показ (`_show_choices`) и на сбор (`values`).
@@ -606,6 +717,7 @@ class SettingsDialog(QDialog):
         self._build_cost_fields()
         self._build_time_fields()
         self._build_risk_fields()
+        self._build_live_fields()
         self._build_algorithm_row()
 
     def _build_instrument_fields(self) -> None:
@@ -844,6 +956,39 @@ class SettingsDialog(QDialog):
             "проверка на истории отвечает на тот же вопрос, что и бой. "
             "Дни, объявленные нерабочими самой биржей, сюда не попадают "
             "никогда: это факт про мир, а не настройка."
+        )
+
+    def _build_live_fields(self) -> None:
+        """Ожидания боевого исполнителя: четыре целых, пауза и список пауз.
+
+        Границы — `LIVE_LIMITS_BOUNDS`, та же таблица, что проверяет
+        `app/convert.py::live_limits` при «Применить»: окно не даёт ввести
+        то, что откажет проверка, и не держит своей второй пары чисел.
+        """
+        # Имена — явными присваиваниями, а не `setattr` в цикле: поле окна
+        # обязано быть видно проверке типов и поиску по коду.
+        self.live_stale_after_sec = _live_whole("live_stale_after_sec")
+        self.live_event_wait_sec = _live_whole("live_event_wait_sec")
+        self.live_fill_wait_sec = _live_whole("live_fill_wait_sec")
+        self.live_cancel_wait_sec = _live_whole("live_cancel_wait_sec")
+        low, high = LIVE_LIMITS_BOUNDS["live_position_settle_sec"]
+        self.live_position_settle_sec = _decimal(low, high, 0.5, " с", decimals=1)
+        # Список пауз — строкой: число пауз от одной до десяти, и десять полей
+        # ради одного списка — это окно, которое никто не дочитает. Буквы
+        # не вводятся вовсе; негодное число говорится строкой под полем.
+        self.live_reconnect_pauses_sec = QLineEdit()
+        self.live_reconnect_pauses_sec.setPlaceholderText("Например: 1, 2, 5, 10, 30")
+        self.live_reconnect_pauses_sec.setValidator(
+            QRegularExpressionValidator(r"[0-9,;\s]*", self.live_reconnect_pauses_sec)
+        )
+        self.live_reconnect_pauses_sec.textChanged.connect(self._sync_live)
+        self.live_note = _alert()
+        self.live_note.setVisible(False)
+        self.live_scope_note = _hint(
+            "Эти числа действуют только в боевой торговле: проверка на истории "
+            "и наблюдение их не читают. Ни одно не замерено на живом счёте — "
+            "сколько брокер молчит после заявки, пока неизвестно; числа в полях — "
+            "отправная точка."
         )
 
     def _build_risk_fields(self) -> None:
@@ -1342,6 +1487,19 @@ class SettingsDialog(QDialog):
             row = cast("tuple[int, object]", layout.getWidgetPosition(self.time_exit_order))
             layout.insertRow(row[0] + 1, self.time_exit_note)
             layout.addRow(self.calendar_note)
+        return box
+
+    def _live_group(self) -> QGroupBox:
+        """Сколько ждать брокера и что делать, если не дождались."""
+        box = self._group("Ожидание ответов брокера", [
+            (FIELD_CAPTIONS[name], getattr(self, name), f"{_LIVE_HINTS[name]} {LIVE_WHEN}")
+            for name in (*_LIVE_WHOLE, "live_position_settle_sec",
+                         "live_reconnect_pauses_sec")
+        ])
+        layout = box.layout()
+        if isinstance(layout, QFormLayout):
+            layout.insertRow(0, self.live_scope_note)
+            layout.addRow(self.live_note)
         return box
 
     def _program_group(self) -> QGroupBox:
@@ -1911,6 +2069,9 @@ class SettingsDialog(QDialog):
             # self.free_funds_reserve_enabled, self.free_funds_reserve,
             self.commission, self.slippage_steps, self.minute_order,
             self.minute_bar_limit,
+            # «Бой»
+            *(getattr(self, name) for name in _LIVE_WHOLE),
+            self.live_position_settle_sec, self.live_reconnect_pauses_sec,
             # «Программа»
             self.log_directory,
         ]
@@ -1985,6 +2146,12 @@ class SettingsDialog(QDialog):
         self.slippage_steps.setValue(settings.slippage_steps)
         self.time_exit_limit_steps.setValue(settings.time_exit_limit_steps)
         self.time_exit_wait_bars.setValue(settings.time_exit_wait_bars)
+        for name in _LIVE_WHOLE:
+            getattr(self, name).setValue(getattr(settings, name))
+        self.live_position_settle_sec.setValue(settings.live_position_settle_sec)
+        self.live_reconnect_pauses_sec.setText(
+            _pauses_text(settings.live_reconnect_pauses_sec)
+        )
         self.log_directory.setText(settings.log_directory)
         self.window_start.setTime(QTime(settings.window_start.hour, settings.window_start.minute))
         self.window_end.setTime(QTime(settings.window_end.hour, settings.window_end.minute))
@@ -2115,6 +2282,8 @@ class SettingsDialog(QDialog):
             # Календарь окно не правит, а переносит: правится он в своём окне.
             calendar=self._calendar,
             slippage_steps=self.slippage_steps.value(),
+            live_position_settle_sec=self.live_position_settle_sec.value(),
+            live_reconnect_pauses_sec=_pauses_of(self.live_reconnect_pauses_sec.text()),
             log_directory=self.log_directory.text().strip(),
             volume=self.volume.value(),
             # ⚠️ Числа отдаются как стоят, независимо от галочек. «Выключено»
@@ -2134,7 +2303,10 @@ class SettingsDialog(QDialog):
             commission_per_side_rub=(
                 None if self.commission.value() <= 0 else self.commission.value()
             ),
-        ).replace(**chosen)
+        ).replace(
+            **chosen,
+            **{name: getattr(self, name).value() for name in _LIVE_WHOLE},
+        )
 
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
     # def _sync_volume_cap(self, *_: object) -> None:
@@ -2307,10 +2479,37 @@ class SettingsDialog(QDialog):
             )
         return ""
 
+    def live_error(self) -> str:
+        """Почему паузы переподключения отдавать нельзя. Пусто — можно.
+
+        Проверка **не** торговое правило: она повторяет границы
+        `LIVE_LIMITS_BOUNDS`, которые держит `app/convert.py::live_limits`,
+        чтобы владелец счёта увидел отказ в момент ввода, а не после «ОК».
+        Остальные поля вкладки границ не нарушат: их держат сами поля.
+        """
+        pauses = _pauses_of(self.live_reconnect_pauses_sec.text())
+        low, high = LIVE_LIMITS_BOUNDS["live_reconnect_pauses_sec"]
+        if 1 <= len(pauses) <= LIVE_PAUSES_MAX and all(
+            low <= pause <= high for pause in pauses
+        ):
+            return ""
+        return (
+            f"«{FIELD_CAPTIONS['live_reconnect_pauses_sec']}»: нужно от 1 до "
+            f"{LIVE_PAUSES_MAX} целых чисел через запятую, каждое от {int(low)} "
+            f"до {int(high)} секунд, например «1, 2, 5, 10, 30»."
+        )
+
+    def _sync_live(self, *_: object) -> None:
+        """Строка под паузами переподключения и кнопки — по `live_error`."""
+        reason = self.live_error()
+        self.live_note.setText(reason)
+        self.live_note.setVisible(bool(reason))
+        self._sync_buttons()
+
     def _sync_buttons(self) -> None:
         """«ОК» и «Применить» гаснут, пока хоть одна проверка не пройдена.
 
-        Проверок три — тейк, издержки, выход по концу окна, — и решение о кнопках
+        Проверок три — тейк, издержки, паузы переподключения, — и решение о кнопках
         принимается в одном месте. Врозь они гасили бы кнопки по очереди:
         последняя сработавшая включала бы их обратно, отменяя чужой запрет.
 
@@ -2324,7 +2523,7 @@ class SettingsDialog(QDialog):
         # Первая непройденная проверка — и запрет, и подсказка серой кнопки:
         # погасшая «ОК» без слова «почему» выглядит сломанной (находка
         # 04.10.2026 — причина стояла под полем, уехавшим под прокрутку).
-        reason = self.take_error() or self.costs_error()
+        reason = self.take_error() or self.costs_error() or self.live_error()
         hint = f"Недоступно: {reason}" if reason else ""
         for standard in (
             QDialogButtonBox.StandardButton.Ok,

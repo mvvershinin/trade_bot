@@ -118,6 +118,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 
 from engine import (
+    ExecutionHalted,
     ExecutionRefused,
     Fill,
     LevelTouch,
@@ -648,6 +649,14 @@ class ExecutionModel:
     и первый раз выполняется на реальных деньгах. Сверкой с прототипом эти
     ветки не проходятся никогда — отказов в снятии в эталонном прогоне ноль
     из 85.
+
+    Остановка по слову исполнителя (`ExecutionHalted`, решение 0066) —
+    тем же порядком и по той же причине. `halt_on` — имена заявок (или тех,
+    кого они снимают) и причина словами: подача такой заявки кончается
+    остановкой. `halt_at` — начала свечей и причина: вопрос о сделках
+    по закрытой свече кончается остановкой, и сделки, которые модель
+    по этой свече нашла, уходят **вместе с исключением**, а не пропадают.
+    Обе остановки срабатывают один раз.
     """
 
     def __init__(
@@ -656,10 +665,14 @@ class ExecutionModel:
         costs: Costs | None = None,
         refuse: dict[str, Refusal] | None = None,
         hollow_cancel: bool = False,
+        halt_on: dict[str, str] | None = None,
+        halt_at: dict[datetime, str] | None = None,
     ) -> None:
         self.costs = costs if costs is not None else Costs()
         self.refuse = dict(refuse or {})
         self.hollow_cancel = hollow_cancel
+        self.halt_on = dict(halt_on or {})
+        self.halt_at = dict(halt_at or {})
         #: Рыночные заявки, ждущие открытия следующей свечи.
         self.pending: list[OrderRequest] = []
         #: Сторожимые уровни по имени заявки. Словарь — самое короткое
@@ -746,6 +759,9 @@ class ExecutionModel:
 
     async def submit(self, order: OrderRequest) -> None:
         """Принять заявку. Возврат означает «принято к исполнению»."""
+        for name in (order.order_id, order.target_id or ""):
+            if name in self.halt_on:
+                raise ExecutionHalted(self.halt_on.pop(name))
         reason = refusal_for(order, self.refuse)
         if reason is not None:
             raise ExecutionRefused(
@@ -804,14 +820,27 @@ class ExecutionModel:
             self.fills.extend(opened)
             return opened
         self._remember(candle)
-        fills = self._market_fills(candle)
-        if not fills:
+        found: Sequence[Fill | PriceSeen]
+        opened = self._market_fills(candle)
+        if opened:
+            self.fills.extend(opened)
+            found = opened
+        else:
             walk = self._walk_of(candle)
             if walk is not None:
-                return self._walked(walk, candle)
-            fills = self._level_fills(candle)
-        self.fills.extend(fills)
-        return fills
+                found = self._walked(walk, candle)
+            else:
+                levels = self._level_fills(candle)
+                self.fills.extend(levels)
+                found = levels
+        why = self.halt_at.pop(candle.time, None)
+        if why is not None:
+            # Сделки этого ответа уходят вместе с остановкой: на счёте они
+            # уже есть, и движок обязан разобрать их до строки остановки.
+            raise ExecutionHalted(
+                why, [item for item in found if isinstance(item, Fill)]
+            )
+        return found
 
     def _walk_of(self, candle: MarketCandle) -> _Walk | None:
         """Обход этого бара — начатый или новый. `None` — бар идёт по размаху.

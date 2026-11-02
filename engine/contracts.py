@@ -38,6 +38,7 @@ __all__ = [
     "PositionState",
     "AccountFunds",
     "DayMoney",
+    "DayRecord",
     "Position",
     "OrderAction",
     "LevelTouch",
@@ -218,6 +219,83 @@ class DayMoney:
 
     def __post_init__(self) -> None:
         _check_money(self.realized, "результат за день")
+
+
+@dataclass(frozen=True, slots=True)
+class DayRecord:
+    """День, прожитый до запуска движка: то, что о нём записано снаружи.
+
+    Решение 0066, Р7: программу перезапустили в тот же день — движок обязан
+    знать, что тейк сегодня уже был и сколько день уже принёс. Иначе
+    «стоп после тейка» снимается перезапуском: робот, остановившийся
+    на день по правилу, после перезапуска входит снова, и правило, ради
+    которого заказчик держит тейк, перестаёт существовать.
+
+    ⚠️ **Значение кладут внутрь, движок за ним не ходит** — как деньги счёта
+    (`AccountFunds`, `Engine.on_funds`). Откуда оно взято — из таблицы
+    исполнений боевого счёта или из прогона по истории, — движку неизвестно
+    и неразличимо (ARCHITECTURE.md §1). Само правило «стоп после тейка»
+    остаётся в движке: значение сообщает факты дня, а не решение.
+
+    `day` — московская календарная дата, к которой относятся деньги.
+    `opening` — первый снимок счёта этой даты, если он записан; `None` —
+    не записан, базой станет первый снимок после запуска. `realized` —
+    зафиксированный результат за дату в рублях, комиссия обеих сторон
+    вычтена, **полный**: значение заменяет результат дня у движка, а не
+    складывается с ним.
+
+    `take_profit_date` и `last_exit_date` — те же поля, что у `EngineState`,
+    посчитанные тем же способом: дата **времени сделки** по МСК (путь Б,
+    PROTOTYPE.md §5). `None` — такого события не было.
+
+    `unknown_commissions` — сколько сделок даты без известной комиссии,
+    `foreign` — исполнения даты без своей команды (не учтены). Оба не про
+    правило, а про **правду строки**: не ноль и не пусто — результат дня
+    неполон, и журнал обязан это сказать, а не назвать его «с комиссией».
+
+    Поля один к одному с днём, который собирает слой данных
+    (`market.TradingDay` и `market.OpeningFunds`): сборка перекладывает,
+    а не пересчитывает.
+    """
+
+    day: date
+    opening: AccountFunds | None = None
+    realized: float = 0.0
+    take_profit_date: date | None = None
+    last_exit_date: date | None = None
+    unknown_commissions: int = 0
+    foreign: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Отказать вслух на значении, которое правило дня прочитало бы молча.
+
+        ⚠️ Момент вместо даты (`datetime` — потомок `date`) — самый тихий
+        из отказов: сравнение с датой свечи у него ложно всегда, и «стоп
+        после тейка» после перезапуска не срабатывал бы, ни разу не упав.
+        """
+        _check_money(self.realized, "результат за день")
+        unknown = self.unknown_commissions
+        if isinstance(unknown, bool) or not isinstance(unknown, int) or unknown < 0:
+            raise ValueError(
+                f"сделок без комиссии — целое не меньше нуля, получено {unknown!r}"
+            )
+        if self.opening is not None and not isinstance(self.opening, AccountFunds):
+            raise TypeError(
+                f"счёт на утро — engine.AccountFunds, получено {self.opening!r}"
+            )
+        for what, value, optional in (
+            ("дата дня", self.day, False),
+            ("дата тейка", self.take_profit_date, True),
+            ("дата выхода", self.last_exit_date, True),
+        ):
+            if value is None and optional:
+                continue
+            if isinstance(value, datetime) or not isinstance(value, date):
+                raise TypeError(
+                    f"{what} — календарная дата (datetime.date), получено "
+                    f"{value!r}. Момент со временем с датой свечи не сравнится "
+                    "никогда, и правило дня молча перестанет работать"
+                )
 
 
 class OrderAction(enum.Enum):

@@ -631,3 +631,70 @@ def test_the_instrument_refusal_names_its_field(loop, tmp_path) -> None:
     assert "Инструмент не сменён" in reason, reason
     assert field == "instrument", f"отказ пришёл без поля «Инструмент»: {field!r}"
     assert kept.instrument == "MXU6"
+
+
+# ------------------------------------------- бой и уточнение (`/risk` 2в З7)
+
+
+def test_the_first_contract_check_keeps_the_live_off_with_its_own_reason(loop, base) -> None:
+    """З7: первое уточнение контрактов держит бой своей причиной, а не словами о загрузке.
+
+    Запуск, биржа ещё не ответила: решения робота ждут её ответа. Слот
+    загрузки занят уточнением, но загрузки истории нет, и «выключите бой»
+    здесь неправда — бой не включён. Стережёт: пока биржа молчит, среди
+    причин — первое уточнение контрактов и нет слов о загрузке истории;
+    биржа ответила — причина ушла.
+    """
+    chain = GatedChain(TODAY)
+    seen: list[tuple[str, ...]] = []
+
+    async def during(port: HistoryPort, _heard: Heard) -> None:
+        try:
+            seen.append(port.live_status().why_not)
+        finally:
+            chain.gate.set()
+        for _ in range(300):
+            await port.wait()
+            if not any("уточнение контрактов" in why for why in port.live_status().why_not):
+                break
+            await asyncio.sleep(0.01)
+        seen.append(port.live_status().why_not)
+
+    _start(loop, base, chain, instrument="MXZ6", during=during)
+
+    asking, answered = seen
+    assert any("первое уточнение контрактов" in why for why in asking), asking
+    assert not any("выключите бой" in why for why in asking), asking
+    assert not any("уточнение контрактов" in why for why in answered), answered
+
+
+def test_minutes_written_after_the_switch_keep_the_live_off_as_a_load(
+    loop, base, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """З7: запись минут после перехода на действующий контракт — та же загрузка для боя.
+
+    Не кнопка «Загрузить историю», а уточнение при запуске: MXU6 истёк,
+    программа перешла на MXZ6 и пишет его минуты в базу. Запись занимает
+    поток данных — решения робота ждали бы её. Стережёт: пока минуты пишутся,
+    бой недоступен с причиной о загрузке.
+    """
+    gate, reached = asyncio.Event(), asyncio.Event()
+
+    async def slow_minutes(_self: object, *_args: object) -> None:
+        reached.set()
+        await gate.wait()
+
+    monkeypatch.setattr(HistoryPort, "_load_legs", slow_minutes)
+    seen: list[tuple[str, ...]] = []
+
+    async def during(port: HistoryPort, _heard: Heard) -> None:
+        try:
+            await asyncio.wait_for(reached.wait(), 5)
+            seen.append(port.live_status().why_not)
+        finally:
+            gate.set()
+
+    port, _, _, _ = _start(loop, base, ExpiredChain(TODAY), during=during)
+
+    assert port.values.instrument == "MXZ6", "перехода не было — не тот случай"
+    assert seen and any("выключите бой" in why for why in seen[0]), seen

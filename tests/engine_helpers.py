@@ -27,6 +27,7 @@ from engine import (
     ExecutionRefused,
     ExitReason,
     Fill,
+    MarketCandle,
     OrderAction,
     OrderRequest,
     Position,
@@ -193,7 +194,7 @@ class RecordingExecutor:
 
     submitted: list[OrderRequest] = field(default_factory=list)
     scripted: list[Sequence[Fill]] = field(default_factory=list)
-    seen: list[FakeCandle] = field(default_factory=list)
+    seen: list[MarketCandle] = field(default_factory=list)
     refuse: dict[str, Refusal] = field(default_factory=dict)
 
     async def submit(self, order: OrderRequest) -> None:
@@ -205,8 +206,10 @@ class RecordingExecutor:
             )
         self.submitted.append(order)
 
-    async def fills_at(self, market_candle: FakeCandle) -> Sequence[Fill]:
-        self.seen.append(market_candle)
+    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill]:
+        # Подпись — как у порта (`engine.OrderExecutor.fills_at`), иначе
+        # проверка типов не признаёт подставку исполнителем.
+        self.seen.append(candle)
         return self.scripted.pop(0) if self.scripted else ()
 
 
