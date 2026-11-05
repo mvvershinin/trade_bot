@@ -13,7 +13,7 @@
 
 * `LiveLimits` — пределы ожидания боевого исполнителя. Значения, а не правило:
   их собирает окно (`app/convert.py::live_limits`), и сборке окна незачем
-  тянуть за собой пишущий путь ради класса из семи чисел;
+  тянуть за собой пишущий путь ради класса из девяти чисел;
 * `FactDesks` и `FactDesk` — что порту нужно знать о боевой стороне: можно ли
   включить бой, как собрать исполнитель, остановлен ли он, есть ли у брокера
   незакрытые команды;
@@ -63,7 +63,7 @@ def _finite(value: object) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class LiveLimits:
-    """Пределы ожидания боевого исполнителя, в секундах и свечах.
+    """Пределы боевого исполнителя: ожидания в секундах и свечах, отступ цены в процентах.
 
     Правило 16: каждое число — поле окна (`app/convert.py::live_limits`).
     Живьём не замерено ни одно: сколько брокер молчит после заявки,
@@ -78,8 +78,9 @@ class LiveLimits:
         прогнала бы через «факт» старые бары с настоящими заявками.
     :param event_wait: сколько ждать первого события по заявке, прежде чем
         спросить статус по ключу (§2.2 п. 7–8).
-    :param fill_wait: сколько ждать конца рыночной заявки (`2` или `8`).
-        Частичная без конца к этому сроку — остаток снимается (0066, Р6).
+    :param fill_wait: сколько ждать конца заявки «исполнить целиком или снять»
+        (`2`, `4` или `8`; 0067). Частичная без конца к этому сроку — остаток
+        снимается (0066, Р6): у FOK её быть не должно, это страховка.
     :param cancel_wait: сколько ждать `4` после запроса на снятие.
     :param limit_exit_bars: сколько закрытых свечей ждать исполнения выхода
         по времени с пределом (Р3). Одно число — одно место: кладёт его
@@ -91,6 +92,12 @@ class LiveLimits:
         сделок, и «закрыть всё» по отставшему портфелю продало бы дважды.
     :param reconnect_pauses: паузы между попытками открыть поток статусов —
         по нарастающей, последняя повторяется.
+    :param fok_percent: отступ цены заявки «исполнить целиком или снять»
+        от текущей, **в процентах** (решение 0067): покупка — текущая плюс,
+        продажа — минус. Два процента — владелец счёта.
+    :param band_wait: сколько секунд ждать ответа MOEX ISS о планке цены
+        дня, прежде чем подать выход с пределом движка по проценту (0067).
+        Пять секунд — временное значение, замеров нет.
     """
 
     stale_after: float = 60.0
@@ -100,9 +107,15 @@ class LiveLimits:
     limit_exit_bars: int = 3
     position_settle: float = 1.0
     reconnect_pauses: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
+    fok_percent: float = 2.0
+    band_wait: float = 5.0
 
     def __post_init__(self) -> None:
-        waits = (self.stale_after, self.event_wait, self.fill_wait, self.cancel_wait)
+        if not _finite(self.fok_percent) or self.fok_percent <= 0:
+            raise ValueError(f"отступ цены заявки — положительный процент: {self.fok_percent!r}")
+        waits = (
+            self.stale_after, self.event_wait, self.fill_wait, self.cancel_wait, self.band_wait
+        )
         pauses = (self.position_settle, *self.reconnect_pauses)
         if any(not _finite(value) or value <= 0 for value in waits):
             raise ValueError(f"пределы ожидания — положительные секунды: {waits}")
@@ -168,6 +181,12 @@ class FactRequest:
         проход через единственный слот прогона (план §3).
     :param notice: сообщение человеку без остановки — строкой журнала решений.
     :param ruble_per_point: вес пункта — для дня по исполнениям (Р7).
+    :param funds_account: номер договора из последнего снимка счёта, который
+        получил порт (`D-044`, Р-9). Сборка сверяет его с договором, по которому
+        пойдут заявки: размер счёта у движков обязан быть от того же счёта.
+        Пусто — снимка нет, сборка отказывает.
+    :param price_step: шаг цены инструмента — из движка (`EngineSettings.price_step`):
+        сетка цены каждой заявки FOK и планки биржи (решение 0067, Р-3).
     """
 
     ticker: str
@@ -177,6 +196,8 @@ class FactRequest:
     session_id: int
     on_news: Callable[[], None]
     notice: Callable[[str], None]
+    funds_account: str
+    price_step: float
 
 
 class FactDesk(Protocol):
@@ -269,6 +290,7 @@ DAY_FIELDS: Final[Mapping[str, Callable[[TradingDay], object]]] = {
     "last_exit_date": lambda day: day.last_exit_date,
     "unknown_commissions": lambda day: day.unknown_commissions,
     "foreign": lambda day: day.foreign,
+    "entries_closed_date": lambda day: day.entries_closed_date,
 }
 
 #: Поля `TradingDay`, которых движок не получает, — с причиной.

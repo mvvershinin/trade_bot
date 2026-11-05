@@ -89,8 +89,10 @@ DIFFERENT = Settings(
     # Выход по концу окна (Ф3 задачи З8). Предельная форма — требование
     # алгоритма и умолчание; стережётся отдельно (`_COVERED_APART`).
     time_exit_order=TimeExitKind.LIMIT,
-    time_exit_limit_steps=7,
+    time_exit_limit_pct=3.5,
     time_exit_wait_bars=3,
+    # Р-10: «Заходить заново при обрыве связи», не умолчание.
+    reenter_after_disconnect=True,
     # Ожидания боевого исполнителя (вкладка «Бой»).
     live_stale_after_sec=90,
     live_event_wait_sec=5,
@@ -98,6 +100,8 @@ DIFFERENT = Settings(
     live_cancel_wait_sec=20,
     live_position_settle_sec=2.5,
     live_reconnect_pauses_sec=(2, 4, 8),
+    live_fok_pct=3.5,
+    live_band_wait_sec=12,
     log_directory="/tmp/терминал-логи",
     # Оба вида отметки сразу: «не торгуем» на будний день и «торгуем»
     # на субботу. Один вид проверял бы половину: перевод «да/нет» в файл
@@ -546,9 +550,11 @@ OWNER_FILE = """{
     "free_funds_reserve_pct": 30.0,
     "history_depth_days": 90,
     "instrument": "MXU6",
+    "live_band_wait_sec": 5,
     "live_cancel_wait_sec": 10,
     "live_event_wait_sec": 10,
     "live_fill_wait_sec": 30,
+    "live_fok_pct": 2.0,
     "live_position_settle_sec": 1.0,
     "live_reconnect_pauses_sec": [
       1,
@@ -563,6 +569,7 @@ OWNER_FILE = """{
     "minute_order": "near_first",
     "on_price_equals_average": "skip",
     "price_step": 1.0,
+    "reenter_after_disconnect": false,
     "reversal_moment": "same_bar",
     "ruble_per_point": 1.0,
     "ruble_per_point_source": "биржей — карточка MXU6",
@@ -593,8 +600,9 @@ def _migrated(text: str) -> str:
     """Файл владельца в нынешнем виде: так его запишет «ОК» после чтения.
 
     Поля убранного алгоритма уходят, имя алгоритма и форма выхода — те,
-    что выставлены при чтении (решение 0063). Строками, а не через `json`:
-    проверка ниже сверяет файл знак в знак.
+    что выставлены при чтении (решение 0063). Отступ предельной цены —
+    процентом по умолчанию вместо шагов (решение 0067, `REPLACED_KEYS`).
+    Строками, а не через `json`: проверка ниже сверяет файл знак в знак.
     """
     gone = ('"confirm_bars"', '"filter_enabled"', '"on_price_equals_average"',
             '"threshold_percent"')
@@ -603,6 +611,7 @@ def _migrated(text: str) -> str:
         "\n".join(lines)
         .replace('"strategy_id": "ema_reverse"', '"strategy_id": "ma_reverse_always"')
         .replace('"time_exit_order": "market"', '"time_exit_order": "limit"')
+        .replace('"time_exit_limit_steps": 10', '"time_exit_limit_pct": 2.0')
     )
 
 

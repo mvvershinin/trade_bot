@@ -142,9 +142,13 @@ FIXED_VALUES: dict[str, Any] = {
     "calendar": NO_MARKS,
     "exchange_days": NO_MARKS,
     "time_exit_order": TimeExitOrder.LIMIT,
-    "time_exit_limit_steps": 10,
+    # Решение 0067: предел выхода по концу окна — процент, умолчание владельца.
+    "time_exit_limit_percent": 2.0,
     "time_exit_wait_bars": 1,
     "price_step": PRICE_STEP,
+    # Р-10: модель прогона событие «уровень не исполнился» не выдаёт —
+    # настройка на образец не влияет, стоит умолчанием.
+    "hold_after_unfilled_level": False,
 }
 
 #: Вариант (б): то же со скользящим уровнем 0,20 / 0,10 / 0,05 и минутками.

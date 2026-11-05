@@ -2217,8 +2217,10 @@ SAMPLE = Settings(
     # Выход по концу окна (Ф3 задачи З8). Предельная форма — не умолчание
     # и годится второму алгоритму, которого требует (`_ALWAYS_DEMANDS`).
     time_exit_order=TimeExitKind.MARKET,
-    time_exit_limit_steps=7,
+    time_exit_limit_pct=3.5,
     time_exit_wait_bars=3,
+    # Р-10: «Заходить заново при обрыве связи», не умолчание.
+    reenter_after_disconnect=True,
     # Ожидания боевого исполнителя (вкладка «Бой»).
     live_stale_after_sec=90,
     live_event_wait_sec=5,
@@ -2226,6 +2228,9 @@ SAMPLE = Settings(
     live_cancel_wait_sec=20,
     live_position_settle_sec=2.5,
     live_reconnect_pauses_sec=(2, 4, 8),
+    # Решение 0067: отступ цены боевой заявки и ожидание планки биржи.
+    live_fok_pct=3.5,
+    live_band_wait_sec=12,
     log_directory="/tmp/терминал-логи",
     # ⚠️ Поля календаря в этом окне нет: его правят в своём окне, из меню
     # «Настройки». Но пронести его через обмен окно обязано — иначе «Применить»

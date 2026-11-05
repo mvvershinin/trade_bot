@@ -52,8 +52,8 @@ from broker.session import BrokerSession
 from broker.throttle import Throttle
 from broker.token_store import TokenStore
 from broker.tokens import TokenScope
-from engine import ExitReason, Fill
-from market import MSK, Candle, CandleStore, MarketWorker, Source
+from engine import AccountFunds, ExitReason, Fill
+from market import MSK, Candle, CandleStore, MarketWorker, PriceBand, Source
 from market.commands import (
     BrokerCommand,
     BrokerExecution,
@@ -205,10 +205,17 @@ class Exchange:
     def created(self, order: BookOrder) -> None:
         self.reveal()
         price = minute(self.current).open
-        if order.order_type == "1":
+        if order.order_type == "1" or order.time_in_force == "2":
+            # Немедленного исполнения — рыночная или «исполнить целиком или
+            # снять» (FOK, 0067): по открытию идущей минуты (по уровню у выхода
+            # сторожа). FOK, чей предел эту цену не пускает, снимается целиком.
             level = self._guard_level(order)
             worse = price + (self.slip if order.side == "1" else -self.slip)
-            self.broker.execute(order.key, order.quantity, worse if level is None else level)
+            done = worse if level is None else level
+            if order.order_type == "2" and not self._fits(order, low=done, high=done):
+                self.broker.kill(order.key)
+                return
+            self.broker.execute(order.key, order.quantity, done)
             return
         assert order.price is not None
         if self._fits(order, low=price, high=price):
@@ -250,6 +257,18 @@ class Exchange:
 # --------------------------------------------------------------- стенд
 
 
+#: Планка биржи стенда (0067, Р-4): коридор ± 6 % от `BASE` — шире любого хода
+#: ряда, на сетке шага. Выход по концу окна «факта» уходит по ней.
+BAND = PriceBand(SYMBOL, high=BASE * 1.06, low=BASE * 0.94, told="планка стенда")
+
+
+class _BenchWorker(MarketWorker):
+    """Поток данных стенда: планку биржи отвечает сам, в сеть не ходит."""
+
+    async def price_band(self, symbol: str, *, timeout: float, **_rest: object) -> PriceBand:
+        return dataclasses.replace(BAND, secid=symbol)
+
+
 @dataclass
 class Bench:
     """Порт с потоком, боевой стороной на подделке и идеальной биржей."""
@@ -285,7 +304,7 @@ async def _bench(
 ) -> tuple[Bench, BrokerSession]:
     path = tmp_path / "candles.sqlite3"
     _history(path)
-    worker = MarketWorker(path)
+    worker = _BenchWorker(path)
     await worker.open()
     if before is not None:
         await before(worker)
@@ -316,10 +335,26 @@ async def _close(bench: Bench, session: BrokerSession) -> None:
     await bench.worker.close()
 
 
+def account_read(bench: Bench) -> None:
+    """Опрос счёта прочитал счёт подставного брокера — как после подключения (`D-044`).
+
+    Стенд собирает порт без звена связи (`attach_stream(lambda on: None)`),
+    поэтому снимок кладётся тем же вызовом, каким его кладёт опрос счёта
+    в программе (`HistoryPort.account_read`, проводка — `app/main.py`).
+    Сама проводка стережётся отдельно, через настоящую сборку
+    (`tests/test_app_live_funds_gate.py`).
+    """
+    bench.port.account_read(
+        bench.broker.account,
+        AccountFunds(at=bench.exchange.now, equity=1_000_000.0, free=900_000.0),
+    )
+
+
 async def _connect(bench: Bench, *, live: bool = True) -> None:
-    """Поток включён, прогон прошёл, бой попрошен — к 09:00."""
+    """Поток включён, счёт прочитан, прогон прошёл, бой попрошен — к 09:00."""
     bench.exchange.now = LIVE_FROM - timedelta(seconds=58)
     bench.port.stream(True)
+    account_read(bench)
     await bench.port.wait()
     if live:
         bench.port.set_live(True)
@@ -467,6 +502,14 @@ def test_fact_deals_equal_forecast_deals_on_an_ideal_broker(
     held = fact.position
     signed = 0 if held is None else signed_position(held.side, held.volume)
     assert at_broker == signed, "позиция у брокера разошлась с «фактом»"
+    # 0067 через настоящую сборку (`LiveDesks.open`): рыночных заявок нет,
+    # немедленные — FOK, выход по концу окна — дневная по планке стенда,
+    # а не по пределу движка: источник планки дошёл до исполнителя.
+    assert [order.key for order in broker.orders if order.order_type == "1"] == []
+    if ExitReason.WINDOW_END in case.exits:
+        exits = {(order.side, order.price) for order in broker.orders if order.time_in_force == "1"}
+        assert exits, "выход по концу окна не ушёл дневной заявкой"
+        assert exits <= {("2", BAND.low), ("1", BAND.high)}, exits
 
 
 # --------------------------------------------------------------- отказы включения
@@ -700,6 +743,81 @@ def test_after_a_restart_on_a_take_day_neither_engine_enters(
         assert "тейк в этот день уже был" in day, day
 
 
+@pytest.mark.parametrize(
+    ("born", "filled", "words", "enters"),
+    [
+        # В4: выход «не в убытке» после неисполненного уровня — тейк.
+        pytest.param("unfilled-take", True, "тейк в этот день уже был", False, id="take"),
+        # Н5: выход «в убытке» не исполнился, позицию владелец закрыл руками.
+        pytest.param(
+            "unfilled-day", False, "решено до конца дня не входить", False, id="day-closed"
+        ),
+        # Проверка самой проверки: выход по сигналу день не закрывает, и тот
+        # же ряд даёт вход — значит, «ни одной заявки» выше не пустое.
+        pytest.param("close", False, "тейка в этот день не было", True, id="control"),
+    ],
+)
+def test_after_a_restart_on_a_day_closed_by_an_unfilled_level_neither_engine_enters(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker,
+    *, born: str, filled: bool, words: str, enters: bool,
+) -> None:
+    """Р-10 п. 5–6: день, закрытый выходом после неисполненного уровня, переживает перезапуск.
+
+    Имена рождённых заявок — те, что даёт движок; предикаты к ним сборка
+    отдаёт слою данных (`app/live_trading.py`). Неисполненный выход закрыт
+    владельцем счёта руками — чужим исполнением без команды.
+    """
+    keys = ("00000000-0000-4000-8000-0000000000c1", "00000000-0000-4000-8000-0000000000c2")
+    morning = DAY.replace(hour=7, minute=10)
+
+    def write(store: CandleStore) -> None:
+        run = store.open_journal_session(
+            SessionRecord(RunOrigin.LIVE, symbol=SYMBOL), now=DAY.replace(hour=7)
+        )
+        for key, name, side in (
+            (keys[0], "open:long:утро", CommandSide.BUY),
+            (keys[1], f"{born}:long:{morning.isoformat()}", CommandSide.SELL),
+        ):
+            store.record_broker_command(run.id, BrokerCommand(
+                client_order_id=key, action=CommandAction.CREATE, order_id=name,
+                symbol=SYMBOL, side=side, volume=1, price=None, account=broker.account,
+            ), now=morning)
+        executions = [(keys[0], "EXEC-c1", BASE)]
+        executions.append((keys[1], "EXEC-c2", BASE + 300) if filled
+                          else ("manual-order", "EXEC-HAND", BASE - 300))
+        for key, execution_id, price in executions:
+            store.record_broker_execution(BrokerExecution(
+                execution_id=execution_id, client_order_id=key, volume=1, price=price,
+                at=morning + timedelta(minutes=5), commission=14.0,
+            ))
+        store.set_broker_command_status(keys[0], CommandStatus.FILLED, reason="")
+        store.set_broker_command_status(
+            keys[1], CommandStatus.FILLED if filled else CommandStatus.CANCELLED, reason=""
+        )
+
+    async def plant(worker: MarketWorker) -> None:
+        await worker.call(write)
+
+    async def go() -> tuple[LiveStatus, int]:
+        bench, session = await _bench(tmp_path, broker, NO_TAKE, before=plant)
+        try:
+            await _connect(bench)
+            await _ride(bench)
+            created = len([one for one in broker.commands if one[0] == "create"])
+            return bench.port.live_status(), created
+        finally:
+            await _close(bench, session)
+
+    status, created = loop.run_until_complete(go())
+    assert (created > 0) is enters, f"заявок брокеру: {created}"
+    assert status.forecast is not None
+    assert bool(status.forecast.deals) is enters, _deals(status.forecast)
+    for run in (status.fact, status.forecast):
+        assert run is not None
+        day = " ".join(one.reason for one in run.journal if one.event == "День до запуска принят")
+        assert words in day, day
+
+
 def test_the_executor_waits_for_a_limit_exit_as_many_bars_as_the_engine(
     loop, tmp_path: pathlib.Path, broker: FakeBroker
 ) -> None:
@@ -843,8 +961,9 @@ def test_mode_off_keeps_guarding_the_frozen_trailing_level(
     Шорт, скользящий уровень встал на закрытии 10:15; в 10:16 — «Выключен».
     Дальше цена идёт в пользу шорта (в рабочем режиме уровень подтянулся бы),
     а в 11:05 минутка задевает уровень, вставший до выключения. Стережёт:
-    уровень после «Выключен» не двигается; на касании — ровно одна рыночная
-    покупка по уровню; движок видит выход, позиции у «факта» и у брокера нет.
+    уровень после «Выключен» не двигается; на касании — ровно одна покупка
+    «исполнить целиком или снять» (FOK, 0067) от уровня, исполненная по уровню;
+    движок видит выход, позиции у «факта» и у брокера нет.
     """
     monkeypatch.delitem(_SPIKES, LAST_MINUTE_TOUCH)
     touch = LIVE_FROM + timedelta(minutes=125)
@@ -880,7 +999,9 @@ def test_mode_off_keeps_guarding_the_frozen_trailing_level(
     # В рабочем режиме лучшая цена после выключения подтянула бы уровень
     # больше чем на шаг подтяжки — иначе проверка «не сдвинулся» пуста.
     assert armed.take_level - best_close > 125.0 + 25.0, best_close
-    assert [(body["side"], body["orderType"]) for body in bodies] == [("1", "1")], bodies
+    assert [
+        (body["side"], body["orderType"], body["timeInForce"]) for body in bodies
+    ] == [("1", "2", "2")], bodies
     assert status.position is None, "движок не увидел выход по уровню"
     assert broker.position(SYMBOL) == 0
     assert status.fact is not None

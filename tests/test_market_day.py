@@ -16,7 +16,7 @@ import pathlib
 import sqlite3
 import uuid
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -38,6 +38,11 @@ WEIGHT = {SYMBOL: 10.0}
 def is_take(order_id: str) -> bool:
     """Соглашение движка об имени тейка (`engine.pipeline.take_order_id`)."""
     return order_id.startswith("take:")
+
+
+def closes_day(order_id: str) -> bool:
+    """Соглашение движка об имени выхода, закрывшего день (`engine.closes_entries_day`)."""
+    return order_id.startswith("unfilled-day:")
 
 
 def key(number: int) -> str:
@@ -85,7 +90,9 @@ def funds(at: datetime, equity: float, account: str = ACCOUNT) -> OpeningFunds:
 
 
 def live_day(store: CandleStore, day: date = DAY, account: str = ACCOUNT) -> TradingDay:
-    return store.executions_day(account, day, ruble_per_point=WEIGHT, is_take=is_take)
+    return store.executions_day(
+        account, day, ruble_per_point=WEIGHT, is_take=is_take, closes_day=closes_day
+    )
 
 
 def a_morning(store: CandleStore) -> None:
@@ -247,7 +254,97 @@ def test_an_exit_without_its_point_weight_is_refused(tmp_path: pathlib.Path) -> 
     with CandleStore(tmp_path / "day.sqlite3") as store:
         a_morning(store)
         with pytest.raises(ValueError, match=SYMBOL):
-            store.executions_day(ACCOUNT, DAY, ruble_per_point={}, is_take=is_take)
+            store.executions_day(
+                ACCOUNT, DAY, ruble_per_point={}, is_take=is_take, closes_day=closes_day
+            )
+
+
+# -- день, закрытый для входов (0067, Р-10 п. 6) ------------------------------
+
+
+def command(
+    store: CandleStore,
+    session: int,
+    number: int,
+    order_id: str,
+    at: datetime,
+    *,
+    account: str = ACCOUNT,
+) -> None:
+    """Команда подачи без исполнений: решение есть, сделки по нему нет."""
+    store.record_broker_command(
+        session,
+        BrokerCommand(
+            client_order_id=key(number), action=CommandAction.CREATE, order_id=order_id,
+            symbol=SYMBOL, side=CommandSide.SELL, volume=1, account=account,
+        ),
+        now=at,
+    )
+
+
+def test_the_day_is_closed_by_the_command_even_if_the_owner_closed_by_hand(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Н5: DAY-выход по планке не исполнился, позицию закрыл владелец руками.
+
+    Исполнения у рождённой заявки нет, а закрывшее позицию — чужое (без
+    команды). Запрет на вход до конца дня всё равно стоит: дату даёт
+    команда, а не сделка.
+    """
+    with CandleStore(tmp_path / "day.sqlite3") as store:
+        session = open_run(store)
+        trade(store, session, 1, side=CommandSide.BUY, order_id="open:long:28",
+              fills=[("E-1", 1, 100.0, msk(2026, 10, 28, 10, 0), 1.0)])
+        command(store, session, 2, "unfilled-day:long:28", msk(2026, 10, 28, 11, 30))
+        store.record_broker_execution(
+            BrokerExecution("E-HAND", "manual-order", 1, 98.0, msk(2026, 10, 28, 11, 45), 1.0)
+        )
+        day = live_day(store)
+    assert day.entries_closed_date == DAY
+    assert day.foreign == ("E-HAND",)
+    assert day.last_exit_date is None, "чужая сделка засчитана выходом робота"
+
+
+def test_only_a_name_that_closes_the_day_closes_it(tmp_path: pathlib.Path) -> None:
+    """Выход по сигналу, тейк и «закрыть всё» день для входов не закрывают."""
+    with CandleStore(tmp_path / "day.sqlite3") as store:
+        a_morning(store)
+        command(store, open_run(store), 9, "close:long:28", msk(2026, 10, 28, 12, 0))
+        assert live_day(store).entries_closed_date is None
+
+
+def test_the_closed_day_is_dated_in_moscow_time(tmp_path: pathlib.Path) -> None:
+    """Команда в 01:30 МСК 28.10 — это 22:30 UTC 27.10, а закрыт день 28.10."""
+    in_utc = datetime(2026, 10, 27, 22, 30, tzinfo=UTC)
+    with CandleStore(tmp_path / "day.sqlite3") as store:
+        command(store, open_run(store), 1, "unfilled-day:short:28", in_utc)
+        assert live_day(store).entries_closed_date == DAY
+        assert live_day(store, date(2026, 10, 27)).entries_closed_date is None
+
+
+def test_a_cancel_and_another_account_do_not_date_the_closed_day(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Дата — у **подачи** своего счёта: снятие той же заявки и чужой счёт не в счёт.
+
+    Вчерашний запрет остаётся вчерашним: движок закрывает вход только
+    в дату запрета (`entries_closed_date == сегодня`).
+    """
+    with CandleStore(tmp_path / "day.sqlite3") as store:
+        session = open_run(store)
+        command(store, session, 1, "unfilled-day:long:27", msk(2026, 10, 27, 18, 0))
+        store.record_broker_command(
+            session,
+            BrokerCommand(
+                client_order_id=key(2), action=CommandAction.CANCEL,
+                order_id="unfilled-day:long:27", symbol=SYMBOL,
+                target_client_order_id=key(1), account=ACCOUNT,
+            ),
+            now=msk(2026, 10, 28, 9, 0),
+        )
+        command(store, session, 3, "unfilled-day:long:28", msk(2026, 10, 28, 10, 0),
+                account=OTHER)
+        assert live_day(store).entries_closed_date == date(2026, 10, 27)
 
 
 # -- счёт на утро --------------------------------------------------------------

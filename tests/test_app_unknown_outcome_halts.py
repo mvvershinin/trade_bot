@@ -302,7 +302,7 @@ def _poll_once(failure: BrokerError) -> tuple[list[tuple[str, str]], list[Any]]:
         cast("Any", _Account(failure)),  # подставной счёт, предмет проверки — сам опрос
         ticker="MXU6",
         watchers=live_feed.FundsWatchers(
-            funds=lambda money: None,
+            funds=lambda _account, _money: None,
             say=lambda event, why, level: said.append((event, why, level)),
             halt=lambda event, why: halts.append((event, why)),
             # Подставной порт: остановлен ровно тогда, когда `halt` уже
@@ -418,7 +418,7 @@ def test_the_account_poll_is_wired_to_ask_the_port_about_the_halt(
         ticker="MXU6",
         class_code="SPBFUT",
     )
-    watchers = link._funds_watchers(lambda money: None)  # noqa: SLF001 — предмет проверки
+    watchers = link._funds_watchers(lambda _account, _money: None)  # noqa: SLF001 — предмет проверки
     assert not watchers.halted(), (
         "опрос счёта считает робота остановленным до всякой остановки: "
         "жалоба про счёт станет гнать человека в терминал брокера без повода"

@@ -35,6 +35,7 @@ TRADING = TradingDay(
     take_profit_date=date(2026, 6, 19),
     last_exit_date=date(2026, 6, 18),
     foreign=("FAKE-EXEC-7", "FAKE-EXEC-9"),
+    entries_closed_date=date(2026, 6, 17),
 )
 
 
@@ -54,6 +55,7 @@ def test_every_field_of_the_day_reaches_the_engine() -> None:
         last_exit_date=date(2026, 6, 18),
         unknown_commissions=2,
         foreign=("FAKE-EXEC-7", "FAKE-EXEC-9"),
+        entries_closed_date=date(2026, 6, 17),
     )
     defaults = DayRecord(day=record.day)
     missed = [

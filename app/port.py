@@ -71,7 +71,7 @@ from app.runs import (
     settings_text,
 )
 from backtest import HistoryRun, Plan, Summary, pairs, replay, reversal_entries, summarise
-from engine import MSK, EngineSettings, PositionState, close_time, in_moscow
+from engine import MSK, AccountFunds, EngineSettings, PositionState, close_time, in_moscow
 from engine import Side as EngineSide
 from market import (
     FUTURES,
@@ -243,9 +243,18 @@ _TWO_STEPS = (
 
 #: Почему бой не включается без шага цены (`D-147`, `D-148`).
 _NO_STEP = (
-    "Шаг цены инструмента не известен: неподвижный тейк у брокера — лимитная "
-    "заявка на сетке шага, выход по времени — с пределом в шагах, и без шага "
-    "ни то ни другое не поставить (D-147). Шаг сообщает биржа — дождитесь её ответа."
+    "Шаг цены инструмента не известен: неподвижный тейк у брокера и выход по концу "
+    "окна с предельной ценой — лимитные заявки, цена которых обязана лежать на сетке "
+    "шага, и без шага ни одну не поставить (D-147). Шаг сообщает биржа — дождитесь "
+    "её ответа."
+)
+
+#: Почему бой не включается до первого снимка счёта (`D-044`, Р-9).
+_NO_FUNDS = (
+    "Счёт у брокера ещё не прочитан ни разу с подключения: робот не знает ни размера "
+    "счёта, ни свободных средств, а входить вслепую бой не вправе. Программа читает "
+    "счёт сама — сразу после подключения и затем раз в полминуты; если строка "
+    "не уходит, в журнале выше сказано, почему брокер не ответил про счёт."
 )
 
 #: Почему «Старт» и «Стоп» без боя ничего не делают. Текст один на все места,
@@ -737,6 +746,12 @@ class _Live:
     #: Событие строки «бой закрыт», которую скажет `_retire` с позицией
     #: по брокеру («Бой выключен»). Пусто — говорить нечего.
     closing: str = ""
+    #: Последний снимок счёта с подключения: номер договора и деньги (`D-044`,
+    #: Р-9). `None` — с подключения брокер о счёте ещё не ответил ни разу,
+    #: и бой не включается: движок не отличил бы «счёт не прочитан» от прогона
+    #: по истории и вошёл бы, ни разу не узнав размера счёта (решение 0037).
+    #: Снимается отключением потока (`_observe`): «с подключения», а не «когда-то».
+    funds: tuple[str, AccountFunds] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1460,6 +1475,32 @@ class HistoryPort(TerminalPort):
         if observer is not None and observer.paired:
             return observer.fact_position
         return self._live.left
+
+    def account_read(self, account: str, funds: AccountFunds) -> None:
+        """Опрос счёта прочитал счёт у брокера (`LiveLink.deliver_funds_to`). Немедленно.
+
+        Две вещи, и обе — здесь, а не в сборке (Р-9, правки 9.2 и 9.3 гейта):
+
+        * **снимок запоминается всегда**, и в наблюдении тоже: без него бой
+          не включается (`_live_blockers`, `D-044`), а номер договора уходит
+          в сборку боевой стороны — та сверяет его с договором исполнителя
+          (`LiveDesks.open`);
+        * **движкам снимок отдаётся только у пары** — «факту» и «прогнозу»
+          одним и тем же (`LiveObserver.funds`). Наблюдение денег счёта
+          не получает (решение 0037, следствие 1): иначе ход без заявок
+          начал бы отличаться от прогона по истории.
+
+        Строки журнала здесь нет: опрос идёт раз в полминуты, строку
+        «Размер счёта принят» пишет движок — один раз на дату.
+        """
+        first = self._live.funds is None
+        self._live.funds = (account, funds)
+        observer = self._watch.observer
+        if observer is not None and observer.paired:
+            observer.funds(funds)
+        if first:
+            # Причина «счёт не прочитан» снялась — окно узнаёт снимком.
+            self._publish_live()
 
     def stream(self, on: bool) -> None:
         """Команда окна: подключиться к брокеру или отключиться.
@@ -3934,6 +3975,11 @@ class HistoryPort(TerminalPort):
         # — со строкой про позицию у брокера (`set_live`). Сам по себе он
         # при следующем подключении не включится: это решение человека.
         self.set_live(False)
+        # Снимок счёта — «с подключения» (`D-044`): на следующее подключение
+        # прежний не переносится. Снимается при отключении, а не при включении:
+        # включение доходит сюда и после уточнения контрактов, когда первый
+        # снимок нового подключения уже мог прийти.
+        self._live.funds = None
         self.note(
             "Наблюдение выключено",
             "Живой ход движка прекращён вместе с потоком котировок. На графике "
@@ -4363,6 +4409,7 @@ class HistoryPort(TerminalPort):
         checks = (
             (not self._watch.observing,
              "Нет потока котировок: бой идёт поверх живого потока, сначала «Подключиться»."),
+            (self._watch.observing and self._live.funds is None, _NO_FUNDS),
             (self._back.span is not None,
              "Показ закреплён на отрезке истории: бой идёт по текущим барам, сначала "
              "«Вернуться к текущим»."),
@@ -4920,6 +4967,10 @@ class HistoryPort(TerminalPort):
             fact = await self._open_fact(frame, symbol, candles)
             if fact is not None:
                 observer.pair_with(fact)
+                # Последний снимок — паре сразу, а не через полминуты опроса:
+                # без него движки до следующего снимка не знали бы счёта (`D-044`).
+                if self._live.funds is not None:
+                    observer.funds(self._live.funds[1])
         return observer
 
     async def _open_fact(
@@ -4953,6 +5004,7 @@ class HistoryPort(TerminalPort):
                 "брокеру не пишется, а без журнала заявка не уходит."
             )
             return None
+        seen = self._live.funds
         request = FactRequest(
             ticker=symbol,
             bar_minutes=convert.timeframe_of(frame.values.timeframe).minutes,
@@ -4961,6 +5013,12 @@ class HistoryPort(TerminalPort):
             session_id=session_id,
             on_news=self._fact_news,
             notice=self._fact_notice,
+            # `_live_blockers` выше уже отказал бы без снимка; пустой номер
+            # здесь — защита от гонки со сменой связи, и сборка откажет словами.
+            funds_account="" if seen is None else seen[0],
+            # Шаг цены — тем же путём, что свечи выхода (`_fact_limits`): из
+            # движка. Ноль сюда не доходит — `_live_blockers` отказал бы (`_NO_STEP`).
+            price_step=frame.engine.price_step,
         )
         desk = await self._open_desk(desks, request)
         if desk is None:

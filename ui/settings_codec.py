@@ -57,8 +57,10 @@ from ui.models import (
 )
 
 __all__ = [
+    "REPLACED_KEYS",
     "BadValue",
     "Codec",
+    "Replaced",
     "codec_of",
     "encode_fields",
     "field_codecs",
@@ -292,6 +294,59 @@ def field_codecs() -> dict[str, Codec]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class Replaced:
+    """Поле `Settings`, сменившее старый ключ файла, и что поменялось словами.
+
+    :param field: имя нового поля
+    :param change: продолжение фразы «Настройка «…» …» — что стало иначе
+    :param was_unit: в чём было старое значение, для «(в шагах цены: 10)»
+    :param unit: единица нового значения, для «взято «2 %»»
+    """
+
+    field: str
+    change: str
+    was_unit: str
+    unit: str
+
+
+#: Ключи файла, которые сменило другое поле с другой единицей: старый ключ →
+#: новое поле. Прежнее значение **не переводится**: десять шагов цены
+#: в процентах — это разное число при каждой цене, и перевод выдал бы
+#: за выбор владельца счёта число, которого он не выбирал.
+#:
+#: ⚠️ Молча такой ключ не пропускается (правило 13): без этой таблицы новое
+#: поле попало бы в общую строку «появилось в новой сборке», а старый ключ —
+#: в «незнакомые», со словами «файл сделан более новой сборкой», то есть
+#: неправдой, и возвращался бы в файл при каждой записи. Строка идёт
+#: в отвергнутые: значение, которое стояло в файле, потеряно.
+REPLACED_KEYS: Final[Mapping[str, Replaced]] = {
+    # Решение 0067: предел выхода по концу окна — процент, а не шаги цены.
+    "time_exit_limit_steps": Replaced(
+        field="time_exit_limit_pct",
+        change="теперь задаётся в процентах от закрытия свечи, а не в шагах цены",
+        was_unit="в шагах цены",
+        unit=" %",
+    ),
+}
+
+
+def _replaced_line(name: str, raw: Mapping[str, object], start: Settings) -> str:
+    """Строка о поле, сменившем старый ключ файла. Пусто — ключа в файле нет."""
+    for old, replaced in REPLACED_KEYS.items():
+        if replaced.field == name and old in raw:
+            return (
+                f"Настройка «{caption_of(name)}» {replaced.change}. Прежнее "
+                f"значение из файла ({replaced.was_unit}: {shown(raw[old])}) "
+                "в новые единицы не переводится и не применено. Взято "
+                f"«{human_value(getattr(start, name))}{replaced.unit}» — "
+                "проверьте его в окне "
+                "«Настройки»; в файл оно запишется, когда вы примените "
+                "настройки. Остальные настройки прочитаны."
+            )
+    return ""
+
+
 def read_fields(
     raw: Mapping[str, object], table: Mapping[str, Codec], start: Settings
 ) -> tuple[dict[str, object], list[str], list[str]]:
@@ -300,13 +355,21 @@ def read_fields(
     Негодное поле теряет **себя**, а не весь файл: остальные настройки
     остаются прочитанными, а про это говорится отдельной строкой с именем
     поля и с тем, что подставлено вместо него.
+
+    Поле, сменившее старый ключ, который в файле есть (`REPLACED_KEYS`), —
+    не «пропущенное», а отвергнутое: значение в файле было, и оно потеряно.
+    Строка одна, своими словами, а не общая «появилось в новой сборке».
     """
     changes: dict[str, object] = {}
     refused: list[str] = []
     missing: list[str] = []
     for name, codec in table.items():
         if name not in raw:
-            missing.append(name)
+            replaced = _replaced_line(name, raw, start)
+            if replaced:
+                refused.append(replaced)
+            else:
+                missing.append(name)
             continue
         try:
             changes[name] = _within_bounds(name, codec.load(raw[name]), raw[name])

@@ -53,9 +53,9 @@ from broker.account import parse_positions
 from broker.errors import BrokerError
 from broker.session import PORTFOLIO_PATH, BrokerSession
 from broker.tokens import now_utc
-from engine import DayRecord, in_moscow, is_take_order
+from engine import DayRecord, closes_entries_day, in_moscow, is_take_order
 from market import Candle as MarketCandle
-from market import MarketWorker
+from market import MarketWorker, PriceBand
 from market.commands import StoredCommand
 
 __all__ = ["LiveDesk", "LiveDesks", "Seat"]
@@ -199,6 +199,26 @@ class LiveDesk:
         )
 
 
+def _same_account(read: str, trading: str) -> None:
+    """Снимок счёта у движков — от того договора, по которому пойдут заявки (Р-9, 9.3).
+
+    Иначе движки считали бы свободные средства и размер счёта по одному договору,
+    а заявки уходили бы по другому. Отказ — `FactRefused` словами, до любой команды
+    брокеру.
+    """
+    if not read:
+        raise FactRefused(
+            "Счёт у брокера ещё не прочитан с подключения: без размера счёта бой "
+            f"не включается. {_NOT_ON}"
+        )
+    if read != trading:
+        raise FactRefused(
+            f"Состояние счёта прочитано по договору {read}, а заявки пошли бы "
+            f"по договору {trading}: размер счёта и свободные средства у робота были бы "
+            f"не от того счёта. {_NOT_ON}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class LiveDesks:
     """Чем порт собирает боевую сторону (`app.fact.FactDesks`). Ставит `app/main.py`.
@@ -239,17 +259,27 @@ class LiveDesks:
         session = self.session()
         assert session is not None, "сессию только что проверил `refusal`"
         account = await self._account(session)
+        _same_account(request.funds_account, account)
         book = StoreBook(self.worker, request.session_id)
         worker, ticker = self.worker, request.ticker
 
         async def minutes(since: datetime) -> Sequence[MarketCandle]:
             return await worker.minutes(ticker, since=since)
 
+        waited = request.limits.band_wait
+
+        async def band() -> PriceBand:
+            # Планка биржи для выхода с пределом (0067, Р-4): сетевой поток
+            # потока данных, одна попытка, не дольше `band_wait` (правка 4.1).
+            return await worker.price_band(ticker, timeout=waited)
+
         wiring = Wiring(
             session, book, minutes, events=self.events, clock=self.clock,
-            sleep=self.sleep, on_news=request.on_news, notice=request.notice,
+            sleep=self.sleep, on_news=request.on_news, notice=request.notice, band=band,
         )
-        instrument = Instrument(ticker, self.class_code, request.bar_minutes, account)
+        instrument = Instrument(
+            ticker, self.class_code, request.bar_minutes, account, request.price_step
+        )
         executor = LiveExecutor(wiring, instrument, request.limits)
         await executor.start()
         try:
@@ -371,7 +401,7 @@ class LiveDesks:
             trading = await self.worker.executions_day(
                 account, today,
                 ruble_per_point={request.ticker: request.ruble_per_point},
-                is_take=is_take_order,
+                is_take=is_take_order, closes_day=closes_entries_day,
             )
         except (sqlite3.Error, ValueError, LookupError, RuntimeError, OSError) as error:
             raise FactRefused(

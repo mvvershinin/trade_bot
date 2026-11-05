@@ -1,9 +1,10 @@
 """Ожидания боевого исполнителя — в настройках и в окне (правило 16, решение 0066).
 
-`app/fact.py::LiveLimits` держит шесть чисел, от которых зависит,
-какие сигналы пропускаются, когда робот встаёт и сколько продаётся при
-закрытии. Седьмое — сколько свечей ждать выхода с пределом — своего поля
-не имеет: это `time_exit_wait_bars` движка, одно число на двоих.
+`app/fact.py::LiveLimits` держит восемь чисел, от которых зависит,
+какие сигналы пропускаются, когда робот встаёт, сколько продаётся при
+закрытии и по какой цене уходит боевая заявка. Девятое — сколько свечей
+ждать выхода с пределом — своего поля не имеет: это `time_exit_wait_bars`
+движка, одно число на двоих.
 
 Что стережётся здесь, словами:
 
@@ -13,7 +14,11 @@
   исполнителя, и ни одно поле исполнителя, кроме свечей выхода, не забыто;
 * негодное значение (ноль, NaN, «да», выше границы, пустой список пауз)
   отвергается отказом, который называет поле подписью окна;
-* изменение каждого поля даёт строку «было → стало» с его подписью;
+* изменение каждого поля даёт строку «было → стало» с его подписью, и строка
+  говорит, что действует со следующего включения боя (правка 5.2 гейта);
+* отступ цены боевой заявки (решение 0067) — проценты: ни отказ, ни строка
+  журнала, ни снимок прогона, ни поле окна не называют его секундами
+  (правка 5.1 гейта);
 * у свечей выхода с пределом поля в окне нет;
 * окно не даёт ввести то, что отвергнет проверка: границы полей те же,
   негодный список пауз гасит кнопки и говорится строкой под полем;
@@ -48,6 +53,8 @@ WINDOW_TO_LIMITS: dict[str, str] = {
     "live_cancel_wait_sec": "cancel_wait",
     "live_position_settle_sec": "position_settle",
     "live_reconnect_pauses_sec": "reconnect_pauses",
+    "live_fok_pct": "fok_percent",
+    "live_band_wait_sec": "band_wait",
 }
 
 #: Поле исполнителя без своего поля в окне — и откуда оно берётся.
@@ -61,6 +68,8 @@ OTHER: dict[str, object] = {
     "live_cancel_wait_sec": 20,
     "live_position_settle_sec": 2.5,
     "live_reconnect_pauses_sec": (2, 4, 8),
+    "live_fok_pct": 3.5,
+    "live_band_wait_sec": 12,
 }
 
 #: Поле → негодные значения. Ноль и NaN — из задания; «да» — `bool` есть
@@ -69,8 +78,9 @@ BAD: list[tuple[str, object]] = [
     *((name, value) for name in (
         "live_stale_after_sec", "live_event_wait_sec",
         "live_fill_wait_sec", "live_cancel_wait_sec", "live_position_settle_sec",
+        "live_fok_pct", "live_band_wait_sec",
     ) for value in (0, -5, math.nan, math.inf, True)),
-    *((name, LIVE_LIMITS_BOUNDS[name][1] * 2) for name in LIVE_LIMITS_BOUNDS
+    *((name, LIVE_LIMITS_BOUNDS[name].high * 2) for name in LIVE_LIMITS_BOUNDS
       if name != "live_reconnect_pauses_sec"),
     ("live_reconnect_pauses_sec", ()),
     ("live_reconnect_pauses_sec", (0,)),
@@ -127,6 +137,8 @@ def test_an_old_file_without_the_live_fields_gives_the_executor_its_defaults(
         ("live_position_settle_sec", 0.0, "от 0,1 до 30"),
         ("live_reconnect_pauses_sec", [0], "каждое от 1 до 600"),
         ("live_reconnect_pauses_sec", [], "от 1 до 10 чисел"),
+        ("live_fok_pct", 50, "число процентов от 0,1 до 20"),
+        ("live_band_wait_sec", 0, "число секунд от 1 до 30"),
     ],
     ids=repr,
 )
@@ -223,8 +235,8 @@ def test_a_bad_value_is_refused_with_the_window_caption(field: str, value: objec
 @pytest.mark.parametrize("field", sorted(LIVE_LIMITS_BOUNDS))
 def test_both_bounds_themselves_are_accepted(field: str) -> None:
     """Границы включительно: проверка не строже окна, иначе поле с краю — тупик."""
-    low, high = LIVE_LIMITS_BOUNDS[field]
-    for edge in (low, high):
+    bound = LIVE_LIMITS_BOUNDS[field]
+    for edge in (bound.low, bound.high):
         value: object = (int(edge),) if field == "live_reconnect_pauses_sec" else edge
         convert.live_limits(Settings().replace(**{field: value}))
 
@@ -246,16 +258,89 @@ def test_a_change_of_each_live_field_is_one_journal_line_with_its_caption(field:
     assert len(mine) == 1, f"изменение «{caption}» в журнале: {lines}"
 
 
+def _line_of(lines: list[str], field: str) -> str:
+    """Строка журнала о поле — по подписи окна. Ровно одна, иначе падение."""
+    mine = [line for line in lines if line.startswith(f"{FIELD_CAPTIONS[field]}: ")]
+    assert len(mine) == 1, f"строк о «{FIELD_CAPTIONS[field]}»: {lines}"
+    return mine[0]
+
+
 def test_the_seconds_in_the_line_read_as_seconds() -> None:
     """Секунды — с единицей и по-русски, список пауз — через запятую."""
     lines = convert.window_changes(
         Settings(),
-        Settings(live_position_settle_sec=0.5, live_reconnect_pauses_sec=(3, 7)),
+        Settings(
+            live_position_settle_sec=0.5, live_reconnect_pauses_sec=(3, 7),
+            live_band_wait_sec=12,
+        ),
     )
-    assert f"{FIELD_CAPTIONS['live_position_settle_sec']}: 1 с → 0,5 с" in lines, lines
-    assert (
+    assert _line_of(lines, "live_position_settle_sec").startswith(
+        f"{FIELD_CAPTIONS['live_position_settle_sec']}: 1 с → 0,5 с"
+    ), lines
+    assert _line_of(lines, "live_reconnect_pauses_sec").startswith(
         f"{FIELD_CAPTIONS['live_reconnect_pauses_sec']}: 1, 2, 5, 10, 30 с → 3, 7 с"
-    ) in lines, lines
+    ), lines
+    assert _line_of(lines, "live_band_wait_sec").startswith(
+        f"{FIELD_CAPTIONS['live_band_wait_sec']}: 5 с → 12 с"
+    ), lines
+
+
+@pytest.mark.parametrize("field", sorted(WINDOW_TO_LIMITS))
+def test_each_live_change_line_says_it_waits_for_the_next_switch_on(field: str) -> None:
+    """Строка о смене поля «Боя» называет все три момента, с которых оно действует.
+
+    Правка 5.2 гейта 04.11.2026 и `/risk` 04.11.2026 п. 2. Исполнитель берёт
+    эти числа при сборке «факта» и на ходу не перечитывает
+    (`app/fact.py::LiveLimits`); сборка — включение боя, «Возобновить работу»
+    и перезапуск хода (`app/port.py`, `_open_fact` → `_fact_limits`). Строка
+    «2 % → 3 %» без оговорки читалась бы как действующая; строка «со следующего
+    включения боя, идущий бой — со старым» врала бы при перезапуске хода
+    в том же применении. Слова записаны здесь руками, а не взяты
+    у `ui.models.LIVE_LATER`.
+    Мутация молчания: убрать хвост у строк «Боя» или любой из трёх моментов
+    из него — тест падает на каждом поле.
+    """
+    lines = convert.window_changes(Settings(), Settings().replace(**{field: OTHER[field]}))
+    line = _line_of(lines, field)
+    for moment in (
+        "действует не сразу",
+        "с включения боя",
+        "с «Возобновить работу»",
+        "с перезапуска хода робота",
+        "по прежнему значению",
+    ):
+        assert moment in line, (moment, line)
+    assert "идущий бой — со старым" not in line, line
+
+
+def test_the_order_offset_is_a_percent_everywhere_and_never_seconds(dialog) -> None:
+    """Правка 5.1 гейта 04.11.2026: отступ цены боевой заявки — проценты.
+
+    Стережёт четыре места, где единица видна человеку: отказ при «Применить»,
+    строку журнала «Настройки изменены», снимок прогона, поле окна. Все
+    ожидаемые строки записаны руками. Мутация: единица поля в таблице
+    `LIVE_LIMITS_BOUNDS` — секунды (как было до 0067) — роняет каждую
+    проверку; секунды, вписанные в одно из мест мимо таблицы, — её проверку.
+    """
+    from app import runs
+
+    caption = FIELD_CAPTIONS["live_fok_pct"]
+    with pytest.raises(convert.SettingsRefused) as refused:
+        convert.live_limits(Settings(live_fok_pct=50.0))
+    said = str(refused.value)
+    assert "число процентов от 0,1 до 20" in said and "«50 %»" in said, said
+    assert "секунд" not in said, said
+
+    line = _line_of(convert.window_changes(Settings(), Settings(live_fok_pct=3.5)), "live_fok_pct")
+    assert line.startswith(f"{caption}: 2 % → 3,5 %"), line
+
+    marks = runs.snapshot_marks(runs.snapshot_of(Settings(live_fok_pct=3.5)))
+    assert marks.get(f"{caption}, %") == "3,5", {
+        title: value for title, value in marks.items() if caption in title
+    }
+    assert f"{caption}, с" not in marks
+
+    assert dialog.live_fok_pct.suffix().strip() == "%", dialog.live_fok_pct.suffix()
 
 
 # ------------------------------------------------------------------- окно
@@ -297,11 +382,11 @@ def test_the_window_bounds_are_the_check_bounds(dialog) -> None:
     Мутация: граница поля шире таблицы — человек введёт 0, «ОК» уйдёт,
     и отказ придёт уже после нажатия.
     """
-    for name, (low, high) in LIVE_LIMITS_BOUNDS.items():
+    for name, bound in LIVE_LIMITS_BOUNDS.items():
         widget = getattr(dialog, name)
         if not isinstance(widget, (QSpinBox, QDoubleSpinBox)):
             continue
-        assert (widget.minimum(), widget.maximum()) == pytest.approx((low, high)), name
+        assert (widget.minimum(), widget.maximum()) == pytest.approx((bound.low, bound.high)), name
 
 
 def test_the_live_fields_survive_the_exchange_through_the_window(dialog) -> None:

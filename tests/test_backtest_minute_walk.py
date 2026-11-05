@@ -40,6 +40,7 @@ from engine import (
     Mode,
     OrderAction,
     OrderRequest,
+    LevelUnfilled,
     PriceSeen,
     Side,
     TradingWindow,
@@ -59,8 +60,8 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 #: Минутки MXZ6 из локальной базы — вне git (`reference/minutes/README.md`).
 MXZ6 = REPO / "reference" / "minutes" / "MXZ6.csv"
 
-Answer = Sequence[Fill | PriceSeen]
-React = Callable[[Fill | PriceSeen], Sequence[OrderRequest]]
+Answer = Sequence[Fill | PriceSeen | LevelUnfilled]
+React = Callable[[Fill | PriceSeen | LevelUnfilled], Sequence[OrderRequest]]
 
 
 def at(hour: int, minute: int) -> datetime:
@@ -148,7 +149,7 @@ def test_a_moved_level_is_touched_by_the_segment_not_by_the_range_already_passed
     model = ExecutionModel()
     model.use_minutes(Minutes([one(10, 10, (100, 102, 99, 101.5))]))
 
-    def react(item: Fill | PriceSeen) -> Sequence[OrderRequest]:
+    def react(item: Fill | PriceSeen | LevelUnfilled) -> Sequence[OrderRequest]:
         if isinstance(item, Fill) and item.action is OrderAction.OPEN:
             return [arm(98.0, item.at)]
         if isinstance(item, PriceSeen) and item.price == 102:
@@ -179,7 +180,7 @@ def test_a_level_moved_inside_the_bar_is_guarded_from_the_next_segment() -> None
         one(10, 11, (102, 102, 100.5, 100.5)),
     ]))
 
-    def react(item: Fill | PriceSeen) -> Sequence[OrderRequest]:
+    def react(item: Fill | PriceSeen | LevelUnfilled) -> Sequence[OrderRequest]:
         if isinstance(item, Fill) and item.action is OrderAction.OPEN:
             return [arm(98.0, item.at)]
         if isinstance(item, PriceSeen) and item.price == 102:

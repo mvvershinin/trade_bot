@@ -146,7 +146,7 @@ import pathlib
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from itertools import groupby
@@ -168,6 +168,7 @@ from market.day import (
     OpeningFunds,
     TradingDay,
     day_of,
+    entries_closed_date,
     execution_events,
     trade_events,
 )
@@ -4066,6 +4067,7 @@ class CandleStore:
         *,
         ruble_per_point: Mapping[str, float],
         is_take: Callable[[str], bool],
+        closes_day: Callable[[str], bool],
     ) -> TradingDay:
         """День счёта по исполнениям брокера — для боевого движка («факт»).
 
@@ -4080,6 +4082,9 @@ class CandleStore:
 
         :param ruble_per_point: рублей за пункт по тикеру.
         :param is_take: имя заявки движка → это выход по уровню тейка.
+        :param closes_day: имя заявки движка → она закрыла день для входов.
+            Спрашивается у **команд** счёта, а не у исполнений
+            (`market.day.entries_closed_date`).
         :raises ValueError: у тикера с выходом не назван вес пункта.
         """
         mine = self._clean(account)
@@ -4103,9 +4108,20 @@ class CandleStore:
                     execution, CommandSide(str(side)), str(symbol), str(order_id)
                 ))
         events = execution_events(attributed, ruble_per_point=ruble_per_point, is_take=is_take)
-        return day_of(
+        commands = (
+            (str(order_id), _from_ts(int(at)))
+            for order_id, at in self._db.execute(
+                "SELECT order_id, at FROM broker_command "
+                "WHERE account = ? AND action = ? AND at < ?",
+                (mine, CommandAction.CREATE.value, _to_ts(_day_end(day))),
+            )
+        )
+        built = day_of(
             events, account=account, day=day,
             opening=self.opening_funds(account, day), foreign=tuple(foreign),
+        )
+        return replace(
+            built, entries_closed_date=entries_closed_date(commands, day=day, closes_day=closes_day)
         )
 
     def journal_day(

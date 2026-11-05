@@ -80,8 +80,10 @@ from ui.models import (
     FIELD_CAPTIONS,
     LIVE_LIMITS_BOUNDS,
     LIVE_PAUSES_MAX,
+    LIVE_TAKES_EFFECT,
     MAX_TIME_EXIT_WAIT_BARS,
     STEP_WAIT,
+    TIME_EXIT_LIMIT_PCT_LIMITS,
     AfterTakeProfit,
     AlgorithmOption,
     AverageKind,
@@ -230,11 +232,14 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("trailing_start_pct", "Вход и выход", "trailing_start"),
     ("trailing_offset_pct", "Вход и выход", "trailing_offset"),
     ("trailing_step_pct", "Вход и выход", "trailing_step"),
+    # Р-10 плана координатора 04.11.2026: под числами скользящего уровня —
+    # настройка касается только его (неподвижный тейк стоит у брокера).
+    ("reenter_after_disconnect", "Вход и выход", "reenter_after_disconnect"),
     ("window_start", "Торговое окно", "window_start"),
     ("window_end", "Торговое окно", "window_end"),
     ("close_on_time_end", "Торговое окно", "close_on_time_end"),
     ("time_exit_order", "Торговое окно", "time_exit_order"),
-    ("time_exit_limit_steps", "Торговое окно", "time_exit_limit_steps"),
+    ("time_exit_limit_pct", "Торговое окно", "time_exit_limit"),
     ("time_exit_wait_bars", "Торговое окно", "time_exit_wait_bars"),
     ("calendar", "Торговое окно", "calendar_note"),
     ("volume", "Деньги", "volume"),
@@ -255,28 +260,44 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("live_cancel_wait_sec", "Бой", "live_cancel_wait_sec"),
     ("live_position_settle_sec", "Бой", "live_position_settle_sec"),
     ("live_reconnect_pauses_sec", "Бой", "live_reconnect_pauses_sec"),
+    ("live_fok_pct", "Бой", "live_fok_pct"),
+    ("live_band_wait_sec", "Бой", "live_band_wait_sec"),
     ("log_directory", "Программа", "log_directory"),
 )
 
 #: Поля «Бой», задаваемые целыми секундами: имя поля `Settings`
 #: равно имени поля окна. Таблица на сборку (`_build_live_fields`), показ
-#: и обмен (`set_values`, `values`): четыре поля одной формы, и пятое,
+#: и обмен (`set_values`, `values`): пять полей одной формы, и шестое,
 #: забытое в одном из трёх мест, вернулось бы к умолчанию на «Применить».
 _LIVE_WHOLE: tuple[str, ...] = (
     "live_stale_after_sec",
     "live_event_wait_sec",
     "live_fill_wait_sec",
     "live_cancel_wait_sec",
+    "live_band_wait_sec",
+)
+
+#: Порядок полей «Бой» на вкладке и в обходе Tab: сначала цена заявки
+#: и планка — что уходит брокеру, — затем ожидания ответов.
+_LIVE_ORDER: tuple[str, ...] = (
+    "live_fok_pct",
+    "live_band_wait_sec",
+    "live_stale_after_sec",
+    "live_event_wait_sec",
+    "live_fill_wait_sec",
+    "live_cancel_wait_sec",
+    "live_position_settle_sec",
+    "live_reconnect_pauses_sec",
 )
 
 #: С какого момента действует новое значение поля «Бой» — хвост
 #: каждой подсказки. Исполнитель берёт пределы при сборке и на ходу их
 #: не перечитывает (`app/fact.py::LiveLimits`); сборка — включение боя,
-#: «Возобновить работу» и пересборка хода робота. Одной строкой на шесть
-#: полей, а не своей в каждой: шесть копий одного утверждения разошлись бы.
+#: «Возобновить работу» и пересборка хода робота. Одной строкой на восемь
+#: полей, а не своей в каждой: восемь копий одного утверждения разошлись бы.
 LIVE_WHEN = (
-    "Новое значение действует не сразу, а с включения боя, с «Возобновить "
-    "работу» или с перезапуска хода робота; идущий бой доживает со старым."
+    f"Новое значение действует не сразу, а {LIVE_TAKES_EFFECT}; "
+    "идущий бой доживает со старым."
 )
 
 #: Подсказки полей «Бой». Подписи — `FIELD_CAPTIONS`: журнал
@@ -297,11 +318,13 @@ _LIVE_HINTS: dict[str, str] = {
         "спрашивает брокера. Это же время программа ждёт при закрытии, пока "
         "допишется журнал команд брокеру.",
     "live_fill_wait_sec":
-        "Сколько секунд ждать, пока рыночная заявка исполнится целиком. "
-        "Не исполнилась — остаток снимается, робот останавливается и зовёт вас: "
-        "позиция у брокера может отличаться от той, что считает робот. Столько "
-        "же робот ждёт, пока биржа примет заявку с предельной ценой (тейк, выход "
-        "по концу окна); не приняла — тоже остановка.",
+        "Сколько секунд ждать от брокера, чем кончилась заявка «исполнить "
+        "целиком или снять» (вход, выход по сигналу, переворот): исполнена "
+        "или снята. Ответа нет — робот снимает то, что от заявки осталось, "
+        "останавливается и зовёт вас: позиция у брокера может отличаться "
+        "от той, что считает робот. Столько же робот ждёт, пока биржа примет "
+        "заявку с предельной ценой (тейк, выход по концу окна); не приняла — "
+        "тоже остановка.",
     "live_cancel_wait_sec":
         "Сколько секунд ждать от брокера подтверждения, что заявка снята. "
         "Не подтвердил — робот останавливается: заявка у брокера, возможно, "
@@ -310,7 +333,8 @@ _LIVE_HINTS: dict[str, str] = {
         "Брокер иногда показывает позицию с опозданием. Если позиция у брокера "
         "не совпала с той, что считает робот, программа ждёт столько секунд "
         "и спрашивает ещё раз. Совпало — работа идёт дальше. Не совпало — робот "
-        "снимает заявки, закрывает позицию по рынку и останавливается. Та же "
+        "снимает заявки, закрывает позицию заявкой «исполнить целиком или "
+        "снять» и останавливается. Та же "
         "пауза — между двумя чтениями позиции перед таким закрытием. Слишком "
         "малая пауза — риск закрыть позицию из-за опоздания брокера, а не из-за "
         "настоящего расхождения.",
@@ -320,7 +344,76 @@ _LIVE_HINTS: dict[str, str] = {
         "связь не вернётся. Пока связи нет, заявки не подаются и сигналы "
         "пропускаются, причина пишется в журнал решений. Целые секунды через "
         f"запятую, от 1 до {LIVE_PAUSES_MAX} чисел.",
+    # Решение 0067: рыночных заявок в бою нет.
+    "live_fok_pct":
+        "Рыночных заявок робот в бою не подаёт. Вход, выход по сигналу средней, "
+        "переворот, выход по касанию скользящего уровня и «закрыть всё» уходят "
+        "лимитной заявкой «исполнить целиком или снять»: покупка — по текущей "
+        "цене плюс столько процентов, продажа — минус. Биржа исполняет её "
+        "по лучшим ценам в стакане, но не хуже названной, и только целиком; "
+        "целиком не выходит — снимает всю заявку, частичной сделки не бывает. "
+        "Текущая цена — закрытие свечи сигнала; у выхода по касанию — сам "
+        "уровень; у «закрыть всё» — закрытие последней минуты. Заявка снята — "
+        "робот останавливается и зовёт вас, позиция у брокера осталась та, "
+        "что была до заявки. Исключение — выход по касанию скользящего уровня "
+        "после обрыва связи: что тогда, решает настройка «Заходить заново "
+        "при обрыве связи» на вкладке «Вход и выход». Больше процент — заявка "
+        "надёжнее исполняется при резком движении, но может исполниться хуже. "
+        "Движение на два процента за пять минут, по словам заказчика, бывает "
+        "раз в несколько лет. Проверка на истории этот процент не читает: "
+        "там сделки идут по расчётной цене.",
+    "live_band_wait_sec":
+        "Выход по концу окна с предельной ценой робот в бою подаёт по планке — "
+        "крайней цене, которую на сегодня разрешает сама биржа: нижней "
+        "при закрытии лонга, верхней при закрытии шорта. Планку программа "
+        "спрашивает у Московской биржи перед заявкой. Сколько секунд ждать "
+        "ответа: не ответила — заявка уходит с пределом по проценту "
+        "«Отступ предельной цены» с вкладки «Торговое окно», и это сказано "
+        "строкой в журнале решений. Так же подаётся выход после неисполненного "
+        "скользящего уровня при обрыве связи. Больше значение — дольше "
+        "открытая позиция ждёт ответа биржи; меньше — чаще робот обходится "
+        "процентом.",
 }
+
+#: Подсказка галочки «Заходить заново при обрыве связи» (Р-10 плана
+#: координатора 04.11.2026, таблица решения 0067). Подробная — просьба
+#: владельца счёта: когда срабатывает, что делает каждое положение, режим
+#: «Выключен», чем закрывается позиция (П6 гейта 04.11.2026) и что на прогон
+#: по истории галочка не влияет (П8). Модулем, а не строкой в группе:
+#: её читают и сторожа текста.
+REENTER_HINT = (
+    "Срабатывает редко и только в бою со скользящим уровнем. Связь с брокером "
+    "пропадала, и за это время цена задела скользящий уровень. Программа "
+    "узнаёт о касании, когда связь вернулась, и подаёт выход заявкой "
+    "«исполнить целиком или снять» по цене уровня ± «Отступ цены боевой "
+    "заявки» (вкладка «Бой»). Цена за время обрыва ушла дальше — биржа "
+    "снимает заявку целиком: позиция не закрыта, а сторожить её уже "
+    "нечем. Что дальше, зависит от позиции на закрытии последней свечи "
+    "по сравнению с ценой входа.\n"
+    "• Не в убытке — галочка не важна: робот закрывает позицию, и выход "
+    "считается сработавшим тейком (дальше — как в поле «После сработавшего "
+    "тейка»).\n"
+    "• В убытке, галочка снята (умолчание) — робот сразу закрывает позицию "
+    "и до конца дня не входит.\n"
+    "• В убытке, галочка стоит — позиция остаётся, и решает средняя на этой "
+    "свече, как будто касания не было: сигнал по стороне позиции — держать, "
+    "обратный — закрыть или перевернуть новой заявкой. Скользящий уровень "
+    "начинается заново, как у только что открытой позиции: пока прибыль "
+    "не дойдёт до порога включения, уровня нет, и позицию держат только "
+    "переворот по средней и выход по концу окна. В режиме «Выключен» робот "
+    "позицией не управляет вовсе — ни уровня, ни переворота; закрыть её "
+    "можно в приложении брокера.\n"
+    "Закрывает позицию в этих случаях заявка с предельной ценой — так же, "
+    "как выход по концу окна: по планке биржи, а если биржа не ответила — "
+    "с пределом по проценту «Отступ предельной цены» с вкладки «Торговое "
+    "окно». Не исполнилась за число свечей из поля «Ждать исполнения» "
+    "той же вкладки — робот останавливается и зовёт вас. Поле "
+    "«Ждать исполнения заявки «целиком или снять»» на вкладке «Бой» — "
+    "другое, к этой заявке оно не относится.\n"
+    "На прогон по истории галочка не влияет: там связь не обрывается, "
+    "и такого случая не бывает. Сравнивать прогоны с разным положением "
+    "галочки бессмысленно — сделки у них одни и те же."
+)
 
 #: Разделители чисел в поле пауз переподключения: запятая, точка с запятой,
 #: пробелы. Дробей в поле нет — паузы целые, и запятая не спутается
@@ -329,9 +422,20 @@ _PAUSES_SPLIT = re.compile(r"[\s,;]+")
 
 
 def _live_whole(name: str) -> QSpinBox:
-    """Поле целых секунд «Бой» с границами из `LIVE_LIMITS_BOUNDS`."""
-    low, high = LIVE_LIMITS_BOUNDS[name]
-    return _whole(int(low), int(high), " с")
+    """Поле целых секунд «Бой» с границами и единицей из `LIVE_LIMITS_BOUNDS`."""
+    bound = LIVE_LIMITS_BOUNDS[name]
+    return _whole(int(bound.low), int(bound.high), f" {bound.unit.sign}")
+
+
+def _live_decimal(name: str, step: float, decimals: int = 1) -> QDoubleSpinBox:
+    """Дробное поле «Бой» с границами и единицей из таблицы.
+
+    Секунды — одним знаком после запятой, проценты — двумя, как все
+    проценты окна: «2,00 %» на вкладке «Торговое окно» рядом с «2,0 %»
+    на вкладке «Бой» читаются как два разных числа (проход 4.1 Э4).
+    """
+    bound = LIVE_LIMITS_BOUNDS[name]
+    return _decimal(bound.low, bound.high, step, f" {bound.unit.sign}", decimals=decimals)
 
 
 def _pauses_of(text: str) -> tuple[int, ...]:
@@ -585,6 +689,13 @@ class _Form(QFormLayout):
         super().setGeometry(rect)
 
 
+#: Размер окна настроек, который оно просит при открытии; экран меньше —
+#: меньше (`resize_within_screen`). Именем, а не числами в вызове: по ширине
+#: сторож `tests/test_ui_settings_fit.py` проверяет, что ни одна вкладка
+#: не шире окна.
+DEFAULT_SIZE: tuple[int, int] = (820, 800)
+
+
 class SettingsDialog(QDialog):
     """Настройки робота. Применяются на ходу, без перезапуска программы."""
 
@@ -598,7 +709,7 @@ class SettingsDialog(QDialog):
         # Шире прежних 560: подсказки под полями переносились через слово,
         # а с крупным шрифтом (`FONT_SCALE`) — тем более. Просьба владельца
         # счёта 05.10.2026 (`ROADMAP.md`, Н1): «окно настроек сделать шире».
-        resize_within_screen(self, 820, 800)
+        resize_within_screen(self, *DEFAULT_SIZE)
 
         #: Строки у полей: требование алгоритма и отказ «Применить». Ключ —
         #: имя поля `Settings` и вид строки. Создаются по первому требованию
@@ -834,6 +945,22 @@ class SettingsDialog(QDialog):
         self.trailing_step.setSpecialValueText("0,00 % — без ограничения")
         self.trailing_step.valueChanged.connect(self._sync_take)
 
+        # Р-10 плана координатора 04.11.2026, решение 0067. Касается только
+        # скользящего уровня и гаснет вместе с его числами (`_sync_take`):
+        # неподвижный тейк стоит у брокера, и «касание после обрыва» у него
+        # не бывает. Текст галочки не повторяет подпись строки — говорит,
+        # что значит «включено». ⚠️ Две строки, а не одна, и это размер
+        # окна: одной строкой подпись была самым широким элементом вкладки
+        # (482 точки при кегле 10,8) и раздвигала её шире окна — снизу
+        # прокрутка, пояснения всех групп обрезаны справа (проход 4.1 Э4).
+        # `QCheckBox` сам не переносит, перенос задан здесь; условие «если
+        # выход не исполнился» не отрезано — без него галочка читалась бы
+        # как «никогда не закрывать убыточную позицию». Сторож —
+        # `tests/test_ui_settings_fit.py`.
+        self.reenter_after_disconnect = QCheckBox(
+            "Держать позицию в убытке,\nесли выход по уровню не исполнился"
+        )
+
         self.take_note = QLabel()
         self.take_note.setWordWrap(True)
 
@@ -932,10 +1059,9 @@ class SettingsDialog(QDialog):
         # Числа гаснут при рыночной заявке: они читаются только предельной.
         self.time_exit_order = _choice(TimeExitKind)
         self.time_exit_order.currentIndexChanged.connect(self._sync_window_close)
-        # Верхняя граница поля — не правило, а предел ввода: у движка отступ
-        # сверху не ограничен. Тысяча шагов — 25 000 пунктов на фьючерсе
-        # на индекс, дальше любой предел уже не предел.
-        self.time_exit_limit_steps = _whole(0, 1000, " × шаг цены")
+        # Отступ — процентом от закрытия свечи (решение 0067), дробным полем.
+        # Границы — одна пара с проверкой при «Применить».
+        self.time_exit_limit = _decimal(*TIME_EXIT_LIMIT_PCT_LIMITS, 0.1, " %")
         self.time_exit_wait_bars = _whole(1, MAX_TIME_EXIT_WAIT_BARS, " св.")
         # Шаг цены живёт на другой вкладке, а нужен предельной цене здесь:
         # его правка обязана перерисовать строку и здесь.
@@ -959,7 +1085,7 @@ class SettingsDialog(QDialog):
         )
 
     def _build_live_fields(self) -> None:
-        """Ожидания боевого исполнителя: четыре целых, пауза и список пауз.
+        """Числа боевого исполнителя: отступ цены, пять целых, пауза и список пауз.
 
         Границы — `LIVE_LIMITS_BOUNDS`, та же таблица, что проверяет
         `app/convert.py::live_limits` при «Применить»: окно не даёт ввести
@@ -971,8 +1097,11 @@ class SettingsDialog(QDialog):
         self.live_event_wait_sec = _live_whole("live_event_wait_sec")
         self.live_fill_wait_sec = _live_whole("live_fill_wait_sec")
         self.live_cancel_wait_sec = _live_whole("live_cancel_wait_sec")
-        low, high = LIVE_LIMITS_BOUNDS["live_position_settle_sec"]
-        self.live_position_settle_sec = _decimal(low, high, 0.5, " с", decimals=1)
+        self.live_band_wait_sec = _live_whole("live_band_wait_sec")
+        self.live_position_settle_sec = _live_decimal("live_position_settle_sec", 0.5)
+        # Отступ цены боевой заявки — проценты, а не секунды (правка 5.1 гейта
+        # 04.11.2026): единица поля берётся из той же таблицы, что и границы.
+        self.live_fok_pct = _live_decimal("live_fok_pct", 0.1, decimals=2)
         # Список пауз — строкой: число пауз от одной до десяти, и десять полей
         # ради одного списка — это окно, которое никто не дочитает. Буквы
         # не вводятся вовсе; негодное число говорится строкой под полем.
@@ -987,8 +1116,8 @@ class SettingsDialog(QDialog):
         self.live_scope_note = _hint(
             "Эти числа действуют только в боевой торговле: проверка на истории "
             "и наблюдение их не читают. Ни одно не замерено на живом счёте — "
-            "сколько брокер молчит после заявки, пока неизвестно; числа в полях — "
-            "отправная точка."
+            "сколько брокер молчит после заявки и по какой цене он на самом деле "
+            "ставит заявку, пока неизвестно; числа в полях — отправная точка."
         )
 
     def _build_risk_fields(self) -> None:
@@ -1257,7 +1386,8 @@ class SettingsDialog(QDialog):
              "только показывает, что сообщила биржа. Нужен в двух местах: "
              "поправке на проскальзывание на вкладке «Деньги» (она задаётся "
              "в шагах) и предельной цене заявки на выход по концу окна "
-             "на вкладке «Торговое окно» (отступ тоже в шагах). Пока биржа "
+             "на вкладке «Торговое окно» (отступ там в процентах, а цена "
+             "округляется до шага). Пока биржа "
              "шаг не сообщила, выход по концу окна идёт по рынку, "
              "а проскальзывание не учитывается."),
             ("Рублей в пункте цены", self.ruble_per_point,
@@ -1385,6 +1515,8 @@ class SettingsDialog(QDialog):
              "пройти, чтобы уровень сдвинулся. Не украшение: без шага каждая "
              "свеча с новой лучшей ценой — это отдельное обращение к брокеру, "
              "до двенадцати за час позиции."),
+            (FIELD_CAPTIONS["reenter_after_disconnect"], self.reenter_after_disconnect,
+             REENTER_HINT),
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
@@ -1460,17 +1592,31 @@ class SettingsDialog(QDialog):
              "Какой заявкой робот закрывает позицию по концу окна и перед "
              "нерабочим днём. «По рынку» — по любой цене, сразу; так работает "
              "ваш нынешний робот, и на этом стоят все замеры. «С предельной "
-             "ценой» — робот назначает цену, хуже которой не закроет: от "
-             "закрытия последней свечи на несколько шагов цены в вашу сторону. "
-             "Позиция при этом закрывается всегда, галочка выше не действует. "
-             "Выход по сигналу средней остаётся рыночным в обоих случаях."),
-            ("Отступ предельной цены", self.time_exit_limit_steps,
-             "На сколько шагов цены предельная цена отстоит от закрытия "
-             "последней свечи — в сторону, худшую для вас: при закрытии лонга "
+             "ценой» — робот назначает цену, хуже которой не закроет "
+             "(«Отступ предельной цены» ниже). Позиция при этом закрывается "
+             "всегда, галочка выше не действует. В бою рыночных заявок нет "
+             "вовсе: «по рынку» и выход по сигналу средней уходят лимитной "
+             "заявкой «исполнить целиком или снять» по цене закрытия свечи "
+             "± процент, заданный для боевых заявок. Не исполнилась целиком — "
+             "биржа её снимает, робот останавливается и зовёт вас."),
+            ("Отступ предельной цены", self.time_exit_limit,
+             "На сколько процентов от закрытия последней свечи предельная "
+             "цена отстоит в сторону, худшую для вас: при закрытии лонга "
              "ниже, при закрытии шорта выше. Больше отступ — заявка "
-             "исполняется надёжнее, но может исполниться хуже. Шаг цены "
-             "берётся из поля «Шаг цены инструмента» на вкладке «Инструмент "
-             "и данные». Действует только при заявке «с предельной ценой»."),
+             "исполняется надёжнее, но может исполниться хуже. Цена "
+             "округляется до шага из поля «Шаг цены инструмента» на вкладке "
+             "«Инструмент и данные» — тоже в худшую для вас сторону. В бою "
+             "робот ставит вместо неё предельную цену, которую на сегодня "
+             "разрешает сама биржа (нижнюю — при закрытии лонга, верхнюю — "
+             "при закрытии шорта); не ответила биржа за «Ждать ответа биржи "
+             "о планке цены» (вкладка «Бой») — этот процент. "
+             "Проверка на истории считает только по проценту: прошлых "
+             "предельных цен биржи у программы нет. Для выхода по концу окна "
+             "действует только при заявке «с предельной ценой». Тем же "
+             "процентом — при любой заявке выше — робот считает предел, когда "
+             "закрывает позицию после неисполненного скользящего уровня "
+             "при обрыве связи (настройка «Заходить заново при обрыве связи» "
+             "на вкладке «Вход и выход»)."),
             ("Ждать исполнения", self.time_exit_wait_bars,
              "Сколько закрытых свечей ждать, пока заявка с предельной ценой "
              "исполнится. Не исполнилась — робот останавливается, заявку "
@@ -1491,10 +1637,9 @@ class SettingsDialog(QDialog):
 
     def _live_group(self) -> QGroupBox:
         """Сколько ждать брокера и что делать, если не дождались."""
-        box = self._group("Ожидание ответов брокера", [
+        box = self._group("Цена заявок и ожидание ответов", [
             (FIELD_CAPTIONS[name], getattr(self, name), f"{_LIVE_HINTS[name]} {LIVE_WHEN}")
-            for name in (*_LIVE_WHOLE, "live_position_settle_sec",
-                         "live_reconnect_pauses_sec")
+            for name in _LIVE_ORDER
         ])
         layout = box.layout()
         if isinstance(layout, QFormLayout):
@@ -2055,9 +2200,10 @@ class SettingsDialog(QDialog):
             self.take_fixed, self.trailing_enabled,
             self.take_profit,
             self.trailing_start, self.trailing_offset, self.trailing_step,
+            self.reenter_after_disconnect,
             # «Торговое окно»
             self.window_start, self.window_end, self.close_on_time_end,
-            self.time_exit_order, self.time_exit_limit_steps,
+            self.time_exit_order, self.time_exit_limit,
             self.time_exit_wait_bars,
             # «Деньги»
             # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): потолка в обходе нет. При
@@ -2070,8 +2216,7 @@ class SettingsDialog(QDialog):
             self.commission, self.slippage_steps, self.minute_order,
             self.minute_bar_limit,
             # «Бой»
-            *(getattr(self, name) for name in _LIVE_WHOLE),
-            self.live_position_settle_sec, self.live_reconnect_pauses_sec,
+            *(getattr(self, name) for name in _LIVE_ORDER),
             # «Программа»
             self.log_directory,
         ]
@@ -2104,6 +2249,7 @@ class SettingsDialog(QDialog):
         for switch, state in (
             (self.take_profit_enabled, settings.take_profit_enabled),
             (self.close_on_time_end, settings.close_on_time_end),
+            (self.reenter_after_disconnect, settings.reenter_after_disconnect),
             # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113)
             # (self.volume_cap_enabled, settings.volume_cap_enabled),
             # (self.daily_loss_limit_enabled, settings.daily_loss_limit_enabled),
@@ -2144,11 +2290,12 @@ class SettingsDialog(QDialog):
         # «закрывать в конце окна» и фильтр против пилы.
         self._calendar = settings.calendar
         self.slippage_steps.setValue(settings.slippage_steps)
-        self.time_exit_limit_steps.setValue(settings.time_exit_limit_steps)
+        self.time_exit_limit.setValue(settings.time_exit_limit_pct)
         self.time_exit_wait_bars.setValue(settings.time_exit_wait_bars)
         for name in _LIVE_WHOLE:
             getattr(self, name).setValue(getattr(settings, name))
         self.live_position_settle_sec.setValue(settings.live_position_settle_sec)
+        self.live_fok_pct.setValue(settings.live_fok_pct)
         self.live_reconnect_pauses_sec.setText(
             _pauses_text(settings.live_reconnect_pauses_sec)
         )
@@ -2267,10 +2414,13 @@ class SettingsDialog(QDialog):
             trailing_start_pct=self.trailing_start.value(),
             trailing_offset_pct=self.trailing_offset.value(),
             trailing_step_pct=self.trailing_step.value(),
+            # Как стоит, и при неподвижной цели тоже: погашенная галочка
+            # не читается, но выбор владельца счёта не теряется.
+            reenter_after_disconnect=self.reenter_after_disconnect.isChecked(),
             window_start=self.window_start.time().toPython(),
             window_end=self.window_end.time().toPython(),
             close_on_time_end=self.close_on_time_end.isChecked(),
-            time_exit_limit_steps=self.time_exit_limit_steps.value(),
+            time_exit_limit_pct=self.time_exit_limit.value(),
             time_exit_wait_bars=self.time_exit_wait_bars.value(),
             price_step=self.price_step.value(),
             ruble_per_point=self.ruble_per_point.value(),
@@ -2283,6 +2433,7 @@ class SettingsDialog(QDialog):
             calendar=self._calendar,
             slippage_steps=self.slippage_steps.value(),
             live_position_settle_sec=self.live_position_settle_sec.value(),
+            live_fok_pct=self.live_fok_pct.value(),
             live_reconnect_pauses_sec=_pauses_of(self.live_reconnect_pauses_sec.text()),
             log_directory=self.log_directory.text().strip(),
             volume=self.volume.value(),
@@ -2488,7 +2639,8 @@ class SettingsDialog(QDialog):
         Остальные поля вкладки границ не нарушат: их держат сами поля.
         """
         pauses = _pauses_of(self.live_reconnect_pauses_sec.text())
-        low, high = LIVE_LIMITS_BOUNDS["live_reconnect_pauses_sec"]
+        bound = LIVE_LIMITS_BOUNDS["live_reconnect_pauses_sec"]
+        low, high = bound.low, bound.high
         if 1 <= len(pauses) <= LIVE_PAUSES_MAX and all(
             low <= pause <= high for pause in pauses
         ):
@@ -2663,7 +2815,7 @@ class SettingsDialog(QDialog):
         """
         limit = self.time_exit_order.currentData() is TimeExitKind.LIMIT
         self.close_on_time_end.setEnabled(not limit)
-        self.time_exit_limit_steps.setEnabled(limit)
+        self.time_exit_limit.setEnabled(limit)
         self.time_exit_wait_bars.setEnabled(limit)
         waiting = self.step_wait()
         self._sync_buttons()
@@ -2711,7 +2863,10 @@ class SettingsDialog(QDialog):
         # движком вовсе. Оставить его доступным значило бы показывать живым
         # поле, которое ни на что не влияет.
         self.take_profit.setEnabled(take_on and not trailing)
-        for field in (self.trailing_start, self.trailing_offset, self.trailing_step):
+        for field in (
+            self.trailing_start, self.trailing_offset, self.trailing_step,
+            self.reenter_after_disconnect,
+        ):
             field.setEnabled(trailing)
 
         error = self.take_error()

@@ -30,14 +30,28 @@ import pytest
 import websockets
 
 from app import live_executor
-from app.live_executor import Instrument, LiveExecutor, LiveLimits, StoreBook, Wiring
+from app.live_executor import (
+    BandSource,
+    Instrument,
+    LiveExecutor,
+    LiveLimits,
+    StoreBook,
+    Wiring,
+)
 from app.reconcile import reconcile
 from broker.secret import Secret
 from broker.session import PORTFOLIO_PATH, BrokerSession
 from broker.throttle import Throttle
 from broker.token_store import TokenStore
 from broker.tokens import TokenScope
-from engine import Engine, EngineSettings, Mode, TradingWindow, is_take_order
+from engine import (
+    Engine,
+    EngineSettings,
+    Mode,
+    TradingWindow,
+    closes_entries_day,
+    is_take_order,
+)
 from engine.contracts import ExitReason, Fill, LevelTouch, OrderAction, OrderRequest, Side
 from engine.ports import ExecutionHalted, ExecutionRefused, Refusal
 from market import MSK, MarketWorker
@@ -67,6 +81,12 @@ from tests.test_broker_session import FAKE_ACCESS, FAKE_REFRESH, START, Clock, n
 
 TICKER = "MXZ6"
 ACCOUNT = "FAKE-ACCOUNT-1"
+#: Шаг цены инструмента: сетка цены каждой заявки FOK (0067).
+STEP = 0.5
+#: Срок заявки в теле создания (13): «исполнить целиком или снять» — то, что
+#: прежде уходило рыночной (0067); «до конца дня» — тейк и выход с пределом.
+FOK = "2"
+DAY = "1"
 #: Свеча решения закрывается в 10:00 — заявка подана в 10:00, исполняется в свече 10:00.
 BAR0 = datetime(2026, 10, 27, 10, 0, tzinfo=MSK)
 BAR1 = BAR0 + timedelta(minutes=5)
@@ -266,6 +286,14 @@ class Rig:
     def sells(self) -> list[dict[str, object]]:
         return [body for body in self.creates() if body["side"] == "2"]
 
+    def told_orders(self) -> list[str]:
+        """Строки человеку «заявка подана по цене…» — по одной на каждую боевую заявку (0067)."""
+        return [note for note in self.notices if " подана по цене " in note]
+
+    def warnings(self) -> list[str]:
+        """Прочие строки человеку без остановки — без штатных строк о поданных заявках."""
+        return [note for note in self.notices if " подана по цене " not in note]
+
 
 @pytest.fixture
 def store(tmp_path: pathlib.Path) -> TokenStore:
@@ -293,6 +321,7 @@ async def make_rig(
     sleep: Callable[[float], Coroutine[object, object, None]] | None = None,
     on_news: Callable[[], None] | None = None,
     limits: LiveLimits = FAST,
+    band: BandSource | None = None,
 ) -> AsyncIterator[Rig]:
     worker = MarketWorker(tmp_path / "candles.sqlite3")
     await worker.open()
@@ -311,7 +340,10 @@ async def make_rig(
         throttle=Throttle(rate=1000.0),
         order_throttle=Throttle(rate=1000.0),
     )
-    minutes: list[Candle] = []
+    # Последняя записанная минутка до первой заявки — 09:59, закрытие 100:
+    # «текущая» цена «закрыть всё» и остатка тейка (0067), свежая на `NOW`.
+    # Сторожа её не видят: они судят минутки не раньше своей подачи (10:00).
+    minutes: list[Candle] = [minute(BAR0 - timedelta(minutes=1), low=99.0)]
     minute_faults: list[Exception] = []
 
     async def source(since: datetime) -> list[Candle]:
@@ -323,9 +355,9 @@ async def make_rig(
     notices: list[str] = []
     wiring = Wiring(
         session, book, source, clock=clock, sleep=sleep or asyncio.sleep,
-        notice=notices.append, on_news=on_news,
+        notice=notices.append, on_news=on_news, band=band,
     )
-    executor = LiveExecutor(wiring, Instrument(TICKER, "SPBFUT", 5, ACCOUNT), limits)
+    executor = LiveExecutor(wiring, Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP), limits)
     exchange = Exchange(broker)
     await executor.start()
     try:
@@ -342,9 +374,23 @@ async def make_rig(
 async def long_open(rig: Rig, price: float = 100.0, volume: int = 1) -> None:
     """Лонг открыт и отдан движку: вход исполнен целиком по `price`."""
     rig.exchange.plans.append(filled((volume, price)))
-    await rig.executor.submit(entry(volume=volume))
+    await submit_on_signal(rig, entry(volume=volume))
     fill = only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
     assert (fill.action, fill.volume) == (OrderAction.OPEN, volume)
+
+
+async def submit_on_signal(rig: Rig, order: OrderRequest) -> None:
+    """Заявка движка так, как её подаёт движок: после `fills_at` своей свечи (Р-2, путь А).
+
+    Свеча сигнала закрылась ровно в `submitted_at` заявки; её закрытие (`bar` —
+    100) — «текущая» цена FOK. Ответ `fills_at` обязан быть пустым: сделка,
+    отданная этим вызовом, пропала бы для проверки самого теста. У стоящего
+    робота `fills_at` не зовётся — подача и так отказывает остановкой.
+    """
+    if rig.executor.halted is None:
+        given = await rig.executor.fills_at(bar(order.submitted_at - timedelta(minutes=5)))
+        assert list(given) == [], f"свеча сигнала отдала то, что ждал тест: {given!r}"
+    await rig.executor.submit(order)
 
 
 async def heard() -> None:
@@ -359,7 +405,7 @@ def only_fill(fills: object) -> Fill:
     return item
 
 
-# --- рыночные заявки: одна сделка на заявку (Р6) ---
+# --- заявки немедленного исполнения (FOK, 0067): одна сделка на заявку (Р6) ---
 
 
 def test_three_executions_of_one_order_are_one_deal_at_the_average_price(
@@ -375,7 +421,7 @@ def test_three_executions_of_one_order_are_one_deal_at_the_average_price(
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(filled((1, 100.0), (1, 101.0), (1, 105.0)))
-            await rig.executor.submit(entry(volume=3))
+            await submit_on_signal(rig, entry(volume=3))
             fill = only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
             assert (fill.action, fill.side, fill.volume) == (OrderAction.OPEN, Side.LONG, 3.0)
             assert fill.price == pytest.approx(102.0)
@@ -404,7 +450,7 @@ def test_a_market_deal_is_not_given_by_a_candle_older_than_its_order(
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(filled((1, 100.0)))
-            await rig.executor.submit(entry())
+            await submit_on_signal(rig, entry())
             assert await rig.executor.fills_at(bar(BAR0 - timedelta(minutes=5))) == []
             fill = only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
             assert fill.at == BAR0
@@ -421,7 +467,7 @@ def test_partial_execution_without_end_cancels_the_rest_and_halts(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(filled((1, 100.0)))
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry(volume=2))
+                await submit_on_signal(rig, entry(volume=2))
             assert "1 из 2" in halted.value.human
             assert halted.value.fills == ()
             assert rig.broker.live() == [], "остаток у брокера не снят"
@@ -440,13 +486,13 @@ def test_new_then_rejected_halts_with_the_exchange_words(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(rejected("Недостаточно обеспечения по счёту"))
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "Недостаточно обеспечения по счёту" in halted.value.human
             assert "отклонила" in halted.value.human
             [row] = await rig.book.rows()
             assert row.status is CommandStatus.REJECTED
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry(at=BAR1))
+                await submit_on_signal(rig, entry(at=BAR1))
             assert len(rig.creates()) == 1, "после остановки ушла ещё заявка"
 
     run(scenario())
@@ -464,7 +510,7 @@ def test_journal_failure_sends_nothing(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.book.fail = True
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "Журнал команд не записал" in halted.value.human
             assert rig.creates() == []
             assert rig.broker.commands == []
@@ -481,7 +527,7 @@ def test_stale_order_is_not_sent(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.clock.now = BAR0 + timedelta(minutes=5, seconds=61)
             with pytest.raises(ExecutionRefused) as refused:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "несвежее" in str(refused.value)
             assert rig.creates() == []
             assert rig.executor.halted is None
@@ -502,7 +548,7 @@ def test_read_only_token_put_in_the_file_halts_before_any_command(
         async with make_rig(tmp_path, store, broker) as rig:
             store.save(Secret(FAKE_REFRESH), TokenScope.READ_ONLY, issued_at=START)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "только для чтения" in halted.value.human
             assert rig.broker.commands == []
 
@@ -524,10 +570,10 @@ def test_position_closed_by_hand_stops_the_reversal(
             rig.broker.outside = -1  # закрыт руками в приложении брокера
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert "у брокера позиции нет" in halted.value.human
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry(Side.SHORT, at=BAR1))
+                await submit_on_signal(rig, entry(Side.SHORT, at=BAR1))
             assert len(rig.creates()) == 1, "после расхождения ушла заявка"
             assert rig.broker.position(TICKER) == 0
 
@@ -554,16 +600,18 @@ def test_position_mismatch_seen_by_the_stream_closes_everything_once(
             assert rig.executor.halted is not None
             rig.exchange.plans.append(filled((2, 99.0)))
             result = await reconcile(rig.executor, expected=1)
-            assert result.halted is not None and "закрыта по рынку" in result.halted
+            assert result.halted is not None and "закрыта заявкой FOK" in result.halted
             assert rig.broker.live() == [], "тейк у брокера не снят"
             assert rig.broker.position(TICKER) == 0
-            closing = [body for body in rig.sells() if body["orderType"] == "1"]
+            closing = [body for body in rig.sells() if body["timeInForce"] == FOK]
             assert [body["orderQuantity"] for body in closing] == [2]
             again = await reconcile(rig.executor, expected=1)
             assert again.halted is not None
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry(at=BAR1))
-            assert [body["orderQuantity"] for body in rig.sells() if body["orderType"] == "1"] == [
+                await submit_on_signal(rig, entry(at=BAR1))
+            assert [
+                body["orderQuantity"] for body in rig.sells() if body["timeInForce"] == FOK
+            ] == [
                 2
             ], "закрыть всё подано второй раз"
 
@@ -590,7 +638,7 @@ def test_position_mismatch_unseen_by_the_stream_is_not_closed(
             assert "лонг 2" in result.halted and "по сделкам программы — лонг 1" in result.halted
             assert "не подана" in result.halted
             assert rig.broker.live() == [], "тейк у брокера не снят"
-            assert [body for body in rig.sells() if body["orderType"] == "1"] == []
+            assert [body for body in rig.sells() if body["timeInForce"] == FOK] == []
             assert rig.broker.position(TICKER) == 2
 
     run(scenario())
@@ -618,7 +666,7 @@ def test_a_failed_close_all_is_not_repeated_by_the_next_reconcile(
             assert rig.broker.position(TICKER) == 2
             again = await reconcile(rig.executor, expected=1)
             assert again.halted is not None and "уже пыталась" in again.halted
-            market_sells = [body for body in rig.sells() if body["orderType"] == "1"]
+            market_sells = [body for body in rig.sells() if body["timeInForce"] == FOK]
             assert len(market_sells) == 1, "закрыть всё подано второй раз"
 
     run(scenario())
@@ -644,11 +692,11 @@ def test_a_mismatch_found_before_an_order_cancels_the_take_at_the_broker(
             rig.exchange.plans.append(filled((2, 99.0)))
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert "лонг 2" in halted.value.human
             assert rig.broker.live() == [], "тейк у брокера пережил «закрыть всё»"
             assert rig.broker.position(TICKER) == 2
-            market_sells = [body for body in rig.sells() if body["orderType"] == "1"]
+            market_sells = [body for body in rig.sells() if body["timeInForce"] == FOK]
             assert market_sells == [], "закрыто по портфелю, не согласному со сделками"
 
     run(scenario())
@@ -675,8 +723,9 @@ def test_a_close_all_names_the_take_it_could_not_cancel(
             rig.exchange.plans.append(filled((2, 99.0)))
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave())
-            assert "Заявку (тейк лонга) снять не удалось" in halted.value.human
+                await submit_on_signal(rig, leave())
+            assert "Заявку (тейк лонга, по цене 110" in halted.value.human
+            assert "снять не удалось" in halted.value.human
             assert "не подана" in halted.value.human
             assert rig.broker.position(TICKER) == 2
 
@@ -712,7 +761,7 @@ def test_a_lagging_portfolio_is_read_again_before_closing_everything(
             honest = rig.broker.replace_route(route, lagging)
             rig.exchange.plans.append(filled((1, 104.0)))
             rig.clock.now = BAR1 + timedelta(seconds=5)
-            await rig.executor.submit(leave())
+            await submit_on_signal(rig, leave())
             assert len(reads) == 2, "портфель не перечитан"
             assert rig.executor.halted is None, "отставший портфель закрыл всё"
             assert [body["orderQuantity"] for body in rig.sells()] == [1]
@@ -737,7 +786,7 @@ def test_fixed_take_is_one_limit_at_the_engine_price_and_rearm_sends_nothing(
             await long_open(rig)
             await rig.executor.submit(arm(110.0, LevelTouch.RISE))
             await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
-            limits = [body for body in rig.creates() if body["orderType"] == "2"]
+            limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
             assert [(body["side"], body["price"]) for body in limits] == [("2", 110.0)]
             assert len(rig.broker.live()) == 1
             rig.broker.execute(str(limits[0]["clientOrderId"]), 1, 110.0)
@@ -765,7 +814,7 @@ def test_take_cancel_returns_only_after_the_cancelled_status(
             assert rig.broker.live() == []
             assert [kind for kind, _ in rig.broker.commands].count("cancel") == 1
             rig.exchange.plans.append(filled((1, 104.0)))
-            await rig.executor.submit(leave())
+            await submit_on_signal(rig, leave())
             fill = only_fill(await rig.executor.fills_at(bar(BAR1, unsettled=True)))
             assert (fill.action, fill.price) == (OrderAction.CLOSE, 104.0)
 
@@ -794,9 +843,9 @@ def test_take_cancelled_by_someone_else_halts(
 def test_partly_filled_take_on_cancel_closes_the_rest_as_one_deal(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Тейк исполнен на 1 из 2 к снятию: остаток — рыночным выходом, движку ОДНА сделка на 2.
+    """Тейк исполнен на 1 из 2 к снятию: остаток — выходом FOK, движку ОДНА сделка на 2.
 
-    Снятие отвечает `ALREADY_TRIGGERED`: движок рыночный выход не подаёт и ждёт
+    Снятие отвечает `ALREADY_TRIGGERED`: движок своего выхода не подаёт и ждёт
     сделку по уровню. Позиция у брокера после этого — ноль, не шорт.
     """
 
@@ -809,6 +858,7 @@ def test_partly_filled_take_on_cancel_closes_the_rest_as_one_deal(
             await heard()
             rig.exchange.plans.append(filled((1, 108.0)))
             rig.clock.now = BAR1 + timedelta(seconds=5)
+            rig.minutes.append(minute(BAR1, low=99.0))
             with pytest.raises(ExecutionRefused) as refused:
                 await rig.executor.submit(disarm(volume=2))
             assert refused.value.reason is Refusal.ALREADY_TRIGGERED
@@ -888,7 +938,7 @@ def test_a_journal_status_write_failure_after_sending_halts_out_loud(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.book.fail_status = True
             rig.exchange.plans.append(filled((1, 100.0)))
-            await rig.executor.submit(entry())
+            await submit_on_signal(rig, entry())
             assert rig.executor.halted is not None, "сбой записи статуса проглочен"
             with pytest.raises(ExecutionHalted) as halted:
                 await rig.executor.fills_at(bar(BAR0, unsettled=True))
@@ -943,7 +993,7 @@ def test_a_portfolio_that_cannot_be_read_halts_before_any_command(
 
             rig.broker.replace_route(route, odd)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "прочитать нельзя" in halted.value.human
             assert rig.executor.halted is not None
             assert rig.creates() == []
@@ -1017,7 +1067,7 @@ def test_an_order_refused_after_its_record_is_closed_in_the_journal(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.broker.create_answers.append(ANSWERS["не принята, 400"])
             with pytest.raises(ExecutionRefused):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert rig.executor.halted is None
             [row] = await rig.book.rows()
             assert row.status is CommandStatus.REFUSED
@@ -1159,10 +1209,10 @@ def test_a_short_fixed_take_is_a_limit_buy_at_the_broker(
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(filled((1, 100.0)))
-            await rig.executor.submit(entry(Side.SHORT))
+            await submit_on_signal(rig, entry(Side.SHORT))
             only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
             await rig.executor.submit(arm(90.0, LevelTouch.FALL, side=Side.SHORT))
-            limits = [body for body in rig.creates() if body["orderType"] == "2"]
+            limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
             assert [(body["side"], body["price"]) for body in limits] == [("1", 90.0)]
             assert len(rig.broker.live()) == 1
 
@@ -1172,7 +1222,7 @@ def test_a_short_fixed_take_is_a_limit_buy_at_the_broker(
 def test_a_rise_touch_of_a_short_buys_exactly_once(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Касание `RISE` у шорта (максимум минутки дошёл до уровня) — одна рыночная покупка.
+    """Касание `RISE` у шорта (максимум минутки дошёл до уровня) — одна покупка FOK (0067).
 
     Зеркало лонга: стоп шорта позади рынка лимитной не выразить, его сторожит
     программа. Максимум ровно на уровне — касание, как у модели (`high >= level`);
@@ -1182,7 +1232,7 @@ def test_a_rise_touch_of_a_short_buys_exactly_once(
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(filled((1, 100.0)))
-            await rig.executor.submit(entry(Side.SHORT))
+            await submit_on_signal(rig, entry(Side.SHORT))
             only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
             await rig.executor.submit(arm(105.0, LevelTouch.RISE, side=Side.SHORT))
             assert rig.broker.live() == [], "стоп шорта ушёл к брокеру лимитной заявкой"
@@ -1196,7 +1246,7 @@ def test_a_rise_touch_of_a_short_buys_exactly_once(
             await rig.executor.watch()
             await rig.executor.watch()
             buys = [body for body in rig.creates() if body["side"] == "1"]
-            assert [(body["orderType"], body["orderQuantity"]) for body in buys] == [("1", 1)]
+            assert [(body["timeInForce"], body["orderQuantity"]) for body in buys] == [(FOK, 1)]
             fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
             assert (fill.action, fill.order_id, fill.price) == (
                 OrderAction.CLOSE, take_name(Side.SHORT), 105.5,
@@ -1212,7 +1262,7 @@ def test_a_rise_touch_of_a_short_buys_exactly_once(
 def test_fall_touch_of_a_long_sells_exactly_once(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Касание `FALL` у лонга — ровно одна рыночная продажа; повторный снимок второй не даёт.
+    """Касание `FALL` у лонга — ровно одна продажа FOK; повторный снимок второй не даёт.
 
     Уровень у брокера не стоит вовсе (лимитной стоп не выразить), продажа
     записана в журнал под именем заявки тейка движка — по нему день узнаёт тейк.
@@ -1232,8 +1282,8 @@ def test_fall_touch_of_a_long_sells_exactly_once(
             rig.minutes[-1] = minute(BAR0 + timedelta(minutes=2), low=93.0)
             rig.minutes.append(minute(BAR0 + timedelta(minutes=3), low=92.0))
             await rig.executor.watch()
-            assert [(body["orderType"], body["orderQuantity"]) for body in rig.sells()] == [
-                ("1", 1)
+            assert [(body["timeInForce"], body["orderQuantity"]) for body in rig.sells()] == [
+                (FOK, 1)
             ]
             fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
             assert (fill.action, fill.order_id, fill.price, fill.at) == (
@@ -1273,7 +1323,7 @@ def test_touch_in_the_last_seconds_then_cancel_is_already_triggered_and_no_short
             fill = only_fill(await rig.executor.fills_at(bar(BAR1)))
             assert (fill.order_id, fill.at, fill.price) == (take_name(), BAR0, 94.5)
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert len(rig.sells()) == 1, "выход движка ушёл к брокеру поверх сработавшего сторожа"
             assert rig.broker.position(TICKER) == 0
 
@@ -1302,10 +1352,10 @@ def test_trailing_arm_after_its_touch_is_already_triggered(
 def test_touch_in_backfilled_minutes_sells_once_after_the_link_returns(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Касание в догруженной после обрыва минутке — выход по рынку после связи, робот работает.
+    """Касание в догруженной после обрыва минутке — выход FOK после связи, робот работает.
 
     Решение владельца 01.11.2026 (0066): пока потока статусов нет, выход
-    не подаётся и робот не встаёт; после связи — ровно одна рыночная продажа
+    не подаётся и робот не встаёт; после связи — ровно одна продажа FOK
     под именем тейка `take:…`, строка журнала до POST. Движок получает выход
     свечой касания, а не свечой связи. Повтор догрузки тех же минуток второй
     продажи не даёт.
@@ -1338,8 +1388,8 @@ def test_touch_in_backfilled_minutes_sells_once_after_the_link_returns(
             gate.set()
             assert await rig.executor.wait_connected(2.0)
             await rig.executor.watch()
-            assert [(body["orderType"], body["orderQuantity"]) for body in rig.sells()] == [
-                ("1", 1)
+            assert [(body["timeInForce"], body["orderQuantity"]) for body in rig.sells()] == [
+                (FOK, 1)
             ]
             assert rig.book.written[-1].order_id == take_name()
             assert rig.book.sent_before[sent:] == [len(rig.broker.commands) - 1]
@@ -1368,8 +1418,8 @@ def test_limit_time_exit_not_filled_halts_naming_the_live_order(
         async with make_rig(tmp_path, store, broker) as rig:
             await long_open(rig)
             rig.clock.now = BAR1 + timedelta(seconds=5)
-            await rig.executor.submit(leave(limit=99.0))
-            [limit] = [body for body in rig.creates() if body["orderType"] == "2"]
+            await submit_on_signal(rig, leave(limit=99.0))
+            [limit] = [body for body in rig.creates() if body["timeInForce"] == DAY]
             assert limit["price"] == 99.0
             assert await rig.executor.fills_at(bar(BAR1)) == []
             with pytest.raises(ExecutionHalted) as halted:
@@ -1393,10 +1443,10 @@ def test_lost_answer_halts_and_nothing_is_sent_twice(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.broker.create_answers.append(ANSWERS["принята, ответ потерян по таймауту"])
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "Неизвестно" in halted.value.human
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry(at=BAR1))
+                await submit_on_signal(rig, entry(at=BAR1))
             assert list(rig.broker.keys_sent("create").values()) == [1]
             assert rig.book.sent_before == [0], "строка журнала записана после POST"
             [row] = await rig.book.rows()
@@ -1415,7 +1465,7 @@ def test_after_lost_answer_reconcile_cancels_the_live_order(
             rig.broker.create_answers.append(ANSWERS["принята, ответ потерян по таймауту"])
             rig.exchange.plans.append(resting)
             with pytest.raises(ExecutionHalted) as earlier:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             result = await reconcile(rig.executor, expected=0)
             assert (result.broker, result.expected) == (0, 0)
             assert result.halted == earlier.value.human, "сверка скрыла, что исполнитель стоит"
@@ -1441,7 +1491,7 @@ def test_after_lost_answer_an_executed_order_is_flattened(
             rig.broker.create_answers.append(ANSWERS["принята, связь оборвана до ответа"])
             rig.exchange.plans.extend([filled((1, 100.0)), filled((1, 98.0))])
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             result = await reconcile(rig.executor, expected=0)
             assert result.halted is not None
             assert rig.broker.position(TICKER) == 0
@@ -1467,13 +1517,13 @@ def test_a_close_all_lands_in_the_day_under_its_real_name_and_is_not_a_take(
             rig.broker.create_answers.append(ANSWERS["принята, связь оборвана до ответа"])
             rig.exchange.plans.extend([filled((1, 100.0)), filled((1, 98.0))])
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             result = await reconcile(rig.executor, expected=0)
             assert result.halted is not None
             day = await rig.book.worker.call(
                 lambda base: base.executions_day(
                     ACCOUNT, BAR0.date(), ruble_per_point={TICKER: 10.0},
-                    is_take=is_take_order,
+                    is_take=is_take_order, closes_day=closes_entries_day,
                 )
             )
             assert (day.gross, day.last_exit_date) == (-20.0, BAR0.date())
@@ -1493,7 +1543,7 @@ def test_429_on_create_halts_without_a_repeat(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.broker.create_answers.append(ANSWERS[answer])
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert len(rig.creates()) == 1
 
     run(scenario())
@@ -1509,7 +1559,7 @@ def test_accepted_without_event_is_found_by_status_after_a_429(
             rig.broker.muted = True
             rig.broker.status_answers.extend([ANSWERS["не принята, 429"].reply, None])
             rig.exchange.plans.append(filled((1, 100.0)))
-            await rig.executor.submit(entry())
+            await submit_on_signal(rig, entry())
             fill = only_fill(await rig.executor.fills_at(bar(BAR0, unsettled=True)))
             assert (fill.action, fill.price) == (OrderAction.OPEN, 100.0)
             assert len(rig.creates()) == 1
@@ -1531,7 +1581,7 @@ def test_accepted_but_not_found_by_status_halts(
 
             rig.broker.status_answers.extend([missing, missing])
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert "не находит" in halted.value.human
 
     run(scenario())
@@ -1558,14 +1608,14 @@ def test_task_cancelled_after_record_reads_as_unknown_not_as_not_sent(
             base_url="https://example.invalid", transport=httpx.MockTransport(handler)
         )
         async with make_rig(tmp_path, store, broker, client=client) as rig:
-            task = asyncio.create_task(rig.executor.submit(entry()))
+            task = asyncio.create_task(submit_on_signal(rig, entry()))
             await entered.wait()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert rig.executor.halted is not None
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry(at=BAR1))
+                await submit_on_signal(rig, entry(at=BAR1))
             notes = await rig.executor.settle_open_commands()
             assert any("не найдена" in note for note in notes)
             [row] = await rig.book.rows()
@@ -1604,7 +1654,7 @@ def test_dead_stream_refuses_and_lost_events_are_recovered_once(
             assert rig.broker.lost, "событие не потерялось — проверка пуста"
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionRefused):
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert len(rig.broker.commands) == sent
             gate.set()
             assert await rig.executor.wait_connected(2.0)
@@ -1656,7 +1706,7 @@ def test_the_token_is_in_no_text(
         async with make_rig(tmp_path, store, broker) as rig:
             rig.broker.create_answers.append(ANSWERS["принята, ответ 500"])
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             texts.extend([halted.value.human, repr(halted.value), str(halted.value)])
             texts.extend(row.reason for row in await rig.book.rows())
             texts.append(rig.executor.halted or "")
@@ -1748,7 +1798,7 @@ def test_a_stale_order_costs_not_a_single_request(
             rig.clock.now = BAR0 + timedelta(minutes=5, seconds=61)
             before = len(rig.broker.requests)
             with pytest.raises(ExecutionRefused):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             assert rig.broker.requests[before:] == [], "несвежая заявка потратила запрос"
             assert rig.executor.halted is None
 
@@ -1779,14 +1829,14 @@ def test_a_dead_stream_costs_no_request_and_the_robot_trades_after_the_link(
             rig.clock.now = BAR1 + timedelta(seconds=5)
             before = len(rig.broker.requests)
             with pytest.raises(ExecutionRefused) as refused:
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert "сигнал пропущен" in str(refused.value)
             assert rig.broker.requests[before:] == [], "заявка без потока потратила запрос"
             assert rig.executor.halted is None, "обрыв потока остановил робота"
             gate.set()
             assert await rig.executor.wait_connected(2.0)
             rig.exchange.plans.append(filled((1, 103.0)))
-            await rig.executor.submit(leave())
+            await submit_on_signal(rig, leave())
             fill = only_fill(await rig.executor.fills_at(bar(BAR1, unsettled=True)))
             assert (fill.action, fill.price) == (OrderAction.CLOSE, 103.0)
             assert rig.broker.position(TICKER) == 0
@@ -2115,8 +2165,8 @@ def test_a_take_cancel_never_confirmed_halts_and_sends_no_exit(
             assert "не подтверждено" in halted.value.human
             assert take_key in halted.value.human
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(leave())
-            assert [body["orderType"] for body in rig.sells()] == ["2"], "ушёл выход"
+                await submit_on_signal(rig, leave())
+            assert [body["timeInForce"] for body in rig.sells()] == [DAY], "ушёл выход"
 
     run(scenario())
 
@@ -2135,7 +2185,7 @@ def test_a_take_level_off_the_whole_grid_goes_to_the_broker_as_is(
         async with make_rig(tmp_path, store, broker) as rig:
             await long_open(rig)
             await rig.executor.submit(arm(110.25, LevelTouch.RISE))
-            limits = [body for body in rig.creates() if body["orderType"] == "2"]
+            limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
             assert [body["price"] for body in limits] == [110.25]
 
     run(scenario())
@@ -2153,23 +2203,25 @@ def _partial_then_foreign(fake: FakeBroker, order: BookOrder) -> None:
 def test_halt_while_a_market_order_fills_cancels_the_rest_and_names_it(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """К1 (S1): остановка пришла посреди рыночной заявки — остаток всё равно снят и назван.
+    """К1 (S1): остановка пришла посреди заявки FOK — остаток всё равно снят и назван.
 
-    Снятие своей рыночной заявки — единственная команда, разрешённая после
-    остановки. Текст: ключ заявки, «исполнено 1 из 2», «остаток снят» и обе
-    причины. Исполненная часть движку не отдаётся (Р6) — названа словами.
+    Снятие своей заявки немедленного исполнения — FOK (0067, Р-7) — единственная
+    команда, разрешённая после остановки. Частичного у FOK быть не должно, это
+    ветка-страховка. Текст: ключ заявки, «исполнено 1 из 2», «остаток снят»
+    и обе причины. Исполненная часть движку не отдаётся (Р6) — названа словами.
     """
 
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             rig.exchange.plans.append(_partial_then_foreign)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry(volume=2))
+                await submit_on_signal(rig, entry(volume=2))
             key = rig.book.written[0].client_order_id
             text = halted.value.human
             assert key in text and "1 из 2" in text and "остаток снят" in text
             assert "не подавала" in text, "первая причина остановки потеряна"
-            assert rig.broker.live() == [], "остаток рыночной заявки жив"
+            assert rig.broker.live() == [], "остаток заявки FOK жив"
+            assert rig.creates()[0]["timeInForce"] == FOK, "вход ушёл не FOK"
             assert list(rig.broker.keys_sent("cancel").values()) == [1]
             assert halted.value.fills == ()
             assert len(rig.creates()) == 1, "после остановки ушла новая заявка"
@@ -2187,7 +2239,7 @@ def test_a_rest_that_could_not_be_cancelled_is_named_alive(
             rig.exchange.plans.append(_partial_then_foreign)
             rig.broker.cancel_answers.append(Answer(False, ACCEPT.reply))
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry(volume=2))
+                await submit_on_signal(rig, entry(volume=2))
             key = rig.book.written[0].client_order_id
             text = halted.value.human
             assert key in text and "1 из 2" in text
@@ -2236,9 +2288,9 @@ def test_close_all_does_not_oversell_when_the_take_fills_during_its_cancel(
             honest_portfolio = rig.broker.replace_route(("GET", PORTFOLIO_PATH), lagging)
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert rig.broker.position(TICKER) == 1, "закрыть всё продало по отставшему портфелю"
-            assert [body for body in rig.sells() if body["orderType"] == "1"] == []
+            assert [body for body in rig.sells() if body["timeInForce"] == FOK] == []
             assert "не сходится" in halted.value.human and "не подана" in halted.value.human
             assert "закрыта" not in halted.value.human
             fill = only_fill(list(halted.value.fills))
@@ -2263,7 +2315,7 @@ def test_an_unresolved_command_fails_reconcile_and_its_later_fill_halts(
             rig.broker.create_answers.append(ANSWERS["принята, ответ потерян по таймауту"])
             rig.exchange.plans.append(resting)
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             key = rig.book.written[0].client_order_id
             await rig.executor.close()
             assert rig.session is not None
@@ -2276,7 +2328,7 @@ def test_an_unresolved_command_fails_reconcile_and_its_later_fill_halts(
 
             fresh = LiveExecutor(
                 Wiring(rig.session, rig.book, no_minutes, clock=rig.clock),
-                Instrument(TICKER, "SPBFUT", 5, ACCOUNT),
+                Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP),
                 FAST,
             )
             await fresh.start()
@@ -2332,9 +2384,9 @@ def test_a_trailing_touch_without_the_stream_is_told_to_the_human(
                 assert await rig.executor.fills_at(bar(start)) == []
             await heard()
             assert rig.executor.halted is None
-            assert len(rig.notices) == 1, rig.notices
-            assert "уровень трейлинга 95" in rig.notices[0]
-            assert "ждёт" in rig.notices[0] and "связи" in rig.notices[0]
+            [told] = rig.warnings()
+            assert "уровень трейлинга 95" in told
+            assert "ждёт" in told and "связи" in told
             assert any(
                 record.levelno == logging.WARNING and "уровень трейлинга 95" in record.getMessage()
                 for record in caplog.records
@@ -2382,9 +2434,9 @@ def test_a_reversal_with_a_portfolio_lagging_past_settle_does_not_open_a_short(
 
             rig.exchange.plans.extend([close_then_lag, filled((1, 104.0))])
             rig.clock.now = BAR1 + timedelta(seconds=5)
-            await rig.executor.submit(leave())
+            await submit_on_signal(rig, leave())
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(entry(side=Side.SHORT, at=BAR1))
+                await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
             assert rig.broker.position(TICKER) == 0, "переворот с отставшим портфелем дал шорт"
             assert len(rig.sells()) == 1
             assert "не сходится" in halted.value.human
@@ -2418,8 +2470,8 @@ def _on_first_ping(
 
 
 def _market_sells(rig: Rig) -> list[object]:
-    """Объёмы рыночных продаж, ушедших к брокеру, по порядку."""
-    return [body["orderQuantity"] for body in rig.sells() if body["orderType"] == "1"]
+    """Объёмы продаж FOK (прежде — рыночных, 0067), ушедших к брокеру, по порядку."""
+    return [body["orderQuantity"] for body in rig.sells() if body["timeInForce"] == FOK]
 
 
 def test_a_halt_arriving_while_a_take_is_being_cancelled_sends_no_cancel(
@@ -2428,10 +2480,10 @@ def test_a_halt_arriving_while_a_take_is_being_cancelled_sends_no_cancel(
     broker: FakeBroker,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """К1: после остановки снимается только остаток своей рыночной заявки — не тейк.
+    """К1: после остановки снимается только остаток своей заявки FOK — не тейк.
 
     Чужая сделка приходит посреди снятия тейка, уже после проверки остановки
-    в начале `submit`. Снятие лимитного тейка — не остаток рыночной: к брокеру
+    в начале `submit`. Снятие лимитного тейка — не остаток FOK: к брокеру
     оно не уходит (`B-077`), тейк жив, человеку названа причина остановки.
     """
 
@@ -2446,7 +2498,8 @@ def test_a_halt_arriving_while_a_take_is_being_cancelled_sends_no_cancel(
             assert "не подавала" in halted.value.human
             sent = [kind for kind, _ in rig.broker.commands if kind == "cancel"]
             assert sent == [], "после остановки к брокеру ушло снятие тейка"
-            assert [one.order_type for one in rig.broker.live()] == ["2"]
+            live = [(one.order_type, one.time_in_force) for one in rig.broker.live()]
+            assert live == [("2", DAY)]
 
     run(scenario())
 
@@ -2473,7 +2526,7 @@ def test_a_halt_arriving_while_an_exit_is_checked_sends_no_order(
             _on_first_ping(rig, monkeypatch, lambda: rig.broker.cancel_outside(take.key))
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             assert "снята не программой" in halted.value.human
             assert _market_sells(rig) == [], "после остановки ушла продажа"
             assert rig.broker.position(TICKER) == 1
@@ -2610,7 +2663,7 @@ def test_a_close_all_that_cannot_read_the_portfolio_tells_to_close_by_hand(
             honest = rig.broker.replace_route(("GET", PORTFOLIO_PATH), failing_after_two)
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave())
+                await submit_on_signal(rig, leave())
             text = halted.value.human
             assert "прочитать не удалось" in text and "закройте позицию сами" in text
             assert _market_sells(rig) == []
@@ -2634,7 +2687,7 @@ def test_a_journal_order_that_cannot_be_cancelled_fails_reconcile(
             rig.broker.create_answers.append(ANSWERS["принята, ответ потерян по таймауту"])
             rig.exchange.plans.append(resting)
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             key = rig.book.written[0].client_order_id
             rig.broker.cancel_answers.append(Answer(False, ACCEPT.reply))
             result = await reconcile(rig.executor, expected=0)
@@ -2663,7 +2716,7 @@ def test_an_execution_known_at_reconcile_does_not_halt_when_the_stream_repeats_i
             rig.broker.create_answers.append(ANSWERS["принята, ответ потерян по таймауту"])
             rig.exchange.plans.append(resting)
             with pytest.raises(ExecutionHalted):
-                await rig.executor.submit(entry())
+                await submit_on_signal(rig, entry())
             key = rig.book.written[0].client_order_id
             await rig.executor.close()
             rig.broker.execute(key, 1, 100.0)  # программа закрыта: событие уходит в пустоту
@@ -2674,7 +2727,7 @@ def test_an_execution_known_at_reconcile_does_not_halt_when_the_stream_repeats_i
 
             fresh = LiveExecutor(
                 Wiring(rig.session, rig.book, no_minutes, clock=rig.clock),
-                Instrument(TICKER, "SPBFUT", 5, ACCOUNT),
+                Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP),
                 FAST,
             )
             await fresh.start()
@@ -2717,9 +2770,9 @@ def test_a_trailing_exit_waiting_for_the_portfolio_is_told_once(
             await heard()
             assert rig.executor.halted is None
             assert rig.sells() == []
-            assert len(rig.notices) == 1, rig.notices
-            assert "уровень трейлинга 95" in rig.notices[0]
-            assert "прочитать не удалось" in rig.notices[0]
+            [told] = rig.warnings()
+            assert "уровень трейлинга 95" in told
+            assert "прочитать не удалось" in told
 
     run(scenario())
 
@@ -2748,7 +2801,7 @@ def test_the_link_back_calls_for_a_pass_when_a_trailing_exit_waits(
             rig.minutes.append(minute(BAR0 + timedelta(minutes=1), low=94.0))
             await rig.executor.watch()
             await heard()
-            assert rig.sells() == [] and len(rig.notices) == 1
+            assert rig.sells() == [] and len(rig.warnings()) == 1
             called.clear()
             rig.exchange.plans.append(filled((1, 94.0)))
             gate.set()
@@ -2780,7 +2833,7 @@ def test_rearming_the_level_after_a_reconcile_keeps_the_one_take(
             [take] = rig.broker.live()
             rig.clock.now = BAR1 + timedelta(seconds=5)
             await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
-            limits = [body for body in rig.creates() if body["orderType"] == "2"]
+            limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
             assert [(body["side"], body["price"]) for body in limits] == [("2", 110.0)]
             assert [order.key for order in rig.broker.live()] == [take.key]
             rig.broker.execute(take.key, 1, 110.0)
@@ -2828,7 +2881,7 @@ def test_a_close_all_that_closed_still_names_the_take_it_could_not_cancel(
 ) -> None:
     """«Закрыть всё» закрыло позицию, а тейк снять не смогло — текст говорит и то, и другое.
 
-    Опасное сочетание: «закрыта по рынку» читается как «на счёте пусто», а
+    Опасное сочетание: «закрыта» читается как «на счёте пусто», а
     лимитный тейк, возможно, жив и, исполнившись, откроет шорт без робота.
     Робот считает лонг 1, а портфель и сделки потока согласно говорят лонг 2:
     объём закрытия подтверждён (К2), продажа на 2 прошла.
@@ -2841,12 +2894,14 @@ def test_a_close_all_that_closed_still_names_the_take_it_could_not_cancel(
             rig.broker.cancel_answers.append(Answer(False, ACCEPT.reply))
             rig.exchange.plans.append(filled((2, 99.0)))
             rig.clock.now = BAR1 + timedelta(seconds=5)
+            rig.minutes.append(minute(BAR1, low=99.0))
             with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(leave(volume=1))
+                await submit_on_signal(rig, leave(volume=1))
             text = halted.value.human
-            assert "закрыта по рынку" in text
-            assert "Заявку (тейк лонга) снять не удалось" in text
-            assert [one.order_type for one in rig.broker.live()] == ["2"]
+            assert "закрыта заявкой FOK" in text
+            assert "Заявку (тейк лонга, по цене 110" in text and "снять не удалось" in text
+            live = [(one.order_type, one.time_in_force) for one in rig.broker.live()]
+            assert live == [("2", DAY)]
             assert rig.broker.position(TICKER) == 0
 
     run(scenario())
@@ -2925,7 +2980,7 @@ def test_a_take_filled_during_the_outage_reaches_the_engine_once(
             result = await reconcile(rig.executor, expected=1)
             assert result.halted is None, result.halted
             assert rig.broker.keys_sent("cancel") == Counter()
-            assert [body for body in rig.sells() if body["orderType"] == "1"] == []
+            assert [body for body in rig.sells() if body["timeInForce"] == FOK] == []
             fill = only_fill(await rig.executor.fills_at(bar(BAR0)))
             assert (fill.action, fill.order_id) == (OrderAction.CLOSE, take_name())
             assert fill.price == 110.0
@@ -2981,7 +3036,7 @@ def test_reconcile_after_a_reconnect_keeps_the_limit_exit_waiting_at_the_broker(
         async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
             await long_open(rig)
             rig.clock.now = BAR1 + timedelta(seconds=5)
-            await rig.executor.submit(leave(limit=99.0))
+            await submit_on_signal(rig, leave(limit=99.0))
             [waiting] = rig.broker.live()
             await _reconnect(rig, gate, lambda: None)
             result = await reconcile(rig.executor, expected=1)
@@ -3182,7 +3237,7 @@ def test_an_entry_not_yet_given_to_the_engine_is_counted_by_the_reconcile(
         gate, sleep = _gated()
         async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
             rig.exchange.plans.append(filled((1, 100.0)))
-            await rig.executor.submit(entry())
+            await submit_on_signal(rig, entry())
             await _reconnect(rig, gate, lambda: None)
             result = await reconcile(rig.executor, expected=0)
             assert result.halted is None, result.halted
@@ -3243,7 +3298,7 @@ def test_rearming_the_same_level_after_the_broker_cancelled_the_take_is_a_halt(
             with pytest.raises(ExecutionHalted) as halted:
                 await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
             assert "снята не программой" in halted.value.human
-            limits = [body for body in rig.creates() if body["orderType"] == "2"]
+            limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
             assert len(limits) == 1, "снятый брокером тейк поставлен заново после остановки"
 
     run(scenario())
@@ -3341,7 +3396,7 @@ def test_a_limit_exit_partly_filled_before_the_link_returned_is_not_a_mismatch_t
         async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
             await long_open(rig, volume=2)
             rig.clock.now = BAR1 + timedelta(seconds=5)
-            await rig.executor.submit(leave(volume=2, limit=99.0))
+            await submit_on_signal(rig, leave(volume=2, limit=99.0))
             [limit] = rig.broker.live()
             await _reconnect(rig, gate, lambda: rig.broker.execute(limit.key, 1, 99.0))
             result = await reconcile(rig.executor, expected=2)

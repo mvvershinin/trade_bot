@@ -90,6 +90,7 @@ from backtest import (
     summarise,
 )
 from engine import (
+    AccountFunds,
     DayRecord,
     Engine,
     EngineSettings,
@@ -97,6 +98,7 @@ from engine import (
     ExitReason,
     Fill,
     JournalEntry,
+    LevelUnfilled,
     Mode,
     OrderAction,
     OrderExecutor,
@@ -531,12 +533,17 @@ class _FactBook:
             raise
         self._sent(order)
 
-    async def fills_at(self, candle: PortCandle) -> Sequence[Fill | PriceSeen]:
+    async def fills_at(
+        self, candle: PortCandle
+    ) -> Sequence[Fill | PriceSeen | LevelUnfilled]:
         try:
             items = await self._inner.fills_at(candle)
         except ExecutionHalted as halted:
             self._take(halted.fills, candle)
             raise
+        # В книгу — только сделки. Ответ движку уходит без отбора: наблюдение
+        # цены и событие «уровень не исполнился» (Р-10, Н6) разбирает он,
+        # и сделкой в книге «факта» ни то ни другое не является.
         self._take([item for item in items if isinstance(item, Fill)], candle)
         return items
 
@@ -712,6 +719,8 @@ class LiveObserver:
         #: «Факт» пары (`pair_with`); `None` — одиночный ход, наблюдение.
         self._fact: _FactSide | None = None
         self._day: DayRecord | None = None
+        #: Снимки счёта, ждущие прохода (`funds`): первый каждой даты и последний.
+        self._funds_due: list[AccountFunds] = []
         self._fact_id: int | None = None
         #: Писатель строк «факта» — в его прогон (`FactLeg.session_id`).
         self._fact_log: PaperLog | None = None
@@ -840,6 +849,7 @@ class LiveObserver:
         self._say_seam(seam)
         recounting, started = not self._tally.recounted, time.monotonic()
         if not self._stopped and not self._failure:
+            self._hand_funds()
             await self._ride()
             self._tally.recounted = self._tally.recounted or self._tally.bars > 0
         self._arm_pair()
@@ -1000,6 +1010,49 @@ class LiveObserver:
             else:
                 position = None
         return position
+
+    def funds(self, money: AccountFunds) -> None:
+        """Снимок счёта — обоим движкам пары, одним и тем же (Р-9). Возврат немедленный.
+
+        Только у пары: одиночный ход — наблюдение — денег счёта не получает
+        (решение 0037, следствие 1), и снимок, пришедший ему, — дефект проводки.
+        Отказ вслух, а не молчаливый пропуск: иначе ход без заявок молча стал бы
+        отличаться от прогона по истории.
+
+        ⚠️ Снимок кладётся в движки **не в момент прихода**, а в начале ближайшего
+        прохода (`feed`), до разбора свечей, — или при включении пары
+        (`_arm_pair`), рядом с днём до запуска. Опрос счёта идёт своей задачей,
+        а движок посреди разбора свечи ждёт исполнителя (`submit`) и после ответа
+        закрепляет состояние, посчитанное **до** ожидания: снимок, положенный
+        в это время, затёрся бы молча. До включения снимок тоже ждёт: прогрев
+        идёт по прошлым барам, и строка «Размер счёта принят» с нынешним
+        временем встала бы посреди них.
+
+        Очередь держит первый снимок каждой даты и последний: движку нужны ровно
+        они (размер счёта на дату и текущие деньги, `Engine.on_funds`), а опрос
+        раз в полминуты без единого прохода копил бы список без конца.
+        """
+        if self._fact is None:
+            raise RuntimeError(
+                "снимок счёта отдают только паре боя: наблюдение денег счёта не получает"
+            )
+        # Снимки приходят по времени, поэтому снимки одной даты — в хвосте.
+        day = in_moscow(money.at).date()
+        same = [one for one in self._funds_due if in_moscow(one.at).date() == day]
+        if len(same) > 1:
+            self._funds_due[-1] = money
+        else:
+            self._funds_due.append(money)
+
+    def _hand_funds(self) -> None:
+        """Отдать ждущие снимки счёта обоим движкам пары — по порядку прихода."""
+        fact = self._fact
+        if fact is None or not fact.armed or not self._funds_due:
+            return
+        due, self._funds_due = self._funds_due, []
+        for money in due:
+            for engine in (fact.engine, self._engine):
+                engine.on_funds(money)
 
     def retarget(self, settings: EngineSettings) -> None:
         """Новые настройки движка — обоим движкам пары на ходу, без пересборки.
@@ -1305,6 +1358,10 @@ class LiveObserver:
         if fact is None or fact.armed or moment is None or self._stopped or self._failure:
             return
         fact.armed = True
+        # Снимок счёта — первым: он получен до сборки пары (без него бой
+        # не включается), и строка «Размер счёта принят» встаёт раньше строки
+        # дня. Счёт на утро движок сводит с днём до запуска сам — более ранний.
+        self._hand_funds()
         for engine in (fact.engine, self._engine):
             if self._day is not None:
                 engine.on_day(self._day, at=moment)

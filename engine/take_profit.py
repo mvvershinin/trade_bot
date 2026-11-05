@@ -86,6 +86,7 @@ __all__ = [
     "TakeProfit",
     "round_level",
     "to_grid",
+    "limit_beyond",
     "fixed_level",
     "target_profit",
     "covers_commission",
@@ -146,9 +147,9 @@ def _percent_of(price: float, percent: float) -> float:
 def to_grid(value: Decimal, step: Decimal, *, up: bool) -> Decimal:
     """Цена к сетке шага: вверх или вниз. Шаг больше нуля — забота вызывающего.
 
-    Одно место на два потребителя: предел выхода по времени
-    (`engine/pipeline.py::_time_exit_limit`) и неподвижный уровень тейка
-    (`fixed_level`). Две копии округления к сетке разошлись бы молча — первой
+    Одно место на два потребителя: предельная цена от процента
+    (`limit_beyond` — выход по времени и заявки исполнителя) и неподвижный
+    уровень тейка (`fixed_level`). Две копии округления к сетке разошлись бы молча — первой
     же правкой направления.
 
     Счёт в `Decimal` от строкового вида чисел: `Decimal(0.1)` тащит двоичный
@@ -158,6 +159,44 @@ def to_grid(value: Decimal, step: Decimal, *, up: bool) -> Decimal:
         rounding=ROUND_CEILING if up else ROUND_FLOOR
     )
     return grid * step
+
+
+def limit_beyond(price: float, percent: float, step: float, *, buying: bool) -> float:
+    """Предельная цена `цена ± процент`, на сетке шага, **от рынка** (решение 0067).
+
+    ::
+
+        покупка: цена + цена * процент / 100, к сетке шага вверх
+        продажа: цена − цена * процент / 100, к сетке шага вниз, не ниже шага
+
+    Одно место на двух потребителей, и копии у правила быть не должно: предел
+    выхода по концу окна считает движок (`engine/pipeline.py::_time_exit_limit`),
+    цену заявки «исполнить целиком или снять» — исполнитель в `app/`. Две копии
+    разошлись бы первой же правкой направления, и ни один тест одной из них
+    этого бы не заметил.
+
+    Округление **от рынка**: предел не оказывается ближе к рынку, чем названо
+    процентом. Цена продажи не опускается ниже одного шага — нулевая или
+    отрицательная цена не предел. Счёт в `Decimal` от строкового вида чисел,
+    как у `to_grid`: двоичный хвост сдвигал бы цену, лежащую ровно на сетке.
+
+    ⚠️ Негодный довод — отказ вслух, а не цена. Шаг ноль у движка сюда
+    не доходит (без шага выход «с предельной ценой» подменяется рыночным,
+    `app/convert.py`), бой при нём запрещён; проверка — от чужого вызова:
+    предел без шага совпал бы с ценой молча.
+
+    :raises ValueError: шаг, процент или цена не больше нуля или не числа.
+    """
+    for value, what in ((step, "шаг цены"), (percent, "процент"), (price, "цена")):
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"предельную цену не посчитать: {what} — {value!r}, а нужно число больше нуля"
+            )
+    grid = Decimal(repr(float(step)))
+    base = Decimal(repr(float(price)))
+    offset = base * Decimal(repr(float(percent))) / Decimal(100)
+    raw = base + offset if buying else base - offset
+    return float(max(to_grid(raw, grid, up=buying), grid))
 
 
 def fixed_level(

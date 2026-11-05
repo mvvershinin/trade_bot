@@ -93,7 +93,14 @@ from strategies import StrategySettings, registry
 from ui import backend
 from ui.backend import RunStats, TemplateRun
 from ui.formatting import fmt_datetime, fmt_money, fmt_share
-from ui.models import FIELD_CAPTIONS, MinuteBarLimit, MinutePriceOrder, Mode, Settings
+from ui.models import (
+    FIELD_CAPTIONS,
+    LIVE_LIMITS_BOUNDS,
+    MinuteBarLimit,
+    MinutePriceOrder,
+    Mode,
+    Settings,
+)
 
 __all__ = [
     "RUNS_KEPT",
@@ -283,9 +290,15 @@ _ENGINE_TITLES: Mapping[str, str] = {
     # Выход по концу окна с предельной ценой меняет сделки — в снимок обязан
     # попасть. Подпись шага своя: «Шаг цены» уже занят блоком издержек.
     "time_exit_order": "Выход по концу окна",
-    "time_exit_limit_steps": "Отступ предельной цены, шагов цены",
+    # Отступ — в процентах с решения 0067. Прежние прогоны хранят снимок
+    # текстом со старой подписью «…, шагов цены»: шаблону они не засчитываются,
+    # и это верно — предел у них другой.
+    "time_exit_limit_percent": "Отступ предельной цены, %",
     "time_exit_wait_bars": "Ожидание выхода с предельной ценой, свечей",
     "price_step": "Шаг цены инструмента, пунктов",
+    # Р-10: на прогон по истории не влияет (модель событие не выдаёт), но
+    # в снимок попадает: два прогона одного снимка обязаны совпасть и в бою.
+    "hold_after_unfilled_level": "Заходить заново при обрыве связи",
     # Три предохранителя по деньгам. В снимок прогона они обязаны попасть:
     # без них два прогона с одинаковыми на вид настройками могут дать разные
     # сделки — потолок объёма и лимит убытка меняют список.
@@ -351,6 +364,9 @@ class ProgramFields:
     live_cancel_wait_sec: int = _DEFAULTS.live_cancel_wait_sec
     live_position_settle_sec: float = _DEFAULTS.live_position_settle_sec
     live_reconnect_pauses_sec: tuple[int, ...] = _DEFAULTS.live_reconnect_pauses_sec
+    #: Отступ цены боевой заявки и ожидание планки биржи (решение 0067, Р-5).
+    live_fok_pct: float = _DEFAULTS.live_fok_pct
+    live_band_wait_sec: int = _DEFAULTS.live_band_wait_sec
 
     @classmethod
     def of(cls, values: Settings) -> ProgramFields:
@@ -367,15 +383,13 @@ _PROGRAM_TITLES: Mapping[str, str] = {
     "history_depth_days": "Глубина загрузки истории, дней",
     "minute_order": "Порядок цен внутри минуты",
     "minute_bar_limit": "Наибольшая свеча для проверки по минуткам",
-    # Пределы боя — подписью окна (`FIELD_CAPTIONS`) и единицей: одна подпись
-    # поля в окне, в журнале «Настройки изменены» и в снимке прогона.
+    # Пределы боя — подписью окна (`FIELD_CAPTIONS`) и **своей** единицей
+    # из таблицы границ: одна подпись поля в окне, в журнале «Настройки
+    # изменены» и в снимке прогона. Отступ цены — «, %», а не «, с»
+    # (правка 5.1 гейта 04.11.2026).
     **{
-        name: f"{FIELD_CAPTIONS[name]}, с"
-        for name in (
-            "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
-            "live_cancel_wait_sec", "live_position_settle_sec",
-            "live_reconnect_pauses_sec",
-        )
+        name: f"{FIELD_CAPTIONS[name]}, {bound.unit.sign}"
+        for name, bound in LIVE_LIMITS_BOUNDS.items()
     },
 }
 
@@ -693,6 +707,11 @@ _UNCONTROLLED_TITLES: frozenset[str] = frozenset(
         # Порог выхода по обратному сигналу поля в окне не имеет и берётся
         # у прежних настроек — тот же случай, что `close_wait_bars`.
         "min_exit_profit_sides",
+        # «Заходить заново при обрыве связи» (Р-10): модель прогона событие
+        # «уровень не исполнился» не выдаёт, сделки прогона от галочки
+        # не зависят. Сличать по ней — отнять у шаблона все прежние прогоны,
+        # сделанные до появления этой строки в снимке.
+        "hold_after_unfilled_level",
         # ⚠️ Выхода по концу окна (форма, отступ, ожидание) и шага цены
         # здесь нет намеренно (Ф3 задачи З8): с Ф3 все четыре задаются окном
         # и меняют сделки — предел заявки считается от шага. Решение то же,
@@ -712,14 +731,11 @@ _UNCONTROLLED_TITLES: frozenset[str] = frozenset(
         # по ней — значит отнять у шаблона его прогоны за то, что в окне
         # стоит другое число дней.
         "expiry_halt_days",
-        # Ожидания боевого исполнителя (Э4 2в): тестер заявок брокеру
-        # не подаёт, и сделки его прогона от них не зависят.
-        "live_stale_after_sec",
-        "live_event_wait_sec",
-        "live_fill_wait_sec",
-        "live_cancel_wait_sec",
-        "live_position_settle_sec",
-        "live_reconnect_pauses_sec",
+        # Числа боевого исполнителя (Э4 2в, 0067) — вся вкладка «Бой», обходом
+        # таблицы границ: тестер заявок брокеру не подаёт, и сделки его
+        # прогона от них не зависят (отступ цены и планку модель прогона
+        # не читает, решение 0067).
+        *LIVE_LIMITS_BOUNDS,
         # ⚠️ Порядка цен минутки здесь нет намеренно (Ф5 задачи З9): прогон
         # окна идёт по минуткам, и сделки от порядка зависят. Пропущенный
         # здесь, он молча засчитал бы шаблону прогоны при другом порядке.

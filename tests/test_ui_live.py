@@ -201,6 +201,36 @@ def test_unavailable_combat_turns_the_button_off_and_says_why_in_a_line(setup) -
         assert reason in window.live_action.toolTip(), window.live_action.toolTip()
 
 
+#: Причина 2г так, как её отдаёт порт (`app/port.py::_NO_FUNDS`, `D-044`).
+#: Записана руками: окну важна не формулировка, а то, что её голова видна.
+NO_FUNDS = (
+    "Счёт у брокера ещё не прочитан ни разу с подключения: робот не знает ни размера "
+    "счёта, ни свободных средств, а входить вслепую бой не вправе. Программа читает "
+    "счёт сама — сразу после подключения и затем раз в полминуты; если строка "
+    "не уходит, в журнале выше сказано, почему брокер не ответил про счёт."
+)
+
+
+def test_the_unread_account_reason_is_readable_next_to_the_button(setup) -> None:
+    """2г: «счёт не прочитан» — видна у кнопки строкой, и обрезка не съедает суть.
+
+    Поток включён, а счёт ещё не прочитан — единственная причина, и она
+    длинная (четыре строки). Строка в панели обрезается справа; стережётся,
+    что слова «счёт у брокера ещё не прочитан» остаются на экране, а целиком
+    причина — в подсказке кнопки и строки. Мутации: строка только
+    в подсказке; обрезка уже, чем голова причины.
+    """
+    window, _port, _asked = setup
+    _show(window, LiveStatus(available=False, why_not=(NO_FUNDS,)))
+
+    assert not window.live_action.isEnabled()
+    assert not window.live_note.isHidden(), "строки рядом с кнопкой нет"
+    shown = window.live_note.text()
+    assert shown.startswith("Бой недоступен: Счёт у брокера ещё не прочитан"), shown
+    for tip in (window.live_action.toolTip(), window.live_note.toolTip()):
+        assert NO_FUNDS in tip, tip
+
+
 def test_before_the_first_snapshot_the_button_is_off_and_says_so(qapp) -> None:
     """Порт без боя (`DetachedPort`) снимка не шлёт — кнопка не обещает ничего."""
     window = MainWindow(sanitize=redact)
@@ -492,6 +522,7 @@ def test_every_live_field_hint_says_when_the_value_takes_effect(qapp) -> None:
         for name in (
             "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
             "live_cancel_wait_sec", "live_position_settle_sec", "live_reconnect_pauses_sec",
+            "live_fok_pct", "live_band_wait_sec",
         ):
             widget = getattr(dialog, name)
             assert LIVE_WHEN in widget.toolTip(), FIELD_CAPTIONS[name]

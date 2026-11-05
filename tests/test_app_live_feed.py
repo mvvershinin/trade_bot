@@ -61,6 +61,7 @@ from broker.session import (
     BrokerSession,
 )
 from broker.stream import CandleSnapshot, StreamRejected
+from engine import AccountFunds
 from market import (
     MSK,
     Candle,
@@ -1354,6 +1355,8 @@ class FakePort:
         self.confirmed: list[tuple[str, datetime]] = []
         #: Чем собирать боевую сторону (`HistoryPort.attach_live`, Э4 2в).
         self.desks: object | None = None
+        #: Снимки счёта, пришедшие от опроса (`HistoryPort.account_read`, Э4 2г).
+        self.accounts: list[tuple[str, object]] = []
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))
@@ -1392,6 +1395,9 @@ class FakePort:
 
     def attach_live(self, desks: object) -> None:
         self.desks = desks
+
+    def account_read(self, account: str, funds: object) -> None:
+        self.accounts.append((account, funds))
 
     def stream(self, on: bool) -> None:
         """Как настоящий порт: команду передал, причину отказа наружу **не** вернул.
@@ -3734,7 +3740,7 @@ def watch_of(
         cast(Any, account),
         ticker=ticker,
         watchers=live_feed.FundsWatchers(
-            funds=money.append,
+            funds=lambda _account, value: money.append(value),
             say=lambda event, reason, level: said.append((event, reason, level)),
             halt=lambda event, reason: halts.append((event, reason)),
             # Подставной порт: остановлен ровно тогда, когда `halt` уже
@@ -4149,7 +4155,13 @@ def test_a_portfolio_that_answers_again_is_announced() -> None:
 
 
 def test_an_incomplete_snapshot_is_not_half_a_snapshot() -> None:
-    """Половина ответа в движок не уходит: она читается как целое."""
+    """Половина ответа в движок не уходит: она читается как целое.
+
+    Строка называет недостающие поля **и** вероятную причину: опрос идёт без
+    кода биржи (`D-047`, `/risk` 04.11.2026 22:35, находка 3), и при рублях
+    на двух рынках снимок неполон, хотя имена полей верны. Мутация молчания:
+    убрать фразу о нескольких рынках и `D-047`.
+    """
     account = FakeAccount(account_snapshot(equity=None))
     watch, money, said = watch_of(account)
 
@@ -4160,7 +4172,10 @@ def test_an_incomplete_snapshot_is_not_half_a_snapshot() -> None:
 
     asyncio.run(scenario())
     assert money == []
-    assert "размер счёта" in said[0][1], said[0][1]
+    # Недостающее названо именно в «не хватает …», а не где-то в последствии
+    # (мутация: список полей выпал, «размер счёта» осталось в хвосте строки).
+    assert "не хватает размер счёта." in said[0][1], said[0][1]
+    assert "несколько рынков" in said[0][1] and "(D-047)" in said[0][1], said[0][1]
 
 
 def test_a_broken_parser_is_logged_as_ours_not_blamed_on_the_broker(caplog) -> None:
@@ -4243,7 +4258,7 @@ def link_with_funds(monkeypatch, port, stream: FakeStream, tmp_path: pathlib.Pat
     monkeypatch.setattr(live_feed, "RETRY_FIRST", 0.0)
     monkeypatch.setattr(live_feed, "RETRY_CAP", 0.0)
     link = link_of(port, FakeWorker(), tmp_path / "userdata")
-    link.deliver_funds_to(lambda funds: None)
+    link.deliver_funds_to(lambda _account, _funds: None)
     return link, watches
 
 
@@ -4353,7 +4368,7 @@ def test_the_account_poll_is_queued_before_the_backfill(
     monkeypatch.setattr(live_feed, "FundsWatch", OrderedWatch)
     monkeypatch.setattr(live_feed, "candle_stream", stream)
     link = link_of(port, FakeWorker(), tmp_path / "userdata")
-    link.deliver_funds_to(lambda funds: None)
+    link.deliver_funds_to(lambda _account, _funds: None)
 
     async def scenario() -> None:
         assert link.switch(True) is None
@@ -4425,6 +4440,49 @@ def test_without_a_receiver_the_link_never_asks_about_the_account(
     asyncio.run(scenario())
     assert "счёт" not in built, "портфель спросили без боевой сборки"
     schedule_was_asked()
+
+
+def test_the_program_assembly_hands_the_account_snapshot_to_the_port(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Э4 2г (`D-044`, правка 9.1 гейта): сборка программы проводит опрос счёта в порт.
+
+    Стережёт **проводку**, а не порт: собирает звено настоящая сборка
+    `app/main.py::_live_feed`, опрос счёта — настоящий `FundsWatch`, подставлены
+    только сеть и брокер. Порт получает номер договора из снимка отдельным
+    доводом и деньги счёта. Без этого снимка бой не включается никогда.
+
+    Мутации, обязанные ронять проверку: убрать `link.deliver_funds_to(...)`
+    из `_live_feed` — опрос не собирается, порт снимка не получает; перенести
+    вызов после `port.stream(True)` — то же при ключе `--stream`; потерять
+    номер договора по дороге (`FundsWatch` отдаёт пустую строку) — сверка
+    «тот же счёт» в сборке боя откажет на каждом включении.
+    """
+    socket = FakeSocket([wire(snapshot(MINUTE_A, close=100.0, turnover=1000.0))])
+    quiet_session(monkeypatch)
+    monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
+    monkeypatch.setattr(live_feed, "Backfiller", lambda *a, **k: SimpleNamespace(
+        start=lambda boundary: None, request_stop=lambda: None, aclose=_noop_aclose,
+    ))
+    monkeypatch.setattr(live_feed, "History", lambda session: session)
+    monkeypatch.setattr(
+        live_feed, "Account", lambda session, exchange=None: FakeAccount(account_snapshot())
+    )
+    monkeypatch.setattr(live_feed, "candle_stream", FakeStream(socket))
+    port: Any = FakePort()
+    worker: Any = FakeWorker()
+    link = _live_feed(port, worker, tmp_path / "userdata", Settings(), _arguments([]))
+
+    async def scenario() -> None:
+        assert link.switch(True) is None
+        await settle(lambda: bool(port.accounts), "снимок счёта дошёл до порта")
+        await link.aclose()
+
+    asyncio.run(scenario())
+    account, money = port.accounts[0]
+    assert account == "9876543", f"номер договора не дошёл до порта: {account!r}"
+    assert isinstance(money, AccountFunds), money
+    assert (money.equity, money.free) == (210_850.0, 248_500.0), money
 
 
 async def _noop_aclose() -> None:

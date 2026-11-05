@@ -98,6 +98,9 @@ from ui.formatting import (
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
     FIELD_CAPTIONS,
+    LIVE_LATER,
+    LIVE_LIMITS_BOUNDS,
+    TIME_EXIT_LIMIT_PCT_LIMITS,
     AfterTakeProfit,
     AlgorithmDemand,
     AlgorithmOption,
@@ -108,6 +111,7 @@ from ui.models import (
     DecisionRow,
     Layer,
     LinePoint,
+    LiveUnit,
     Marker,
     MarkerKind,
     MinutePriceOrder,
@@ -370,6 +374,35 @@ def _time_exit_in_force(values: Settings) -> TimeExitOrder:
     return _TIME_EXIT_ORDERS[values.time_exit_order]
 
 
+def _time_exit_percent(values: Settings) -> float:
+    """Отступ предела выхода по концу окна, % — или отказ вслух (решение 0067).
+
+    Границы — те же, что у поля окна (`TIME_EXIT_LIMIT_PCT_LIMITS`): файл
+    настроек правится и руками, а движок проверяет только арифметику (больше
+    нуля и меньше ста). Без этой проверки 50 % из файла ушли бы в предел
+    молча — продажа по половине цены.
+
+    Отказ — `ValueError`, как у границ самого движка, а не `SettingsRefused`:
+    на нём стоят оба пути, которые обязаны его поймать, — «Применить»
+    («Значение не годится…», `HistoryPort.apply_settings`) и запуск с файлом,
+    где негодное число ставится в умолчание вслух (`_numbers_repaired`).
+    `SettingsRefused` при запуске программу не открыл бы вовсе (`B-050`).
+
+    :raises ValueError: число вне границ или не число.
+    """
+    low, high = TIME_EXIT_LIMIT_PCT_LIMITS
+    share = values.time_exit_limit_pct
+    if (
+        isinstance(share, bool) or not isinstance(share, (int, float))
+        or not math.isfinite(share) or not low <= share <= high
+    ):
+        raise ValueError(
+            f"отступ предельной цены — от {_plain(low)} до {_plain(high)} % "
+            f"от закрытия свечи, а стоит {share!r}"
+        )
+    return float(share)
+
+
 #: Откуда движок берёт каждое своё поле, если оно **приходит из окна**.
 #:
 #: Таблица, а не перечисление в конструкторе, и по той же причине, что
@@ -422,8 +455,11 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     # Выход по концу окна с предельной ценой (Э5, задача З8, Ф3): три поля
     # окна на вкладке «Торговое окно». Форма — таблицей `_TIME_EXIT_ORDERS`.
     "time_exit_order": lambda values, _mode: _time_exit_in_force(values),
-    "time_exit_limit_steps": lambda values, _mode: values.time_exit_limit_steps,
+    "time_exit_limit_percent": lambda values, _mode: _time_exit_percent(values),
     "time_exit_wait_bars": lambda values, _mode: values.time_exit_wait_bars,
+    # «Заходить заново при обрыве связи» (решение 0067, Р-10 п. 9): что делать
+    # с позицией в убытке, когда уровень задет, а выход по нему не исполнился.
+    "hold_after_unfilled_level": lambda values, _mode: values.reenter_after_disconnect,
     # Календарь владельца счёта: отметки окна → набор дат движка. Перевод,
     # а не правило: что значит отметка, решает `engine/window.py`.
     "calendar": lambda values, _mode: DayMarks.of(
@@ -1220,11 +1256,14 @@ _LIVE_FROM_WINDOW: Final[dict[str, str]] = {
     "cancel_wait": "live_cancel_wait_sec",
     "position_settle": "live_position_settle_sec",
     "reconnect_pauses": "live_reconnect_pauses_sec",
+    # Решение 0067, Р-5: отступ цены FOK (проценты) и ожидание планки (секунды).
+    "fok_percent": "live_fok_pct",
+    "band_wait": "live_band_wait_sec",
 }
 
 
 def _plain(value: float) -> str:
-    """Число секунд по-русски, без хвостовых нулей: `60`, `0,5`."""
+    """Число по-русски, без хвостовых нулей: `60`, `0,5`."""
     return f"{value:g}".replace(".", ",")
 
 
@@ -1245,12 +1284,12 @@ def _live_pauses(values: Settings, field: str) -> tuple[float, ...]:
     raise _live_refused(field, _as_pauses(value))
 
 
-def _live_seconds(values: Settings, field: str) -> float:
-    """Одно ожидание в секундах — или отказ с подписью поля."""
+def _live_number(values: Settings, field: str) -> float:
+    """Одно число «Боя» в своей единице — или отказ с подписью поля."""
     value = getattr(values, field)
     if live_limit_fits(field, value):
         return float(value)
-    raise _live_refused(field, _as_seconds(value))
+    raise _live_refused(field, _as_live(LIVE_LIMITS_BOUNDS[field].unit)(value))
 
 
 def live_limits(values: Settings) -> LiveLimits:
@@ -1278,12 +1317,12 @@ def live_limits(values: Settings) -> LiveLimits:
     pauses = _LIVE_FROM_WINDOW["reconnect_pauses"]
     # `Any`: имена полей приходят из таблицы, и тип каждого сверяет не mypy,
     # а `LiveLimits.__post_init__` и тест полноты таблицы.
-    seconds: dict[str, Any] = {
-        inner: _live_seconds(values, outer)
+    numbers: dict[str, Any] = {
+        inner: _live_number(values, outer)
         for inner, outer in _LIVE_FROM_WINDOW.items()
         if outer != pauses
     }
-    return LiveLimits(reconnect_pauses=_live_pauses(values, pauses), **seconds)
+    return LiveLimits(reconnect_pauses=_live_pauses(values, pauses), **numbers)
 
 
 # ---------------------------------------------------------------------------
@@ -1303,6 +1342,11 @@ class _Told:
     #: что предохранитель ещё не включён. Тихое «принято» читалось бы как
     #: «ограничение поставлено», а цена ошибки здесь — деньги на счёте.
     guard: bool = False
+    #: Хвост строки после «было → стало» — когда изменение начнёт
+    #: действовать, если не сразу. У полей «Бой» — `LIVE_LATER`
+    #: (правка 5.2 гейта 04.11.2026): исполнитель читает их при сборке
+    #: «факта» — включение боя, «Возобновить работу», перезапуск хода.
+    tail: str = ""
 
 
 def _as_text(value: object) -> str:
@@ -1337,15 +1381,23 @@ def _as_load_days(value: object) -> str:
     return f"{value} дн."
 
 
-def _as_seconds(value: object) -> str:
-    """Ожидание боевого исполнителя: число и единица, дробь — по-русски.
+def _as_live(unit: LiveUnit) -> Callable[[object], str]:
+    """Число «Боя» в своей единице (`LIVE_LIMITS_BOUNDS`): «0,5 с», «2 %».
+
+    Оформитель по единице из таблицы границ, а не «секунды» на всех (правка
+    5.1 гейта 04.11.2026): отступ цены — проценты, и «2 с → 3 с» в журнале
+    назвало бы его не тем.
 
     NaN и бесконечность — словами: JSON-разбор Питона пропускает `NaN`
     из файла настроек, и «nan с» в отказе человеку ничего не скажет.
     """
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return f"{_plain(value)} с" if math.isfinite(value) else "не число"
-    return str(value)
+
+    def show(value: object) -> str:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return unit.show(value) if math.isfinite(value) else "не число"
+        return str(value)
+
+    return show
 
 
 def _as_pauses(value: object) -> str:
@@ -1426,19 +1478,19 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # в прогоне двигается только на закрытии свечи (`B-058`).
     "minute_bar_limit": _Told("Наибольшая свеча для проверки по минуткам", _as_label),
     "log_directory": _Told("Каталог технического журнала", _as_text),
-    # Ожидания боевого исполнителя (вкладка «Бой», правило 16).
-    # Подпись — та же, что у строки окна: человек ищет поле по ней.
-    # Движок и алгоритм их не знают — рассказать больше некому.
+    # Числа боевого исполнителя (вкладка «Бой», правило 16) — обходом
+    # таблицы границ: поле «Боя», заведённое завтра, получит строку само,
+    # и в своей единице. Подпись — та же, что у строки окна: человек ищет
+    # поле по ней. Движок и алгоритм их не знают — рассказать больше некому.
+    # Хвост — с какого момента действует (правка 5.2 гейта 04.11.2026).
     **{
-        name: _Told(FIELD_CAPTIONS[name], _as_seconds)
-        for name in (
-            "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
-            "live_cancel_wait_sec", "live_position_settle_sec",
+        name: _Told(
+            FIELD_CAPTIONS[name],
+            _as_pauses if name == "live_reconnect_pauses_sec" else _as_live(bound.unit),
+            tail=LIVE_LATER,
         )
+        for name, bound in LIVE_LIMITS_BOUNDS.items()
     },
-    "live_reconnect_pauses_sec": _Told(
-        FIELD_CAPTIONS["live_reconnect_pauses_sec"], _as_pauses
-    ),
     # Три предохранителя: у каждого галочка и число, и в журнал идут оба.
     # Одна галочка без числа читалась бы как «включил и всё» — а включение
     # без числа не значит ничего; одно число без галочки читалось бы как
@@ -1470,8 +1522,10 @@ _TOLD_BY_ENGINE: frozenset[str] = frozenset({
     "trailing_step_pct", "after_take_profit", "commission_per_side_rub",
     "ruble_per_point",
     # Выход по концу окна и шаг цены (Ф3 задачи З8): поля движка.
-    "time_exit_order", "time_exit_limit_steps", "time_exit_wait_bars",
+    "time_exit_order", "time_exit_limit_pct", "time_exit_wait_bars",
     "price_step",
+    # Р-10: строку «Заходить заново при обрыве связи: нет → да» пишет движок.
+    "reenter_after_disconnect",
     # Календарь нерабочих дней: отметки уезжают в `EngineSettings.calendar`,
     # и строку «Календарь нерабочих дней: нет → 12.06.2026 не торгуем» пишет
     # движок. Своей строки в окне у него нет намеренно — двух строк об одном
@@ -1548,7 +1602,7 @@ def _changes_by_field(
         (
             name,
             f"{told.label}: {told.show(getattr(previous, name))} → "
-            f"{told.show(getattr(now, name))}",
+            f"{told.show(getattr(now, name))}" + (f" — {told.tail}" if told.tail else ""),
         )
         for name, told in _WINDOW_TOLD.items()
         if told.guard is guard and getattr(previous, name) != getattr(now, name)

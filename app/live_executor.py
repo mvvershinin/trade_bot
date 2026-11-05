@@ -13,28 +13,45 @@
   позиции нет). Несвежая заявка и мёртвый поток — `ExecutionRefused`: заявки
   нет, сигнал пропущен (`DOMAIN.md` §7, план §8 №7, №15). Расхождение позиции —
   «закрыть всё» (решение 0020) и `ExecutionHalted`.
-* **Рыночные вход и выход** ждут конца заявки — `2` или `8` (0066, §2.6).
-  Исполнения одной заявки складываются в **одну** сделку движку: объём —
-  сумма, цена — средняя; частичного движок не видит (Р6). Не дошла до конца
-  за предел — остаток снимается, `ExecutionHalted`.
+* **Рыночных заявок у брокера нет** (решение 0067). Вход, выход, переворот,
+  выход по касанию трейлинга, остаток тейка и «закрыть всё» — лимитная
+  «исполнить целиком или снять» (FOK) по цене «текущая ± процент», и собирает
+  её одно место — `_fok`. «Текущая» (Р-2 плана координатора 04.11.2026):
+  у входа и выхода движка — закрытие свечи сигнала, то есть свечи последнего
+  закрытого `fills_at` (заявка свечи T подаётся после `fills_at(T)`,
+  `engine/ports.py`); у касания трейлинга — уровень касания; у остатка тейка
+  и «закрыть всё» — закрытие последней записанной минутки, и только свежей:
+  минутка старше порога свежести считается отсутствующей.
+* **Заявка немедленного исполнения** ждёт конца — `2`, `4` или `8` (0066,
+  §2.6). Исполнения одной заявки складываются в **одну** сделку движку:
+  объём — сумма, цена — средняя; частичного движок не видит (Р6). Снята
+  целиком — остановка словами статуса с хвостом «FOK» (Р-6); частичная без
+  конца за предел — страховка: остаток снимается, `ExecutionHalted`.
 * **Неподвижный тейк** — лимитная заявка у брокера по цене из заявки движка,
   как есть: к шагу её приводит движок (Р1). Снятие ждёт `4`. Снята не нами —
-  остановка. Исполнилась частично к снятию — остаток закрывается рыночным
-  выходом, движку одна сделка на весь объём и `ALREADY_TRIGGERED`.
+  остановка. Исполнилась частично к снятию — остаток закрывается FOK,
+  движку одна сделка на весь объём и `ALREADY_TRIGGERED`.
 * **Скользящий тейк** — сторож здесь, в программе (Р2). Касание судится по
   high/low **записанных минуток**, уровнем, поданным не позже начала минутки, —
   зеркало `submitted_at > ready_at` модели (`backtest/execution.py::_fire`).
-  На касании — рыночный выход; движку — сделка по закрытой свече касания.
-  Касание в минутке, догруженной после обрыва, — тот же выход сразу после
-  связи, робот не встаёт (решение владельца 01.11.2026, 0066).
+  На касании — FOK от уровня касания; движку — сделка по закрытой свече
+  касания. Касание вовремя и FOK снята — остановка (Р-6). Касание, выход
+  по которому подан позже порога свежести (догруженная минутка или выход
+  ждал связи), и FOK снята целиком — не остановка: движку событие
+  `LevelUnfilled` по закрытой свече, решает он (0067, Р-10). До отдачи
+  события сторож остаётся и отвечает `ALREADY_TRIGGERED`.
 * **Механизм тейка выбирается по паре (сторона позиции, касание) из заявки**,
   а не по режиму и не по галочке: «лонг, снизу» и «шорт, сверху» — уровень
   впереди рынка, лимитная у брокера; две другие пары — уровень позади рынка,
   то есть стоп, и лимитной его выразить нельзя: она исполнилась бы сразу
   (план §2.3). Запрет держит таблица `_AT_BROKER`, а не окно.
-* **Выход по времени с пределом** (Р3) — лимитная; не исполнилась за
-  `limit_exit_bars` закрытых свечей — остановка, текст называет живую заявку
-  у брокера и её ключ (С9).
+* **Выход с пределом** — по концу окна (Р3) и рождённый событием
+  `LevelUnfilled` — лимитная до конца дня по планке биржи (`HIGHLIMIT`
+  покупка, `LOWLIMIT` продажа, к сетке шага внутрь коридора), если она пришла
+  за `band_wait` и лежит по нужную сторону от закрытия свечи сигнала; иначе —
+  предел движка (Р-4). Какая цена подана и откуда — своей строкой человеку.
+  Не исполнилась за `limit_exit_bars` закрытых свечей — остановка, текст
+  называет живую заявку у брокера, её цену и ключ (С9).
 * **Неясный исход** — таймаут, обрыв, 5xx, 429, отмена задачи посреди подачи
   (`D-177`) — остановка, а не «не подана»: команда записана, заявка у брокера
   может жить. Разбирается сверкой (`settle_open_commands`, `app/reconcile.py`).
@@ -66,7 +83,8 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequen
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Final, Protocol
+from decimal import Decimal
+from typing import Final, NamedTuple, Protocol
 from uuid import UUID
 
 from app.fact import LiveLimits, position_words, signed_position
@@ -96,13 +114,23 @@ from broker.orders import (
     OrderSide,
     OrderStatus,
     OrderType,
+    TimeInForce,
 )
 from broker.session import PORTFOLIO_PATH, BrokerSession
 from broker.tokens import now_utc
-from engine import close_time, in_moscow
-from engine.contracts import Fill, LevelTouch, OrderAction, OrderRequest, PriceSeen, Side
+from engine import close_time, in_moscow, limit_beyond
+from engine.contracts import (
+    Fill,
+    LevelTouch,
+    LevelUnfilled,
+    OrderAction,
+    OrderRequest,
+    PriceSeen,
+    Side,
+)
 from engine.ports import ExecutionHalted, ExecutionRefused, MarketCandle, Refusal
-from market import MarketWorker
+from engine.take_profit import to_grid
+from market import MarketWorker, PriceBand
 from market.commands import (
     BrokerCommand,
     BrokerExecution,
@@ -184,6 +212,17 @@ _FOREIGN_TEXT_LIMIT: Final[int] = 200
 _LINK_SETTLE: Final[float] = 10.0
 _CONTROL: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]+")
 
+#: Насколько назад искать последнюю записанную минутку — «текущую» у «закрыть
+#: всё» и остатка тейка. Число только для слов: минутка старше порога
+#: свежести заявке не годится всё равно, а сутки назад — чтобы назвать её
+#: возраст, а не «минуток нет». На цену заявки не влияет.
+_MINUTE_LOOKBACK: Final[timedelta] = timedelta(days=1)
+
+#: Сбои источника планки биржи: поток данных закрыт (`WorkerClosed` —
+#: `RuntimeError`), негодный таймаут, ошибка сети мимо разбора ISS. Любой из
+#: них значит одно — подать предел движка и сказать почему (Р-4).
+_BAND_FAILURES: Final = (RuntimeError, ValueError, LookupError, OSError)
+
 
 # --------------------------------------------------------------- настройки
 
@@ -196,12 +235,23 @@ class Instrument:
         в каждую строку журнала: в `userdata/` бывает два токена на два счёта,
         и день счёта отбирает свои исполнения по нему (`market/day.py`).
     :param bar_minutes: размер свечи — для свежести заявки (§2.2 п. 1).
+    :param price_step: шаг цены инструмента — сетка цены каждой заявки FOK
+        и планки биржи (0067). Кладёт сборка из движка
+        (`EngineSettings.price_step`), отдельного запроса шага нет. Не больше
+        нуля — отказ сразу: цену без шага не положить на сетку, а бой при
+        шаге ноль и так запрещён (`app/port.py`).
     """
 
     ticker: str
     class_code: str
     bar_minutes: int
     account: str
+    price_step: float
+
+    def __post_init__(self) -> None:
+        step = self.price_step
+        if isinstance(step, bool) or not isinstance(step, (int, float)) or not step > 0:
+            raise ValueError(f"шаг цены инструмента — число больше нуля: {step!r}")
 
 
 class _JournalDown(Exception):
@@ -289,6 +339,11 @@ MinuteSource = Callable[[datetime], Awaitable[Sequence[MarketCandle]]]
 #: Как открыть поток статусов. По умолчанию — `order_events(session)`.
 EventsOpener = Callable[[], AbstractAsyncContextManager[EventStream]]
 
+#: Планка биржи по инструменту исполнителя (Р-4). Сборка (`app/live_trading.py`):
+#: `lambda: worker.price_band(ticker, timeout=limits.band_wait)`. Исполнитель
+#: ждёт её не дольше `LiveLimits.band_wait` сам, обещанию источника не веря.
+BandSource = Callable[[], Awaitable[PriceBand]]
+
 
 @dataclass(frozen=True, slots=True)
 class Wiring:
@@ -311,6 +366,9 @@ class Wiring:
     #: Сообщение человеку **без** остановки: 2в выводит его в журнал решений
     #: и окно. Не подключено — остаётся строка WARNING технического лога.
     notice: Callable[[str], None] | None = None
+    #: Планка биржи для выхода с пределом (0067, Р-4). `None` — источника нет:
+    #: подаётся предел движка, и строка об этом говорит.
+    band: BandSource | None = None
 
 
 # --------------------------------------------------------------- состояние
@@ -366,12 +424,29 @@ class _Ticket:
     told_state: tuple[OrderStatus | None, int] | None = None
     note: str = ""
     journaled: CommandStatus | None = None
+    #: Заявка закрывает позицию: снятая FOK оставляет её открытой без тейка (6.2).
+    closing: bool = False
+    #: Снятая целиком — не остановка: решает движок (`LevelUnfilled`, Р-10).
+    #: Только у выхода по касанию трейлинга, поданного позже порога свежести.
+    spared: bool = False
     executions: dict[str, BrokerExecution] = field(default_factory=dict)
     cancels: list[_Cancel] = field(default_factory=list)
 
     @property
     def final(self) -> bool:
         return self.status in FINAL_STATUSES
+
+    @property
+    def killed(self) -> bool:
+        """Кончилась, не исполнившись ни на контракт: снята (`4`) или отклонена (`8`).
+
+        У FOK это «не исполнилась целиком». Какой из двух статусов даёт БКС,
+        неизвестно (план координатора §9), поэтому оба — одно.
+        """
+        return (
+            self.status in (OrderStatus.CANCELLED, OrderStatus.REJECTED)
+            and self.done_volume == 0
+        )
 
     @property
     def done_volume(self) -> int:
@@ -395,7 +470,7 @@ class _Deal:
     """Сделка для движка: одна на заявку движка, сколько бы исполнений ни было.
 
     `level` — по уровню (тейк, сторож): отдаётся только по закрытой свече.
-    `moment` — у рыночной момент подачи (`submitted_at`): сделка не раньше
+    `moment` — у немедленной (FOK) момент подачи (`submitted_at`): сделка не раньше
     свечи, начавшейся не раньше него, — как в модели; у уровня — момент
     касания: сделка по закрытой свече, в интервал которой он попал.
     """
@@ -468,6 +543,30 @@ class _Take:
         return ticket is not None and ticket.final and ticket.done_volume > 0
 
 
+class _Priced(NamedTuple):
+    """Заявка к подаче и её цена словами — «по цене X: откуда она» (0067).
+
+    Ходят парой: цена без слов дала бы строку журнала «подана» без цены,
+    слова без заявки — цену, которой у брокера нет.
+    """
+
+    order: NewOrder
+    words: str
+
+
+@dataclass(eq=False)
+class _Unfilled:
+    """Событие «уровень не исполнился», ещё не отданное движку, и его сторож.
+
+    Сторож остаётся в `_takes`, пока событие не отдано: вооружение и снятие
+    этого имени отвечают `ALREADY_TRIGGERED`, и старый уровень не встанет
+    заново до того, как движок сбросит план (гейт Р-10, требование к 2.1).
+    """
+
+    take: _Take
+    event: LevelUnfilled
+
+
 @dataclass(eq=False)
 class _LimitExit:
     """Выход по времени с пределом, ждущий исполнения (Р3): сколько свечей прошло."""
@@ -516,10 +615,16 @@ def _msk(moment: datetime) -> str:
     return f"{in_moscow(moment):%H:%M}"
 
 
+def _age_words(age: timedelta) -> str:
+    """Возраст минутки словами: «7 мин», «2 ч 5 мин»."""
+    hours, minutes = divmod(max(int(age.total_seconds() // 60), 0), 60)
+    return f"{hours} ч {minutes} мин" if hours else f"{minutes} мин"
+
+
 def _already(order: OrderRequest) -> ExecutionRefused:
     return ExecutionRefused(
-        f"Уровень {order.price or 0:g} уже сработал: сделка по нему придёт следующей. "
-        "Выход по рынку не подаётся.",
+        f"Уровень {order.price or 0:g} уже сработал: исход выхода по нему придёт следующим. "
+        "Второй выход не подаётся.",
         Refusal.ALREADY_TRIGGERED,
     )
 
@@ -532,6 +637,29 @@ def _touched(order: OrderRequest, minute: MarketCandle) -> bool:
     if order.touch is LevelTouch.RISE:
         return minute.high >= level
     return minute.low <= level
+
+
+def _fok_tail(ticket: _Ticket) -> str:
+    """Хвост слов статуса у FOK, кончившейся без исполнения (Р-6, правки 6.1 и 6.2).
+
+    Пусто у всего остального: у дневной лимитной и у FOK с исполнением
+    (такой не бывает — тогда слова статуса уже назвали исполненное).
+    У выхода — позиция открыта, и тейка у неё нет: перед выходом по сигналу
+    движок тейк снял, а сторож трейлинга снят вместе с касанием (6.2).
+    """
+    order = ticket.order
+    if order.time_in_force is not TimeInForce.FILL_OR_KILL or not ticket.killed:
+        return ""
+    left = (
+        " Позиция у брокера открыта без тейка — закройте её сами в приложении брокера."
+        if ticket.closing
+        else ""
+    )
+    return (
+        f" Это заявка «исполнить целиком или снять» (FOK) по {order.price or 0:g}: целиком "
+        "она не исполнилась, и позиция у брокера та, что была до неё."
+        f"{left}"
+    )
 
 
 def _journal_status(ticket: _Ticket) -> CommandStatus | None:
@@ -605,6 +733,7 @@ class LiveExecutor:
         self._sleep = wiring.sleep
         self._on_news = wiring.on_news
         self._notice = wiring.notice
+        self._band = wiring.band
         self._instrument = instrument
         self._limits = limits or LiveLimits()
         self._lock = asyncio.Lock()
@@ -617,6 +746,10 @@ class LiveExecutor:
         self._takes: dict[str, _Take] = {}
         self._deals: list[_Deal] = []
         self._limit_exits: list[_LimitExit] = []
+        self._unfilled: list[_Unfilled] = []
+        #: Свеча последнего `fills_at` — только закрытая: её закрытие —
+        #: «текущая» у заявок движка этой свечи (Р-2, путь А гейта 0.2).
+        self._signal: MarketCandle | None = None
         self._halt: str | None = None
         self._flattened = False
         #: Позиция по нашим сведениям: последнее чтение портфеля, совпавшее
@@ -736,9 +869,16 @@ class LiveExecutor:
                 raise self._stop(halted.human, None) from None
             await self._flush()
 
-    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen]:
-        """Накопленные сделки. Остановка уносит с собой всё исполненное (0066, §2.6)."""
+    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen | LevelUnfilled]:
+        """Накопленные сделки и события. Остановка уносит с собой всё (0066, §2.6).
+
+        Закрытая свеча запоминается: её закрытие — «текущая» заявок, которые
+        движок подаст по ней следом (`engine/ports.py`, «Когда подаются
+        заявки свечи»). Незакрытая не запоминается: по ней движок не решает.
+        """
         async with self._lock:
+            if not getattr(candle, "unsettled", False):
+                self._signal = candle
             await self._sweep()
             await self._flush()
             self._count_limit_exits(candle)
@@ -839,9 +979,12 @@ class LiveExecutor:
                 return actual, robot, await self._flatten(why)
 
     async def close_everything(self, why: str) -> str:
-        """Решение 0020 (0066): снять заявки, закрыть позицию по рынку, остановиться.
+        """Решение 0020 (0066): снять заявки, закрыть позицию заявкой FOK, остановиться.
 
-        Один раз за жизнь исполнителя: второй вызов ничего не подаёт.
+        Закрывающая заявка — одна за жизнь исполнителя: после поданной второй
+        вызов ничего не подаёт. Попытка, после которой заявка не ушла (цены
+        нет, позиция не прочиталась), не считается.
+
         Остановка ставится **до** закрывающей заявки. Возврат — текст для журнала.
         """
         async with self._lock:
@@ -879,10 +1022,10 @@ class LiveExecutor:
 
     async def _open(self, order: OrderRequest) -> None:
         volume = self._contracts(order)
+        current = self._signal_close(order)
         await self._admit(order, expected=0)
-        ticket = await self._send(
-            order.order_id, _order_words(order), self._market(_OPENING[order.side], volume)
-        )
+        priced = self._fok(_OPENING[order.side], volume, current, "закрытие свечи сигнала")
+        ticket = await self._send(order.order_id, _order_words(order), priced)
         self._deals.append(_Deal(
             order.order_id, OrderAction.OPEN, order.side, volume,
             level=False, moment=order.submitted_at, tickets=[ticket],
@@ -890,26 +1033,45 @@ class LiveExecutor:
         await self._fill_market(ticket)
 
     async def _close(self, order: OrderRequest) -> None:
+        """Выход движка: без предела — FOK от закрытия свечи сигнала; с пределом — Р-4."""
         volume = self._contracts(order)
+        current = self._signal_close(order)
+        if order.limit_price is not None:
+            await self._close_limited(order, volume, current)
+            return
         await self._admit(order, expected=signed_position(order.side, volume))
-        limit = order.limit_price
-        request = NewOrder(
+        priced = self._fok(_CLOSING[order.side], volume, current, "закрытие свечи сигнала")
+        ticket = await self._send(order.order_id, _order_words(order), priced, closing=True)
+        self._deals.append(_Deal(
+            order.order_id, OrderAction.CLOSE, order.side, volume,
+            level=False, moment=order.submitted_at, tickets=[ticket],
+        ))
+        await self._fill_market(ticket)
+
+    async def _close_limited(self, order: OrderRequest, volume: int, close: float) -> None:
+        """Выход с пределом (по концу окна, после неисполненного уровня): DAY, Р-4.
+
+        Планка спрашивается **до** проверки позиции: портфель читается
+        последним перед подачей, а не за `band_wait` до неё.
+        """
+        price, words = await self._exit_price(order, close)
+        await self._admit(order, expected=signed_position(order.side, volume))
+        priced = _Priced(NewOrder(
             side=_CLOSING[order.side],
-            order_type=OrderType.MARKET if limit is None else OrderType.LIMIT,
+            order_type=OrderType.LIMIT,
             quantity=volume,
             ticker=self._instrument.ticker,
             class_code=self._instrument.class_code,
-            price=limit,
-        )
-        ticket = await self._send(order.order_id, _order_words(order), request)
+            price=price,
+        ), words)
+        reason = "" if order.exit_reason is None else f" — {order.exit_reason.label}"
+        what = f"выход из {_GENITIVE[order.side]}{reason}"
+        ticket = await self._send(order.order_id, what, priced, closing=True)
         deal = _Deal(
             order.order_id, OrderAction.CLOSE, order.side, volume,
             level=False, moment=order.submitted_at, tickets=[ticket],
         )
         self._deals.append(deal)
-        if limit is None:
-            await self._fill_market(ticket)
-            return
         await self._accepted(ticket)
         self._limit_exits.append(_LimitExit(order, deal, ticket))
 
@@ -972,7 +1134,10 @@ class LiveExecutor:
             class_code=self._instrument.class_code,
             price=order.price,
         )
-        ticket = await self._send(order.order_id, f"тейк {_GENITIVE[order.side]}", request)
+        words = f"по цене {order.price or 0:g}: уровень тейка движка, до конца дня"
+        ticket = await self._send(
+            order.order_id, f"тейк {_GENITIVE[order.side]}", _Priced(request, words)
+        )
         self._takes[order.order_id] = _Take(order, ticket)
         await self._accepted(ticket)
 
@@ -1004,11 +1169,9 @@ class LiveExecutor:
             return
         try:
             await self._require_position(signed_position(order.side, rest), order)
-            closing = await self._send(
-                order.order_id,
-                f"закрытие остатка тейка {_GENITIVE[order.side]}",
-                self._market(_CLOSING[order.side], rest),
-            )
+            what = f"закрытие остатка тейка {_GENITIVE[order.side]}"
+            priced = await self._fok_now(_CLOSING[order.side], rest, what)
+            closing = await self._send(order.order_id, what, priced, closing=True)
             take.deal.tickets.append(closing)
             await self._fill_market(closing)
         except ExecutionRefused as refusal:
@@ -1103,14 +1266,202 @@ class LiveExecutor:
 
     # -- команды брокеру -------------------------------------------------------
 
-    def _market(self, side: OrderSide, volume: int) -> NewOrder:
+    def _fok(
+        self, side: OrderSide, volume: int, current: float, source: str
+    ) -> _Priced:
+        """Заявка FOK «текущая ± %» (0067): цена от «текущей» и процента пределов.
+
+        Цена — `engine.limit_beyond`: одно правило округления с пределом
+        движка (Р-3), покупка — к сетке вверх, продажа — вниз, не ближе
+        к рынку, чем процент. Саму заявку собирает `_fok_at`.
+
+        :param current: «текущая» цена — откуда она, говорит `source` (Р-2).
+        :returns: заявка и её цена словами — «по цене X: текущая Y (откуда) ± p %».
+        :raises ExecutionRefused: цену не посчитать (текущая не больше нуля) —
+            заявка не подана.
+        """
+        percent = self._limits.fok_percent
+        buying = side is OrderSide.BUY
+        try:
+            price = limit_beyond(current, percent, self._instrument.price_step, buying=buying)
+        except ValueError as error:
+            raise ExecutionRefused(
+                f"Цену заявки не посчитать ({error}): заявка не подана."
+            ) from None
+        sign = "+" if buying else "−"
+        words = f"по цене {price:g}: текущая {current:g} ({source}) {sign} {percent:g} %, FOK"
+        return _Priced(self._fok_at(side, volume, price), words)
+
+    def _fok_at(self, side: OrderSide, volume: int, price: float) -> NewOrder:
+        """Единственный сборщик заявки немедленного исполнения: лимитная FOK по цене `price`.
+
+        Все шесть мест, где прежде уходила рыночная заявка, — вход, выход
+        движка, остаток тейка, выход по касанию трейлинга, «закрыть всё» —
+        собирают заявку только здесь, и рыночной взяться неоткуда (гейт 0.2,
+        «удалить `_market`»). Цену приносит вызывающий: «текущая ± %» (`_fok`)
+        или планка биржи (`_fok_now`).
+        """
         return NewOrder(
             side=side,
-            order_type=OrderType.MARKET,
+            order_type=OrderType.LIMIT,
             quantity=volume,
             ticker=self._instrument.ticker,
             class_code=self._instrument.class_code,
+            price=price,
+            time_in_force=TimeInForce.FILL_OR_KILL,
         )
+
+    def _signal_close(self, order: OrderRequest) -> float:
+        """«Текущая» заявки движка — закрытие свечи сигнала (Р-2, путь А гейта 0.2).
+
+        Свеча сигнала — свеча последнего закрытого `fills_at`: заявки свечи T
+        движок подаёт после `fills_at(T)`, и их `submitted_at` — закрытие T
+        (`engine/ports.py`). Не сошлось — цены нет, и заявка не подаётся:
+        цена от чужой свечи — это вход по цене, которой уже нет.
+
+        :raises ExecutionRefused: заявка несвежая или свечи сигнала нет.
+        """
+        self._refuse_stale(order)
+        signal = self._signal
+        closes = None if signal is None else close_time(signal)
+        if signal is None or closes != order.submitted_at:
+            seen = (
+                "закрытой свечи у исполнителя ещё не было"
+                if closes is None
+                else f"последняя закрытая свеча у исполнителя закрылась в {_msk(closes)}"
+            )
+            raise ExecutionRefused(
+                f"Нет цены свечи сигнала: заявка ({_order_words(order)}) решена по свече, "
+                f"закрывшейся в {_msk(order.submitted_at)}, а {seen}. Заявка не подана."
+            )
+        return float(signal.close)
+
+    async def _fok_now(self, side: OrderSide, volume: int, what: str) -> _Priced:
+        """FOK «сейчас» — у «закрыть всё» и остатка тейка (0067, «Последняя минутка несвежая»).
+
+        * Свежая минутка — FOK от её закрытия ± процент.
+        * Несвежая (старше `_freshness`; после обрыва сверка идёт раньше
+          догрузки минуток, гейт 0.2, 2.a) — FOK по планке биржи, к сетке
+          внутрь коридора: от цены, которой уже нет, FOK снялась бы, а планка —
+          граница, внутри которой биржа исполнит. Сторона от закрытия здесь
+          не проверяется: несвежее закрытие — не та мера, которой судить
+          коридор биржи.
+        * Планки нет — FOK от несвежей минутки ± процент, в словах её возраст.
+          Подать лучше, чем не подать (`/risk` 04.11.2026 22:35, находка 1):
+          снятая FOK оставляет ту же позицию, что неподанная, и те же слова.
+
+        :raises ExecutionRefused: ни минутки за сутки, ни годной планки —
+            цены нет вовсе, заявка не подана.
+        """
+        now = self._clock()
+        last, missing = await self._last_minute()
+        if last is not None and last.time >= now - self._freshness():
+            return self._fok(side, volume, float(last.close), f"закрытие минутки {_msk(last.time)}")
+        stale = (
+            missing if last is None
+            else f"последняя минутка {_msk(last.time)} несвежая — ей {_age_words(now - last.time)}"
+        )
+        selling = side is OrderSide.SELL
+        band, trouble = await self._fetch_band()
+        if band is not None:
+            edge, trouble = self._band_edge(band, None, selling=selling)
+            if edge is not None:
+                name, column = ("нижней", "LOWLIMIT") if selling else ("верхней", "HIGHLIMIT")
+                words = (
+                    f"по цене {edge:g}: по {name} планке биржи ({column}, {band.told}), FOK — "
+                    f"{stale}"
+                )
+                return _Priced(self._fok_at(side, volume, edge), words)
+        if last is None:
+            raise ExecutionRefused(
+                f"Цены для заявки ({what}) нет: {missing}, а планка биржи не годится — "
+                f"{trouble}. Заявка не подана."
+            )
+        return self._fok(
+            side, volume, float(last.close),
+            f"закрытие минутки {_msk(last.time)}, несвежей — ей "
+            f"{_age_words(now - last.time)}; планки нет: {trouble}",
+        )
+
+    async def _last_minute(self) -> tuple[MarketCandle | None, str]:
+        """Последняя записанная минутка за сутки — или почему её нет, словами."""
+        try:
+            minutes = await self._minutes(self._clock() - _MINUTE_LOOKBACK)
+        except _JOURNAL_FAILURES as error:
+            return None, f"минутки не прочитались ({type(error).__name__})"
+        if not minutes:
+            return None, "за последние сутки не записано ни одной минутки"
+        return max(minutes, key=lambda one: one.time), ""
+
+    async def _exit_price(self, order: OrderRequest, close: float) -> tuple[float, str]:
+        """Цена выхода с пределом (Р-4): планка биржи, иначе предел движка. И слова: откуда.
+
+        Планка годна, если пришла за `band_wait`, обе границы названы и
+        `LOWLIMIT < закрытие < HIGHLIMIT`. Продажа — по `LOWLIMIT`, покупка —
+        по `HIGHLIMIT`, к сетке шага **внутрь** коридора (правка 4.3 гейта 0.2):
+        округление от рынка вывело бы цену за коридор, и биржа отказала бы
+        на каждом выходе. Иначе — предел движка как есть.
+
+        :returns: цена и слова «по цене X: откуда она».
+        """
+        limit = order.limit_price
+        assert limit is not None, "цена выхода с пределом — только у заявки с пределом"
+        selling = _CLOSING[order.side] is OrderSide.SELL
+        band, trouble = await self._fetch_band()
+        if band is not None:
+            edge, trouble = self._band_edge(band, close, selling=selling)
+            if edge is not None:
+                name, column = ("нижней", "LOWLIMIT") if selling else ("верхней", "HIGHLIMIT")
+                return edge, (
+                    f"по цене {edge:g}: по {name} планке биржи ({column}, {band.told}; "
+                    f"закрытие свечи сигнала {close:g}), до конца дня; предел движка "
+                    f"{limit:g} не подан"
+                )
+        return limit, (
+            f"по цене {limit:g}: предел движка, до конца дня — планка биржи не годится: "
+            f"{trouble}"
+        )
+
+    async def _fetch_band(self) -> tuple[PriceBand | None, str]:
+        """Планка от источника — не дольше `band_wait`, обещанию источника не веря."""
+        source = self._band
+        if source is None:
+            return None, "источник планки не подключён"
+        waited = self._limits.band_wait
+        try:
+            return await asyncio.wait_for(source(), waited), ""
+        except TimeoutError:
+            return None, f"биржа не ответила за {waited:g} с"
+        except _BAND_FAILURES as error:
+            log.warning("планка биржи не получена: %s", type(error).__name__)
+            return None, f"планку спросить не удалось ({type(error).__name__})"
+
+    def _band_edge(
+        self, band: PriceBand, close: float | None, *, selling: bool
+    ) -> tuple[float | None, str]:
+        """Граница планки на сетке шага внутрь коридора — или почему она не годится.
+
+        `close` — закрытие, которое коридор обязан охватывать; `None` — сторона
+        не проверяется (несвежая минутка, `_fok_now`), только сама планка.
+        """
+        low, high = band.low, band.high
+        if not band.usable or low is None or high is None:
+            return None, band.told
+        if close is not None and not low < close < high:
+            return None, (
+                f"планка {low:g}–{high:g} не охватывает закрытие свечи сигнала {close:g}"
+            )
+        step = Decimal(repr(float(self._instrument.price_step)))
+        raw = low if selling else high
+        edge = float(to_grid(Decimal(repr(float(raw))), step, up=selling))
+        reference = close if close is not None else (high if selling else low)
+        if (selling and edge >= reference) or (not selling and edge <= reference):
+            return None, (
+                f"граница {raw:g}, положенная на сетку шага внутрь коридора, дошла до "
+                f"{'закрытия свечи сигнала' if close is not None else 'другой границы'} "
+                f"{reference:g}"
+            )
+        return edge, ""
 
     def _contracts(self, order: OrderRequest) -> int:
         volume = order.volume
@@ -1151,18 +1502,39 @@ class LiveExecutor:
             account=self._instrument.account,
         )
 
-    async def _send(self, name: str, what: str, request: NewOrder) -> _Ticket:
+    async def _send(
+        self,
+        name: str,
+        what: str,
+        priced: _Priced,
+        *,
+        closing: bool = False,
+        spared: bool = False,
+    ) -> _Ticket:
         """Создать заявку: строка журнала до POST (С5), ответ HTTP → наш язык (§2.4).
 
         Заявка регистрируется **в записи**, до POST: события потока по ней
         приходят раньше ответа 200, и найти их хозяина обязан уже первый.
+        Поэтому и `closing`, и `spared` ставятся здесь, а не после возврата:
+        конец заявки может прийти потоком раньше.
+
+        :param what: что за заявка словами — «вход в лонг», «тейк лонга».
+        :param priced: заявка и её цена словами — «по цене X: текущая Y
+            (откуда) ± p %». Слова обязательны: в журнал решений на **каждую** боевую заявку
+            уходит строка «подана по цене…» (решение владельца 04.11.2026,
+            0067), а в тексты отказов и остановок — цена поданной, а не предел
+            движка (правка 4.2 гейта 0.2).
         """
         self._gate()
         made: list[_Ticket] = []
+        request, words = priced
+        named = f"{what}, {words}"
 
         async def record(key: UUID, command: OrderCommand) -> None:
             await self._record(self._command_row(key, name, command))
-            ticket = _Ticket(key=key, name=name, what=what, order=request)
+            ticket = _Ticket(
+                key=key, name=name, what=named, order=request, closing=closing, spared=spared
+            )
             self._tickets[str(key)] = ticket
             made.append(ticket)
 
@@ -1182,6 +1554,7 @@ class LiveExecutor:
         ticket = made[0]
         ticket.answer = _Answer.ACCEPTED
         self._sync(ticket)
+        self._say(f"Заявка ({what}) подана {words}.")
         return ticket
 
     def _refusal_of(self, error: BrokerError, ticket: _Ticket | None, what: str) -> Exception:
@@ -1279,7 +1652,7 @@ class LiveExecutor:
         )
 
     async def _cancel_rest(self, ticket: _Ticket) -> bool:
-        """Снять остаток своей рыночной заявки. `True` — заявка кончилась (снята или исполнена).
+        """Снять остаток своей заявки немедленного исполнения. `True` — заявка кончилась.
 
         Любой отказ здесь — не «не подано» (заявка у брокера есть), а «остаток,
         возможно, жив»: вызывающий называет это словами с ключом заявки.
@@ -1334,17 +1707,26 @@ class LiveExecutor:
         self._after_change(ticket)
         return True
 
-    async def _fill_market(self, ticket: _Ticket) -> None:
-        """Рыночная: ждать `2` или `8`. Без конца к пределу — снять остаток и стоп (Р6)."""
+    async def _fill_market(self, ticket: _Ticket) -> bool:
+        """Заявка немедленного исполнения (FOK): ждать `2`, `4` или `8`.
+
+        `True` — исполнена целиком. `False` бывает только у заявки, чьё снятие
+        целиком решает движок (`spared`, Р-10): кончилась без единого
+        исполнения. Любой другой конец — остановка словами статуса (Р-6).
+        Частичная без конца к пределу — страховка (0067: у FOK частичного
+        остатка нет): остаток снимается, стоп (Р6).
+        """
         if not await self._wait(ticket, _is_final, self._limits.fill_wait):
             await self._ask(ticket)
         if ticket.status is OrderStatus.FILLED:
-            return
+            return True
+        if ticket.spared and ticket.killed:
+            return False
         if ticket.final or ticket.missing:
             raise self._halted_by(self._end_words(ticket))
         cancelled = await self._cancel_rest(ticket)
         if _is_filled(ticket):
-            return
+            return True
         raise self._halted_by(self._partial_words(ticket, cancelled=cancelled))
 
     def _partial_words(self, ticket: _Ticket, *, cancelled: bool) -> str:
@@ -1381,18 +1763,23 @@ class LiveExecutor:
             raise self._halted_by(self._end_words(ticket))
 
     def _end_words(self, ticket: _Ticket) -> str:
-        """Почему заявка кончилась не исполнением — словами (правило 13)."""
+        """Почему заявка кончилась не исполнением — словами (правило 13).
+
+        У FOK, кончившейся без исполнения, к словам статуса — хвост
+        `_fok_tail` (правка 6.1 гейта 0.2): у `8` остаются слова биржи —
+        «цена вне лимитов» общими словами о снятой FOK пряталась бы.
+        """
         if ticket.status is OrderStatus.REJECTED:
             reason = _foreign_text(ticket.reject) or "причину биржа не назвала"
             return (
                 f"Биржа отклонила заявку ({ticket.what}) уже после приёма брокером: "
-                f"«{reason}». {_HALT_TAIL}"
+                f"«{reason}».{_fok_tail(ticket)} {_HALT_TAIL}"
             )
         if ticket.status is OrderStatus.CANCELLED:
             part = f", успев исполниться на {ticket.done_volume}" if ticket.done_volume else ""
             return (
                 f"Заявка ({ticket.what}) снята не программой — биржей, брокером или руками "
-                f"в приложении брокера{part}. {_HALT_TAIL}"
+                f"в приложении брокера{part}.{_fok_tail(ticket)} {_HALT_TAIL}"
             )
         if ticket.missing:
             return (
@@ -1438,10 +1825,11 @@ class LiveExecutor:
                 return
 
     async def _fire(self, take: _Take, moment: datetime) -> None:
-        """Уровень задет: рыночный выход ровно один раз; сделка движку — по свече касания.
+        """Уровень задет: выход FOK ровно один раз; сделка движку — по свече касания.
 
-        Касание в догруженной минутке (после обрыва) — тот же выход, сразу,
-        и робот работает дальше (решение владельца 01.11.2026, 0066). С этой
+        Касание в догруженной минутке (после обрыва) — тот же выход, сразу;
+        исполнился — робот работает дальше (решение владельца 01.11.2026,
+        0066), снят целиком — решает движок (`_send_fire`, 0067). С этой
         минуты уровень сработал: снятие и вооружение отвечают
         `ALREADY_TRIGGERED`, второго выхода не будет, даже если догрузка
         пришлёт те же минутки ещё раз.
@@ -1467,6 +1855,12 @@ class LiveExecutor:
         ждущим: его подаст следующий проход сторожа (`watch`, `fills_at`,
         `submit`). Отказ брокера на уже записанную команду и любая остановка —
         стоп: повтор той же заявки дал бы тот же отказ.
+
+        Цена — FOK от уровня касания (0067). Граница «после обрыва» — порог
+        свежести (`_freshness`) от минутки касания **в момент подачи**: так
+        ловятся оба случая Р-2 — минутка догружена после обрыва и выход ждал
+        связи. Касание вовремя и FOK снята — остановка (Р-6); после обрыва —
+        событие движку (`_unfilled_level`, Р-10).
         """
         order = take.order
         deal = take.deal
@@ -1476,17 +1870,23 @@ class LiveExecutor:
         if not self.connected:
             self._tell_waiting(take, "связи с потоком статусов заявок нет")
             return
+        level = order.price or 0.0
+        late = deal.moment < self._clock() - self._freshness()
         recorded = len(self._tickets)
         try:
             await self._require_stream()
             await self._require_position(signed_position(order.side, deal.volume), order)
+            priced = self._fok(_CLOSING[order.side], deal.volume, level, "уровень касания")
             ticket = await self._send(
                 order.order_id,
-                f"выход из {_GENITIVE[order.side]} по трейлингу {order.price or 0:g}",
-                self._market(_CLOSING[order.side], deal.volume),
+                f"выход из {_GENITIVE[order.side]} по трейлингу {level:g}",
+                priced,
+                closing=True,
+                spared=late,
             )
             deal.tickets.append(ticket)
-            await self._fill_market(ticket)
+            if not await self._fill_market(ticket):
+                self._unfilled_level(take, ticket)
         except ExecutionRefused as refusal:
             if len(self._tickets) == recorded:
                 self._tell_waiting(take, str(refusal))
@@ -1507,29 +1907,88 @@ class LiveExecutor:
         held = position_words(signed_position(order.side, take.deal.volume))
         self._tell(
             f"Цена прошла уровень трейлинга {order.price or 0:g} ({held}) "
-            f"в {_msk(take.deal.moment)}, а выход по рынку подать нельзя: {why}. Выход ждёт "
+            f"в {_msk(take.deal.moment)}, а выход подать нельзя: {why}. Выход ждёт "
             "связи и будет подан сразу после неё. Робот не остановлен; пока выхода нет, "
             "позиция открыта без защиты."
         )
 
+    def _unfilled_level(self, take: _Take, ticket: _Ticket) -> None:
+        """Выход после обрыва снят целиком: не остановка, а событие движку (0067, Р-10).
+
+        Сделки касания не было — она уходит из отдачи. Сторож остаётся
+        в `_takes` с отметкой «сработал»: вооружение и снятие этого имени
+        отвечают `ALREADY_TRIGGERED`, пока событие не отдано (`_release`),
+        иначе движок поставил бы старый уровень заново — и снова касание.
+        Решение — держать, закрыть, закрыть и не входить — за движком
+        (`engine.pipeline.apply_unfilled`); строка человеку — здесь.
+        """
+        deal = take.deal
+        assert deal is not None, "событие — только у сработавшего сторожа"
+        if deal in self._deals:
+            self._deals.remove(deal)
+        order = take.order
+        held = position_words(signed_position(order.side, deal.volume))
+        why = "биржа её отклонила" if ticket.status is OrderStatus.REJECTED else "биржа её сняла"
+        said = _foreign_text(ticket.reject)
+        if said:
+            why = f"{why}: «{said}»"
+        reason = (
+            f"Цена прошла уровень трейлинга {order.price or 0:g} ({held}) в "
+            f"{_msk(deal.moment)}, а выход по нему подан только в {_msk(self._clock())} — "
+            f"после обрыва связи. Выход ({ticket.what}) целиком не исполнился — {why}. "
+            "Позиция у брокера та же, сторожа у неё больше нет; что делать дальше — "
+            "решает робот по настройке «Заходить заново при обрыве связи» на ближайшей "
+            "закрытой свече."
+        )
+        self._unfilled.append(_Unfilled(take, LevelUnfilled(order.order_id, deal.moment, reason)))
+        self._tell(reason)
+        self._news()
+
     # -- отдача сделок ---------------------------------------------------------
 
-    def _ready(self, candle: MarketCandle) -> list[Fill]:
-        """Порядок отдачи (план §3): сначала рыночные; по незакрытой — только они."""
+    def _ready(self, candle: MarketCandle) -> list[Fill | LevelUnfilled]:
+        """Порядок отдачи (план §3): сначала по открытию; по незакрытой — только они.
+
+        Сделки по уровню и события «уровень не исполнился» — только по закрытой
+        свече и не в одном ответе с исполнениями по открытию (`engine/ports.py`,
+        `fills_at`; Н4 гейта Р-10).
+        """
         self._collect_takes()
         market = [
             deal for deal in self._deals
             if not deal.level and deal.complete and candle.time >= deal.moment
         ]
         if market:
-            return self._deliver(market, candle)
+            return list(self._deliver(market, candle))
         if getattr(candle, "unsettled", False):
             return []
         closes = close_time(candle)
         level = [
             deal for deal in self._deals if deal.level and deal.complete and closes > deal.moment
         ]
-        return self._deliver(level, candle)
+        return [*self._deliver(level, candle), *self._events_at(closes)]
+
+    def _events_at(self, closes: datetime) -> list[LevelUnfilled]:
+        """События, которые отдаются свечой, закрывшейся в `closes`.
+
+        Только свечой, решения по которой ещё подаются брокеру: движок
+        на событии рождает выход со временем закрытия этой свечи, и по свече
+        догрузки (старше порога свежести) он был бы отвергнут как несвежий —
+        позиция осталась бы без выхода. Событие ждёт первой свежей закрытой
+        свечи; сторож всё это время отвечает `ALREADY_TRIGGERED`.
+        """
+        if closes < self._clock() - self._freshness():
+            return []
+        return self._release([one for one in self._unfilled if closes > one.event.at])
+
+    def _release(self, due: list[_Unfilled]) -> list[LevelUnfilled]:
+        """Отдать события: с ними уходит и сторож — дальше уровень за движком (Р-10)."""
+        for one in due:
+            self._unfilled.remove(one)
+            name = one.take.order.order_id
+            if self._takes.get(name) is one.take:
+                del self._takes[name]
+        return [one.event for one in due]
 
     def _collect_takes(self) -> None:
         """Тейк у брокера исполнился целиком сам — сделка по уровню."""
@@ -1572,17 +2031,21 @@ class LiveExecutor:
 
         Без правил очерёдности фаз: свечей после остановки не будет, а сделка
         на счёте есть — движок обязан о ней узнать (`engine/ports.py`,
-        `ExecutionHalted`). Рыночные — первыми, как в обычной отдаче.
+        `ExecutionHalted`). Исполненные по открытию — первыми, как в обычной
+        отдаче. Неотданные события «уровень не исполнился» — тоже с ней,
+        в `unfilled`: позиция у брокера открыта без сторожа, и движок обязан
+        назвать это строкой журнала (`engine/ports.py`, `ExecutionHalted`).
         """
         self._collect_takes()
         ready = [deal for deal in self._deals if deal.complete]
         ready.sort(key=lambda deal: deal.level)
-        return ExecutionHalted(text, self._deliver(ready, candle))
+        fills = self._deliver(ready, candle)
+        return ExecutionHalted(text, fills, unfilled=self._release(list(self._unfilled)))
 
     def _bar_of(self, deal: _Deal, candle: MarketCandle | None) -> datetime:
-        """Начало свечи сделки: у рыночной — свеча отдачи, как в модели; у уровня — свеча касания.
+        """Начало свечи сделки: у FOK — свеча отдачи, как в модели; у уровня — свеча касания.
 
-        Без свечи (остановка из `submit`) рыночная берёт момент подачи — это
+        Без свечи (остановка из `submit`) немедленная берёт момент подачи — это
         граница свечи исполнения, — а уровень считается от полуночи по Москве.
         """
         if not deal.level:
@@ -1613,13 +2076,14 @@ class LiveExecutor:
 
     @staticmethod
     def _limit_exit_words(waiting: _LimitExit) -> str:
+        """Живая заявка у брокера — её цена и откуда она, а не предел движка (правка 4.2)."""
         ticket = waiting.ticket
         part = (
             f" Исполнено {ticket.done_volume} из {ticket.order.quantity}."
             if ticket.done_volume else ""
         )
         return (
-            f"Заявка на {_order_words(waiting.order)} не исполнилась за "
+            f"Заявка ({ticket.what}) не исполнилась за "
             f"{_bars_words(len(waiting.bars))}.{part} Она жива у брокера (ключ "
             f"{ticket.key}): сначала снимите её в приложении брокера, иначе она "
             f"исполнится без робота. {_HALT_TAIL}"
@@ -1640,7 +2104,10 @@ class LiveExecutor:
             )
             self._halt = text
             return text
-        self._flattened = True
+        # «Уже пыталась» ставит `_close_position`, и только когда закрывающая
+        # заявка ушла к брокеру (`/risk` 04.11.2026 22:35, находка 1): попытка
+        # без заявки — позиция не прочиталась, цены нет — не гасит кнопку
+        # «Закрыть всё» до конца жизни исполнителя.
         # Остановка — ДО закрывающей заявки: ни одна заявка движка больше не уйдёт.
         self._halt = f"{why} Робот остановлен, позиция закрывается."
         with self._permitted():
@@ -1674,7 +2141,15 @@ class LiveExecutor:
         return notes
 
     async def _close_position(self) -> str:
-        """Один рыночный ордер на всё, что у брокера, — только по согласным сведениям (С2, К2).
+        """Одна заявка FOK на всё, что у брокера, — только по согласным сведениям (С2, К2).
+
+        Цена — `_fok_now`: от свежей минутки, иначе по планке биржи, иначе
+        от несвежей минутки с её возрастом в словах.
+
+        Заявка ушла к брокеру (записана и не отвергнута им точно) — второго
+        «закрыть всё» за жизнь исполнителя не будет (`_flattened`): программа,
+        стреляющая закрывающими заявками на каждой сверке, хуже остановленной
+        (С2). Не ушла — следующая попытка разрешена.
 
         Объём — из двух чтений портфеля подряд, и оба обязаны совпасть между
         собой и с позицией по исполнениям потока (`_ledger`), если она известна.
@@ -1698,15 +2173,22 @@ class LiveExecutor:
             return "Позиции у брокера нет — закрывать нечего."
         side = OrderSide.SELL if position > 0 else OrderSide.BUY
         what = f"закрыть всё: {position_words(position)}"
+        known = set(self._tickets)
         try:
+            priced = await self._fok_now(side, abs(position), what)
             ticket = await self._send(
-                f"flatten:{self._clock().isoformat()}", what, self._market(side, abs(position))
+                f"flatten:{self._clock().isoformat()}", what, priced, closing=True
             )
             await self._fill_market(ticket)
         except (ExecutionRefused, ExecutionHalted) as error:
             return (
                 f"Позицию ({position_words(position)}) закрыть не удалось: {error} "
                 "Закройте её сами в приложении брокера."
+            )
+        finally:
+            self._flattened = self._flattened or any(
+                one.answer is not _Answer.REFUSED
+                for key, one in self._tickets.items() if key not in known
             )
         return await self._closed_words(position, ticket)
 
@@ -1740,7 +2222,7 @@ class LiveExecutor:
         known = self._ledger
         if after == 0 and (known is None or known == 0):
             return (
-                f"Позиция у брокера ({position_words(position)}) закрыта по рынку{at}; "
+                f"Позиция у брокера ({position_words(position)}) закрыта заявкой FOK{at}; "
                 "после закрытия позиции нет."
             )
         by_deals = "неизвестна" if known is None else position_words(known)
@@ -2019,11 +2501,17 @@ class LiveExecutor:
         self._notify()
 
     def _ended(self, ticket: _Ticket) -> None:
-        """Заявка кончилась. Исполнена — новость; снята не нами или отклонена — стоп."""
+        """Заявка кончилась. Исполнена — новость; снята не нами или отклонена — стоп.
+
+        Кроме FOK, чьё снятие целиком решает движок (`spared`, Р-10): её конец
+        разбирает ждущий её `_send_fire`, и остановки здесь нет.
+        """
         if ticket.status is OrderStatus.FILLED:
             self._news()
             return
         if ticket.status is OrderStatus.CANCELLED and ticket.cancelling:
+            return
+        if ticket.spared and ticket.killed:
             return
         self._set_halt(self._end_words(ticket))
 
@@ -2124,6 +2612,18 @@ class LiveExecutor:
     def _tell(self, text: str) -> None:
         """Человеку — без остановки (С2): в журнал решений через 2в и в технический лог."""
         log.warning("боевой исполнитель: %s", text)
+        self._notify_human(text)
+
+    def _say(self, text: str) -> None:
+        """Штатная строка человеку — тем же путём в журнал решений; в техническом логе — INFO.
+
+        Каждая боевая заявка (решение владельца 04.11.2026, 0067): по какой цене
+        подана и откуда цена. Не предупреждение — потому и уровень лога ниже.
+        """
+        log.info("боевой исполнитель: %s", text)
+        self._notify_human(text)
+
+    def _notify_human(self, text: str) -> None:
         if self._notice is not None:
             asyncio.get_running_loop().call_soon(self._notice, text)
 
@@ -2144,11 +2644,16 @@ class LiveExecutor:
         остановлен», действует руками, и любая заявка программы следом —
         вторая сделка поверх его. Исключения два: пути, разрешённые
         `_permitted` (сверка и «закрыть всё» из 2в), и **снятие** своей
-        рыночной заявки (`cancelling`) — остатка, который иначе исполнится
-        без робота (решение владельца 01.11.2026). Снятие позицию не создаёт;
-        новых заявок это разрешение не открывает.
+        заявки немедленного исполнения (`cancelling`) — FOK или рыночной из
+        журнала прошлых версий: остатка, который иначе исполнится без робота
+        (решение владельца 01.11.2026; Р-7 и правка 7 гейта 0.2). Снятие
+        позицию не создаёт; новых заявок это разрешение не открывает.
+
+        ⚠️ Исключение — здесь, а не в `_blocked`: `_blocked` зовут ждущий
+        выход сторожа и «закрыть всё», и ослабленный он разрешил бы после
+        остановки новые заявки поверх ручных действий человека (`B-077`).
         """
-        if cancelling is not None and cancelling.order.order_type is OrderType.MARKET:
+        if cancelling is not None and _immediate(cancelling.order):
             return
         if self._halt is not None and self._blocked():
             raise ExecutionHalted(self._halt)
@@ -2170,6 +2675,11 @@ class LiveExecutor:
 def _technical(error: BaseException) -> str:
     """Что писать в технический лог: у отказа брокера — его техническую часть, иначе тип."""
     return error.technical if isinstance(error, BrokerError) else type(error).__name__
+
+
+def _immediate(order: NewOrder) -> bool:
+    """Заявка немедленного исполнения: FOK или рыночная (Р-7)."""
+    return order.time_in_force is TimeInForce.FILL_OR_KILL or order.order_type is OrderType.MARKET
 
 
 def _is_final(ticket: _Ticket) -> bool:

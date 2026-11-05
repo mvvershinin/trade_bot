@@ -2513,5 +2513,6 @@ def test_a_repeated_candle_does_not_fill_an_order_at_its_own_open() -> None:
 
     following = replace(candle(10, 15, close=PRICE), open=PRICE)
     fills = asyncio.run(executor.fills_at(following))
-    assert [fill.price for fill in fills] == [PRICE]
-    assert fills[0].at == following.time, "время сделки — начало свечи исполнения"
+    (deal,) = fills
+    assert isinstance(deal, Fill) and deal.price == PRICE
+    assert deal.at == following.time, "время сделки — начало свечи исполнения"

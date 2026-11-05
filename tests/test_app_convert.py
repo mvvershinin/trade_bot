@@ -423,6 +423,8 @@ def test_every_engine_field_has_a_source() -> None:
         # Шаг цены — одно поле окна на всю программу, общее с издержками
         # тестера (решение владельца счёта 04.10.2026, задача З8).
         "price_step",
+        # «Заходить заново при обрыве связи» (решение 0067, Р-10 п. 9).
+        "hold_after_unfilled_level",
     }
     from_the_previous = {
         "close_on_time_end", "trade_in_weekend", "partial_candles",
@@ -433,7 +435,7 @@ def test_every_engine_field_has_a_source() -> None:
         "exchange_days",
         # Выход по концу окна с предельной ценой: полей в окне пока нет
         # (Ф3 задачи З8), «Применить» не должно их стирать.
-        "time_exit_order", "time_exit_limit_steps", "time_exit_wait_bars",
+        "time_exit_order", "time_exit_limit_percent", "time_exit_wait_bars",
     }
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): предохранителей в настройках движка больше нет.
     # # Три предохранителя по деньгам. Проведены 05.09.2026 (`D-030`), но

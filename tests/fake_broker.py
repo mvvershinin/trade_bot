@@ -35,8 +35,9 @@ HTTP — `httpx.MockTransport` (вызов объекта — обработчи
 сессия, и расхождение не проверяет.
 
 Что ещё умеет тест: исполнить заявку сразу при создании (`on_create`),
-отклонить принятую (`reject`, `orderStatus 8`), снять не по нашей команде
-(`cancel_outside`), заглушить поток (`muted`: события теряются, как при
+отклонить принятую (`reject`, `orderStatus 8`), снять FOK целиком без
+исполнения (`kill`: `4` или `8` — каким БКС, неизвестно), снять не по нашей
+команде (`cancel_outside`), заглушить поток (`muted`: события теряются, как при
 обрыве, а сокет жив), прислать сделку по заявке, поданной не программой
 (`foreign_trade`).
 
@@ -163,6 +164,9 @@ class BookOrder:
     class_code: str
     price: float | None
     exchange_id: str
+    #: Срок заявки, `timeInForce` (13): `1` — до конца дня, `2` — исполнить
+    #: целиком или снять (FOK). Ушло без поля — `None`: подделка не додумывает.
+    time_in_force: str | None = None
     status: str = "0"
     executed: int = 0
     turnover: float = 0.0
@@ -298,6 +302,7 @@ class FakeBroker:
                 class_code=str(body["classCode"]),
                 price=body.get("price"),
                 exchange_id=f"FAKE-EXCH-{next(self._numbers)}",
+                time_in_force=None if "timeInForce" not in body else str(body["timeInForce"]),
             )
             self.orders.append(order)
             self._note_live()
@@ -419,6 +424,26 @@ class FakeBroker:
         order = self._living(key)
         order.status = "8"
         self._emit(order, execution_type="8", extra={"rejectReason": reason})
+        self._note_live()
+
+    def kill(self, key: str, status: str = "4", reason: str = "") -> None:
+        """Заявка «исполнить целиком или снять» не исполнилась: биржа её сняла целиком.
+
+        Каким статусом БКС говорит об этом — `4` без исполнения или `8`, — в снимке
+        документации нет (13, 24; план координатора 04.11.2026 §9), поэтому тест
+        задаёт его сам: `status` — `"4"` или `"8"`, `reason` — слова биржи у `8`.
+        Исполнения нет ни одного: частичного у FOK не бывает.
+        """
+        if status not in ("4", "8"):
+            raise AssertionError(f"FOK снимается статусом 4 или 8, а не {status!r}")
+        order = self._living(key)
+        if order.executed:
+            raise AssertionError(f"заявка {key} уже исполнялась: целиком её не снять")
+        order.status = status
+        extra: dict[str, object] | None = (
+            {"rejectReason": reason} if status == "8" and reason else None
+        )
+        self._emit(order, execution_type=status, extra=extra)
         self._note_live()
 
     def cancel_outside(self, key: str) -> None:

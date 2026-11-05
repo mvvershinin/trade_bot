@@ -51,6 +51,12 @@
 разбор — `engine.pipeline.apply_price`, подача вооружения — тем же путём,
 что у заявки, рождённой сделкой.
 
+Третий вид — **событие «уровень не исполнился»** (`LevelUnfilled`, решение
+0067, Р-10): разбор — `engine.pipeline.apply_unfilled`, рождённый выход
+подаётся тем же путём. Какой вид сообщения куда идёт — одна таблица
+(`_route`), а не двоичный выбор: третий вид, прошедший мимо неё, молча
+стал бы «сделкой».
+
 Шаг 7 стоит последним, и это не стиль
 --------------------------------------
 Здесь стоял обратный порядок: состояние переводилось в «закрывается», строка
@@ -84,9 +90,11 @@ ERROR. Дальше становилось только хуже: на след�
 
 from __future__ import annotations
 
+import enum
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import date, datetime
+from typing import Any, assert_never, cast
 
 from strategies import Strategy
 
@@ -99,6 +107,7 @@ from engine.contracts import (
     Fill,
     JournalEntry,
     JournalLevel,
+    LevelUnfilled,
     OrderAction,
     OrderRequest,
     Position,
@@ -112,6 +121,7 @@ from engine.pipeline import (
     after_submit,
     apply_fill,
     apply_price,
+    apply_unfilled,
     money,
     order_words,
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `percent` держал дневной
@@ -323,10 +333,18 @@ def _halted_words(halted: ExecutionHalted) -> str:
     return human or "исполнитель причину не назвал"
 
 
-def _carried(halted: ExecutionHalted) -> tuple[Fill, ...]:
-    """Сделки, отданные вместе с остановкой. Наблюдения цены — не сделки."""
-    return tuple(
-        item for item in getattr(halted, "fills", ()) or () if isinstance(item, Fill)
+def _carried(halted: ExecutionHalted) -> tuple[Fill | PriceSeen | LevelUnfilled, ...]:
+    """Сообщения, отданные вместе с остановкой: сделки, затем события. Без отбора.
+
+    Что с каждым делать, решает таблица `_route` (`Engine._settle_known`):
+    сделка разбирается, событие «уровень не исполнился» называется строкой,
+    наблюдение цены отбрасывается. Отбор здесь по типу «только сделки»
+    выбросил бы событие молча (Р-10, Н6). `getattr` — как у `_named_reason`:
+    подкласс, не позвавший конструктор, не роняет обработчик остановки.
+    """
+    return (
+        *(getattr(halted, "fills", ()) or ()),
+        *(getattr(halted, "unfilled", ()) or ()),
     )
 
 
@@ -591,6 +609,26 @@ class Engine:
         self._publish(result.lines(0))
         return result
 
+    def on_unfilled(self, event: LevelUnfilled, candle: MarketCandle) -> FillOutcome:
+        """Уровень задет, выход по нему не исполнился. Возвращает рождённую заявку.
+
+        Рождённая заявка бывает одна — выход после неисполненного уровня
+        (`engine.pipeline.apply_unfilled`, решение 0067). Подаёт её, как
+        и заявку от сделки, `_exchange`, и строку про выход публикует только
+        по принятой. Безусловная строка — само событие и решение по нему.
+
+        :param candle: свеча, в обмене которой пришло событие. По её
+            закрытию решается «в убытке ли позиция» и считается предел, её
+            временем закрытия помечается выход (Р-10, Н1). Незакрытая —
+            остановка со словами (Н4).
+        """
+        result = apply_unfilled(self._state, event, self._settings, candle)
+        self._state = result.state
+        self._publish(result.lines(0))
+        if result.halt:
+            self._halt_text(result.halt)
+        return result
+
     def apply_settings(
         self, settings: EngineSettings, *, at: datetime | None = None
     ) -> tuple[JournalEntry, ...]:
@@ -694,9 +732,9 @@ class Engine:
 
         Что принимается:
 
-        * даты тейка и выхода — **более поздняя** из своей и пришедшей. Дата
-          события назад не едет: значение, собранное до сделки этой сессии,
-          не отменяет её тейк;
+        * даты тейка, выхода и закрытого после неисполненного уровня дня —
+          **более поздняя** из своей и пришедшей. Дата события назад не едет:
+          значение, собранное до сделки этой сессии, не отменяет её тейк;
         * деньги дня — если дата значения не старше дня движка. Результат
           дня **заменяется** — в значении он полный, сложение посчитало бы
           дважды то, что движок уже видел. Счёт на утро — более ранний
@@ -740,6 +778,9 @@ class Engine:
             day=day,
             take_profit_date=_later(state.take_profit_date, record.take_profit_date),
             last_exit_date=_later(state.last_exit_date, record.last_exit_date),
+            entries_closed_date=_later(
+                state.entries_closed_date, record.entries_closed_date
+            ),
         )
         entry = JournalEntry(
             at=moment,
@@ -778,6 +819,11 @@ class Engine:
             parts.append("тейка в этот день не было")
         if record.last_exit_date == record.day:
             parts.append("выход в этот день уже был")
+        if record.entries_closed_date == record.day:
+            parts.append(
+                "после неисполненного уровня в этот день решено до конца дня "
+                "не входить — новых входов в эту дату не будет"
+            )
         text = "; ".join(parts)
         if stale and self._state.day is not None:
             text += (
@@ -944,9 +990,10 @@ class Engine:
         того, как движок ответил заявкой вооружить тейк от полученной цены
         входа.
 
-        Внутрибарное событие — сделка по уровню или наблюдение цены. Разбор
-        у них разный (`on_fill` / `on_price`), подача рождённых заявок и
-        строки журнала — общие: две копии подачи разошлись бы молча.
+        Внутрибарное событие — сделка по уровню, наблюдение цены или «уровень
+        не исполнился». Разбор у них разный (`on_fill` / `on_price` /
+        `on_unfilled`, таблица `_route`), подача рождённых заявок и строки
+        журнала — общие: две копии подачи разошлись бы молча.
 
         `ExecutionHalted` — третий исход вопроса о сделках, кроме ответа
         и падения: исполнитель знает, почему торговать нельзя. Строка
@@ -979,10 +1026,7 @@ class Engine:
                 self._halt(self._executor_endless(close_time(candle)))
                 return
             for number, item in enumerate(fills):
-                result = (
-                    self.on_price(item) if isinstance(item, PriceSeen)
-                    else self.on_fill(item)
-                )
+                result = _route(item).handle(self, item, candle)
                 # Строку журнала о сделке мог не принять приёмник, а сама сделка
                 # могла не сопоставиться ни с одной заявкой — в обоих случаях
                 # робот уже остановлен, и решать по этой свече нельзя.
@@ -998,7 +1042,7 @@ class Engine:
         self,
         result: FillOutcome,
         executor: OrderExecutor,
-        rest: Sequence[Fill | PriceSeen],
+        rest: Sequence[Fill | PriceSeen | LevelUnfilled],
     ) -> bool:
         """Подать заявки, рождённые сделкой или наблюдением. `True` — обмен идёт дальше.
 
@@ -1023,6 +1067,12 @@ class Engine:
         # не работает: безусловная строка «Лонг открыт» стоит рядом и всё
         # уже сказала.
         self._publish(result.tied(sent.accepted))
+        if sent.declined is not None and result.refused:
+            # Свой разбор вместо общего «выход повторит следующая свеча»:
+            # повторять выход после неисполненного уровня некому (Р-10, Н2).
+            self._halt(self._born_refused(sent.declined, result.refused))
+            self._warn_lost_fills(rest)
+            return False
         self._apply_decline(sent.declined)
         if sent.halted is not None:
             # Остаток пачки — тоже известные сделки, и пришли они раньше
@@ -1211,7 +1261,7 @@ class Engine:
         *,
         order: OrderRequest | None = None,
         rest: int = 0,
-        earlier: Sequence[Fill | PriceSeen] = (),
+        earlier: Sequence[Fill | PriceSeen | LevelUnfilled] = (),
     ) -> None:
         """Остановка по `ExecutionHalted`: сначала известные сделки, потом строка.
 
@@ -1226,12 +1276,17 @@ class Engine:
         :param earlier: остаток пачки сделок, отданной раньше исключения.
             Это тоже известные сделки, и пришли они первыми.
         """
-        settled = self._settle_known((*earlier, *_carried(halted)))
+        settled, named = self._settle_known((*earlier, *_carried(halted)))
         what = f"Заявка ({order_words(order)}): " if order is not None else ""
         known = (
             f" Сделки, о которых исполнитель знал к остановке ({settled}), "
             "разобраны строками выше."
             if settled else ""
+        ) + (
+            f" События «уровень не исполнился» ({named}) названы строками "
+            "выше: решения по ним не будет — после остановки заявок нет, "
+            "и позиция стоит без сторожа."
+            if named else ""
         )
         self._halt(JournalEntry(
             at=at,
@@ -1248,27 +1303,62 @@ class Engine:
             level=JournalLevel.ERROR,
         ))
 
-    def _settle_known(self, items: Sequence[Fill | PriceSeen]) -> int:
-        """Разобрать сделки, известные к остановке. Заявок по ним не подаётся.
+    def _settle_known(
+        self, items: Sequence[Fill | PriceSeen | LevelUnfilled]
+    ) -> tuple[int, int]:
+        """Разобрать сообщения, известные к остановке. Заявок по ним не подаётся.
 
-        Рождённое сделкой вооружение не подаётся — после остановки заявок
-        нет никаких, — и строка про уровень не печатается: печатается только
-        безусловная часть, сама сделка (`on_fill`). Наблюдения цены
-        пропускаются: это не сделки, и двигать по ним уровень, которого
-        робот больше не подаст, незачем.
+        Что с каким видом — таблица `_route`, столбец `at_halt`:
+
+        * **сделка** разбирается: счёт уже изменился. Рождённое ею
+          вооружение не подаётся — после остановки заявок нет никаких, —
+          и строка про уровень не печатается: только безусловная часть,
+          сама сделка (`on_fill`);
+        * **событие «уровень не исполнился»** называется строкой: решения
+          по нему не будет, а позиция у брокера стоит без сторожа, и человек
+          обязан узнать об этом из журнала (Р-10, Н6);
+        * **наблюдение цены** отбрасывается: это не сделка, и двигать по нему
+          уровень, которого робот больше не подаст, незачем.
 
         Сделка, которую разбор отверг с остановкой (чужая, частичная), —
         конец разбора: дальше состояние уже не сходится со счётом,
         и остаток называется `_warn_lost_fills`, а не выбрасывается молча.
 
-        :returns: сколько сделок прошло через разбор, включая отвергнутую.
+        :returns: сколько сделок прошло через разбор, включая отвергнутую,
+            и сколько событий названо.
         """
-        deals = [item for item in items if isinstance(item, Fill)]
-        for number, deal in enumerate(deals):
-            if self.on_fill(deal).halt:
-                self._warn_lost_fills(deals[number + 1:])
-                return number + 1
-        return len(deals)
+        settled = named = 0
+        for number, item in enumerate(items):
+            route = _route(item)
+            if route.at_halt is _AtHalt.NAME:
+                self._publish((_unread_unfilled(cast(LevelUnfilled, item)),))
+                named += 1
+            elif route.at_halt is _AtHalt.SETTLE:
+                settled += 1
+                if self.on_fill(cast(Fill, item)).halt:
+                    self._warn_lost_fills(items[number + 1:])
+                    return settled, named
+        return settled, named
+
+    @staticmethod
+    def _born_refused(declined: _Declined, words: str) -> JournalEntry:
+        """Строка остановки на определённом отказе в рождённой заявке (Р-10, Н2).
+
+        Заменяет общую строку отказа (`_DECLINED`): та обещала бы, что
+        «выход повторит следующая свеча», а выход после неисполненного уровня
+        не повторит никто — уровня у позиции уже нет. Остановка — не общая
+        «повторим», а человек: позиция открыта без сторожа.
+        """
+        order = declined.order
+        return JournalEntry(
+            at=order.submitted_at,
+            event="Выход после неисполненного уровня не принят",
+            reason=(
+                f"Исполнитель отклонил заявку ({order_words(order)}): "
+                f"{declined.reason.label}. {words}"
+            ),
+            level=JournalLevel.ERROR,
+        )
 
     @staticmethod
     def _what_may_happen_alone(order: OrderRequest) -> str:
@@ -1367,20 +1457,32 @@ class Engine:
             level=JournalLevel.WARNING,
         )
 
-    def _warn_lost_fills(self, tail: Sequence[Fill | PriceSeen]) -> None:
-        """Остаток пачки сделок при остановке посреди неё.
+    def _warn_lost_fills(
+        self, tail: Sequence[Fill | PriceSeen | LevelUnfilled]
+    ) -> None:
+        """Остаток пачки при остановке посреди неё. Вид — по таблице `_route`.
 
-        ⚠️ Молча их выбросить нельзя: это уже случившиеся сделки, движок про
+        ⚠️ Молча сделки выбросить нельзя: они уже случились, движок про
         них не узнает, а человек, разбирающий остановку, обязан знать, что
         состояние движка отстало от счёта не на одну сделку, а на несколько.
         Соседняя ветка (остановка по числу кругов) про это предупреждает,
         а эта раньше молчала.
 
+        ⚠️ **Событие «уровень не исполнился» — тоже не выбрасывается**: оно
+        называется своей строкой (Р-10, Н6). Позиция у брокера стоит без
+        сторожа, и узнать об этом человек должен из журнала.
+
         Наблюдения цены из остатка **выбрасываются**: это не сделки, счёт
         от них не меняется, и «ещё N сделок не разобраны» с наблюдениями
         в счёте называло бы расхождение с брокером, которого нет.
         """
-        rest = [item for item in tail if isinstance(item, Fill)]
+        rest: list[Fill] = []
+        for item in tail:
+            route = _route(item)
+            if route.at_halt is _AtHalt.NAME:
+                self._publish((_unread_unfilled(cast(LevelUnfilled, item)),))
+            elif route.at_halt is _AtHalt.SETTLE:
+                rest.append(cast(Fill, item))
         if not rest:
             return
         self._publish((JournalEntry(
@@ -1535,3 +1637,81 @@ class Engine:
                     "свои действия он больше не может"
                 )
                 return
+
+
+# ---------------------------------------------------------------------------
+# Сообщения исполнителя: вид → обработчик (Р-10, Н6; правило 9)
+# ---------------------------------------------------------------------------
+
+class _AtHalt(enum.Enum):
+    """Что делать с сообщением, пришедшим вместе с остановкой или после неё."""
+
+    #: Сделка: счёт уже изменился — разобрать до строки остановки.
+    SETTLE = "settle"
+    #: Событие: решения не будет, но назвать его строкой обязательно.
+    NAME = "name"
+    #: Наблюдение цены: не сделка и не событие — двигать уровень незачем.
+    DROP = "drop"
+
+
+@dataclass(frozen=True, slots=True)
+class _Route:
+    """Как движок обходится с одним видом сообщения исполнителя.
+
+    `handle` — разбор в обмене внутри свечи: сообщение, движок, свеча
+    обмена. `at_halt` — что с ним при остановке (`_AtHalt`).
+    """
+
+    handle: Callable[[Engine, Any, MarketCandle], FillOutcome]
+    at_halt: _AtHalt
+
+
+_DEAL = _Route(lambda engine, item, _candle: engine.on_fill(item), _AtHalt.SETTLE)
+_SEEN = _Route(lambda engine, item, _candle: engine.on_price(item), _AtHalt.DROP)
+_UNFILLED = _Route(
+    lambda engine, item, candle: engine.on_unfilled(item, candle), _AtHalt.NAME
+)
+
+
+def _route(item: Fill | PriceSeen | LevelUnfilled) -> _Route:
+    """Таблица «вид сообщения исполнителя → как с ним обходится движок».
+
+    Одно место на все потребители: обмен внутри свечи (`_exchange`), разбор
+    при остановке (`_settle_known`) и остаток пачки (`_warn_lost_fills`).
+    Здесь стоял двоичный выбор «наблюдение или сделка» и пять фильтров
+    `isinstance(item, Fill)`; третий вид сообщения прошёл бы первый как
+    сделку, а фильтры при остановке выбросили бы его молча (Р-10, Н6).
+    `assert_never` превращает новый вид, не названный здесь, в отказ mypy,
+    а не в тихую ветку.
+    """
+    match item:
+        case Fill():
+            return _DEAL
+        case PriceSeen():
+            return _SEEN
+        case LevelUnfilled():
+            return _UNFILLED
+        case _:
+            assert_never(item)
+
+
+def _unread_unfilled(event: LevelUnfilled) -> JournalEntry:
+    """Строка о событии «уровень не исполнился», которое движок не разобрал.
+
+    Остановка пришла раньше решения: робот не держит и не закрывает
+    позицию, она у брокера открыта и без сторожа.
+    """
+    reason = event.reason.strip().rstrip(".").strip() or "исполнитель причину не назвал"
+    return JournalEntry(
+        at=event.at,
+        event="Событие исполнителя не разобрано",
+        reason=(
+            f"Робот остановлен, а исполнитель сообщил: уровень заявки "
+            f"«{event.order_id}» задет в {in_moscow(event.at):%d.%m %H:%M}, "
+            f"выход по нему не исполнился ({reason}). Решения по этому событию "
+            "не будет: после остановки заявок нет. Позиция у брокера открыта "
+            "и без сторожа — закройте её или поставьте защиту в приложении "
+            "брокера"
+        ),
+        level=JournalLevel.ERROR,
+    )

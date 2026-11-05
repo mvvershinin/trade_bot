@@ -70,7 +70,13 @@ from typing import Final
 
 from strategies import registry
 from ui.models import Settings
-from ui.settings_codec import caption_of, encode_fields, field_codecs, read_fields
+from ui.settings_codec import (
+    REPLACED_KEYS,
+    caption_of,
+    encode_fields,
+    field_codecs,
+    read_fields,
+)
 from ui.userdata_file import write_atomically
 
 __all__ = [
@@ -426,9 +432,13 @@ class SettingsStore:
         table = field_codecs()
         # Поля убранного алгоритма (решение 0063) в «незнакомые» не идут
         # и обратно в файл не пишутся: им больше некому принадлежать.
+        # Ключи, сменённые другим полем (`REPLACED_KEYS`), — тоже: о них
+        # своя строка из `read_fields`, а «файл сделан более новой сборкой»
+        # было бы про них неправдой.
         self._unknown = {
             key: item for key, item in raw.items()
             if key not in table and key not in RETIRED_KEYS
+            and key not in REPLACED_KEYS
         }
         # Выключенные на этапе предохранители объясняются **своими словами**,
         # а не общим «файл новее»: ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113).

@@ -87,7 +87,7 @@ from pathlib import Path
 from typing import Final
 
 from ui.formatting import MSK
-from ui.models import Settings
+from ui.models import LIVE_LIMITS_BOUNDS, Settings
 from ui.settings_codec import BadValue, encode_fields, field_codecs
 from ui.userdata_file import write_atomically
 
@@ -161,15 +161,13 @@ BUILTIN_NAME: Final[str] = "Умолчания проекта"
 #: (`app/convert.py::live_limits`), сделок прогона они не меняют, а про связь
 #: с брокером, а не про торговое правило. Шаблон, сохранённый до их появления,
 #: иначе вернул бы умолчания поверх чисел, выставленных владельцем счёта.
+#: Перечислены обходом таблицы границ «Боя»: поле вкладки, заведённое
+#: завтра, в шаблон не попадёт само (отступ цены боевой заявки и ожидание
+#: планки, решение 0067, — тоже).
 NOT_IN_TEMPLATE: Final[tuple[str, ...]] = (
     "instrument",
     "expiry_halt_days",
-    "live_stale_after_sec",
-    "live_event_wait_sec",
-    "live_fill_wait_sec",
-    "live_cancel_wait_sec",
-    "live_position_settle_sec",
-    "live_reconnect_pauses_sec",
+    *LIVE_LIMITS_BOUNDS,
 )
 
 #: Сколько знаков имени шаблона показывается и хранится. Ограничение

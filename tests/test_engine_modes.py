@@ -351,12 +351,16 @@ _SETTINGS_CHANGE_CASES: list[tuple[dict, str]] = [
         {"time_exit_order": TimeExitOrder.LIMIT, "price_step": 25.0},
         "Выход по концу окна: По рынку → С предельной ценой",
     ),
-    ({"time_exit_limit_steps": 4}, "Отступ предельной цены: 10 шагов цены → 4 шага цены"),
+    ({"time_exit_limit_percent": 2.5}, "Отступ предельной цены, %: 2 → 2,5"),
     (
         {"time_exit_wait_bars": 2},
         "Ожидание выхода с предельной ценой: 1 свеча → 2 свечи",
     ),
     ({"price_step": 25.0}, "Шаг цены инструмента: не задан → 25"),
+    (
+        {"hold_after_unfilled_level": True},
+        "Заходить заново при обрыве связи (держать позицию в убытке): нет → да",
+    ),
 ]
 
 
