@@ -53,7 +53,7 @@ from broker.throttle import Throttle
 from broker.token_store import TokenStore
 from broker.tokens import TokenScope
 from engine import AccountFunds, ExitReason, Fill
-from market import MSK, Candle, CandleStore, MarketWorker, PriceBand, Source
+from market import MSK, Candle, CandleStore, DecisionLevel, MarketWorker, PriceBand, Source
 from market.commands import (
     BrokerCommand,
     BrokerExecution,
@@ -66,6 +66,7 @@ from tests.exchange_card import exchange
 from tests.fake_broker import CREATE, BookOrder, FakeBroker, _unavailable
 from tests.test_broker_session import FAKE_REFRESH, START, Clock, no_sleep
 from ui.models import ChartData, DecisionRow, Layer, MinuteBarLimit, Mode
+from ui.models import DecisionLevel as RowLevel
 from ui.models import RunOrigin as WindowOrigin
 from ui.models import Settings as UiSettings
 
@@ -406,13 +407,17 @@ class _Spy:
 
     real: LiveDesks
     requests: list[FactRequest]
+    #: Собранные настоящие стороны — чтобы дотянуться до их исполнителя.
+    opened: list[LiveDesk] = field(default_factory=list)
 
     def refusal(self) -> str | None:
         return self.real.refusal()
 
     async def open(self, request: FactRequest) -> FactDesk:
         self.requests.append(request)
-        return await self.real.open(request)
+        desk = await self.real.open(request)
+        self.opened.append(desk)
+        return desk
 
 
 @pytest.fixture
@@ -850,23 +855,89 @@ def test_the_executor_notice_becomes_a_journal_line(
     """`Wiring.notice` — строка журнала решений: «уровень пройден, выход ждёт связи».
 
     Исполнитель говорит человеку без остановки (С2); сказанное обязано
-    дойти до окна, а не остаться строкой технического лога.
+    дойти до окна, а не остаться строкой технического лога. Уровень строки
+    журнала — тот, что назвал исполнитель: предупреждение — WARNING, строка
+    о поданной заявке — INFO (решение владельца 10.11). Мутации: порт
+    ставит один уровень на всё; порт сводит TRADE и ERROR к INFO или WARNING
+    («своего уровня не ставит» — про все четыре, а не про два ходовых).
     """
     requests: list[FactRequest] = []
     words = "Цена прошла уровень трейлинга 249675, а выход по рынку подать нельзя"
+    order = "Заявка (вход) подана по цене 250000: текущая 245100 + 2 %."
+    # Ожидание выписано руками, а не через `RowLevel(level.value)`: перевод
+    # тем же приёмом, что в порту, позеленел бы вместе с его поломкой.
+    sent = (
+        (words, DecisionLevel.WARNING, RowLevel.WARNING),
+        (order, DecisionLevel.INFO, RowLevel.INFO),
+        ("Проба: строка уровня сделки", DecisionLevel.TRADE, RowLevel.TRADE),
+        ("Проба: строка уровня ошибки", DecisionLevel.ERROR, RowLevel.ERROR),
+    )
+    assert {level for _, level, _ in sent} == set(DecisionLevel), "новый уровень — новая строка"
 
-    async def go() -> list[tuple[str, str]]:
+    async def go() -> tuple[list[tuple[str, str]], dict[str, object]]:
         bench, session = await _bench(tmp_path, broker, OWNER)
+        levels: dict[str, object] = {}
+        bench.port.decision_appended.connect(
+            lambda row: levels.__setitem__(getattr(row, "reason", ""), getattr(row, "level", None))
+        )
         bench.port.attach_live(_Spy(bench.desks, requests))
         try:
             await _connect(bench)
-            requests[0].notice(words)
-            return list(bench.notes)
+            for text, level, _ in sent:
+                requests[0].notice(text, level)
+            return list(bench.notes), levels
         finally:
             await _close(bench, session)
 
-    notes = loop.run_until_complete(go())
+    notes, levels = loop.run_until_complete(go())
     assert ("Боевой исполнитель", words) in notes, notes[-3:]
+    assert ("Боевой исполнитель", order) in notes, notes[-3:]
+    assert {text: levels.get(text) for text, _, _ in sent} == {
+        text: row for text, _, row in sent
+    }, levels
+
+
+def test_the_real_desk_carries_the_executor_level_to_the_journal_row(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Уровень строки исполнителя доходит до журнала через настоящую сборку стороны.
+
+    Среднее звено — `LiveDesks.open` собирает `Wiring` с `notice` из запроса
+    порта. Тесты по краям его не видят: исполнитель проверен на подставном
+    `Wiring`, порт — прямым вызовом `FactRequest.notice`. Здесь — настоящий
+    вход на подделке брокера: строки «Заявка (…) подана по цене» в журнале
+    INFO; предупреждение настоящего исполнителя (`tell`) — WARNING.
+    Мутация: сборка стороны ставит один уровень на всё (любой из двух).
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+    requests: list[FactRequest] = []
+    words = "Проба: предупреждение исполнителя без остановки"
+
+    async def go() -> list[DecisionRow]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        rows: list[DecisionRow] = []
+
+        def heard(row: object) -> None:
+            if isinstance(row, DecisionRow) and row.event == "Боевой исполнитель":
+                rows.append(row)
+
+        bench.port.decision_appended.connect(heard)
+        spy = _Spy(bench.desks, requests)
+        bench.port.attach_live(spy)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=45))
+            [desk] = spy.opened
+            desk.executor.tell(words)
+            await asyncio.sleep(0)  # `_notify_human` отдаёт строку через `call_soon`
+            return rows
+        finally:
+            await _close(bench, session)
+
+    rows = loop.run_until_complete(go())
+    orders = [row.level for row in rows if " подана по цене " in row.reason]
+    assert orders and set(orders) == {RowLevel.INFO}, [(r.reason, r.level) for r in rows]
+    assert [row.level for row in rows if row.reason == words] == [RowLevel.WARNING], rows
 
 
 def test_the_forecast_layer_is_the_shadow_and_its_journal_is_marked_simulation(

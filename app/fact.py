@@ -34,7 +34,7 @@ from typing import Any, Final, Protocol
 
 from backtest import HistoryRun
 from engine import AccountFunds, DayRecord, OrderExecutor, Side
-from market import OpeningFunds, TradingDay
+from market import DecisionLevel, OpeningFunds, TradingDay
 from ui.models import RunOrigin
 
 __all__ = [
@@ -179,7 +179,8 @@ class FactRequest:
         каждая команда брокеру записывается под ним (`StoreBook`).
     :param on_news: у исполнителя появилось, что отдать движку, — порт ставит
         проход через единственный слот прогона (план §3).
-    :param notice: сообщение человеку без остановки — строкой журнала решений.
+    :param notice: сообщение человеку без остановки — строкой журнала решений
+        с уровнем: WARNING у предупреждения, INFO у строки о поданной заявке.
     :param ruble_per_point: вес пункта — для дня по исполнениям (Р7).
     :param funds_account: номер договора из последнего снимка счёта, который
         получил порт (`D-044`, Р-9). Сборка сверяет его с договором, по которому
@@ -195,7 +196,7 @@ class FactRequest:
     limits: LiveLimits
     session_id: int
     on_news: Callable[[], None]
-    notice: Callable[[str], None]
+    notice: Callable[[str, DecisionLevel], None]
     funds_account: str
     price_step: float
 

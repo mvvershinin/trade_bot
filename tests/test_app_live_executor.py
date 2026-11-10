@@ -54,7 +54,7 @@ from engine import (
 )
 from engine.contracts import ExitReason, Fill, LevelTouch, OrderAction, OrderRequest, Side
 from engine.ports import ExecutionHalted, ExecutionRefused, Refusal
-from market import MSK, MarketWorker
+from market import MSK, DecisionLevel, MarketWorker
 from market.candles import M5, MINUTE, Candle
 from market.commands import (
     BrokerCommand,
@@ -274,6 +274,8 @@ class Rig:
     #: Что исполнитель сказал человеку без остановки (`Wiring.notice`).
     notices: list[str] = field(default_factory=list)
     session: BrokerSession | None = None
+    #: Те же строки с уровнем, который исполнитель назвал журналу решений.
+    levels: list[tuple[str, DecisionLevel]] = field(default_factory=list)
 
     def creates(self) -> list[dict[str, object]]:
         """Тела всех созданий заявок, ушедших к брокеру, по порядку."""
@@ -353,9 +355,15 @@ async def make_rig(
 
     clock = Moment(NOW)
     notices: list[str] = []
+    levels: list[tuple[str, DecisionLevel]] = []
+
+    def heard(text: str, level: DecisionLevel) -> None:
+        notices.append(text)
+        levels.append((text, level))
+
     wiring = Wiring(
         session, book, source, clock=clock, sleep=sleep or asyncio.sleep,
-        notice=notices.append, on_news=on_news, band=band,
+        notice=heard, on_news=on_news, band=band,
     )
     executor = LiveExecutor(wiring, Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP), limits)
     exchange = Exchange(broker)
@@ -363,7 +371,8 @@ async def make_rig(
     try:
         assert await executor.wait_connected(2.0), "поток статусов не открылся"
         yield Rig(
-            broker, exchange, executor, book, clock, minutes, minute_faults, notices, session
+            broker, exchange, executor, book, clock, minutes, minute_faults, notices, session,
+            levels,
         )
     finally:
         await executor.close()
@@ -3407,6 +3416,10 @@ def test_a_limit_exit_partly_filled_before_the_link_returned_is_not_a_mismatch_t
             assert [order.key for order in rig.broker.live()] == [limit.key]
             await heard()
             assert any("исполнена на 1 из 2" in note for note in rig.notices), rig.notices
+            # Предупреждение остаётся предупреждением в журнале решений, а не
+            # штатной строкой: уровень называет исполнитель (0067).
+            partial = [level for text, level in rig.levels if "исполнена на 1 из 2" in text]
+            assert partial and set(partial) == {DecisionLevel.WARNING}, rig.levels
 
     run(scenario())
 

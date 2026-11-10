@@ -220,7 +220,7 @@ def test_a_refusal_to_turn_live_on_carries_the_position_only_when_it_was_freshly
     desks = LiveDesks(lambda: cast(Any, _Session()), cast(Any, None), class_code="SPBFUT")
     request = FactRequest(
         ticker="MXZ6", bar_minutes=15, ruble_per_point=1.0, limits=FAST, session_id=1,
-        on_news=lambda: None, notice=lambda _text: None, funds_account="FAKE-ACCOUNT-1",
+        on_news=lambda: None, notice=lambda _text, _level: None, funds_account="FAKE-ACCOUNT-1",
         price_step=1.0,
     )
 

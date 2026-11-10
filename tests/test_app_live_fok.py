@@ -36,7 +36,7 @@ from engine.contracts import (
     Side,
 )
 from engine.ports import ExecutionHalted, ExecutionRefused, Refusal
-from market import PriceBand
+from market import DecisionLevel, PriceBand
 from market.candles import M5, Candle
 from tests.fake_broker import ANSWERS, BookOrder, FakeBroker
 from tests.test_app_live_executor import (
@@ -773,8 +773,10 @@ def test_every_live_order_has_its_line_with_price_and_source_in_the_decision_jou
     «Заявка (что) подана по цене X: откуда цена» — FOK от «текущей ± %»,
     тейк по уровню движка, выход по концу окна по планке биржи. Строк ровно
     столько, сколько заявок ушло к брокеру, и цена в строке — цена в теле
-    заявки. Технический лог сохраняет ту же строку уровнем INFO. Мутации
-    молчания: убрать строку у любого вида заявки; назвать цену не ту, что ушла.
+    заявки. Технический лог сохраняет ту же строку уровнем INFO, журнал
+    решений — тоже INFO: штатная строка не мигает предупреждением на каждом
+    перевороте (решение владельца 10.11). Мутации молчания: убрать строку
+    у любого вида заявки; назвать цену не ту, что ушла; поднять уровень.
     """
 
     async def scenario() -> None:
@@ -784,6 +786,8 @@ def test_every_live_order_has_its_line_with_price_and_source_in_the_decision_jou
             prices = [body["price"] for body in rig.creates()]
             told = rig.told_orders()
             assert len(told) == len(prices), (prices, told)
+            journal = [level for text, level in rig.levels if " подана по цене " in text]
+            assert journal == [DecisionLevel.INFO] * len(prices), rig.levels
             for price, line in zip(prices, told, strict=True):
                 assert f"подана по цене {price:g}:" in line, (price, line)
             sources = (

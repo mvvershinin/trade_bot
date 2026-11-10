@@ -111,6 +111,9 @@ from market import (
 from market import (
     Candle as MarketCandle,
 )
+from market import (
+    DecisionLevel as JournalLevel,
+)
 from market.contracts import monthly_assets
 from ui.formatting import fmt_datetime
 from ui.models import (
@@ -4350,9 +4353,15 @@ class HistoryPort(TerminalPort):
             return
         self.refresh("событие по заявке у брокера")
 
-    def _fact_notice(self, text: str) -> None:
-        """Исполнитель говорит человеку без остановки (С2) — строкой журнала."""
-        self.note("Боевой исполнитель", text, DecisionLevel.WARNING)
+    def _fact_notice(self, text: str, level: JournalLevel) -> None:
+        """Исполнитель говорит человеку без остановки (С2) — строкой журнала.
+
+        Уровень называет исполнитель: строка о каждой поданной заявке — INFO,
+        иначе журнал мигает предупреждением на каждом перевороте (0067).
+        Перевод по значению: `market.DecisionLevel` и `ui.models.DecisionLevel`
+        пишут уровни дословно одинаково (`market/journal.py`).
+        """
+        self.note("Боевой исполнитель", text, DecisionLevel(level.value))
 
     async def _growing_forming(self, frame: _Frame, symbol: str) -> MarketCandle | None:
         """Бар исполнения по растущей минутке, пока ни одной его минуты нет в базе.

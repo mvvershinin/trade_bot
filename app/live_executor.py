@@ -130,7 +130,7 @@ from engine.contracts import (
 )
 from engine.ports import ExecutionHalted, ExecutionRefused, MarketCandle, Refusal
 from engine.take_profit import to_grid
-from market import MarketWorker, PriceBand
+from market import DecisionLevel, MarketWorker, PriceBand
 from market.commands import (
     BrokerCommand,
     BrokerExecution,
@@ -364,8 +364,10 @@ class Wiring:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     on_news: Callable[[], None] | None = None
     #: Сообщение человеку **без** остановки: 2в выводит его в журнал решений
-    #: и окно. Не подключено — остаётся строка WARNING технического лога.
-    notice: Callable[[str], None] | None = None
+    #: и окно с уровнем строки — WARNING у предупреждения, INFO у штатной
+    #: строки о поданной заявке (0067). Не подключено — остаётся строка
+    #: технического лога.
+    notice: Callable[[str, DecisionLevel], None] | None = None
     #: Планка биржи для выхода с пределом (0067, Р-4). `None` — источника нет:
     #: подаётся предел движка, и строка об этом говорит.
     band: BandSource | None = None
@@ -2612,7 +2614,7 @@ class LiveExecutor:
     def _tell(self, text: str) -> None:
         """Человеку — без остановки (С2): в журнал решений через 2в и в технический лог."""
         log.warning("боевой исполнитель: %s", text)
-        self._notify_human(text)
+        self._notify_human(text, DecisionLevel.WARNING)
 
     def _say(self, text: str) -> None:
         """Штатная строка человеку — тем же путём в журнал решений; в техническом логе — INFO.
@@ -2621,11 +2623,11 @@ class LiveExecutor:
         подана и откуда цена. Не предупреждение — потому и уровень лога ниже.
         """
         log.info("боевой исполнитель: %s", text)
-        self._notify_human(text)
+        self._notify_human(text, DecisionLevel.INFO)
 
-    def _notify_human(self, text: str) -> None:
+    def _notify_human(self, text: str, level: DecisionLevel) -> None:
         if self._notice is not None:
-            asyncio.get_running_loop().call_soon(self._notice, text)
+            asyncio.get_running_loop().call_soon(self._notice, text, level)
 
     def _fault(self, text: str) -> None:
         log.error("боевой исполнитель: %s", text)
