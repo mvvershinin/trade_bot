@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pathlib
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -62,6 +63,7 @@ from tests.test_app_live_executor import (
     make_rig,
     minute,
     only_fill,
+    resting,
     run,
     take_name,
 )
@@ -301,13 +303,18 @@ def test_a_fok_killed_whole_halts_in_its_status_words_with_the_fok_tail(
 
 
 @pytest.mark.parametrize(
+    ("answer", "who"),
+    [(killed("4"), "биржа её сняла"), (resting, "программа её сняла")],
+    ids=["снята биржей", "без ответа, снята программой"],
+)
+@pytest.mark.parametrize(
     ("shift", "late"),
     [(-timedelta(seconds=1), False), (timedelta(seconds=1), True)],
     ids=["вовремя", "после обрыва"],
 )
 def test_a_killed_trailing_fok_halts_in_time_and_becomes_an_event_after_the_freshness_limit(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
-    *, shift: timedelta, late: bool,
+    *, shift: timedelta, late: bool, answer: Plan, who: str,
 ) -> None:
     """§6 п. 4 и §3 «граница порога свежести»: касание судится по обе стороны порога.
 
@@ -316,6 +323,13 @@ def test_a_killed_trailing_fok_halts_in_time_and_becomes_an_event_after_the_fres
     словами «FOK» и «открыта без тейка», события нет. Подан позже порога
     и снят — остановки нет, движку событие `LevelUnfilled`, сделки касания
     нет. Мутация: принять касание вовремя за «после обрыва» и наоборот.
+
+    «Снята» — двумя путями: биржа сняла сама (`4`), или ответа нет за
+    `fill_wait` и программа сняла её сама, ни контракта не исполнив (ревью
+    10.11, находка 3). Второй путь судится так же: вовремя — остановка,
+    после обрыва — событие, и его слова называют, кто снял (`/risk` 10.11, 4).
+    Мутации (test-expert 10.11): снятая нами «пощажённая» — остановка; снятая
+    нами обычная — событие без остановки; «биржа сняла» о снятой нами.
     """
 
     async def scenario() -> None:
@@ -324,9 +338,10 @@ def test_a_killed_trailing_fok_halts_in_time_and_becomes_an_event_after_the_fres
             await rig.executor.submit(arm(95.0, LevelTouch.FALL))
             rig.minutes.append(minute(TOUCH, low=94.0))
             rig.clock.now = TOUCH + FRESH + shift
-            rig.exchange.plans.append(killed("4"))
+            rig.exchange.plans.append(answer)
             await rig.executor.watch()
             assert immediate(rig)[-1] == ("2", 93.0)
+            assert not [order for order in rig.broker.orders if order.live], rig.broker.orders
             if not late:
                 assert rig.executor.halted is not None
                 assert "FOK" in rig.executor.halted and "открыта без тейка" in rig.executor.halted
@@ -338,6 +353,7 @@ def test_a_killed_trailing_fok_halts_in_time_and_becomes_an_event_after_the_fres
             [event] = await rig.executor.fills_at(bar(BAR0))
             assert isinstance(event, LevelUnfilled), event
             assert (event.order_id, event.at) == (take_name(), TOUCH)
+            assert who in event.reason, event.reason
             assert rig.broker.position(TICKER) == 1
 
     run(scenario())
@@ -516,7 +532,7 @@ async def _closed_worker() -> PriceBand:
     ("source", "words"),
     [
         (_silent, "биржа не ответила за 0.3 с"),
-        (band(100.5, 110.0), "не охватывает закрытие свечи сигнала 100"),
+        (band(100.5, 110.0), "не охватывает текущую цену 100"),
         (band(None, None, "биржа не дала планку MXZ6: нет строки RFUD"), "нет строки RFUD"),
         (_closed_worker, "планку спросить не удалось (RuntimeError)"),
         (None, "источник планки не подключён"),
@@ -644,9 +660,10 @@ async def _stale_take_rest(rig: Rig) -> str:
     ("source", "price", "words"),
     [
         (GOOD_BAND, 90.5, "по цене 90.5: по нижней планке биржи (LOWLIMIT, MOEX ISS), FOK"),
-        (None, 98.0, "текущая 100 (закрытие минутки 09:59, несвежей — ей 8 мин; планки нет: "
-                     "источник планки не подключён) − 2 %, FOK"),
-        (band(None, None, "биржа не дала планку"), 98.0, "ей 8 мин; планки нет: биржа не дала"),
+        (None, 98.0, "текущая 100 (закрытие минутки 09:59, несвежей — ей 8 мин) − 2 %, FOK — "
+                     "планки нет: источник планки не подключён"),
+        (band(None, None, "биржа не дала планку"), 98.0,
+         "ей 8 мин) − 2 %, FOK — планки нет: биржа не дала"),
     ],
     ids=["по планке", "планки нет", "планка негодна"],
 )
@@ -770,7 +787,7 @@ def test_every_live_order_has_its_line_with_price_and_source_in_the_decision_jou
 ) -> None:
     """0067, решение владельца 04.11: на **каждую** боевую заявку — строка в журнал решений.
 
-    «Заявка (что) подана по цене X: откуда цена» — FOK от «текущей ± %»,
+    «Заявка (что) подана по цене X: откуда цена» — FOK по планке биржи,
     тейк по уровню движка, выход по концу окна по планке биржи. Строк ровно
     столько, сколько заявок ушло к брокеру, и цена в строке — цена в теле
     заявки. Технический лог сохраняет ту же строку уровнем INFO, журнал
@@ -791,10 +808,11 @@ def test_every_live_order_has_its_line_with_price_and_source_in_the_decision_jou
             for price, line in zip(prices, told, strict=True):
                 assert f"подана по цене {price:g}:" in line, (price, line)
             sources = (
-                "текущая 100 (закрытие свечи сигнала) + 2 %",
+                "по верхней планке биржи (HIGHLIMIT, MOEX ISS; текущая 100 — закрытие свечи "
+                "сигнала), FOK",
                 "уровень тейка движка",
                 "по нижней планке биржи",
-                "текущая 95 (уровень касания) − 2 %",
+                "по нижней планке биржи (LOWLIMIT, MOEX ISS; текущая 95 — уровень касания), FOK",
             )
             for source in sources:
                 assert any(source in line for line in told), (source, told)
@@ -815,3 +833,493 @@ def test_an_instrument_without_a_price_step_is_refused() -> None:
             Instrument(TICKER, "SPBFUT", 5, ACCOUNT, step)
     assert Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP).price_step == STEP
     assert LiveLimits().fok_percent == 2.0
+
+
+# ------------------------------------------- FOK по планке биржи (владелец 10.11.2026)
+
+
+@pytest.mark.parametrize(
+    ("source", "price", "words"),
+    [
+        (band(90.0, 101.5), 101.5, "по цене 101.5: по верхней планке биржи (HIGHLIMIT"),
+        (band(90.2, 101.8), 101.5, "по цене 101.5: по верхней планке биржи (HIGHLIMIT"),
+        (band(80.0, 95.0), 102.5, "+ 2 %, FOK — планка биржи не годится: планка 80–95 не "
+                                  "охватывает"),
+        (None, 102.5, "+ 2 %, FOK — планка биржи не годится: источник планки не подключён"),
+        (_silent, 102.5, "+ 2 %, FOK — планка биржи не годится: биржа не ответила за 0.3 с"),
+    ],
+    ids=["у края планки", "край вне сетки", "планка не охватывает", "планки нет", "молчит"],
+)
+def test_an_entry_fok_goes_by_the_band_and_never_beyond_it(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    *, source: Callable[[], Awaitable[PriceBand]] | None, price: float, words: str,
+) -> None:
+    """Вход FOK — по верхней планке к сетке внутрь, а не «текущая + 2 %» за ней (ревью 10.11, 1).
+
+    Закрытие 100,3: «+ 2 %» — 102,5, за верхней планкой 101,5 биржа заявку
+    не примет, и в трендовый день робот вставал бы на каждом выходе против
+    движения. По планке — 101,5; планка 101,8 вне сетки 0,5 — внутрь, 101,5.
+    Планка, не охватывающая «текущую», или её нет, или биржа молчит дольше
+    `band_wait` — «текущая ± %», и слова говорят почему. Мутации: подать «± %»
+    при годной планке; округлить край от рынка; подать по планке, не
+    охватывающей «текущую»; промолчать о причине; ждать планку без срока.
+    """
+
+    async def scenario() -> None:
+        limits = replace(FAST, band_wait=0.3)
+        async with make_rig(tmp_path, store, broker, limits=limits, band=source) as rig:
+            rig.exchange.plans.append(filled((1, 100.5)))
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            # Срок — у самой проверки: ждущий планку без срока повесил бы тест.
+            await asyncio.wait_for(submit_on(rig, entry(Side.LONG), close=100.3), 0.3 + 2.0)
+            waited = loop.time() - started
+            assert waited < 0.3 + 1.0, f"вход ждал планку {waited:.2f} с"
+            assert immediate(rig) == [("1", price)], rig.creates()
+            await heard()
+            [told] = rig.told_orders()
+            assert words in told, told
+
+    run(scenario())
+
+
+def test_a_trailing_exit_fok_goes_by_the_lower_band_not_below_it(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Выход по касанию трейлинга 95 при планке 94–110: продажа по 94, а не «− 2 %» = 93.
+
+    93 ниже LOWLIMIT — отказ биржи вовремя и остановка с открытой позицией
+    без сторожа (ревью 10.11, находка 1). Мутация: выход сторожа мимо планки.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker, band=band(94.0, 110.0)) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(95.0, LevelTouch.FALL))
+            rig.minutes.append(minute(TOUCH, low=94.5))
+            rig.exchange.plans.append(filled((1, 94.5)))
+            await rig.executor.watch()
+            assert immediate(rig)[-1] == ("2", 94.0), rig.creates()
+            assert rig.broker.position(TICKER) == 0
+            assert rig.executor.halted is None, rig.executor.halted
+
+    run(scenario())
+
+
+#: Шесть мест Р-2 при годной планке 90,2–109,8 (`GOOD_BAND`): покупка — 109,5,
+#: продажа — 90,5, край на сетку 0,5 внутрь коридора. «± 2 %» дало бы 102 и 98,
+#: касание — 93 (`SIX_POINTS`): точка мимо планки видна ценой в теле заявки.
+BY_THE_BAND: dict[str, list[tuple[object, object]]] = {
+    "вход": [("1", 109.5)],
+    "выход по сигналу": [("1", 109.5), ("2", 90.5)],
+    "переворот": [("1", 109.5), ("2", 90.5), ("2", 90.5)],
+    "остаток тейка": [("1", 109.5), ("2", 90.5)],
+    "касание трейлинга": [("1", 109.5), ("2", 90.5)],
+    "закрыть всё": [("1", 109.5), ("2", 90.5)],
+}
+
+
+@pytest.mark.parametrize("point", list(SIX_POINTS))
+def test_every_fok_of_the_six_points_goes_by_a_usable_band(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, point: str
+) -> None:
+    """Решение владельца 10.11 (0067): **каждая** FOK — по планке, не только вход и касание.
+
+    Те же шесть сценариев, что у `test_no_point_of_the_six_sends_a_market_order`,
+    но планка годна: «текущая» каждой точки (закрытие свечи сигнала 100,
+    закрытие свежей минутки 100, уровень касания 95) лежит внутри коридора.
+    Каждая немедленная заявка — по своему краю, и строка о ней называет
+    планку. Мутация (test-expert 10.11): любая одна точка — выход по сигналу,
+    переворот, остаток тейка, «закрыть всё» при свежей минутке — мимо планки.
+    """
+    scenario_of, _ = SIX_POINTS[point]
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker, band=GOOD_BAND) as rig:
+            await scenario_of(rig)
+            assert immediate(rig) == BY_THE_BAND[point], f"{point}: {rig.creates()}"
+            await heard()
+            immediate_lines = [line for line in rig.told_orders() if ", FOK" in line]
+            assert len(immediate_lines) == len(BY_THE_BAND[point]), rig.told_orders()
+            for line in immediate_lines:
+                assert "планке биржи" in line and "%" not in line, line
+
+    run(scenario())
+
+
+class _ShiftingBand:
+    """Планка 90–110; пока её ждут — позиция у брокера сдвигается мимо программы.
+
+    Сдвиг — `outside` подделки: сделка руками или принудительное закрытие,
+    о которых поток статусов молчит. Один раз, на первом вопросе о планке
+    после взвода (`armed`): вход, открывающий позицию, планку спрашивает тоже.
+    """
+
+    def __init__(self, broker: FakeBroker, by: int) -> None:
+        self.broker = broker
+        self.by = by
+        self.armed = False
+
+    async def __call__(self) -> PriceBand:
+        if self.armed:
+            self.armed = False
+            self.broker.outside += self.by
+        return PriceBand(TICKER, high=110.0, low=90.0, told="MOEX ISS")
+
+
+async def _race_entry(rig: Rig, shift: _ShiftingBand) -> None:
+    shift.armed = True
+    rig.exchange.plans.append(filled((1, 99.0)))
+    await submit_on(rig, entry(), close=100.0)
+
+
+async def _race_signal_exit(rig: Rig, shift: _ShiftingBand) -> None:
+    await long_open(rig)
+    shift.armed = True
+    rig.exchange.plans.append(filled((1, 99.0)))
+    await submit_on(rig, leave(), close=100.0)
+
+
+async def _race_trailing_touch(rig: Rig, shift: _ShiftingBand) -> None:
+    await long_open(rig)
+    await rig.executor.submit(arm(95.0, LevelTouch.FALL))
+    rig.minutes.append(minute(TOUCH, low=94.0))
+    rig.exchange.plans.append(filled((1, 94.0)))
+    shift.armed = True
+    await rig.executor.watch()
+
+
+async def _race_take_rest(rig: Rig, shift: _ShiftingBand) -> None:
+    await long_open(rig, volume=2)
+    await rig.executor.submit(arm(110.0, LevelTouch.RISE, volume=2))
+    rig.broker.execute(str(rig.creates()[-1]["clientOrderId"]), 1, 110.0)
+    await heard()
+    rig.exchange.plans.append(filled((1, 109.0)))
+    shift.armed = True
+    await rig.executor.submit(disarm(volume=2))
+
+
+async def _race_close_all(rig: Rig, shift: _ShiftingBand) -> None:
+    await long_open(rig)
+    rig.exchange.plans.append(filled((1, 99.0)))
+    shift.armed = True
+    await rig.executor.close_everything("Проверка: закрыть всё.")
+
+
+#: Пять мест, где FOK ждёт планку: сценарий, сдвиг позиции мимо программы
+#: и позиция у брокера после него — та, которую робот обязан оставить.
+RACES: dict[str, tuple[Callable[[Rig, _ShiftingBand], Awaitable[None]], int, int]] = {
+    "вход": (_race_entry, +1, 0),
+    "выход по сигналу": (_race_signal_exit, -1, 0),
+    "касание трейлинга": (_race_trailing_touch, -1, 0),
+    "остаток тейка": (_race_take_rest, -1, 0),
+    "закрыть всё": (_race_close_all, -1, 0),
+}
+
+
+@pytest.mark.parametrize("point", list(RACES))
+def test_a_position_changed_while_the_band_is_awaited_is_never_traded_on_the_old_reading(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, point: str
+) -> None:
+    """`/risk` 10.11, находка 1: планка спрашивается **до** чтения позиции, а не после.
+
+    Ожидание планки — до `band_wait` (5 с). Между чтением портфеля и подачей
+    оно оставляло окно, в которое позиция менялась руками, — и заявка уходила
+    на старый объём: выход из лонга, проданного руками, становился шортом,
+    вход поверх купленного руками — двойным лонгом. Порядок «планка → позиция
+    → подача» видит сдвиг: заявка на старый объём не уходит, робот стоит.
+    Мутация (test-expert 10.11): в любой одной точке планка — после проверки
+    позиции.
+    """
+    scenario_of, by, left = RACES[point]
+
+    async def scenario() -> None:
+        shift = _ShiftingBand(broker, by)
+        async with make_rig(tmp_path, store, broker, band=shift) as rig:
+            with contextlib.suppress(ExecutionHalted, ExecutionRefused):
+                await scenario_of(rig, shift)
+            assert not shift.armed, "сценарий ни разу не спросил планку после взвода"
+            assert rig.broker.position(TICKER) == left, (point, rig.creates())
+            assert rig.executor.halted is not None, point
+
+    run(scenario())
+
+
+async def _flat_by_the_fok(rig: Rig) -> str:
+    """«Закрыть всё» закроет позицию своей FOK."""
+    rig.exchange.plans.append(filled((1, 99.0)))
+    return "закрыта заявкой FOK"
+
+
+async def _flat_by_hand(rig: Rig) -> str:
+    """Позицию уже закрыли руками в приложении брокера: поток принёс чужую сделку."""
+    rig.broker.foreign_trade("2", 1, 99.0)
+    await heard()
+    return "Позиции у брокера нет — закрывать нечего"
+
+
+@pytest.mark.parametrize("flat", [_flat_by_the_fok, _flat_by_hand], ids=["заявкой", "руками"])
+def test_close_everything_after_an_unfilled_level_hands_no_open_position_event(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    flat: Callable[[Rig], Awaitable[str]],
+) -> None:
+    """Выход после обрыва снят, событие ждёт; «закрыть всё» нашло позицию нулевой — события нет.
+
+    Иначе с остановкой движок пишет ERROR «позиция открыта и без сторожа —
+    закройте её» рядом со словами «закрыта заявкой FOK» (ревью 10.11, 2).
+    Ноль — двумя путями: закрыла FOK «закрыть всё» или позицию уже закрыли
+    руками, и закрывать нечего. Мутация: не забыть событие после закрытия;
+    не забыть его, когда позиции нет (test-expert 10.11).
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await _killed_after_outage(rig)
+            words = await flat(rig)
+            text = await rig.executor.close_everything("Проверка: закрыть всё.")
+            assert rig.broker.position(TICKER) == 0, text
+            assert words in text, text
+            with pytest.raises(ExecutionHalted) as halted:
+                await rig.executor.fills_at(bar(BAR0 + timedelta(minutes=10)))
+            assert halted.value.unfilled == (), halted.value.unfilled
+
+    run(scenario())
+
+
+def test_close_everything_that_did_not_close_keeps_the_open_position_event(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """«Закрыть всё» не закрыло (FOK снята) — событие «уровень не исполнился» уходит с остановкой.
+
+    Позиция открыта и без сторожа — это правда, и движок обязан сказать её
+    строкой журнала. Мутация: забывать событие при любом «закрыть всё».
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await _killed_after_outage(rig)
+            rig.exchange.plans.append(killed("4"))
+            text = await rig.executor.close_everything("Проверка: закрыть всё.")
+            assert rig.broker.position(TICKER) == 1, text
+            with pytest.raises(ExecutionHalted) as halted:
+                await rig.executor.fills_at(bar(BAR0 + timedelta(minutes=10)))
+            [event] = halted.value.unfilled
+            assert event.order_id == take_name(), event
+
+    run(scenario())
+
+
+def test_an_unanswered_fok_cancelled_by_the_program_says_the_position_is_unchanged(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """FOK без ответа за `fill_wait`, снята программой, ни контракта: «позиция та же», не «не та».
+
+    Ревью 10.11, находка 3: прежде остановка говорила «исполнена на 0 из 1…
+    позиция у брокера не та, что у робота» — и человек шёл искать
+    расхождение, которого нет. Мутация: слова частичной при нуле исполненных.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            rig.exchange.plans.append(resting)
+            with pytest.raises(ExecutionHalted) as halted:
+                await submit_on(rig, entry(Side.LONG), close=100.0)
+            words = halted.value.human
+            assert "не исполнившись ни на контракт" in words, words
+            assert "позиция у брокера та, что была до заявки" in words, words
+            assert "не та, что у робота" not in words, words
+            assert rig.broker.position(TICKER) == 0
+
+    run(scenario())
+
+
+# ------------------------------- исполнение против «текущей» (владелец 10.11.2026)
+
+
+@pytest.mark.parametrize(
+    ("side", "fill", "words"),
+    [
+        (Side.LONG, 100.5, "исполнена по 100.5: текущая была 100, хуже текущей на 0.5 (0.50 %)"),
+        (Side.LONG, 99.5, "исполнена по 99.5: текущая была 100, лучше текущей на 0.5 (0.50 %)"),
+        (Side.SHORT, 99.0, "исполнена по 99: текущая была 100, хуже текущей на 1 (1.00 %)"),
+        (Side.SHORT, 101.0, "исполнена по 101: текущая была 100, лучше текущей на 1 (1.00 %)"),
+        (Side.LONG, 100.0, "исполнена по 100: текущая была 100, по текущей."),
+    ],
+    ids=["покупка хуже", "покупка лучше", "продажа хуже", "продажа лучше", "по текущей"],
+)
+def test_every_filled_fok_tells_its_price_against_the_current_one(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    *, side: Side, fill: float, words: str,
+) -> None:
+    """FOK по планке на пустом стакане исполнится до края коридора (`/risk` 10.11, 2).
+
+    Поэтому у каждой исполненной заявки — строка INFO «исполнена по X:
+    текущая была Y, хуже/лучше текущей на N (p %)»: покупка хуже — дороже,
+    продажа хуже — дешевле. Мутации: перепутать «хуже» и «лучше» по стороне;
+    промолчать об исполнении; поднять уровень до предупреждения.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker, band=GOOD_BAND) as rig:
+            rig.exchange.plans.append(filled((1, fill)))
+            await submit_on(rig, entry(side), close=100.0)
+            await heard()
+            [told] = rig.told_fills()
+            assert words in told, told
+            assert [level for text, level in rig.levels if text == told] == [DecisionLevel.INFO]
+
+    run(scenario())
+
+
+def test_a_take_filled_at_its_level_tells_no_price_against_the_current_one(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Тейк — лимитная по уровню движка: «текущей» у него нет, строки об отклонении нет.
+
+    Строка об исполнении — одна, у входа FOK. Мутация: строка у заявки без «текущей».
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            rig.broker.execute(str(rig.creates()[-1]["clientOrderId"]), 1, 110.0)
+            await heard()
+            fills = rig.told_fills()
+            assert len(fills) == 1 and "вход в лонг" in fills[0], fills
+
+    run(scenario())
+
+
+async def _limited_exit(rig: Rig) -> None:
+    """Лонг; выход с пределом 98 (конец окна) по свече сигнала с закрытием 100, исполнен по 99."""
+    await long_open(rig)
+    rig.exchange.plans.append(filled((1, 99.0)))
+    await submit_on(rig, leave(limit=98.0), close=100.0)
+
+
+#: Строка о входе лонга `long_open`: FOK исполнена по закрытию свечи сигнала, 100.
+_LONG_IN = ("вход в лонг", "исполнена по 100: текущая была 100, по текущей.")
+
+#: Каждая точка исполнения → строки «исполнена по X: текущая была Y…» по порядку:
+#: (что за заявка — начало скобок, слова об исполнении). Без планки — FOK «± %».
+#: «Текущая» — у каждой своя: закрытие свечи сигнала, уровень касания (95),
+#: закрытие свежей минутки 09:59 (100), у выхода с пределом — закрытие свечи сигнала.
+FILL_LINES: dict[str, tuple[Callable[[Rig], Awaitable[object]], list[tuple[str, str]]]] = {
+    "вход": (_entry, [_LONG_IN]),
+    "выход по сигналу": (_signal_exit, [
+        _LONG_IN,
+        ("выход из лонга", "исполнена по 99: текущая была 100, хуже текущей на 1 (1.00 %)"),
+    ]),
+    "переворот": (_reversal, [
+        _LONG_IN,
+        ("выход из лонга", "исполнена по 99: текущая была 100, хуже текущей на 1 (1.00 %)"),
+        ("вход в шорт", "исполнена по 99: текущая была 100, хуже текущей на 1 (1.00 %)"),
+    ]),
+    "остаток тейка": (_take_rest, [
+        _LONG_IN,
+        ("закрытие остатка тейка лонга",
+         "исполнена по 109: текущая была 100, лучше текущей на 9 (9.00 %)"),
+    ]),
+    "касание трейлинга": (_trailing_touch, [
+        _LONG_IN,
+        ("выход из лонга по трейлингу 95",
+         "исполнена по 94: текущая была 95, хуже текущей на 1 (1.05 %)"),
+    ]),
+    "закрыть всё": (_close_all, [
+        _LONG_IN,
+        ("закрыть всё: лонг 1", "исполнена по 99: текущая была 100, хуже текущей на 1 (1.00 %)"),
+    ]),
+    "выход с пределом": (_limited_exit, [
+        _LONG_IN,
+        ("выход из лонга — ", "исполнена по 99: текущая была 100, хуже текущей на 1 (1.00 %)"),
+    ]),
+}
+
+
+@pytest.mark.parametrize("point", list(FILL_LINES))
+def test_each_point_of_execution_tells_the_fill_against_its_own_current(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, point: str
+) -> None:
+    """Строка об исполнении — у каждой точки, где «текущая» известна, и от **её** «текущей».
+
+    Вход, выход по сигналу, переворот, остаток тейка при свежей минутке,
+    касание трейлинга, «закрыть всё» — FOK; выход с пределом — дневная, его
+    «текущая» — закрытие свечи сигнала (владелец 10.11.2026). Строк ровно
+    столько, сколько исполненных заявок с «текущей», каждая INFO, каждая
+    называет свою заявку. Тест входа выше этого не видит: он ходит одной
+    точкой. Мутации (test-expert 10.11): «текущая» не доехала до билета
+    в одной точке — трейлинг, «закрыть всё», остаток тейка, выход по сигналу,
+    выход с пределом (`_close_limited` без `close`), FOK «± %» без планки.
+    """
+    scenario_of, expected = FILL_LINES[point]
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await scenario_of(rig)
+            await heard()
+            fills = rig.told_fills()
+            assert len(fills) == len(expected), f"{point}: {fills}"
+            for line, (what, words) in zip(fills, expected, strict=True):
+                assert line.startswith(f"Заявка ({what}"), f"{point}: {line}"
+                assert words in line, f"{point}: {line}"
+            levels = [level for text, level in rig.levels if text in fills]
+            assert levels == [DecisionLevel.INFO] * len(fills), f"{point}: {rig.levels}"
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("scenario_of", [_stale_close_all, _stale_take_rest],
+                         ids=["закрыть всё", "остаток тейка"])
+@pytest.mark.parametrize(("source", "price"), [(GOOD_BAND, 90.5), (None, 98.0)],
+                         ids=["по планке", "без планки"])
+def test_a_fok_by_the_band_at_a_stale_minute_tells_no_price_against_a_current_one(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    *, scenario_of: Callable[[Rig], Awaitable[str]],
+    source: Callable[[], Awaitable[PriceBand]] | None, price: float,
+) -> None:
+    """Несвежая минутка: «текущей» нет — строки «текущая была» нет, с планкой и без неё.
+
+    Без планки FOK уходит «± %» от несвежей минутки, но судить по ней
+    исполнение — та же ошибка (координатор 10.11, мутация: строка от
+    несвежей минутки у FOK без планки).
+
+    Цена несвежей минутки — цена, которой уже нет (0067): сравнивать с ней
+    исполнение по планке значило бы назвать «хуже на 9» то, что хуже только
+    давно ушедшей цены. Строка одна — у входа; продажа исполнена (позиция 0),
+    то есть строки нет не потому, что нечего было исполнять. Мутация
+    (test-expert 10.11): FOK по планке при несвежей минутке судится от неё.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker, band=source) as rig:
+            await scenario_of(rig)
+            await heard()
+            assert immediate(rig)[-1] == ("2", price), rig.creates()
+            assert rig.broker.position(TICKER) == 0
+            fills = rig.told_fills()
+            assert len(fills) == 1 and fills[0].startswith("Заявка (вход в лонг"), fills
+
+    run(scenario())
+
+
+def test_a_fok_filled_at_two_prices_averaging_the_current_tells_it_went_by_the_current(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """FOK исполнена по двум ценам стакана, средняя ровно равна «текущей» — «по текущей».
+
+    Сетка 0,05, как у живых фьючерсов: (2900,15 + 2900,05) / 2 в плавающей
+    точке — 2900,1000000000004, а не 2900,1. Без округления пунктов строка
+    сказала бы «хуже текущей на 4.54747e-13 (0.00 %)» — шум вместо слов.
+    Мутация (test-expert 10.11): разность цен без округления.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            rig.exchange.plans.append(filled((1, 2900.15), (1, 2900.05)))
+            await submit_on(rig, entry(volume=2), close=2900.1)
+            await heard()
+            [told] = rig.told_fills()
+            assert "исполнена по 2900.1: текущая была 2900.1, по текущей." in told, told
+
+    run(scenario())

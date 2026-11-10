@@ -293,8 +293,12 @@ class Rig:
         return [note for note in self.notices if " подана по цене " in note]
 
     def warnings(self) -> list[str]:
-        """Прочие строки человеку без остановки — без штатных строк о поданных заявках."""
-        return [note for note in self.notices if " подана по цене " not in note]
+        """Предупреждения человеку без остановки — уровень WARNING, без штатных строк INFO."""
+        return [text for text, level in self.levels if level is DecisionLevel.WARNING]
+
+    def told_fills(self) -> list[str]:
+        """Строки «исполнена по X: текущая была Y…» — у исполненных заявок (владелец 10.11)."""
+        return [note for note in self.notices if " исполнена по " in note]
 
 
 @pytest.fixture

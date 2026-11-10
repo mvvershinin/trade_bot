@@ -269,8 +269,9 @@ class LiveDesks:
         waited = request.limits.band_wait
 
         async def band() -> PriceBand:
-            # Планка биржи для выхода с пределом (0067, Р-4): сетевой поток
-            # потока данных, одна попытка, не дольше `band_wait` (правка 4.1).
+            # Планка биржи — цена каждой FOK и выхода с пределом (0067, Р-4;
+            # владелец 10.11.2026): сетевой поток потока данных, одна попытка,
+            # не дольше `band_wait` (правка 4.1).
             return await worker.price_band(ticker, timeout=waited)
 
         wiring = Wiring(
