@@ -14,12 +14,19 @@
 # `--assume-yes-for-downloads`, это её штатный и рекомендованный путь, а не
 # костыль) и кодировки консоли/CRLF. Первый настоящий тег — первая живая
 # проверка. Если упадёт — это находка о Windows-раннере, а не о замысле.
+#
+# Ветка preview/** — пробная сборка без выпуска (владелец счёта 12.11.2026,
+# «собери под виндовс»: Windows-машины нет, Nuitka не собирает под Windows
+# с Linux). Версия — из pyproject.toml, артефакты — на странице прогона,
+# джоб `release` не запускается.
 name: Release
 
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - "preview/**"
 
 # gh release create/upload пишет в Releases репозитория этим токеном.
 # Секретов не заводим — токен выдаётся GitHub автоматически на каждый прогон.
@@ -36,12 +43,20 @@ jobs:
     outputs:
       version: ${{ steps.parse.outputs.version }}
     steps:
+      - name: Забрать код (версия пробной сборки — из pyproject.toml)
+        if: github.ref_type == 'branch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Разобрать и проверить тег
         id: parse
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
+          if [ "${GITHUB_REF_TYPE}" = "branch" ]; then
+            VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          else
+            VERSION="${TAG#v}"
+          fi
           # Строго X.Y.Z: этого просит и Nuitka (--file-version/--product-version
           # на Windows — числовые поля), и `tools/set_version.py`, и pyproject.toml
           # (версия обязана быть PEP 440). Суффиксы вида -rc1 сюда сознательно
@@ -246,6 +261,7 @@ jobs:
   release:
     name: Публикация в Releases
     needs: [version, build-linux, build-windows]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
