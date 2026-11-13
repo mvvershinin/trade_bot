@@ -131,6 +131,8 @@ __all__ = [
     "Outcome",
     "FillOutcome",
     "process_closed_candle",
+    "adopted_state",
+    "dropped_state",
     "after_submit",
     "after_refused_cancel",
     "after_refused_exit",
@@ -862,6 +864,74 @@ def apply_fill(
     if order.action is OrderAction.OPEN:
         return _opened(state, fill, order, pending, settings)
     return _closed(state, fill, order, pending, settings)
+
+
+def adopted_state(
+    state: EngineState,
+    held: tuple[Side, float, float],
+    at: datetime,
+    settings: EngineSettings,
+) -> tuple[EngineState, JournalEntry]:
+    """Позиция, взятая у брокера при включении боя (решение 0070). **Не сделка.**
+
+    Сторона и объём — из портфеля, цена входа — средняя брокера. План тейка —
+    тот же, что у сделки открытия (`_opened`), от этой цены, на сетке шага.
+    Уровень у брокера ставит шаг 5 ближайшей закрытой свечи — как у любой
+    позиции без принятого вооружения: заявки здесь не рождаются, и подавать
+    их некому (метод синхронный, вызывается между свечами). Комиссии и денег
+    дня нет: сделку делал не этот запуск.
+
+    :param held: сторона, объём, средняя цена брокера.
+    """
+    side, volume, price = held
+    position = Position(side=side, volume=volume, entry_price=price, entry_time=at)
+    plan = settings.plan().initial(price, position.side_sign)
+    position = replace(position, take=replace(plan, level=None))
+    words = _no_take_reason(plan)
+    take = (
+        f"тейк {_price(plan.level)} встанет у брокера на закрытии ближайшей свечи"
+        if plan.level is not None
+        else words[:1].lower() + words[1:]
+    )
+    entry = JournalEntry(
+        at=at,
+        event="Подхвачена позиция у брокера",
+        reason=(
+            f"{side.label} {_volume(volume)} по средней цене брокера {_price(price)}; "
+            f"{take}. Дальше робот ведёт её по сигналам, как свою"
+        ),
+        level=JournalLevel.WARNING,
+    )
+    return replace(
+        state, position=position, pending=(), closing_bars=0, exit_blocked_bars=0,
+        quiet_note="",
+    ), entry
+
+
+def dropped_state(state: EngineState, at: datetime) -> tuple[EngineState, JournalEntry]:
+    """Позицию закрыл владелец кнопкой «Закрыть позицию» (решение 0069). **Не сделка.**
+
+    Заявки робота по инструменту сняты тем же действием, поэтому забываются
+    и заявки в полёте. Дат тейка и выхода нет: выходил не робот, и «стоп после
+    тейка» ручное закрытие не включает. Деньги дня не трогаются — результат
+    закрытия движок не видел; он есть в таблице исполнений счёта.
+    """
+    position = state.position
+    what = (
+        "позиции у робота не было"
+        if position is None
+        else f"{position.side.label.lower()} {_volume(position.volume)} закрыт"
+    )
+    entry = JournalEntry(
+        at=at,
+        event="Позиция закрыта владельцем",
+        reason=f"Кнопкой «Закрыть позицию»: {what}. Робот без позиции, ждёт следующий сигнал",
+        level=JournalLevel.WARNING,
+    )
+    return replace(
+        state, position=None, pending=(), closing_bars=0, exit_blocked_bars=0,
+        quiet_note="",
+    ), entry
 
 
 def take_managed(state: EngineState, settings: EngineSettings) -> bool:

@@ -11,13 +11,14 @@
    бой недоступен, причина словами (`ReadOnlyToken.human`).
 2. **Счёт** — номер договора из портфеля: под ним пишется каждая команда
    журнала и считается день (в `userdata/` бывает два токена на два счёта).
-3. **Позиция у брокера** — свежим запросом, **до** разбора журнала; не ноль —
-   бой не включается, и ни одной команды брокеру: живая заявка прошлого
-   запуска при позиции — это её тейк, и снять его значило бы оставить
-   позицию голой (`/risk` 2в, БЛОК 1). Позицию, открытую не этим включением,
-   «факт» вести не может: его движок рождается без позиции. Закрывать её
-   программа здесь **не** берётся: включение боя само к сделке не ведёт.
-   Совпавший ноль становится основой позиции по сделкам (К2 `/risk`).
+3. **Позиция у брокера** — свежим запросом, **до** разбора журнала. Не ноль —
+   позиция **подхватывается** (решение 0070, `_adopt`): сторона и объём из
+   портфеля, цена входа — средняя брокера, тейк движок поставит по настройкам
+   от неё. Живая заявка робота прошлого включения при позиции — это её тейк:
+   снимать его нельзя (`/risk` 2в, БЛОК 1), ставить второй — тоже, поэтому
+   тогда бой не включается, и ни одной команды брокеру. Живые заявки
+   не робота — словами, не трогая. Совпавшая позиция становится основой
+   позиции по сделкам (К2 `/risk`).
 4. **Журнал** — поток статусов открыт; незакрытые команды прошлых
    запусков разобраны по ключу у брокера (0017: живые сняты, исполненные
    и снятые закрыты в журнале), каждое снятие — фразой. Судьба хоть одной
@@ -41,7 +42,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from app.fact import FactRefused, FactRequest, day_record, position_words
+from app.fact import FactPosition, FactRefused, FactRequest, day_record, position_words
 from app.live_executor import (
     EventsOpener,
     Instrument,
@@ -55,7 +56,7 @@ from broker.account import portfolio_account, read_holdings
 from broker.errors import BrokerError
 from broker.session import PORTFOLIO_PATH, BrokerSession
 from broker.tokens import now_utc
-from engine import DayRecord, closes_entries_day, in_moscow, is_take_order
+from engine import DayRecord, Side, closes_entries_day, in_moscow, is_take_order
 from market import Candle as MarketCandle
 from market import MarketWorker, PriceBand
 from market.commands import CommandAction, StoredCommand
@@ -107,6 +108,9 @@ class LiveDesk:
         notes: tuple[str, ...],
     ) -> None:
         self._executor = executor
+        #: Позиция у брокера, подхваченная включением (0070); `None` — включён
+        #: при нуле. Ставит сборка (`LiveDesks.open`).
+        self.adopted: FactPosition | None = None
         self._book = book
         self._seat = seat
         self._account = seat.account
@@ -134,6 +138,15 @@ class LiveDesk:
     def halted(self) -> str | None:
         """Почему исполнитель стоит — его словами; `None` — не стоит."""
         return self._executor.halted
+
+    @property
+    def flat_by_hand(self) -> bool:
+        """Владелец закрыл позицию кнопкой, движок «факта» ещё не принял ноль (0069)."""
+        return self._executor.flat_by_hand
+
+    def flat_taken(self) -> None:
+        """Движок «факта» принял ноль — исполнитель снова подаёт заявки как обычно."""
+        self._executor.flat_taken()
 
     @property
     def undelivered(self) -> tuple[str, ...]:
@@ -268,13 +281,15 @@ class LiveDesks:
         executor, book = self._executor(session, account, request)
         await executor.start()
         try:
-            notes = await self._prepare(executor, book, account, request)
+            notes, adopted = await self._prepare(executor, book, account, request)
             day = await self._day(account, request, notes)
         except BaseException:
             await executor.close()
             raise
         seat = Seat(session, request.ticker, account)
-        return LiveDesk(executor, book=book, seat=seat, day=day, notes=notes)
+        desk = LiveDesk(executor, book=book, seat=seat, day=day, notes=notes)
+        desk.adopted = adopted
+        return desk
 
     def _executor(
         self, session: BrokerSession, account: str, request: FactRequest
@@ -321,8 +336,8 @@ class LiveDesks:
         """Снять одну заявку робота: исполнителем боя, если он собран, иначе своим.
 
         :param desk: собранная боевая сторона порта или `None`. Собрана —
-            снимает её исполнитель: он ведёт эту заявку, и робот при этом
-            останавливается (`LiveExecutor.cancel_by_hand`). Не собрана
+            снимает её исполнитель: он ведёт эту заявку; снят тейк чисто —
+            робот торгует дальше, иначе стоит (`LiveExecutor.cancel_by_hand`). Не собрана
             (робот стоит, бой выключен) — исполнитель на одну команду.
         :raises FactRefused: снимать нечем — связи, прав, потока статусов нет.
         """
@@ -399,8 +414,10 @@ class LiveDesks:
 
     async def _prepare(
         self, executor: LiveExecutor, book: StoreBook, account: str, request: FactRequest
-    ) -> tuple[str, ...]:
-        """Поток открыт, позиция у брокера — ноль, журнал разобран. Иначе отказ.
+    ) -> tuple[tuple[str, ...], FactPosition | None]:
+        """Поток открыт, позиция у брокера — ноль или подхвачена, журнал разобран.
+
+        Возврат — строки сверки и подхваченная позиция (`None` — ноль).
 
         ⚠️ Позиция читается **первой**, до разбора журнала (`/risk` 2в, БЛОК 1).
         Разбор снимает живые заявки прошлых запусков (0017) — а при позиции
@@ -416,7 +433,7 @@ class LiveDesks:
             )
         before = await self._position(executor, (), None)
         if before != 0:
-            raise FactRefused(self._not_flat(before, request, ()), position=before)
+            return await self._adopt(executor, book, account, request, before)
         # Робот включается без позиции: заявку прошлого запуска, снятую не нами,
         # сверка сравнивает с нулём и при совпадении не останавливает (13.11.2026).
         notes = await executor.settle_open_commands(0)
@@ -443,7 +460,70 @@ class LiveDesks:
         actual = await self._position(executor, notes, None if notes else before)
         if actual != 0:
             raise FactRefused(self._not_flat(actual, request, notes), notes=notes, position=actual)
-        return notes
+        return notes, None
+
+    async def _adopt(
+        self, executor: LiveExecutor, book: StoreBook, account: str, request: FactRequest,
+        before: int,
+    ) -> tuple[tuple[str, ...], FactPosition]:
+        """Позиция у брокера не ноль — взять её под робота (решение 0070).
+
+        Отказ — одной строкой, до любой команды брокеру (B-101):
+
+        * в журнале команд этого счёта есть незакрытая заявка робота — при
+          позиции это её тейк; снять его — оставить позицию голой (БЛОК 1),
+          поставить второй — при касании исполнятся оба;
+        * брокер не назвал среднюю цену — тейк считать не от чего;
+        * позиция поменялась между чтениями.
+
+        Живые заявки у брокера по инструменту, которых нет в журнале робота, —
+        строкой сверки, не трогая (0070).
+        """
+        ticker = request.ticker
+        mine = [row for row in await book.open_commands() if row.command.account == account]
+        if mine:
+            raise FactRefused(
+                f"У брокера {position_words(before)} по {ticker}, и жива заявка робота "
+                f"прошлого включения ({hand_words(mine[0])}) — возможно, тейк: снимите её "
+                f"кнопкой «Снять заявку» и включите бой снова. {_NOT_ON}",
+                position=before,
+            )
+        try:
+            held = read_holdings(
+                await self._seat_session().read(PORTFOLIO_PATH)
+            ).position(ticker)
+            actual = await executor.check_position(before)
+        except BrokerError as error:
+            raise FactRefused(
+                f"Позицию у брокера прочитать не удалось: {error.human} {_NOT_ON}",
+                position=before,
+            ) from None
+        price = None if held is None else held.average_price
+        if actual != before or held is None or int(held.quantity) != before:
+            raise FactRefused(
+                f"Позиция у брокера менялась во время включения ({position_words(before)} → "
+                f"{position_words(actual)}): включите бой снова. {_NOT_ON}",
+                position=actual,
+            )
+        if price is None or not price > 0:
+            raise FactRefused(
+                f"У брокера {position_words(before)} по {ticker}, а средней цены брокер "
+                f"не назвал — тейк считать не от чего. {_NOT_ON}",
+                position=before,
+            )
+        if executor.halted is not None:
+            raise FactRefused(f"{executor.halted} {_NOT_ON}", position=before)
+        foreign = await executor.foreign_orders()
+        adopted = FactPosition(
+            side=Side.LONG if before > 0 else Side.SHORT,
+            volume=float(abs(before)), entry_price=float(price),
+        )
+        return ((foreign,) if foreign else ()), adopted
+
+    def _seat_session(self) -> BrokerSession:
+        session = self.session()
+        assert session is not None, "сессию проверил `refusal` в `open`"
+        return session
 
     @staticmethod
     async def _fresh(executor: LiveExecutor, notes: tuple[str, ...], before: int) -> int | None:
@@ -481,10 +561,8 @@ class LiveDesks:
     @staticmethod
     def _not_flat(actual: int, request: FactRequest, notes: tuple[str, ...]) -> str:
         return (
-            f"У брокера {position_words(actual)} по {request.ticker}. Бой включается только "
-            "при нулевой позиции у брокера: позицию, открытую не этим включением, робот "
-            "вести не может, а её заявки у брокера (тейк) программа не трогает. Закройте "
-            f"позицию в приложении брокера и включите бой снова. {_tail(notes)}"
+            f"У брокера {position_words(actual)} по {request.ticker} — появилась во время "
+            f"сверки журнала: включите бой снова, робот подхватит её. {_tail(notes)}"
         )
 
     async def _day(
