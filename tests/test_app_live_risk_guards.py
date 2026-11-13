@@ -83,6 +83,7 @@ from tests.test_app_live_pair import (
     STEP,
     SYMBOL,
     Bench,
+    Takes,
     _bench,
     _close,
     _connect,
@@ -553,19 +554,19 @@ def test_a_second_change_while_the_rebuild_is_held_is_said_and_shown(
 # --------------------------------------------------------------- замечания: слова кнопок
 
 
-def test_close_position_in_combat_closes_it_and_stops_the_robot(
+def test_close_position_in_combat_leaves_the_robot_trading_without_a_position(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """«Закрыть позицию» при лонге «факта» в бою: тейк снят, позиция закрыта, робот стоит.
+    """Стережёт 0069: после «Закрыть позицию» в бою робот не стоит, без позиции, входит по сигналу.
 
-    Задача владельца 13.11.2026: закрытие — заявкой из программы, а не советом
-    «закройте в приложении брокера». Закрывает исполнитель боя, и робот
-    после этого стоит до «Возобновить работу» (0020): позицию, которую он
-    вёл, закрыл не он.
+    Лонг «факта» с тейком у брокера; владелец закрывает позицию кнопкой —
+    тейк снят, позиция ноль, робот не остановлен. Следующий сигнал (10:00,
+    закрытие ниже средней) — вход в шорт настоящей заявкой: движок «факта»
+    принял «позиции нет», иначе он вышел бы из лонга, которого у брокера нет.
     """
     monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
 
-    async def go() -> tuple[str, LiveStatus]:
+    async def go() -> tuple[str, LiveStatus, int, LiveStatus]:
         bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
         try:
             await _connect(bench)
@@ -573,16 +574,71 @@ def test_close_position_in_combat_closes_it_and_stops_the_robot(
             assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
             bench.port.close_position()
             await bench.port.wait()
-            return bench.said("Закрытие позиции руками"), bench.port.live_status()
+            said, after = bench.said("Закрытие позиции руками"), bench.port.live_status()
+            flat = broker.position(SYMBOL)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=61),
+                since=LIVE_FROM + timedelta(minutes=51),
+            )
+            return said, after, flat, bench.port.live_status()
         finally:
             await _close(bench, session)
 
-    said, status = loop.run_until_complete(go())
-    assert broker.position(SYMBOL) == 0, said
-    assert not broker.live(), f"у брокера осталась живая заявка: {said}"
+    said, after, flat, later = loop.run_until_complete(go())
+    assert flat == 0, said
     assert "закрыта" in said, said
-    assert status.halted, "робот после ручного закрытия не остановлен"
-    assert not status.on
+    assert not after.halted and after.on, f"робот после ручного закрытия стоит: {after.halted}"
+    assert broker.position(SYMBOL) == -1, "вход по сигналу после ручного закрытия не подан"
+    assert not later.halted, later.halted
+
+
+def test_cancel_take_in_combat_leaves_the_robot_trading_by_signal_without_a_new_take(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стережёт 0069: после «Снять заявку» (тейк) в бою робот не стоит и выходит по сигналу.
+
+    Лонг «факта» с тейком у брокера; владелец снимает тейк кнопкой — робот
+    не остановлен. Сигнал 10:00 — выход из лонга и вход в шорт настоящими
+    заявками. Тейк шорта снят так же — на закрытиях 10:15 и 10:30 робот его
+    заново не ставит: владелец снял его намеренно.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def cancel_take(bench: Bench) -> LiveStatus:
+        (take,) = [order.key for order in broker.live()]
+        bench.port.cancel_robot_order(take)
+        await bench.port.wait()
+        assert not broker.live(), bench.said("Снятие заявки руками")
+        return bench.port.live_status()
+
+    async def go() -> tuple[LiveStatus, int, LiveStatus, Takes, LiveStatus]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
+            first = await cancel_take(bench)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=62),
+                since=LIVE_FROM + timedelta(minutes=51),
+            )
+            turned = broker.position(SYMBOL)
+            second = await cancel_take(bench)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=91),
+                since=LIVE_FROM + timedelta(minutes=63),
+            )
+            return first, turned, second, _takes(broker), bench.port.live_status()
+        finally:
+            await _close(bench, session)
+
+    first, turned, second, takes, later = loop.run_until_complete(go())
+    assert not first.halted and first.on, f"робот после снятия тейка стоит: {first.halted}"
+    assert turned == -1, "выход и вход по сигналу 10:00 после снятия тейка не поданы"
+    assert not second.halted and second.on, second.halted
+    assert takes == [], f"тейк поставлен заново: {takes}"
+    assert not later.halted and later.on, later.halted
+    assert broker.position(SYMBOL) == -1
 
 
 def test_start_without_combat_says_how_combat_is_switched_on(

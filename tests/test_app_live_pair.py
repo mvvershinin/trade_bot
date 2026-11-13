@@ -52,7 +52,7 @@ from broker.session import BrokerSession
 from broker.throttle import Throttle
 from broker.token_store import TokenStore
 from broker.tokens import TokenScope
-from engine import AccountFunds, ExitReason, Fill
+from engine import AccountFunds, ExitReason, Fill, fixed_level
 from market import MSK, Candle, CandleStore, DecisionLevel, MarketWorker, PriceBand, Source
 from market.commands import (
     BrokerCommand,
@@ -520,32 +520,36 @@ def test_fact_deals_equal_forecast_deals_on_an_ideal_broker(
 # --------------------------------------------------------------- отказы включения
 
 
-def test_live_is_refused_with_a_position_at_the_broker(
+def test_live_adopts_a_short_at_the_broker_with_a_take_from_its_average(
     loop, tmp_path: pathlib.Path, broker: FakeBroker
 ) -> None:
-    """0066: бой включается только при нулевой позиции у брокера — иначе отказ словами.
+    """Стережёт 0070: «Включить бой» при шорте 1 у брокера — подхват, а не отказ.
 
-    Позиция открыта мимо программы (руками в приложении брокера). Ни одной
-    команды брокеру, бой не включён, ход остался наблюдением, причина —
-    в журнале и в снимке боя: позиция названа словами.
+    Шорт открыт мимо программы по 249 650. Бой включён, позиция «факта» —
+    шорт 1 по средней брокера, и на первой закрытой свече у брокера одна
+    лимитная покупка — тейк движка от этой средней на сетке шага. Окно
+    с 09:00: свеча 09:15 в окне, вне окна движок закрыл бы позицию сам.
     """
+    values = dataclasses.replace(FIXED_TAKE, window_start=time(9, 0))
 
-    async def go() -> tuple[Bench, list[tuple[str, str]]]:
-        broker.outside = 2
-        bench, session = await _bench(tmp_path, broker, OWNER)
+    async def go() -> tuple[LiveStatus, Takes, str]:
+        bench, session = await _bench(tmp_path, broker, values)
         try:
+            broker.foreign_trade("2", 1, 249_650.0, ticker=SYMBOL)
             await _connect(bench)
-            return bench, list(bench.notes)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=16))  # закрытие 09:15
+            status = bench.port.live_status()
+            return status, _takes(broker), bench.said("Подхвачена позиция у брокера")
         finally:
             await _close(bench, session)
 
-    bench, notes = loop.run_until_complete(go())
-    assert broker.commands == [], broker.commands
-    refused = " ".join(reason for event, reason in notes if event == "Бой не включён")
-    assert "лонг 2" in refused and "нулевой позиции" in refused, refused
-    status = bench.port.live_status()
-    assert not status.on and not status.wanted
-    assert "лонг 2" in status.refused
+    status, takes, said = loop.run_until_complete(go())
+    assert status.on and not status.halted, (status.refused, status.halted)
+    assert status.position is not None, said
+    assert (status.position.signed, status.position.entry_price) == (-1, 249_650.0)
+    level = fixed_level(249_650.0, -1, values.take_profit_pct, STEP)
+    assert takes == [("1", level)], (takes, level)
+    assert "Шорт 1" in said, said
 
 
 def test_live_is_refused_with_an_unsettled_command(
@@ -665,7 +669,7 @@ def test_an_executor_halt_reaches_the_robot_halt_in_its_words(
     вида «состояние счёта» с **текстом исполнителя** — в окне и в таблице
     `robot_halt` (переживает перезапуск). Новых заявок робот не подаёт.
     «Возобновить» пересобирает исполнитель **после сверки** (С3): чужой лонг
-    у брокера остался — бой не включается, и это сказано словами.
+    у брокера остался — бой подхватывает его (0070), и это сказано словами.
     """
 
     async def go() -> tuple[str, list[str], int, str]:
@@ -681,7 +685,7 @@ def test_an_executor_halt_reaches_the_robot_halt_in_its_words(
             halted = bench.port.halted
             bench.port.resume()
             await bench.port.wait()
-            return halted, stored, sent, bench.said("Бой не включён")
+            return halted, stored, sent, bench.said("Подхвачена позиция у брокера")
         finally:
             await _close(bench, session)
 
@@ -690,7 +694,7 @@ def test_an_executor_halt_reaches_the_robot_halt_in_its_words(
     assert words in halted, halted
     assert any(words in reason for reason in stored), stored
     assert sent == 0
-    assert "лонг 1" in after_resume, after_resume
+    assert "Лонг 1" in after_resume, after_resume
 
 
 def test_after_a_restart_on_a_take_day_neither_engine_enters(

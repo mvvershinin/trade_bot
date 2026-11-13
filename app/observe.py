@@ -487,12 +487,15 @@ class FactLeg:
         тейка» ни у «факта», ни у «прогноза».
     :param session_id: прогон «факта» в журнале прогонов — строки его
         решений, заявок и сделок пишутся туда. `None` — не писать.
+    :param position: позиция у брокера, подхваченная включением (0070), —
+        «факту» на включении пары; «прогноз» её не получает.
     """
 
     strategy: Strategy
     executor: OrderExecutor
     day: DayRecord | None = None
     session_id: int | None = None
+    position: FactPosition | None = None
 
 
 class _FactBook:
@@ -608,6 +611,11 @@ class _FactSide:
     volumes: dict[str, float] = field(default_factory=dict)
     #: Прогрев пройден и режим включён (`LiveObserver._arm_pair`).
     armed: bool = False
+    #: Позиция у брокера, подхваченная включением: движку — на включении пары.
+    adopted: FactPosition | None = None
+    #: Владелец закрыл позицию кнопкой: движку — до его следующей свечи, затем
+    #: этот вызов (исполнитель снова подаёт заявки). `None` — не закрывал.
+    flat: Callable[[], None] | None = None
 
 
 # ---------------------------------------------------------------- наблюдение
@@ -765,6 +773,7 @@ class LiveObserver:
             engine=Engine(fact.strategy, start, journal=said.append),
             book=_FactBook(fact.executor, ruble_per_point=self._settings.ruble_per_point),
             journal=said,
+            adopted=fact.position,
         )
         self._day = fact.day
         self._fact_id = fact.session_id
@@ -1142,6 +1151,8 @@ class LiveObserver:
                 # тени ему незачем. Порядок внутри свечи сделок не меняет:
                 # движки пары друг о друге не знают.
                 fact = self._fact
+                if fact is not None:
+                    self._hand_over(fact, candle)
                 fact_orders = (
                     () if fact is None
                     else (await fact.engine.on_market_candle(candle, fact.book)).orders
@@ -1188,6 +1199,7 @@ class LiveObserver:
             return
         fact = self._fact
         if fact is not None:
+            self._hand_over(fact, forming)
             await fact.engine.on_market_candle(forming, fact.book)
         if self._engine.halted:
             return
@@ -1375,6 +1387,35 @@ class LiveObserver:
             "исполнения — расхождение между ними видно сделками.",
             DecisionLevel.WARNING,
         )
+        # Подхваченная позиция (0070) — «факту», между свечами и после режима:
+        # план тейка — от рабочих настроек, а не от «Выключен».
+        held, fact.adopted = fact.adopted, None
+        if held is not None:
+            (taken,) = fact.engine.adopt_position(
+                (held.side, held.volume, held.entry_price), at=moment
+            )
+            self._say(taken.event, taken.reason, DecisionLevel.WARNING)
+
+    def fact_flat(self, taken: Callable[[], None]) -> None:
+        """Владелец закрыл позицию «факта» кнопкой (0069): движку — до его свечи.
+
+        Не сразу: движок мог стоять посреди свечи в ожидании исполнителя,
+        и `accept` переписал бы состояние. `taken` зовётся, когда движок
+        принял ноль.
+        """
+        if self._fact is None:
+            taken()  # «факта» нет — ждать некому, исполнитель не держит заявки
+            return
+        self._fact.flat = taken
+
+    def _hand_over(self, fact: _FactSide, candle: MarketCandle) -> None:
+        """Ручное закрытие — движку «факта» до этой свечи, затем `taken` (`fact_flat`)."""
+        taken, fact.flat = fact.flat, None
+        if taken is None:
+            return
+        (said,) = fact.engine.drop_position(at=self._tally.last_close or close_time(candle))
+        self._say(said.event, said.reason, DecisionLevel.WARNING)
+        taken()
 
     def _say_warmup(self) -> None:
         """Сказать про прогрев — один раз, после первого отрезка.

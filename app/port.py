@@ -1910,8 +1910,8 @@ class HistoryPort(TerminalPort):
             )
         else:
             self.note(event, text, DecisionLevel.WARNING)
-            if desk is not None and desk.halted:
-                self._halt_fact(desk.halted)
+            if desk is not None:
+                self._after_hand(desk)
         finally:
             if record is not None:
                 with contextlib.suppress(Exception):  # запись важна, итог человеку важнее
@@ -1920,6 +1920,23 @@ class HistoryPort(TerminalPort):
             # ещё не `done()` — она здесь, в своём `finally`.
             self._live.hand = None
             self._publish_live()
+
+    def _after_hand(self, desk: FactDesk) -> None:
+        """Бой после ручного действия: стоит — остановка робота; иначе торгует дальше (0069).
+
+        Закрыл позицию — «позиции нет» движку «факта» до его следующей свечи,
+        не посреди неё (`LiveObserver.fact_flat`).
+        """
+        if desk.halted:
+            self._halt_fact(desk.halted)
+            return
+        if not desk.flat_by_hand:
+            return
+        observer = self._watch.observer
+        if observer is None:
+            desk.flat_taken()
+            return
+        observer.fact_flat(desk.flat_taken)
 
     def _hand_request(self, frame: _Frame, symbol: str, session_id: int) -> FactRequest:
         """Просьба к исполнителю ручного действия — те же числа, что у боя (`_open_live`)."""
@@ -5297,6 +5314,7 @@ class HistoryPort(TerminalPort):
             executor=desk.executor,
             day=desk.day,
             session_id=session_id,
+            position=desk.adopted,
         )
 
     async def _open_desk(self, desks: FactDesks, request: FactRequest) -> FactDesk | None:
@@ -5330,7 +5348,7 @@ class HistoryPort(TerminalPort):
             return None
         finally:
             self._live.opening = False
-        # Сборка прочитала у брокера ноль: оставшейся позиции нет.
+        # Позиция у брокера теперь у «факта» (ноль или подхвачена, 0070): запомненной нет.
         self._live.left, self._live.left_note, self._live.left_take = None, "", ""
         for note in desk.notes:
             self.note("Сверка с брокером", note, DecisionLevel.WARNING)
@@ -5587,8 +5605,8 @@ class HistoryPort(TerminalPort):
                 + (f" ({note})" if note else "")
                 + ": выключение её не закрывает, робот ею больше не управляет; "
                 + (self._live.left_take or _take_words(position.take_level, None, sure=False))
-                + ". Закройте её в приложении брокера или включите бой снова — новый бой "
-                "включится только при нулевой позиции."
+                + ". Закройте её кнопкой «Закрыть позицию» или включите бой снова — "
+                "робот подхватит её."
                 if position is not None else "Позиции у робота нет."
             ),
             DecisionLevel.WARNING if position is not None else DecisionLevel.INFO,
