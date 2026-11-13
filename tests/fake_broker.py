@@ -328,6 +328,12 @@ class FakeBroker:
         return answer.reply(request, key)
 
     def _status(self, request: httpx.Request) -> httpx.Response:
+        """Статус по ключу (11): `data` — **объект**, последнее сообщение о заявке.
+
+        Так отвечает живой сервер 13.11.2026, а не массивом всей истории, как
+        обещает снимок сайта. Отсюда худшая для нас сторона: исполнение,
+        потерянное в потоке и не последнее по заявке, по статусу не узнать.
+        """
         key = request.url.params["orderId"]
         scripted = self.status_answers.pop(0) if self.status_answers else None
         if scripted is not None:
@@ -337,7 +343,7 @@ class FakeBroker:
             return httpx.Response(404, json={"type": "NOT_FOUND", "traceId": "fake-trace"})
         return httpx.Response(
             200,
-            json={"clientOrderId": key, "originalClientOrderId": key, "data": order.reports},
+            json={"clientOrderId": key, "originalClientOrderId": "", "data": order.reports[-1]},
         )
 
     def _search(self, request: httpx.Request) -> httpx.Response:

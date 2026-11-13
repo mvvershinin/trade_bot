@@ -534,15 +534,105 @@ def test_journal_failure_sends_nothing(
 def test_stale_order_is_not_sent(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """§8 №15: заявка старше «сейчас − свеча − порог» к брокеру не уходит; это отказ, не стоп."""
+    """§8 №15: заявка старше «сейчас − свеча − порог» к брокеру не уходит; это отказ, не стоп.
+
+    Выход, а не вход: у входа своя, более строгая отсечка (сторож ниже).
+    """
 
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
-            rig.clock.now = BAR0 + timedelta(minutes=5, seconds=61)
+            rig.clock.now = BAR1 + timedelta(minutes=5, seconds=61)
             with pytest.raises(ExecutionRefused) as refused:
-                await submit_on_signal(rig, entry())
+                await submit_on_signal(rig, leave())
             assert "несвежее" in str(refused.value)
             assert rig.creates() == []
+            assert rig.executor.halted is None
+
+    run(scenario())
+
+
+def test_an_entry_from_a_candle_that_came_late_is_skipped(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Стережёт: вход по свече, дошедшей позже порога после закрытия, к брокеру не уходит.
+
+    13.11.2026 поток отставал на 2–4 минуты, и робот вошёл в 11:52 по свече,
+    закрывшейся в 11:50. Прежнее окно «свеча + порог» пускало вход до шести
+    минут после сигнала. Порог — «Допустимое опоздание заявки» (здесь 60 с).
+    Отказ, а не остановка: сигнал пропущен, следующая свеча решает заново.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            rig.clock.now = BAR0 + timedelta(seconds=61)
+            before = len(rig.broker.requests)
+            with pytest.raises(ExecutionRefused) as refused:
+                await submit_on_signal(rig, entry())
+            assert "сигнал пропущен" in str(refused.value)
+            assert "61 с" in str(refused.value)
+            assert rig.broker.requests[before:] == [], "отказ по опозданию потратил запрос"
+            assert rig.executor.halted is None
+
+    run(scenario())
+
+
+def test_an_entry_inside_the_allowed_lateness_is_sent(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Стережёт границу отсечки: свеча дошла через 59 с при пороге 60 — вход подан."""
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            rig.exchange.plans.append(filled((1, 100.0)))
+            rig.clock.now = BAR0 + timedelta(seconds=59)
+            await submit_on_signal(rig, entry())
+            assert len(rig.creates()) == 1
+            assert rig.executor.halted is None
+
+    run(scenario())
+
+
+def test_an_entry_waiting_for_its_own_reversal_close_is_not_late(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Стережёт: опоздание входа меряется по приходу свечи, а не по моменту подачи.
+
+    Переворот в той же свече: снятие тейка и закрытие идут перед входом,
+    и ответ брокера может занять десятки секунд (`/risk` 13.11.2026). Свеча
+    дошла через 20 с, вход подаётся через 61 с — это время робота, а не
+    свечи, и сигнал не пропускается.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            rig.exchange.plans.append(filled((1, 100.0)))
+            rig.clock.now = BAR0 + timedelta(seconds=20)
+            given = await rig.executor.fills_at(bar(BAR0 - timedelta(minutes=5)))
+            assert list(given) == []
+            rig.clock.now = BAR0 + timedelta(seconds=61)
+            await rig.executor.submit(entry())
+            assert len(rig.creates()) == 1, "вход отсечён за время закрытия на перевороте"
+            assert rig.executor.halted is None
+
+    run(scenario())
+
+
+def test_an_exit_from_a_candle_that_came_late_still_goes(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Стережёт: отсечка опоздания — только для входа; выход по той же поздней свече подан.
+
+    Выход в прежнем окне «свеча + порог»: отказ в нём оставил бы позицию,
+    у которой тейк уже снят, без сторожа.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            rig.exchange.plans.append(filled((1, 101.0)))
+            rig.clock.now = BAR1 + timedelta(seconds=61)
+            await submit_on_signal(rig, leave())
+            assert len(rig.creates()) == 2, "выход по поздней свече не подан"
             assert rig.executor.halted is None
 
     run(scenario())

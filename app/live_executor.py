@@ -826,6 +826,10 @@ class LiveExecutor:
         #: Свеча последнего `fills_at` — только закрытая: её закрытие —
         #: «текущая» у заявок движка этой свечи (Р-2, путь А гейта 0.2).
         self._signal: MarketCandle | None = None
+        #: Когда свеча сигнала дошла до исполнителя (`fills_at`). По нему, а не
+        #: по моменту подачи, меряется опоздание входа: на перевороте вход ждёт
+        #: снятия тейка и закрытия, и это время робота, а не свечи (`/risk` 13.11).
+        self._signal_arrived: datetime | None = None
         self._halt: str | None = None
         self._flattened = False
         #: Позиция по нашим сведениям: последнее чтение портфеля, совпавшее
@@ -955,9 +959,10 @@ class LiveExecutor:
         движок подаст по ней следом (`engine/ports.py`, «Когда подаются
         заявки свечи»). Незакрытая не запоминается: по ней движок не решает.
         """
+        arrived = self._clock()  # до замка: ожидание замка — время робота, не свечи
         async with self._lock:
             if not getattr(candle, "unsettled", False):
-                self._signal = candle
+                self._signal, self._signal_arrived = candle, arrived
             await self._sweep()
             await self._flush()
             self._count_limit_exits(candle)
@@ -1539,7 +1544,36 @@ class LiveExecutor:
         return timedelta(minutes=self._instrument.bar_minutes, seconds=self._limits.stale_after)
 
     def _refuse_stale(self, order: OrderRequest) -> None:
+        """Несвежее решение к брокеру не идёт; вход — строже прочих заявок.
+
+        Вход решён в момент закрытия свечи сигнала (`engine/pipeline.py`,
+        `_open_order`), и подаётся он только в пределах порога от этого
+        момента, без запаса на размер свечи. 13.11.2026 поток отставал
+        на 2–4 минуты, и робот вошёл по свече, дошедшей с опозданием
+        (решение владельца — отсекать). Тейки, снятия и выходы идут в прежнем
+        окне: отказ в них оставил бы позицию без сторожа. Отказ во входе
+        последствий не имеет (`engine/runner.py`, `_apply_decline`): позиция
+        не открылась, на перевороте прежняя уже закрыта — робот без позиции.
+
+        Опоздание меряется по приходу свечи сигнала (`_signal_arrived`), а не
+        по «сейчас»: на перевороте вход ждёт снятия тейка и закрытия.
+        """
         now = self._clock()
+        arrived = now
+        signal = self._signal
+        if signal is not None and close_time(signal) == order.submitted_at:
+            arrived = self._signal_arrived or now
+        lateness = arrived - order.submitted_at
+        allowed = timedelta(seconds=self._limits.stale_after)
+        if order.action is OrderAction.OPEN and lateness > allowed:
+            raise ExecutionRefused(
+                f"Вход ({_order_words(order)}) не подан, сигнал пропущен: свеча закрылась "
+                f"в {_msk(order.submitted_at)}, а дошла до робота в "
+                f"{in_moscow(arrived):%H:%M:%S} — опоздание "
+                f"{lateness.total_seconds():.0f} с при допустимом "
+                f"{allowed.total_seconds():.0f} с (поле «Допустимое опоздание заявки»). "
+                "Похоже на отставание потока свечей."
+            )
         oldest = now - self._freshness()
         if order.submitted_at < oldest:
             raise ExecutionRefused(

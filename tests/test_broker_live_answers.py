@@ -422,6 +422,58 @@ def test_a_holding_without_one_current_row_is_refused(rows: list[dict[str, Any]]
     assert parse_equity(rows) is None
 
 
+#: Денежная строка срока `T0` — есть в любом живом портфеле.
+MONEY_T0: dict[str, Any] = {
+    "type": "moneyLimit", "ticker": "RUB", "currency": "RUB", "term": "T0",
+    "quantity": 500000.0, "currentValueRub": 500000.0,
+    "agreementId": "AGREEMENT-1", "account": "ACCOUNT-1",
+}
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [holding_row("MXZ6", "T0", 1.0, currentValueRub=900.0)] * 2,
+        [{k: v for k, v in holding_row("MXZ6", "T0", 1.0, currentValueRub=900.0).items()
+          if k != "term"}] * 2,
+    ],
+    ids=["два-T0", "две-строки-без-срока"],
+)
+def test_an_ambiguous_holding_next_to_money_makes_the_account_size_unknown(
+    rows: list[dict[str, Any]],
+) -> None:
+    """Стережёт: неоднозначная строка «сейчас» — размер счёта «не знаем», а не деньги без неё.
+
+    Сторож выше спрашивает размер счёта у портфеля из одного актива: там
+    и пропуск актива даёт пустую сумму, то есть тот же `None`. Здесь рядом
+    исправные деньги — пропуск дал бы 500 000 без позиции, и дневной лимит
+    убытка считался бы от размера, которого никто не проверил.
+    """
+    assert parse_equity([MONEY_T0, *rows]) is None
+
+
+def test_the_current_row_is_the_t0_row_wherever_it_stands() -> None:
+    """Стережёт: берётся строка срока `T0`, а не первая строка актива.
+
+    Порядок сроков в ответе живьём не гарантирован, а у бумаг количество
+    по срокам законно расходится, пока сделка в расчёте. Строки нарочно
+    идут от `T365` к `T0`, и у каждого срока своё количество и стоимость:
+    «первая строка» дала бы 15 и чужой размер счёта, совпасть с `T0`
+    случайно она не может. Сторож ниже про бумаги ставит `T0` первой.
+    """
+    quantities = {"T365": 15.0, "T2": 15.0, "T1": 12.0, "T0": 10.0}
+    rows = [
+        {"type": "depoLimit", "ticker": "LKOH", "board": "TQBR", "term": term,
+         "quantity": amount, "currentValueRub": amount * 7000.0,
+         "agreementId": "AGREEMENT-1", "account": "ACCOUNT-1"}
+        for term, amount in quantities.items()
+    ]
+    position = read_holdings(rows).position("LKOH")
+    assert position is not None
+    assert position.quantity == 10.0
+    assert parse_equity(rows) == 70000.0
+
+
 def test_the_window_reads_one_contract_from_the_live_portfolio() -> None:
     """Стережёт: «позиция у брокера» боевой стороны окна — 1, а не 4 (`B-096`).
 
