@@ -1357,6 +1357,8 @@ class FakePort:
         self.desks: object | None = None
         #: Снимки счёта, пришедшие от опроса (`HistoryPort.account_read`, Э4 2г).
         self.accounts: list[tuple[str, object]] = []
+        #: Позиции по инструменту из тех же снимков (`HistoryPort.position_read`, B-097).
+        self.positions: list[tuple[str, int]] = []
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))
@@ -1398,6 +1400,9 @@ class FakePort:
 
     def account_read(self, account: str, funds: object) -> None:
         self.accounts.append((account, funds))
+
+    def position_read(self, ticker: str, signed: int) -> None:
+        self.positions.append((ticker, signed))
 
     def stream(self, on: bool) -> None:
         """Как настоящий порт: команду передал, причину отказа наружу **не** вернул.
@@ -3726,12 +3731,14 @@ def watch_of(
     every: float = 0.001,
     exchange_margin: Callable[[], Any] | None = None,
     halts: list[tuple[str, str]] | None = None,
+    positions: list[tuple[str, int]] | None = None,
 ):
     """Опрос счёта с мгновенным темпом и двумя списками: деньги и строки журнала.
 
     `halts` — куда складывать остановки робота. Довод, а не четвёртое
     возвращаемое значение: остановка нужна одной проверке из тридцати,
-    а распаковку по три поменяли бы все.
+    а распаковку по три поменяли бы все. `positions` — то же для позиции
+    по инструменту, которую опрос отдаёт порту (`B-097`).
     """
     money: list[Any] = []
     said: list[tuple[str, str, DecisionLevel]] = []
@@ -3748,6 +3755,9 @@ def watch_of(
             # читает то, что положил `halt`), и без этого проверки жалобы
             # про счёт зеленели бы на постоянном «робот работает».
             halted=lambda: bool(halts),
+            position=None if positions is None else (
+                lambda ticker, signed: positions.append((ticker, signed))
+            ),
         ),
         every=timedelta(seconds=every),
         exchange_margin=cast(Any, exchange_margin),
@@ -3820,6 +3830,27 @@ def test_a_gap_in_the_snapshot_yields_no_money_at_all(kwargs: dict, what: str) -
     snapshot = account_snapshot(**kwargs)
     assert live_feed.funds_of(snapshot, "MXU6") is None
     assert what in snapshot.funds_missing()
+
+
+def test_each_snapshot_tells_the_port_the_position_of_the_instrument() -> None:
+    """B-097: позиция по инструменту из снимка уходит порту — и при неполных деньгах.
+
+    Запомненную позицию боя порт сверяет по ней (`HistoryPort.position_read`);
+    снимок без рублей деньгам не годится, а позиция в нём та же правда.
+    """
+    positions: list[tuple[str, int]] = []
+    account = FakeAccount(
+        account_snapshot(quantity=0.0, free=None), account_snapshot(quantity=-2.0)
+    )
+    watch, _money, _said = watch_of(account, positions=positions)
+
+    async def scenario() -> None:
+        watch.start()
+        await until(lambda: ("MXU6", -2) in positions)
+        await watch.aclose()
+
+    asyncio.run(scenario())
+    assert positions[0] == ("MXU6", 0), "позиция неполного снимка порту не отдана"
 
 
 # --- ГО под контракт до первого входа (`D-046`, 05.09.2026) ---
@@ -4483,6 +4514,8 @@ def test_the_program_assembly_hands_the_account_snapshot_to_the_port(
     assert account == "9876543", f"номер договора не дошёл до порта: {account!r}"
     assert isinstance(money, AccountFunds), money
     assert (money.equity, money.free) == (210_850.0, 248_500.0), money
+    # B-097: позиция по инструменту тем же снимком — запомненная позиция боя по ней.
+    assert port.positions, "позиция из снимка счёта не дошла до порта"
 
 
 async def _noop_aclose() -> None:

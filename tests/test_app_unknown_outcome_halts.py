@@ -521,6 +521,9 @@ class _Reporter:
     def halt(self, event: str, reason: str) -> None:
         self.halts.append((event, reason))
 
+    def position_read(self, ticker: str, signed: int) -> None:
+        """Позиция из снимка счёта (`B-097`): проводке опроса нужен получатель."""
+
     @property
     def halted(self) -> str:
         """Причина остановки — как у настоящего порта: что положил `halt`.

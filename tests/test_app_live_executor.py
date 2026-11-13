@@ -834,10 +834,15 @@ def test_take_cancel_returns_only_after_the_cancelled_status(
     run(scenario())
 
 
-def test_take_cancelled_by_someone_else_halts(
+def test_take_cancelled_by_someone_else_with_the_same_position_is_placed_again(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Тейк снят не нами — остановка со словами, а не позиция без тейка молча."""
+    """Тейк снят не нами, позиция у брокера та же — робот не стоит, тейк встаёт заново.
+
+    Владелец 13.11.2026: своя заявка, снятая не командой программы, при
+    сходящейся позиции — строка «продолжаю», строка журнала команд закрыта,
+    тейк по уровню движка поставлен заново тем же путём, что после входа.
+    """
 
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
@@ -846,9 +851,44 @@ def test_take_cancelled_by_someone_else_halts(
             take_key = str(rig.creates()[-1]["clientOrderId"])
             rig.broker.cancel_outside(take_key)
             await heard()
+            assert await rig.executor.fills_at(bar(BAR0)) == []
+            assert rig.executor.halted is None, rig.executor.halted
+            [again] = rig.broker.live()
+            assert again.key != take_key and again.price == 110.0 and again.quantity == 1
+            [line] = [note for note in rig.notices if "снята вне программы" in note]
+            assert "сходится (лонг 1) — продолжаю" in line, line
+            assert "Тейк поставлен заново по уровню движка 110" in line, line
+            rows = {row.command.client_order_id: row for row in await rig.book.rows()}
+            assert rows[take_key].status is CommandStatus.CANCELLED
+
+    run(scenario())
+
+
+def test_take_cancelled_by_someone_else_with_another_position_closes_everything(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Тейк снят не нами, а позиция у брокера уже не та — «закрыть всё» и стоп (0020).
+
+    Робот держит лонг 1, у брокера позиции нет (закрыли руками вместе
+    с тейком). Тейк заново не ставится: он открыл бы шорт без сигнала.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            take_key = str(rig.creates()[-1]["clientOrderId"])
+            rig.broker.cancel_outside(take_key)
+            rig.broker.outside = -1
+            await heard()
             with pytest.raises(ExecutionHalted) as halted:
                 await rig.executor.fills_at(bar(BAR0))
-            assert "снята не программой" in halted.value.human
+            text = halted.value.human
+            assert "не сходится: у брокера позиции нет, у робота лонг 1" in text, text
+            assert "решение 0020" in text, text
+            assert rig.broker.live() == []
+            limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
+            assert len(limits) == 1, "снятый тейк поставлен заново при расходящейся позиции"
 
     run(scenario())
 
@@ -2525,10 +2565,11 @@ def test_a_halt_arriving_while_an_exit_is_checked_sends_no_order(
 ) -> None:
     """К1: остановка пришла посреди проверок выхода — продажа к брокеру не уходит.
 
-    Тейк сняли руками в приложении брокера, пока выход проходил проверки:
+    Биржа отклонила стоящий тейк (`8`), пока выход проходил проверки:
     позиция при этом та же, проверка позиции пропускает. Последняя преграда —
     проверка перед самой командой (`B-077`): без неё продажа ушла бы поверх
-    действий человека, прочитавшего «робот остановлен».
+    действий человека, прочитавшего «робот остановлен». (До 13.11.2026 здесь
+    было снятие не нами — теперь оно при той же позиции не остановка.)
     """
 
     async def scenario() -> None:
@@ -2536,11 +2577,11 @@ def test_a_halt_arriving_while_an_exit_is_checked_sends_no_order(
             await long_open(rig)
             await rig.executor.submit(arm(110.0, LevelTouch.RISE))
             [take] = rig.broker.live()
-            _on_first_ping(rig, monkeypatch, lambda: rig.broker.cancel_outside(take.key))
+            _on_first_ping(rig, monkeypatch, lambda: rig.broker.reject(take.key, "клиринг"))
             rig.clock.now = BAR1 + timedelta(seconds=5)
             with pytest.raises(ExecutionHalted) as halted:
                 await submit_on_signal(rig, leave())
-            assert "снята не программой" in halted.value.human
+            assert "Биржа отклонила заявку" in halted.value.human
             assert _market_sells(rig) == [], "после остановки ушла продажа"
             assert rig.broker.position(TICKER) == 1
 
@@ -2752,6 +2793,55 @@ def test_an_execution_known_at_reconcile_does_not_halt_when_the_stream_repeats_i
                 await heard()
                 assert fresh.halted is None, fresh.halted
                 assert await fresh.fills_at(bar(BAR1)) == []
+            finally:
+                await fresh.close()
+
+    run(scenario())
+
+
+def test_a_take_of_the_last_run_cancelled_outside_does_not_stop_the_start(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Утро 13.11.2026: тейк прошлого запуска сняли не программой, позиции у брокера нет.
+
+    Сверка при включении (`_prepare`: позиция ноль, потом журнал) получает
+    по ключу «снята» (`4`) не нашим снятием. Позиция сходится с роботом (ноль) —
+    робот не стоит, строка журнала команд закрыта, одна строка «снята вне
+    программы… продолжаю». Тейк заново не ставится: позиции нет.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+            await rig.executor.close()
+            rig.broker.cancel_outside(take.key)  # программа закрыта: событие уходит в пустоту
+            rig.broker.outside = -1  # позицию закрыли руками
+            assert rig.session is not None
+
+            async def no_minutes(since: datetime) -> list[Candle]:
+                return []
+
+            fresh = LiveExecutor(
+                Wiring(rig.session, rig.book, no_minutes, clock=rig.clock),
+                Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP),
+                FAST,
+            )
+            await fresh.start()
+            try:
+                assert await fresh.wait_connected(2.0)
+                assert await fresh.check_position(0) == 0
+                notes = await fresh.settle_open_commands(0)
+                assert fresh.halted is None, fresh.halted
+                assert not fresh.unsettled
+                [line] = notes
+                assert f"из журнала: {take_name()}" in line, line
+                assert "снята вне программы" in line, line
+                assert "сходится (позиции нет) — продолжаю" in line, line
+                assert rig.broker.live() == [], "тейк поставлен при нулевой позиции"
+                rows = {row.command.client_order_id: row for row in await rig.book.rows()}
+                assert rows[take.key].status is CommandStatus.CANCELLED
             finally:
                 await fresh.close()
 
@@ -3168,14 +3258,15 @@ def test_a_take_filled_in_the_outage_and_missed_on_the_link_reaches_the_engine_o
 @pytest.mark.parametrize(
     "asked_on_link", [True, False], ids=["статус при связи получен", "статус при связи не получен"]
 )
-def test_a_take_cancelled_outside_during_the_outage_halts_in_words_after_the_link(
+def test_a_take_cancelled_outside_during_the_outage_is_placed_again_after_the_link(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker, asked_on_link: bool
 ) -> None:
-    """B-079: тейк сняли не мы, пока связи не было, — после связи остановка словами.
+    """B-079 и владелец 13.11.2026: тейк сняли не мы, пока связи не было, позиция та же.
 
     Событие снятия потеряно; статус по ключу добирает его при переподключении
-    или, если тогда брокер не ответил, на сверке. Робот стоит с причиной
-    «снята не программой»; ни одна заметка сверки не называет тейк живым.
+    или, если тогда брокер не ответил, на сверке. Позиция у брокера сходится —
+    сверка проходит, тейк встаёт заново, строка «снята вне программы…
+    продолжаю»; ни одна заметка сверки не называет снятый тейк живым.
     """
 
     async def scenario() -> None:
@@ -3192,10 +3283,13 @@ def test_a_take_cancelled_outside_during_the_outage_halts_in_words_after_the_lin
                 assert down.calls, "статус при связи не спрашивался — проверка пуста"
             assert rig.broker.lost, "снятие пришло потоком — проверка пуста"
             result = await reconcile(rig.executor, expected=1)
-            text = result.halted or ""
-            assert "снята не программой" in text, text
+            assert result.halted is None, result.halted
             await heard()
             assert not [note for note in rig.notices if "жива" in note], rig.notices
+            told = [note for note in rig.notices if "снята вне программы" in note]
+            assert len(told) == 1 and "продолжаю" in told[0], rig.notices
+            [again] = rig.broker.live()
+            assert again.key != take.key and again.price == 110.0
 
     run(scenario())
 
@@ -3290,14 +3384,15 @@ def test_a_take_partly_filled_before_the_link_returned_is_not_a_mismatch_to_clos
     run(scenario())
 
 
-def test_rearming_the_same_level_after_the_broker_cancelled_the_take_is_a_halt(
+def test_rearming_the_same_level_after_the_broker_cancelled_the_take_places_it_once(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Тейк снят не нами (клиринг, срок, руками), движок вооружает тот же уровень — стоп.
+    """Тейк снят не нами (клиринг, срок, руками), движок вооружает тот же уровень.
 
     Ответ «уже стоит» на мёртвый тейк оставил бы позицию без защиты молча.
-    Ожидаемое: остановка с причиной «снята не программой», второй лимитной
-    заявки нет — робот стоит, решает человек (`B-077`).
+    Позиция та же — снятый тейк встаёт заново ровно один раз (проход перед
+    заявкой, `_sweep`), а вооружение того же уровня поверх живого — пустое:
+    у брокера одна живая лимитная, робот не стоит.
     """
 
     async def scenario() -> None:
@@ -3308,11 +3403,12 @@ def test_rearming_the_same_level_after_the_broker_cancelled_the_take_is_a_halt(
             rig.broker.cancel_outside(take.key)
             await heard()
             rig.clock.now = BAR1 + timedelta(seconds=5)
-            with pytest.raises(ExecutionHalted) as halted:
-                await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
-            assert "снята не программой" in halted.value.human
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE, at=BAR1))
+            assert rig.executor.halted is None, rig.executor.halted
             limits = [body for body in rig.creates() if body["timeInForce"] == DAY]
-            assert len(limits) == 1, "снятый брокером тейк поставлен заново после остановки"
+            assert len(limits) == 2, "снятый тейк не поставлен заново или поставлен дважды"
+            [again] = rig.broker.live()
+            assert again.key != take.key and again.price == 110.0
 
     run(scenario())
 
@@ -3658,17 +3754,17 @@ def test_a_live_take_that_changed_between_reconnects_is_told_again(
     assert "1 из 3" in alive[0] and "2 из 3" in alive[1], alive
 
 
-def test_a_take_cancelled_outside_after_it_was_told_alive_still_halts(
+def test_a_take_cancelled_outside_after_it_was_told_alive_is_still_reported(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """Н5: «уже сказано, что жива» не отменяет сверку — снятый не нами тейк останавливает робота.
+    """Н5: «уже сказано, что жива» не глушит сверку — снятие не нами названо строкой.
 
     Первый обрыв — тейк жив, заметка сказана. За второй тейк сняли
-    в приложении брокера. Стережёт: после второй связи робот стоит словами
-    «снята не программой».
+    в приложении брокера, позиция та же. Стережёт: после второй связи
+    строка «снята вне программы… продолжаю» есть, тейк встал заново.
     """
 
-    async def scenario() -> tuple[str | None, str | None]:
+    async def scenario() -> tuple[str | None, str | None, list[str], int]:
         gate, sleep = _gated()
         async with make_rig(tmp_path, store, broker, sleep=sleep) as rig:
             await long_open(rig, volume=3)
@@ -3676,8 +3772,13 @@ def test_a_take_cancelled_outside_after_it_was_told_alive_still_halts(
             [take] = rig.broker.live()
             first = await _outage(rig, gate, lambda: None)
             assert [note for note in rig.notices if "жива" in note], "заметки «жива» не было"
-            return first, await _outage(rig, gate, lambda: rig.broker.cancel_outside(take.key))
+            second = await _outage(rig, gate, lambda: rig.broker.cancel_outside(take.key))
+            told = [note for note in rig.notices if "снята вне программы" in note]
+            live = [order for order in rig.broker.live() if order.key != take.key]
+            return first, second, told, len(live)
 
-    first, second = run(scenario())
+    first, second, told, live = run(scenario())
     assert first is None, first
-    assert second is not None and "снята не программой" in second, second
+    assert second is None, second
+    assert len(told) == 1 and "продолжаю" in told[0], told
+    assert live == 1, "тейк заново не поставлен"

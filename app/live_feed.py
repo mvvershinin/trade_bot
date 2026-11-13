@@ -1568,6 +1568,11 @@ class FundsWatchers:
     #: ничего не делать (`D-086`, находка Н-2). Спрашивается, а не хранится
     #: флагом: остановить робота может кто угодно ещё, в том числе движок.
     halted: Callable[[], bool]
+    #: Позиция по инструменту у брокера из того же снимка: тикер и количество
+    #: со знаком (`B-097`). Получатель — порт: запомненная позиция боя
+    #: «на момент остановки» сменяется свежей. Возврат немедленный. `None` —
+    #: позицию никому не отдавать.
+    position: Callable[[str, int], None] | None = None
 
 
 class FundsWatch:
@@ -1775,6 +1780,7 @@ class FundsWatch:
                 "Подробность — в выводе программы в консоли."
             )
             return
+        self._tell_position(snapshot)
         self._refresh_exchange_margin(snapshot.taken_at)
         margin = self._margin_now(snapshot)
         money = funds_of(snapshot, self._ticker, margin=margin)
@@ -1798,6 +1804,25 @@ class FundsWatch:
         # из-за чего робот не входит.
         self._say_margin(margin)
         self._watch.funds(snapshot.account or "", money)
+
+    def _tell_position(self, snapshot: AccountSnapshot) -> None:
+        """Позиция по инструменту из снимка — порту (`B-097`), хоть деньги и неполны.
+
+        Непрочитанная позиция своего тикера (`UnexpectedAnswer`) и дробное
+        количество — не отдаются: запомненная позиция остаётся со своей
+        пометкой «на момент остановки», а не подменяется догадкой.
+        """
+        receiver = self._watch.position
+        if receiver is None:
+            return
+        ticker = self._ticker
+        try:
+            mine = snapshot.position(ticker)
+        except BrokerError:
+            return
+        quantity = 0.0 if mine is None else float(mine.quantity)
+        if quantity.is_integer():
+            receiver(ticker, int(quantity))
 
     def _margin_now(self, snapshot: AccountSnapshot) -> MarginPerContract | None:
         """ГО под контракт: у брокера, в памяти или оценкой по бирже. `None` — никак.
@@ -2260,6 +2285,7 @@ class LiveLink:
             say=self._port.note,
             halt=self._port.halt,
             halted=lambda: bool(self._port.halted),
+            position=self._port.position_read,
         )
 
     async def _exchange_margin(self, ticker: str) -> float | None:

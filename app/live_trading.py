@@ -417,7 +417,9 @@ class LiveDesks:
         before = await self._position(executor, (), None)
         if before != 0:
             raise FactRefused(self._not_flat(before, request, ()), position=before)
-        notes = await executor.settle_open_commands()
+        # Робот включается без позиции: заявку прошлого запуска, снятую не нами,
+        # сверка сравнивает с нулём и при совпадении не останавливает (13.11.2026).
+        notes = await executor.settle_open_commands(0)
         tail = _tail(notes)
         if executor.unsettled:
             raise FactRefused(

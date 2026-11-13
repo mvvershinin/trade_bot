@@ -5285,12 +5285,36 @@ class HistoryPort(TerminalPort):
             return None
         return desk
 
-    def _refused_position(self, position: int | None) -> None:
+    def position_read(self, ticker: str, signed: int) -> None:
+        """Опрос счёта прочитал позицию у брокера — запомненная позиция боя по ней (`B-097`).
+
+        Запомненная позиция («на момент остановки») прежде снималась только
+        сборкой боя: после остановки окно часами показывало лонг, которого
+        у брокера давно не было, и владелец не понимал, почему бой не включается.
+        Теперь её сверяет каждый снимок счёта — сразу при подключении и раз
+        в полминуты: у брокера ноль — позиции нет; та же — остаётся с уровнем
+        тейка и словами о нём; другая — на её место встаёт брокерская
+        (`_refused_position`). Остановку робота не снимает: это кнопка владельца.
+        У собранной пары позиция своя, опрос её не трогает.
+        """
+        left = self._live.left
+        if left is None or self._live.desk is not None or self._live.opening:
+            return
+        if ticker != self._values.instrument.strip() or signed == left.signed:
+            return
+        self._refused_position(signed, how="")
+        self._publish_live()
+
+    def _refused_position(
+        self, position: int | None, *, how: str = ", при попытке включить бой,"
+    ) -> None:
         """Отказ включения прочитал позицию у брокера — запомненная позиция по ней (З5).
 
         Ноль — оставшейся позиции нет. Не ноль — она свежая: совпала с запомненной
         по знаку и объёму — та остаётся с новой отметкой времени, иначе на её место
         встаёт позиция брокера (цены и тейка он при отказе не называет).
+
+        :param how: при каком чтении — для слов «по брокеру на HH:MM МСК…».
         """
         if position is None:
             return
@@ -5298,7 +5322,7 @@ class HistoryPort(TerminalPort):
             self._live.left, self._live.left_note, self._live.left_take = None, "", ""
             return
         at = f"{in_moscow(self._clock()):%H:%M}"
-        note = f"по брокеру на {at} МСК, при попытке включить бой, — могла измениться"
+        note = f"по брокеру на {at} МСК{how} — могла измениться"
         left = self._live.left
         if left is None or left.signed != position:
             left = FactPosition(

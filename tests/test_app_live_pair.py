@@ -1409,33 +1409,70 @@ def test_after_close_everything_the_left_position_shows_no_take(
 def test_a_take_cancelled_at_the_broker_is_not_shown_on_the_left_position(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """N3: тейк сняли не мы (биржа, руками) — бой встал; позиция та же, уровня у неё нет.
+    """N3: тейк отклонила биржа (`8`) — бой встал; позиция та же, уровня у неё нет.
 
     Позиция у брокера совпадает с движком (лонг 1), а тейка у брокера уже
     нет. Стережёт: окно не показывает уровень, которого нет, — уровень
     остаётся у запомненной позиции, только пока заявка тейка жива в журнале.
+    (Снятие не нами при той же позиции с 13.11.2026 не остановка — тейк
+    встаёт заново, поэтому сценарий — отказ биржи.)
     """
     monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
 
     async def go() -> LiveStatus:
         bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
         try:
-            await _connect(bench)
-            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
-            [take] = [order for order in broker.live() if order.order_type == "2"]
-            broker.cancel_outside(take.key)
-            await asyncio.sleep(0.2)
-            await bench.port.wait()
-            await bench.port.wait()
+            await _halted_with_a_long(bench, broker)
             return bench.port.live_status()
         finally:
             await _close(bench, session)
 
     status = loop.run_until_complete(go())
-    assert status.halted and not status.on, "снятие тейка не остановило бой — сценарий не тот"
+    assert status.halted and not status.on, "отказ тейка не остановил бой — сценарий не тот"
     assert status.position is not None and status.position.signed == 1, status.position
     assert status.position.take_level is None, "окно показывает снятый тейк"
     assert "на момент остановки" in status.position_note, status.position_note
+
+
+async def _halted_with_a_long(bench: Bench, broker: FakeBroker) -> None:
+    """Бой с лонгом 1 и тейком; биржа отклонила тейк — робот стоит, позиция запомнена."""
+    await _connect(bench)
+    await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+    [take] = [order for order in broker.live() if order.order_type == "2"]
+    broker.reject(take.key, "клиринг")
+    await asyncio.sleep(0.2)
+    await bench.port.wait()
+    await bench.port.wait()
+
+
+def test_the_left_position_is_read_again_at_the_broker_by_the_account_poll(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-097: робот стоит с запомненной позицией, у брокера её уже нет — окно видит ноль.
+
+    13.11.2026: после остановки окно часами показывало «лонг … на момент
+    остановки», хотя позицию закрыли, а связь была. Опрос счёта читает позицию
+    у брокера (`position_read` — тем же вызовом, что опрос в программе);
+    запомненная сменяется свежей, остановка остаётся до кнопки владельца.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[LiveStatus, LiveStatus]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _halted_with_a_long(bench, broker)
+            before = bench.port.live_status()
+            broker.outside = -1  # позицию закрыли руками в приложении брокера
+            bench.port.position_read(SYMBOL, broker.position(SYMBOL))
+            return before, bench.port.live_status()
+        finally:
+            await _close(bench, session)
+
+    before, after = loop.run_until_complete(go())
+    assert before.position is not None and "на момент остановки" in before.position_note, before
+    assert after.position is None, after.position
+    assert after.position_note == "" and after.take_note == "", after
+    assert after.halted, "опрос счёта снял остановку — это кнопка владельца"
 
 
 # ------------------------------------------- третий /risk 2в: Н1–Н4

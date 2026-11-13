@@ -156,7 +156,7 @@ class _Preparing:
     async def broker_position(self) -> int:
         return _answer(self.fresh.pop(0))
 
-    async def settle_open_commands(self) -> tuple[str, ...]:
+    async def settle_open_commands(self, expected: int | None = None) -> tuple[str, ...]:
         return self.notes
 
     async def start(self) -> None:
