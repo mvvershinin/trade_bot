@@ -76,6 +76,7 @@ from PySide6.QtWidgets import (
 from market import warmup_bars
 from ui.algorithm_dialog import AlgorithmDialog
 from ui.confirm_changes import confirm_changes
+from ui.formatting import headline
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
     FIELD_CAPTIONS,
@@ -540,6 +541,19 @@ def _decimal(
 ALERT_ROLE = "терминал-тревога"
 
 
+def trailing_in_live(timeframe: str) -> str:
+    """Как часто скользящий тейк двигается в бою — по размеру свечи из поля.
+
+    Дополнение владельца счёта 13.11.2026: следствие запрета D-141 должно
+    быть видно всё время, а не только в отказе. В бою уровень едет лишь
+    на закрытии свечи.
+    """
+    return (
+        f"⚠️ В бою скользящий тейк двигается раз в свечу ({timeframe}) — "
+        "на её закрытии, а не каждую минуту."
+    )
+
+
 def _alert(text: str = "") -> QLabel:
     """Строка тревоги под полем: цвет опасности из темы, полужирный.
 
@@ -973,6 +987,8 @@ class SettingsDialog(QDialog):
         # которых ещё нет.
         self.take_fixed.setChecked(True)
         self.take_method.buttonToggled.connect(self._sync_take)
+        # Строка про бой называет размер свечи — сменили свечу, строка следом.
+        self.timeframe.currentTextChanged.connect(self._sync_take)
 
         # ⚠️ Нижняя граница обоих полей — ноль, хотя ноль отступа негоден.
         # Границей поля это правило не выражается: Qt подрезал бы пришедшее
@@ -2087,20 +2103,20 @@ class SettingsDialog(QDialog):
         widget = self._widget_of(field) if field else None
         caption = self._caption_of(widget) if widget is not None else ""
         where = next((tab for name, tab, _attr in PLACEMENT if name == field), "")
-        # Причина целиком — у поля, если поле известно; наверху — куда идти.
-        # Одна и та же фраза дважды на одном экране читалась как два отказа.
+        # Одной строкой — что поменять (B-101, владелец 13.11.2026: абзац
+        # с кодом решения не прочитан). Почему — в подсказке, наведением.
+        short = headline(reason).rstrip(".")
+        place = f"поле «{caption}» на вкладке «{where}»: " if caption else ""
         self.refusal_note.setText(
-            f"Настройки не приняты: поменяйте поле «{caption}» на вкладке "
-            f"«{where}» — причина под полем. В силе прежние настройки; ваши "
-            "правки остались в полях и не применены."
-            if caption else
-            f"Настройки не приняты. {reason} Ваши правки остались в полях "
-            "и не применены."
+            f"Настройки не приняты: {place}{short}. Остальные правки тоже не применены — "
+            "они остались в полях."
         )
+        self.refusal_note.setToolTip(reason)
         self.refusal_note.setVisible(True)
         note = self._field_note(field, "refusal") if field else None
         if note is not None and widget is not None:
-            note.setText(reason)
+            note.setText(short)
+            note.setToolTip(reason)
             note.setVisible(True)
             page = self.page_of(where)
             if page is not None:
@@ -2962,7 +2978,8 @@ class SettingsDialog(QDialog):
                 f"и дальше поедет за ценой с отступом {_pct(self.trailing_offset.value())}; "
                 "назад он не поедет никогда. Пока порог не пройден, уровня "
                 "выхода нет совсем. Замеров по скользящему уровню у проекта "
-                "нет — сравнивать его будет не с чем."
+                "нет — сравнивать его будет не с чем. "
+                + trailing_in_live(self.timeframe.currentText())
             )
         if self.take_profit.value() <= 0:
             return (

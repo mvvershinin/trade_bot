@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ui.formatting import fmt_price, fmt_volume
+from ui.formatting import fmt_price, fmt_volume, headline
 from ui.models import LiveView, Side
 from ui.status_panel import fact_side, position_head
 
@@ -105,7 +105,7 @@ class LiveLook:
 
 
 def _reasons(view: LiveView) -> str:
-    """Все причины недоступности — списком, по строке на причину."""
+    """Все причины недоступности — списком: что нажать, под ней — почему."""
     return "\n".join(f"• {reason}" for reason in view.why_not)
 
 
@@ -159,7 +159,7 @@ def _asked(_view: LiveView) -> LiveLook:
 
 def _refused(view: LiveView) -> LiveLook:
     return LiveLook(
-        f"Бой не включён: {view.refused}",
+        f"Бой не включён: {headline(view.refused)}",
         f"Бой не включён: {view.refused}"
         + (f"\n\nСейчас мешает:\n{_reasons(view)}" if view.why_not else ""),
         "danger",
@@ -167,7 +167,7 @@ def _refused(view: LiveView) -> LiveLook:
 
 
 def _unavailable(view: LiveView) -> LiveLook:
-    first = view.why_not[0] if view.why_not else "причина не названа"
+    first = headline(view.why_not[0]) if view.why_not else "причина не названа"
     # Число причин — **до** первой: строка в панели обрезается справа,
     # и счёт в хвосте пропадал бы первым (проверено на ширине 720).
     count = len(view.why_not)

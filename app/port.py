@@ -139,6 +139,7 @@ from ui.models import (
     FIELD_CAPTIONS,
     LIVE_LIMITS_BOUNDS,
     STEP_WAIT,
+    AccountLine,
     BacktestOptions,
     BacktestRequest,
     Candle,
@@ -258,6 +259,21 @@ _TRAILING_FIX = (
 
 #: Свеча в 1 минуту: порога меньше неё нет, остаётся свеча крупнее.
 _TRAILING_FIX_ONE = "Возьмите свечу крупнее 1 минуты или выключите скользящий уровень."
+
+#: Одной строкой — что переключить и что из этого выйдет (B-101, владелец
+#: 13.11.2026 15:15 и дополнение того же дня).
+_TRAILING_SHORT = (
+    "поставьте «Наибольшая свеча для проверки по минуткам» = 1 минута (вкладка «Деньги») "
+    "или выберите «Неподвижная цель»; в бою скользящий тейк передвигается раз в {bar} мин "
+    "— на закрытии свечи, не каждую минуту"
+)
+_TRAILING_SHORT_ONE = (
+    "выберите «Неподвижная цель» (вкладка «Вход и выход») или свечу крупнее 1 минуты"
+)
+
+#: Строка журнала при включении боя со скользящим тейком (дополнение владельца
+#: 13.11.2026): в бою уровень двигается только на закрытии свечи (D-141).
+_TRAILING_IN_LIVE = "Скользящий тейк в бою двигается раз в {bar} мин (на закрытии свечи)."
 
 #: Почему загрузка истории и бой не идут вместе (решение владельца 01.11.2026, 0066).
 _LOAD_IN_LIVE = (
@@ -1488,6 +1504,7 @@ class HistoryPort(TerminalPort):
                 "Итог — следующей строкой.",
                 DecisionLevel.WARNING,
             )
+            self._say_trailing_in_live()
             self._publish_live()
             self.refresh("включение боя")
             return
@@ -1500,6 +1517,22 @@ class HistoryPort(TerminalPort):
             self._say_closed("Бой выключен")
         self._publish_live()
         self.refresh("выключение боя")
+
+    def _say_trailing_in_live(self) -> None:
+        """Бой включается со скользящим тейком — строкой, как часто он двигается.
+
+        Запрет D-141 сюда не дошёл бы (`_live_blockers`), значит скользящий
+        уровень в бою разрешён: порог минуток меньше свечи, и уровень едет
+        только на закрытии свечи — раз в её размер, а не каждую минуту.
+        """
+        values = self._values
+        if not (values.take_profit_enabled and values.trailing_enabled):
+            return
+        try:
+            bar = convert.timeframe_of(values.timeframe).minutes
+        except convert.SettingsRefused:
+            return
+        self.note("Скользящий тейк в бою", _TRAILING_IN_LIVE.format(bar=bar))
 
     def live_status(self) -> LiveStatus:
         """Снимок боя для окна. Ни одно число здесь не считается заново."""
@@ -1556,6 +1589,14 @@ class HistoryPort(TerminalPort):
         if first:
             # Причина «счёт не прочитан» снялась — окно узнаёт снимком.
             self._publish_live()
+
+    def account_line(self, line: AccountLine) -> None:
+        """Строка «Счёт у брокера» от опроса счёта — в окно как есть (решение 0070).
+
+        Порт ничего в ней не считает и не сверяет с «фактом»: смысл строки —
+        показать брокера рядом с тем, что думает программа, а не вместо.
+        """
+        self._send(self.account_changed, line)
 
     def stream(self, on: bool) -> None:
         """Команда окна: подключиться к брокеру или отключиться.
@@ -3574,6 +3615,9 @@ class HistoryPort(TerminalPort):
         не будет. Посторонний отказ в это время (загрузка «занято»,
         подключение) не запоминается — иначе окно назвало бы чужую причину.
         """
+        # Отказ из двух частей (первая строка — что нажать, B-101) в журнал
+        # и строку состояния идёт одной строкой.
+        reason = reason.replace("\n", " — ")
         self.note(event, reason, DecisionLevel.WARNING)
         if run and self._back.pending is not None:
             self._back.trouble = reason
@@ -4622,22 +4666,26 @@ class HistoryPort(TerminalPort):
         (позиция у брокера, незакрытые команды) знает только сборка
         исполнителя — они приходят отказом `FactRefused`.
         """
+        # Первая строка — что нажать (B-101): окно показывает её у кнопки,
+        # целиком — в подсказке (`ui.formatting.headline`).
         checks = (
-            (not self._watch.observing,
+            (not self._watch.observing, "нажмите «Подключиться»\n"
              "Нет потока котировок: бой идёт поверх живого потока, сначала «Подключиться»."),
-            (self._watch.observing and self._live.funds is None, _NO_FUNDS),
-            (self._back.span is not None,
+            (self._watch.observing and self._live.funds is None,
+             f"подождите до 30 с: счёт у брокера ещё не прочитан\n{_NO_FUNDS}"),
+            (self._back.span is not None, "нажмите «Вернуться к текущим»\n"
              "Показ закреплён на отрезке истории: бой идёт по текущим барам, сначала "
              "«Вернуться к текущим»."),
-            (bool(self._halt.reason),
+            (bool(self._halt.reason), "нажмите «Возобновить работу»\n"
              f"Робот остановлен, сначала «Возобновить работу»: {self._halt.reason}"),
             (self._live.desks is None,
              "Подача заявок в этой сборке программы не подключена."),
-            (self._loading(), _LOAD_IN_LIVE),
-            (self._history.term.holding,
+            (self._loading(), f"дождитесь конца загрузки истории\n{_LOAD_IN_LIVE}"),
+            (self._history.term.holding, "дождитесь уточнения контрактов у биржи\n"
              "Идёт первое уточнение контрактов у биржи: решения робота ждут его ответа. "
              "Включите бой после него."),
             (self._live.hand is not None and not self._live.hand.done(),
+             "дождитесь итога ручного действия\n"
              "Идёт снятие заявки или закрытие позиции руками: включите бой после его итога."),
         )
         reasons = [words for failed, words in checks if failed]
@@ -4685,7 +4733,7 @@ class HistoryPort(TerminalPort):
             # Отказ и при пустом «факте»: незакрытую команду, которая отложит
             # пересборку, из окна не видно (B-084). Слова — без выдуманной причины:
             # что делать в два шага и почему (`/risk` 2в З10).
-            hint = _TWO_STEPS.format(
+            hint = "В бою сначала смените свечу, затем — скользящий уровень\n" + _TWO_STEPS.format(
                 now=settings.timeframe, was=built.values.timeframe,
                 limit=convert.minute_bar_limit_of(built.values),
             )
@@ -6305,6 +6353,13 @@ class HistoryPort(TerminalPort):
             if forecast is None
             else _live_overlay(run, forecast, timeframe, ruble_per_point=rubles, pending=pending)
         )
+        # Бой просили, а «факт» не собран (остановка, сборка): показан прогон-
+        # симуляция, и его сделки в бою — не сделки (решение 0070, владелец
+        # 13.11: «бой включён и заявки из симуляции отображены»). Ни меток,
+        # ни уровней, ни позиции прогона — только настоящие сделки из базы.
+        own = None if self._sim_in_combat() else run
+        if own is None:
+            markers, paths = (), ()
         # Бой: сделки прежних заходов — тем же списком, что у таблицы (B-100).
         live = self._live.shown = self._live_trades(run, symbol, timeframe)
         if live is not None:
@@ -6321,7 +6376,7 @@ class HistoryPort(TerminalPort):
             average_label=convert.average_label(frame.values),
             markers=markers,
             paths=paths,
-            levels=_levels(run),
+            levels=() if own is None else _levels(run),
             shades=convert.shades_of(candles, frame.engine),
             seams=seams,
             basis=self._basis,
@@ -6329,7 +6384,9 @@ class HistoryPort(TerminalPort):
         self._keep_forming(
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
         )
-        self._live.open_row = _open_row(run, candles, rubles, self._origin)
+        self._live.open_row = () if own is None else _open_row(
+            run, candles, rubles, self._origin
+        )
         self._send(self.trades_replaced, *self._trades_of(run, live))
         # Прогон по склейке называет все контракты периода, а не код из настроек.
         named = (
@@ -6338,7 +6395,11 @@ class HistoryPort(TerminalPort):
         )
         self._say_result(frame, named, candles, run)
         self._publish_journal(run)
-        self._publish_state(self._state(frame, symbol, candles, run))
+        self._publish_state(self._state(frame, symbol, candles, own))
+
+    def _sim_in_combat(self) -> bool:
+        """Бой просили, а показан не «факт»: прогон по истории или наблюдение (0070)."""
+        return self._live.wanted and self._origin is not RunOrigin.LIVE
 
     def _forget_report(self) -> None:
         """Обещанный отчёт не состоялся — сказать это вслух, а не промолчать.
@@ -6407,8 +6468,14 @@ class HistoryPort(TerminalPort):
     def _live_trades(
         self, run: HistoryRun, symbol: str, timeframe: Timeframe
     ) -> live_history.LiveTrades | None:
-        """Бой: сделки прежних заходов из базы плюс текущего (B-100). `None` — не бой."""
-        if self._origin is not RunOrigin.LIVE:
+        """Бой: сделки прежних заходов из базы плюс текущего (B-100). `None` — не бой.
+
+        Бой просили, а «факт» не собран (`_sim_in_combat`) — текущего захода нет:
+        только сделки из базы, прогон-симуляция в таблицу не идёт (0070).
+        """
+        if self._sim_in_combat():
+            run = HistoryRun()
+        elif self._origin is not RunOrigin.LIVE:
             return None
         return live_history.compose(
             run, self._live.history, symbol=symbol, timeframe=timeframe, since=self._live.since,
@@ -6437,7 +6504,7 @@ class HistoryPort(TerminalPort):
         Отказ — не пустая таблица (правило 13): строка журнала один раз
         на причину, причина в подписи итога, текущий заход показан.
         """
-        if self._origin is not RunOrigin.LIVE:
+        if self._origin is not RunOrigin.LIVE and not self._live.wanted:
             return
         entry = self._live.entry
         current = None if entry is None else entry.id
@@ -6700,12 +6767,17 @@ def _settings_blocks(values: Settings, was: Settings) -> tuple[tuple[str, str], 
         name for name in ("trailing_enabled", "minute_bar_limit", "timeframe")
         if getattr(values, name) != getattr(was, name)
     ]
+    # Первая строка — что поменять (B-101), дальше — почему.
     checks = (
-        (trailing, moved[0] if moved else "trailing_enabled", _TRAILING_ON_MINUTES.format(
-            bar=timeframe.minutes, limit=convert.minute_bar_limit_of(values),
-            fix=_TRAILING_FIX if timeframe.minutes > 1 else _TRAILING_FIX_ONE)),
-        (values.price_step <= 0, "instrument", _NO_STEP),
+        (trailing, moved[0] if moved else "trailing_enabled",
+         (_TRAILING_SHORT if timeframe.minutes > 1 else _TRAILING_SHORT_ONE).format(
+             bar=timeframe.minutes) + "\n"
+         + _TRAILING_ON_MINUTES.format(
+             bar=timeframe.minutes, limit=convert.minute_bar_limit_of(values),
+             fix=_TRAILING_FIX if timeframe.minutes > 1 else _TRAILING_FIX_ONE)),
+        (values.price_step <= 0, "instrument", f"дождитесь шага цены от биржи\n{_NO_STEP}"),
         (not volume.is_integer() or volume < 1, "volume",
+         "объём — целое число контрактов, не меньше 1\n"
          f"Объём {volume:g} — не целое число контрактов: боевой заявки такой не бывает."),
     )
     return tuple((field, words) for failed, field, words in checks if failed)

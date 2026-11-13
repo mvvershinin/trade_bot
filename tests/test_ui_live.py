@@ -478,7 +478,6 @@ def test_the_fact_layer_is_named_by_the_data_and_not_by_the_mode(setup) -> None:
     assert not any(MarkerKind.WAITING.label in text for text in texts), (
         "в бою легенда обещает «исполнится по открытию следующей свечи» (D-172)"
     )
-    assert any("Прогноз" in text for text in texts), "в легенде нет «Прогноза»"
 
     _show(window, _combat(origin=RunOrigin.PAPER))
     assert RunOrigin.PAPER.label in chart.fact_box.text()
@@ -486,6 +485,34 @@ def test_the_fact_layer_is_named_by_the_data_and_not_by_the_mode(setup) -> None:
 
     _show(window, LiveStatus(available=True))
     assert chart.fact_box.text() == "Факт", "без боя подпись утверждает происхождение"
+
+
+def test_the_forecast_is_hidden_in_combat_until_the_owner_turns_it_on(setup) -> None:
+    """Стережёт: в бою слой «Прогноз» снят по умолчанию, галочкой возвращается (0070).
+
+    Владелец 13.11.2026: «бой включён и заявки из симуляции отображены» —
+    полые метки модели он принимал за заявки. Вне боя слой включён, как был;
+    включённый в бою рукой — следующим снимком боя не гасится.
+    """
+    window, _port, _asked = setup
+    chart = window.chart
+
+    def legend() -> list[str]:
+        return [text.text() for _icon, text in chart.legend.rows]
+
+    assert chart.plan_box.isChecked(), "вне боя «Прогноз» снят — так не было"
+    _show(window, _combat())
+    assert not chart.plan_box.isChecked(), "в бою «Прогноз» показан по умолчанию"
+    assert not any("Прогноз" in text for text in legend()), legend()
+
+    _show(window, LiveStatus(available=True))
+    assert chart.plan_box.isChecked(), "бой выключен, а «Прогноз» остался снят"
+
+    _show(window, _combat())
+    chart.plan_box.setChecked(True)
+    _show(window, _combat())
+    assert chart.plan_box.isChecked(), "снимок боя погасил «Прогноз», включённый рукой"
+    assert any("Прогноз" in text for text in legend()), legend()
 
 
 def _row(origin: RunOrigin | None) -> DecisionRow:

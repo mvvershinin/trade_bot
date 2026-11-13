@@ -122,6 +122,10 @@ class TerminalPort(QObject):
     #: Ответ на `request_robot_orders` — заявки робота или почему не прочитаны
     #: (`ui.models.RobotOrders`). Приходит всегда, и при отказе тоже.
     robot_orders_ready = Signal(object)   # RobotOrders
+    #: Строка «Счёт у брокера» (`ui.models.AccountLine`, решение 0070): что
+    #: ответил брокер про позицию, заявки и деньги — каждым заходом опроса
+    #: счёта и сразу после каждой команды брокеру.
+    account_changed = Signal(object)      # AccountLine
 
     # ⚠️ Два отказа — своими сигналами, а не одним `failed`, и это правило
     # 13 `CLAUDE.md`. `failed` — фраза в строку состояния на 15 секунд; окно

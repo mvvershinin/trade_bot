@@ -48,6 +48,7 @@ from datetime import datetime, timedelta
 from typing import Any, Final, Mapping
 
 from broker.errors import IncompleteAccountData, UnexpectedAnswer
+from broker.orders import ListedOrderStatus, OrdersPage, OrdersQuery
 from broker.parsing import first_mapping, moment, number, pick, text
 from broker.session import LIMITS_PATH, PORTFOLIO_PATH, BrokerSession
 from broker.tokens import now_utc
@@ -198,6 +199,10 @@ class AccountSnapshot:
     #: Активы, позицию которых прочитать нельзя (`read_holdings`). Не мешают
     #: снимку: отказ получает только тот, кто спросит их тикер.
     unreadable: tuple[Unreadable, ...] = ()
+    #: Рубли на счёте по портфелю — строка `moneyLimit` RUB срока `T0`
+    #: (`portfolio_cash`, решение 0070). Только для показа в окне: в движок
+    #: идут деньги «Лимитов» (`money`). `None` — строки нет или их несколько.
+    cash_rub: float | None = None
 
     def position(self, ticker: str) -> Position | None:
         """Позиция по тикеру; `None` — её нет. Непрочитанная — `UnexpectedAnswer`."""
@@ -964,6 +969,24 @@ def read_holdings(portfolio: object) -> Holdings:
     return Holdings(portfolio_account(portfolio), tuple(positions), tuple(unreadable))
 
 
+def portfolio_cash(portfolio: object) -> float | None:
+    """Рубли на счёте из портфеля: строка `moneyLimit` с тикером RUB срока `T0`.
+
+    Та цифра, которую владелец счёта видит в приложении брокера (решение 0070,
+    панель «Счёт у брокера»). Строк таких несколько (два рынка) или ни одной —
+    `None`: складывать или выбирать здесь значило бы угадывать.
+    """
+    found = [
+        number(pick(item, _QUANTITY))
+        for item in positions_list(portfolio)
+        if isinstance(item, Mapping)
+        and _kind(text(pick(item, ("type",)))) == "moneylimit"
+        and (text(pick(item, ("ticker",))) or "").upper() == "RUB"
+        and _term(item) in (CURRENT_TERM, None)
+    ]
+    return found[0] if len(found) == 1 else None
+
+
 def parse_positions(portfolio: Any) -> tuple[tuple[Position, ...], str | None]:
     """**Все** позиции портфеля и номер счёта; любой непрочитанный актив — отказ.
 
@@ -1029,4 +1052,15 @@ class Account:
             positions=holdings.positions,
             equity_rub=parse_equity(portfolio),
             unreadable=holdings.unreadable,
+            cash_rub=portfolio_cash(portfolio),
+        )
+
+    async def live_orders(self, ticker: str) -> OrdersPage:
+        """Живые заявки по инструменту у брокера — первая страница списка (15).
+
+        Для панели «Счёт у брокера» (решение 0070): есть ли тейк и по какой
+        цене — по ответу брокера, а не по журналу команд программы.
+        """
+        return await self._session.search_orders(
+            OrdersQuery(statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,))
         )

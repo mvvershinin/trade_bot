@@ -2354,6 +2354,9 @@ def quiet_session(monkeypatch) -> None:
         def allow_token_retry(self) -> None:
             """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
 
+        def after_commands(self, listener: object) -> None:
+            """Опрос счёта после команд (0070); дублёр команд не подаёт."""
+
     monkeypatch.setattr(live_feed, "BrokerSession", Session)
 
 

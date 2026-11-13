@@ -54,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui import backend
+from ui.account_bar import AccountBar
 from ui.background import busy_cursor
 from ui.backtest_dialog import BacktestDialog
 from ui.backtest_report import BacktestReportDialog
@@ -530,6 +531,8 @@ class MainWindow(QMainWindow):
         self.resize(1360, 900)
 
         self.status_panel = StatusPanel()
+        #: «Счёт у брокера» — по ответу брокера, а не программы (решение 0070).
+        self.account_bar = AccountBar()
         self._build_banners()
         #: Полоска идущего прогона. `None` — прогон не запрашивали.
         self._progress: QProgressDialog | None = None
@@ -551,6 +554,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
         layout.addWidget(self.status_panel)
+        layout.addWidget(self.account_bar)
         for bar in self._banner_column:
             layout.addWidget(bar)
         layout.addWidget(splitter, 1)
@@ -900,6 +904,7 @@ class MainWindow(QMainWindow):
         port.paper_report_ready.connect(self.show_paper_report)
         port.live_changed.connect(self.show_live)
         port.robot_orders_ready.connect(self.show_robot_orders)
+        port.account_changed.connect(self.account_bar.show_line)
 
     # ---------------------------------------------------------------- показ
 
@@ -932,6 +937,7 @@ class MainWindow(QMainWindow):
         """Перечитать системную тему. Вызывается при старте и при её смене."""
         self.theme = current_theme()
         self.status_panel.set_theme(self.theme)
+        self.account_bar.set_theme(self.theme)
         self.chart.set_theme(self.theme)
         self.journals.set_theme(self.theme)
         self.debug_panel.set_theme(self.theme)
@@ -1316,6 +1322,7 @@ class MainWindow(QMainWindow):
         self._gate_history()
         self.status_panel.apply_live(view)
         self.chart.set_fact_origin(view.fact_origin if view.on else None)
+        self.chart.set_combat(view.wanted)
 
     def _mirror_live(self, view: LiveView | None) -> None:
         """Кнопка и строка — по снимку, а не по нажатию (как `_mirror_stream`).

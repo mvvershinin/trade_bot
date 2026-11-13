@@ -533,8 +533,28 @@ class BrokerSession:
         #: Отказ `invalid_grant` на обмене токена: описание и технический текст.
         #: Пока он стоит, обмен к брокеру не идёт — до `allow_token_retry`.
         self._refused: tuple[str, str] | None = None
+        #: Кого позвать после каждой команды брокеру (`after_commands`).
+        self._after_command: list[Callable[[], None]] = []
 
     # --- жизненный цикл ---
+
+    def after_commands(self, listener: Callable[[], None]) -> None:
+        """Звать `listener` после каждой команды — подачи и снятия, удачной или нет.
+
+        Зачем: окно перечитывает счёт у брокера сразу после команды, а не через
+        полминуты опроса (решение 0070). Получатель обязан вернуться немедленно;
+        его исключение в команду не идёт — только в лог.
+        """
+        self._after_command.append(listener)
+
+    def _commanded(self) -> None:
+        """Позвать получателей `after_commands`; упавший — в лог, команде не мешает."""
+        logger = log()
+        for listener in self._after_command:
+            try:
+                listener()
+            except Exception:  # чужой получатель не ломает ответ на команду
+                logger.exception("получатель «после команды» упал")
 
     async def __aenter__(self) -> "BrokerSession":
         return self
@@ -853,7 +873,10 @@ class BrokerSession:
         Возврат значит «брокер принял», а не «исполнена»: факт приходит
         потоком статусов или запросом `order_status` по `CommandAccepted.key`.
         """
-        return await self._command(ORDERS_PATH, order, record)
+        try:
+            return await self._command(ORDERS_PATH, order, record)
+        finally:
+            self._commanded()
 
     async def cancel_order(
         self, target: UUID, *, record: RecordCommand
@@ -864,7 +887,10 @@ class BrokerSession:
         от `target`. Возврат значит «запрос на отмену принят», а не «снята»:
         снятой заявку делает событие `4` по исходной (план Э4 §2.7).
         """
-        return await self._command(CANCEL_ORDER_PATH, CancelOrder(target), record)
+        try:
+            return await self._command(CANCEL_ORDER_PATH, CancelOrder(target), record)
+        finally:
+            self._commanded()
 
     async def _command(
         self, path: str, request: OrderCommand, record: RecordCommand

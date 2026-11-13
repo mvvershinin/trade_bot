@@ -182,6 +182,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import enum
 import logging
@@ -193,6 +194,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Final, Protocol
 
 from app import debug_feed
+from app.account_panel import AccountPanel, AccountSeen
 from app.backfill import Backfiller
 from app.halt import halt_on_unknown_outcome
 from app.live_trading import LiveDesks
@@ -205,6 +207,7 @@ from broker.schedule import DailySchedule, Schedule, TradingStatus
 from broker.session import BrokerSession
 from broker.stream import CandleSnapshot, candle_stream, snapshot_of
 from broker.token_store import TokenStore
+from broker.tokens import now_utc
 from engine import AccountFunds
 from market import MSK, MarketWorker, floor_to_minute
 from market import Candle as MarketCandle
@@ -1867,6 +1870,10 @@ class FundsWatchers:
     #: «на момент остановки» сменяется свежей. Возврат немедленный. `None` —
     #: позицию никому не отдавать.
     position: Callable[[str, int], None] | None = None
+    #: Что брокер ответил заходом — для строки «Счёт у брокера» (решение 0070):
+    #: снимок и живые заявки по инструменту, или почему не прочитано. `None` —
+    #: строки нет, и список заявок не спрашивается вовсе. Возврат немедленный.
+    account: Callable[[AccountSeen], None] | None = None
 
 
 class FundsWatch:
@@ -1950,12 +1957,23 @@ class FundsWatch:
         #: как отказ, и молчать о нём нельзя: владелец счёта иначе не знает,
         #: можно ли уже торговать.
         self._answering = False
+        #: Внеочередной заход (`poke`): будит паузу цикла, а не ставит второй цикл.
+        self._wake = asyncio.Event()
 
     def start(self) -> None:
         """Начать опрос. На работающем опросе ничего не делает."""
         if self._task is not None and not self._task.done():
             return
         self._task = asyncio.ensure_future(self._ride())
+
+    def poke(self) -> None:
+        """Зайти сразу, не дожидаясь паузы, — после команды брокеру (решение 0070).
+
+        Работающего опроса нет — ничего: связь не открыта, спрашивать некого.
+        Несколько толчков подряд дают один заход.
+        """
+        if self._task is not None and not self._task.done():
+            self._wake.set()
 
     def request_stop(self) -> None:
         """Остановить опрос. Возврат немедленный: зовётся из слота окна."""
@@ -2016,11 +2034,50 @@ class FundsWatch:
         часовой давности.
         """
         while True:
+            self._wake.clear()
             await self._once()
-            await asyncio.sleep(self._every)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), self._every)
 
     async def _once(self) -> None:
-        """Один заход: спросить, перевести, положить. Наружу не бросает ничего.
+        """Один заход: деньги в движок, затем — что видно в строке «Счёт у брокера»."""
+        got = await self._funds_once()
+        if self._watch.account is not None:
+            await self._account_once(got)
+
+    async def _account_once(self, got: AccountSnapshot | str) -> None:
+        """Живые заявки по инструменту и всё прочитанное — получателю строки (0070).
+
+        Снимок не прочитан — получатель узнаёт почему, а список заявок
+        не спрашивается: строка без позиции и денег всё равно скажет «не прочитан».
+        Ничего наружу не бросает: строка окна не вправе уронить опрос денег.
+        """
+        receiver = self._watch.account
+        assert receiver is not None, "зовётся только при получателе"
+        ticker = self._ticker
+        if isinstance(got, str):
+            seen = AccountSeen(ticker, None, trouble=got)
+        else:
+            try:
+                seen = AccountSeen(ticker, got, orders=await self._account.live_orders(ticker))
+            except asyncio.CancelledError:
+                raise
+            except BrokerError as failure:
+                seen = AccountSeen(ticker, got, orders_trouble=failure.human)
+            except Exception as error:  # трассировка уходит в log.exception
+                log.exception("список заявок для строки счёта упал", extra={"panel": False})
+                seen = AccountSeen(
+                    ticker, got, orders_trouble=f"ошибка программы: {type(error).__name__}"
+                )
+        try:
+            receiver(seen)
+        except Exception:  # строка окна не роняет опрос денег
+            log.exception("строка «Счёт у брокера» не собрана", extra={"panel": False})
+
+    async def _funds_once(self) -> AccountSnapshot | str:
+        """Спросить, перевести, положить. Снимок — или почему его нет, словами.
+
+        Наружу не бросает ничего.
 
         Три исхода, и все три говорятся человеческим языком:
 
@@ -2055,7 +2112,7 @@ class FundsWatch:
             # эти две строки, и человек прочтёт успокоительную неправду.
             halt_on_unknown_outcome(unknown, self._watch.halt)
             self._blind(str(unknown))
-            return
+            return str(unknown)
         except BrokerError as failure:
             log.warning(
                 "состояние счёта не получено: %s%s",
@@ -2064,16 +2121,17 @@ class FundsWatch:
                 extra={"panel": False},  # в ленте — строка журнала из `_blind`
             )
             self._blind(str(failure))
-            return
+            return failure.human
         except Exception as error:  # трассировка уходит в log.exception
             log.exception(  # мимо ленты: в ней — строка журнала из `_blind`
                 "опрос состояния счёта упал ошибкой программы", extra={"panel": False}
             )
-            self._blind(
+            trouble = (
                 f"Ошибка программы, а не связи: {type(error).__name__}: {error}. "
                 "Подробность — в выводе программы в консоли."
             )
-            return
+            self._blind(trouble)
+            return trouble
         self._tell_position(snapshot)
         self._refresh_exchange_margin(snapshot.taken_at)
         margin = self._margin_now(snapshot)
@@ -2090,7 +2148,7 @@ class FundsWatch:
                 + ". Возможно, на счёте несколько рынков; код биржи для БКС "
                 "неизвестен (D-047)."
             )
-            return
+            return snapshot
         self._recovered(snapshot)
         # ⚠️ Про ГО говорится **после** «счёт получен», а не до. Порядок строк
         # в журнале — это порядок чтения: строка про обеспечение впереди
@@ -2098,6 +2156,7 @@ class FundsWatch:
         # из-за чего робот не входит.
         self._say_margin(margin)
         self._watch.funds(snapshot.account or "", money)
+        return snapshot
 
     def _tell_position(self, snapshot: AccountSnapshot) -> None:
         """Позиция по инструменту из снимка — порту (`B-097`), хоть деньги и неполны.
@@ -2339,6 +2398,8 @@ class LiveLink:
         #: Расписание торгов. Одно на весь запуск: у него своя память ответов,
         #: и пересборка на каждом подключении сделала бы её бесполезной.
         self._hours: Schedule | None = None
+        #: Слова строки «Счёт у брокера» и последнее удачное чтение (0070).
+        self._account_panel = AccountPanel()
 
     def deliver_funds_to(
         self,
@@ -2540,6 +2601,9 @@ class LiveLink:
                 watchers=self._funds_watchers(self._funds_to),
                 exchange_margin=self._exchange_margin,
             )
+            # После каждой команды брокеру — внеочередной заход: строка
+            # «Счёт у брокера» не ждёт полминуты опроса (решение 0070).
+            self._session.after_commands(self._account_now)
         feed = LiveFeed(
             self._session,
             self._worker,
@@ -2590,6 +2654,24 @@ class LiveLink:
             halt=self._port.halt,
             halted=lambda: bool(self._port.halted),
             position=self._port.position_read,
+            account=self._account_seen,
+        )
+
+    def _account_now(self) -> None:
+        """Команда брокеру ушла — опрос счёта заходит сразу (решение 0070)."""
+        if self._funds is not None:
+            self._funds.poke()
+
+    def _account_seen(self, seen: AccountSeen) -> None:
+        """Заход опроса — строкой «Счёт у брокера» в окно (решение 0070).
+
+        Стоимость пункта — из настроек окна и только своего инструмента:
+        у чужого она другая, и тогда результат остаётся в пунктах.
+        """
+        values = self._port.values
+        rubles = values.ruble_per_point if values.instrument.strip() == seen.ticker else None
+        self._port.account_line(
+            self._account_panel.line(seen, at=now_utc(), ruble_per_point=rubles)
         )
 
     async def _exchange_margin(self, ticker: str) -> float | None:
