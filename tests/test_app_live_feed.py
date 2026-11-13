@@ -1359,6 +1359,9 @@ class FakePort:
         self.accounts: list[tuple[str, object]] = []
         #: Позиции по инструменту из тех же снимков (`HistoryPort.position_read`, B-097).
         self.positions: list[tuple[str, int]] = []
+        #: Настройки порта (`HistoryPort.values`): звено читает отсюда порог
+        #: сторожа отставания потока (`LiveLink._lag_after`).
+        self.values = Settings()
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))

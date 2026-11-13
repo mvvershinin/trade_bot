@@ -125,6 +125,23 @@
 Код класса при этом не меняется: он задаётся ключом `--stream-class` и в окне
 не редактируется.
 
+⚠️ Отстающий поток переподключается сам
+---------------------------------------
+Боевой прогон 13.11.2026: машину заняли тесты, программа не успевала читать
+сокет, и **после ухода нагрузки** соединение осталось отстающим — минута
+приходила через 2–4 минуты, часть не пришла вовсе, а второй поток, открытый
+рядом, получал каждую минуту сразу. Брокер был исправен, испорчено было
+соединение. Пятиминутки из неполных минут выбрасывались, робот вошёл в 11:52
+и до ручного переподключения не получил ни одной целой свечи.
+
+Отсюда сторож (`LiveFeed._guard`, срок — `lag_due`): **таймер, а не проверка
+на приходе снимка** — главный случай как раз «снимков нет». Порог — поле
+«Допустимое опоздание» вкладки «Бой» (`live_stale_after_sec`), свежим чтением.
+Сработал — строка в журнал и переподключение тем же путём, что при обрыве,
+с догрузкой пропущенного (`StreamLagging`). Запись законченной минуты в базу
+вынесена из чтения сокета в отдельную задачу (`LiveFeed._race`): база одна
+на прогон, рисунок и таблицу, и ожидание её очереди останавливало приём снимков.
+
 Чего здесь намеренно нет — и почему
 -----------------------------------
 Правил закрытия бара по часам, подачи свечей в движок, догрузки после обрыва,
@@ -192,7 +209,7 @@ from engine import AccountFunds
 from market import MSK, MarketWorker, floor_to_minute
 from market import Candle as MarketCandle
 from market.storage import Source
-from ui.models import Connection, DecisionLevel
+from ui.models import Connection, DecisionLevel, Settings
 
 if TYPE_CHECKING:  # только для подписи: порт живёт в `app/port.py`
     from app.port import HistoryPort
@@ -231,6 +248,77 @@ class SnapshotsLate(BrokerError):
             "Программа переподключится сама.",
             f"first snapshot not received in {waited:.0f} s",
         )
+
+
+class StreamLagging(BrokerError):
+    """Поток открыт, а снимков нет или они старые дольше порога (`lag_due`).
+
+    Повтор помогает — это и есть лечение: на 13.11.2026 отстающее соединение
+    выправилось только переподключением, а брокер всё это время был исправен.
+
+    `aloud` — говорить ли в журнал решений. Молчат два случая: биржа закрыта
+    по расписанию (поток затих по делу, «Биржа закрыта» скажет `_wait_out`)
+    и повтор на той же минуте после переподключения — о ней уже сказано,
+    а брокер подтвердил, что новее у него ничего нет (затишье). Технический
+    лог получает каждое срабатывание.
+    """
+
+    retryable = True
+
+    def __init__(self, human: str, technical: str, *, aloud: bool) -> None:
+        super().__init__(human, technical)
+        self.aloud = aloud
+
+
+def lag_due(*, heard_at: datetime, minute: datetime, since: datetime, after: float) -> datetime:
+    """Когда поток объявляется отстающим, если до тех пор ничего не придёт.
+
+    Два признака, срабатывает ранний:
+
+    * **снимков нет** дольше порога: `heard_at + after`;
+    * **снимки старые**: минута последнего снимка закончилась дольше порога
+      назад, а снимков следующей нет — `конец минуты + after`. Ровно случай
+      13.11.2026: снимки шли, но по минуте, закончившейся минуты назад.
+
+    Второй отсчёт идёт не раньше начала захода (`since`): сразу после
+    подписки брокер присылает свечу прошлой минуты (замер в
+    `.docs/broker-api/20-ws-last-candle.md`), и без этого заход, открытый
+    после затишья, рвался бы немедленно.
+    """
+    return min(heard_at, max(minute + timedelta(minutes=1), since)) + timedelta(seconds=after)
+
+
+def lag_words(minute: datetime, now: datetime) -> str:
+    """Строка журнала: какая минута последняя, который час, что делаем."""
+    return (
+        f"Поток брокера отстаёт: последняя минута {minute.astimezone(MSK):%H:%M}, "
+        f"сейчас {now.astimezone(MSK):%H:%M:%S} — переподключаюсь. Пропущенные "
+        "минуты догрузятся у брокера. Если по инструменту просто нет сделок, "
+        "это затишье, а не сбой."
+    )
+
+
+def _settings_lag_after() -> float:
+    """Порог сторожа, пока сборка не дала свой: умолчание поля окна."""
+    return float(Settings().live_stale_after_sec)
+
+
+def _msk_now() -> datetime:
+    return datetime.now(MSK)
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedMinute:
+    """Законченная минута в очереди записи: инструмент, последний снимок, итог.
+
+    Инструмент — свой у каждой минуты, а не текущий у потока: смена
+    инструмента не должна положить минуту прежнего под новый символ.
+    """
+
+    ticker: str
+    last: CandleSnapshot
+    tally: MinuteTally
+
 
 #: Сколько ждать закрытия сокета при завершении программы. Мёртвый сокет
 #: не должен держать завершение (миниплан Э1-5, §4.6): по истечении задача
@@ -862,6 +950,51 @@ class LiveFeed:
         #: за выходные их 192. Журнал из 192 одинаковых строк — то же
         #: молчание, только громкое.
         self._doubted: set[ScheduleDoubt] = set()
+        #: Сторож отставания (`_guard`): порог в секундах, часы и сон.
+        #: Порог даёт сборка (`pace`); часы и сон подставляет проверка.
+        self._lag_after: Callable[[], float] = _settings_lag_after
+        self._now: Callable[[], datetime] = _msk_now
+        self._nap: Callable[[float], Awaitable[None]] = asyncio.sleep
+        #: По часам `_now`: начало захода, приход последнего своего снимка
+        #: и самая поздняя его минута. Сбрасываются на каждом заходе.
+        self._since: datetime | None = None
+        self._heard_at: datetime | None = None
+        self._heard_minute: datetime | None = None
+        #: Минута, об отставании на которой уже сказано в журнал. Снимается
+        #: первым снимком более поздней минуты: поток догнал часы.
+        self._lag_minute: datetime | None = None
+        #: Очередь записи законченных минут захода (`_race`), сколько в ней
+        #: ещё не записано и растущая минута, придержанная до записи.
+        self._queue: asyncio.Queue[ClosedMinute | None] | None = None
+        self._unwritten = 0
+        self._held: tuple[str, MarketCandle] | None = None
+        #: Первый принятый снимок минуты, ещё не сказанный в ленту (`_show`).
+        self._started: MarketCandle | None = None
+
+    @property
+    def lag_after(self) -> float:
+        """Порог сторожа отставания, секунды — читается на каждой проверке."""
+        return self._lag_after()
+
+    def pace(
+        self,
+        after: Callable[[], float],
+        *,
+        now: Callable[[], datetime] | None = None,
+        nap: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        """Дать сторожу отставания порог: `live_stale_after_sec`, свежим чтением.
+
+        Вызов, а не довод конструктора, — по той же причине, что `follow`
+        (`PLR0913`). Без вызова сторож работает с умолчанием поля окна.
+        `now` и `nap` — часы и сон; их подставляет проверка, чтобы минуты
+        шли без настоящего ожидания.
+        """
+        self._lag_after = after
+        if now is not None:
+            self._now = now
+        if nap is not None:
+            self._nap = nap
 
     def follow(self, hours: TradingHours) -> None:
         """Дать потоку расписание торгов: закрытую биржу он тогда не долбит.
@@ -933,6 +1066,7 @@ class LiveFeed:
         self._tally = None
         self._last = None
         self._complaint = None
+        self._lag_minute = None
         self._foreign.clear()
         self._watch.say(
             "Инструмент подписки изменён",
@@ -1039,7 +1173,8 @@ class LiveFeed:
                 self._complain(str(unknown), unknown.technical)
             except BrokerError as error:
                 final = not error.retryable
-                self._complain(str(error), error.technical)
+                aloud = not isinstance(error, StreamLagging) or error.aloud
+                self._complain(str(error), error.technical, aloud=aloud)
             except Exception as error:  # трассировка уходит в log.exception ниже
                 final = True
                 # Мимо ленты: в ней эта беда — строкой журнала из `_complain`.
@@ -1222,8 +1357,11 @@ class LiveFeed:
         self._complaint = text
         self._watch.say(event, text, level)
 
-    def _complain(self, text: str, technical: str = "") -> None:
+    def _complain(self, text: str, technical: str = "", *, aloud: bool = True) -> None:
         """Причина обрыва: в лог — всегда, в журнал окна — один раз.
+
+        `aloud=False` — только в лог: так молчат повторы сторожа отставания
+        (`StreamLagging.aloud`).
 
         Технический лог получает **обе** половины отказа: человеческую фразу
         и `BrokerError.technical`. До 05.09.2026 причина уходила только
@@ -1242,7 +1380,8 @@ class LiveFeed:
             # а каждый заход виден строкой фазы (`_phase`).
             extra={"panel": False},
         )
-        self._say_once("Связь с брокером", text, DecisionLevel.WARNING)
+        if aloud:
+            self._say_once("Связь с брокером", text, DecisionLevel.WARNING)
 
     async def _drain(self) -> None:
         """Дождаться задач, снятых кнопкой: прежний сокет закрывается до нового.
@@ -1279,6 +1418,8 @@ class LiveFeed:
             await self._worker.open()
         self._tally = None
         self._last = None
+        self._heard_at = self._heard_minute = None
+        self._unwritten, self._held, self._started = 0, None, None
         async with candle_stream(
             self._session,
             ticker=self._ticker,
@@ -1288,8 +1429,55 @@ class LiveFeed:
             # Сокет открыт, снимков ещё нет. У брокера это 3–17 секунд
             # (замер `B-007`), и до `B-022` окно всё это время говорило
             # то же самое, что при неудачной попытке.
+            self._since = self._now()
             self._phase(LinkPhase.AWAITING_FIRST)
-            await self._read(socket)
+            await self._race(socket)
+
+    async def _race(self, socket: object) -> None:
+        """Чтение, запись минут и сторож — три задачи захода; исход решает первая.
+
+        Паттерн — надзор над группой задач, а не `asyncio.TaskGroup`: тот
+        заворачивает отказ в `ExceptionGroup`, и `_ride` перестал бы отличать
+        обрыв, который лечится повтором, от беды программы. Здесь отказ
+        первой закончившейся задачи поднимается **как был**, и поднимается
+        внутри `candle_stream` — отказ сокета переводится в отказ слоя там же,
+        где переводился до 13.11.2026.
+
+        ⚠️ Запись — отдельной задачей, а не ожиданием в чтении. База одна
+        на прогон, рисунок и таблицу контрактов (`MarketWorker`, один поток),
+        и `put_minutes` в чтении ждал всю её очередь: приём снимков вставал,
+        `websockets` переставал читать из сети, брокер копил отставание.
+        Порядок минут держит одна задача записи над очередью.
+
+        Чтение или сторож закончились — очередь **дописывается** до конца:
+        минута, уже прочитанная, не теряется на переподключении. Отказ записи
+        важнее обрыва: это беда программы, и повтор её не лечит.
+        """
+        queue: asyncio.Queue[ClosedMinute | None] = asyncio.Queue()
+        self._queue = queue
+        reader = asyncio.ensure_future(self._read(socket))
+        guard = asyncio.ensure_future(self._guard())
+        writer = asyncio.ensure_future(self._write(queue))
+        try:
+            done, _ = await asyncio.wait(
+                (reader, guard, writer), return_when=asyncio.FIRST_COMPLETED
+            )
+            first = writer if writer in done else reader if reader in done else guard
+            for task in (reader, guard):
+                if task is not first:
+                    task.cancel()
+            await asyncio.wait((reader, guard))
+            for task in (reader, guard):
+                if task is not first and not task.cancelled():
+                    task.exception()  # второй отказ того же захода прочитан и отброшен
+            if first is not writer:
+                queue.put_nowait(None)
+                await writer
+            first.result()
+        finally:
+            self._queue = None
+            for task in (reader, guard, writer):
+                task.cancel()
 
     async def _read(self, socket: object) -> None:
         """Чтение сообщений открытого сокета до обрыва.
@@ -1330,7 +1518,10 @@ class LiveFeed:
                     DecisionLevel.INFO,
                 )
                 first = False
-            if not announced and self._foreign_of(snapshot) is None:
+            own = self._foreign_of(snapshot) is None
+            if own:
+                self._heard(snapshot)
+            if not announced and own:
                 # ⚠️ Минута захода объявляется **один раз** и только по
                 # **своему** снимку (`D-023`): M5 в канале M1 или чужой
                 # инструмент задали бы догрузке границу по своему времени,
@@ -1341,7 +1532,68 @@ class LiveFeed:
                 # закрываться, и лечение дыры само сделало бы новую.
                 announced = True
                 self._watch.connected(floor_to_minute(snapshot.opened_at))
-            await self._accept(snapshot)
+            self._accept(snapshot)
+
+    def _heard(self, snapshot: CandleSnapshot) -> None:
+        """Свой снимок пришёл: отметить для сторожа время прихода и минуту.
+
+        Отвергнутый снимок (`tally_after`) тоже считается: он доказывает,
+        что поток живой и какая у брокера минута, — это и меряет сторож.
+        Минута позже той, об отставании на которой сказано, снимает
+        отметку: поток догнал часы, и следующее отставание — снова вслух.
+        """
+        minute = floor_to_minute(snapshot.opened_at)
+        self._heard_at = self._now()
+        if self._heard_minute is None or minute > self._heard_minute:
+            self._heard_minute = minute
+        if self._lag_minute is not None and minute > self._lag_minute:
+            self._lag_minute = None
+
+    async def _guard(self) -> None:
+        """Сторож отставания потока: таймер, а не проверка на приходе снимка.
+
+        Проверка на приходе не видит главного случая — снимков нет вовсе.
+        Сторож спит до срока (`lag_due`), просыпается и считает заново:
+        пришли снимки — срок отодвинулся, нет — поток отстаёт. До первого
+        своего снимка срока нет: там стережёт `FIRST_SNAPSHOT_WAIT`.
+        Порог читается на каждом круге — правка в окне действует сразу.
+        """
+        while True:
+            after, now = self.lag_after, self._now()
+            due = self._lag_due(after)
+            if due is not None and now >= due:
+                raise await self._lagging(now, after)
+            await self._nap(after if due is None else (due - now).total_seconds())
+
+    def _lag_due(self, after: float) -> datetime | None:
+        heard_at, minute, since = self._heard_at, self._heard_minute, self._since
+        if heard_at is None or minute is None or since is None:
+            return None
+        return lag_due(heard_at=heard_at, minute=minute, since=since, after=after)
+
+    async def _lagging(self, now: datetime, after: float) -> StreamLagging:
+        """Отказ «поток отстаёт»: вслух — один раз на минуту и только при торгах.
+
+        Расписание спрашивается здесь, а не перед каждой проверкой: оно
+        нужно только тогда, когда поток затих, — на клиринге и вечером
+        поток молчит по делу, и строка «отстаёт» была бы ложной тревогой.
+        Повтор переподключения при этом остаётся: дальше `_ride` спросит
+        расписание и будет ждать открытия, не долбя брокера.
+        """
+        minute = self._heard_minute or now
+        heard_at = self._heard_at or now
+        shut = await self._shut()
+        aloud = shut is None and self._lag_minute is None
+        if aloud:
+            self._lag_minute = minute
+        technical = (
+            f"поток {self._ticker} отстаёт: последний снимок "
+            f"{(now - heard_at).total_seconds():.0f} с назад, минута "
+            f"{minute.astimezone(MSK):%H:%M} МСК, порог {after:.0f} с"
+            f"{'; биржа закрыта по расписанию' if shut is not None else ''}"
+            f"{'' if aloud or shut is not None else '; об этой минуте уже сказано'}"
+        )
+        return StreamLagging(lag_words(minute, now), technical, aloud=aloud)
 
     def _foreign_of(self, snapshot: CandleSnapshot) -> str | None:
         """Чем снимок не из нашей подписки — либо `None`, если свой.
@@ -1359,8 +1611,12 @@ class LiveFeed:
             f"а подписка — {expected[0]} ({expected[1]}, {expected[2]})"
         )
 
-    async def _accept(self, snapshot: CandleSnapshot) -> None:
+    def _accept(self, snapshot: CandleSnapshot) -> None:
         """Один снимок: сверка с подпиской, счёт, рисунок; на смене минуты — запись.
+
+        Ничего не ждёт: законченная минута уходит в очередь записи
+        (`_hand_over`), а пишет её отдельная задача (`_write`). Ожидание
+        здесь останавливало чтение сокета — 13.11.2026 это стоило потока.
 
         ⚠️ Отвергнутый снимок (`after.refusal`) не рисуется — выход стоит
         **до** вызова рисующего, и это его единственная защита. Сомнительная
@@ -1379,7 +1635,7 @@ class LiveFeed:
             return
         before, after = self._tally, tally_after(self._tally, snapshot)
         if before is not None and before.minute != after.minute and self._last is not None:
-            await self._close_minute(self._last, before)
+            self._hand_over(self._last, before)
         self._tally = after
         if after.refusal is not None:
             # Вслух — на первом отвергнутом снимке минуты; дальше та же минута
@@ -1395,17 +1651,55 @@ class LiveFeed:
                 )
             return
         first, self._last = self._last is None, snapshot
-        # Снимок принят — растущая минута идёт в окно. **После** записи
-        # закрытой минуты выше: тот, кто рисует, читает из базы минутки этого
-        # же бара, и порядок «сначала записали, потом рисуем» не даёт бару
-        # мигнуть без только что закончившейся минуты.
         growing = to_minute(snapshot, after.contracts, unsettled=True)
         if first:
             # В ленту — первый принятый снимок минуты, а не каждый из девяти.
-            debug_feed.minute_started(self._ticker, growing)
-        self._watch.growing_minute(self._ticker, growing)
+            self._started = growing
+        # Снимок принят — растущая минута идёт в окно. **После** записи
+        # закончившейся минуты: тот, кто рисует, читает из базы минутки этого
+        # же бара, и порядок «сначала записали, потом рисуем» не даёт бару
+        # мигнуть без только что закончившейся минуты. Пока запись в очереди,
+        # минута придерживается, и показывает её задача записи (`_write`).
+        if self._unwritten:
+            self._held = (self._ticker, growing)
+            return
+        self._show(self._ticker, growing)
 
-    async def _close_minute(self, last: CandleSnapshot, tally: MinuteTally) -> None:
+    def _show(self, ticker: str, growing: MarketCandle) -> None:
+        """Растущую минуту — в окно, а начало минуты, если не сказано, — в ленту.
+
+        Лента идёт за записью, как рисунок: «минута пошла» не встаёт раньше
+        «предыдущая закрыта и записана».
+        """
+        started, self._started = self._started, None
+        if started is not None:
+            debug_feed.minute_started(ticker, started)
+        self._watch.growing_minute(ticker, growing)
+
+    def _hand_over(self, last: CandleSnapshot, tally: MinuteTally) -> None:
+        """Законченную минуту — в очередь записи, без ожидания."""
+        queue = self._queue
+        if queue is None:
+            raise RuntimeError("очередь записи минут не заведена: снимок принят вне захода")
+        self._last = None
+        self._unwritten += 1
+        queue.put_nowait(ClosedMinute(self._ticker, last, tally))
+
+    async def _write(self, queue: asyncio.Queue[ClosedMinute | None]) -> None:
+        """Задача записи захода: минуты по одной, в порядке прихода, до `None`.
+
+        После каждой записи — придержанная растущая минута, если очередь
+        опустела: так рисунок идёт за записью, как шёл до 13.11.2026.
+        """
+        while (closed := await queue.get()) is not None:
+            await self._close_minute(closed)
+            self._unwritten -= 1
+            held = self._held
+            if not self._unwritten and held is not None:
+                self._held = None
+                self._show(*held)
+
+    async def _close_minute(self, closed: ClosedMinute) -> None:
         """Минута закончилась — теперь, и только теперь, она пишется в базу.
 
         Пишется её последний принятый снимок с контрактами по приращениям.
@@ -1417,9 +1711,9 @@ class LiveFeed:
         сам, что с этим делать — дорисовать закрытую свечу или гнать прогон
         (`HistoryPort.live_candle`). Поток знает только, что минута записана.
         """
-        written = to_minute(last, tally.contracts)
-        await self._worker.put_minutes(self._ticker, [written], Source.BROKER)
-        self._last = None
+        tally = closed.tally
+        written = to_minute(closed.last, tally.contracts)
+        await self._worker.put_minutes(closed.ticker, [written], Source.BROKER)
         log.info(
             "минута %s: оборот %.0f → %d контрактов%s",
             tally.minute.isoformat(),
@@ -1429,8 +1723,8 @@ class LiveFeed:
             # Мимо ленты: её числа уже есть в строке ленты ниже, с ценами.
             extra={"panel": False},
         )
-        debug_feed.minute_closed(self._ticker, written, tally.refused)
-        self._watch.closed_minute(self._ticker)
+        debug_feed.minute_closed(closed.ticker, written, tally.refused)
+        self._watch.closed_minute(closed.ticker)
         self._tell_clock()
 
     def _tell_clock(self) -> None:
@@ -2261,7 +2555,17 @@ class LiveLink:
             ),
         )
         feed.follow(self._hours)
+        feed.pace(self._lag_after)
         return feed
+
+    def _lag_after(self) -> float:
+        """Порог сторожа отставания — поле «Допустимое опоздание» вкладки «Бой».
+
+        Число то же, что у исполнителя (`LiveLimits.stale_after`): насколько
+        данные вправе опоздать. Читается из порта на каждой проверке, а не
+        при сборке: правка в окне действует сразу, без переподключения.
+        """
+        return float(self._port.values.live_stale_after_sec)
 
     def _funds_watchers(
         self, funds: Callable[[str, AccountFunds], None]
