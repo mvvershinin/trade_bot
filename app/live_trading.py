@@ -16,8 +16,9 @@
    портфеля, цена входа — средняя брокера, тейк движок поставит по настройкам
    от неё. Живая заявка робота прошлого включения при позиции — это её тейк:
    снимать его нельзя (`/risk` 2в, БЛОК 1), ставить второй — тоже, поэтому
-   тогда бой не включается, и ни одной команды брокеру. Живые заявки
-   не робота — словами, не трогая. Совпавшая позиция становится основой
+   тогда бой не включается, и ни одной команды брокеру. Живая заявка
+   не робота на закрытие позиции — тоже отказ (второй тейк); прочие —
+   словами, не трогая. Совпавшая позиция становится основой
    позиции по сделкам (К2 `/risk`).
 4. **Журнал** — поток статусов открыт; незакрытые команды прошлых
    запусков разобраны по ключу у брокера (0017: живые сняты, исполненные
@@ -476,8 +477,9 @@ class LiveDesks:
         * брокер не назвал среднюю цену — тейк считать не от чего;
         * позиция поменялась между чтениями.
 
-        Живые заявки у брокера по инструменту, которых нет в журнале робота, —
-        строкой сверки, не трогая (0070).
+        * живая заявка не робота на закрывающей стороне (`_foreign`).
+
+        Прочие живые заявки не робота — строкой сверки, не трогая (0070).
         """
         ticker = request.ticker
         mine = [row for row in await book.open_commands() if row.command.account == account]
@@ -513,12 +515,37 @@ class LiveDesks:
             )
         if executor.halted is not None:
             raise FactRefused(f"{executor.halted} {_NOT_ON}", position=before)
-        foreign = await executor.foreign_orders()
+        foreign = await self._foreign(executor, before, ticker)
         adopted = FactPosition(
             side=Side.LONG if before > 0 else Side.SHORT,
             volume=float(abs(before)), entry_price=float(price),
         )
         return ((foreign,) if foreign else ()), adopted
+
+    @staticmethod
+    async def _foreign(executor: LiveExecutor, before: int, ticker: str) -> str:
+        """Живые заявки не робота при подхвате: на закрытие позиции — отказ (`/risk` п. 1).
+
+        Такая заявка — чужой тейк: робот поставил бы свой второй, при касании
+        исполнились бы оба, и позиция перевернулась бы без сигнала. Список
+        не прочитан — тоже отказ: второго тейка не исключить.
+        """
+        try:
+            against, words = await executor.foreign_closing(before)
+        except BrokerError as error:
+            raise FactRefused(
+                f"Список заявок у брокера не прочитан ({error.human}): не видно, нет ли "
+                f"у {position_words(before)} по {ticker} чужого тейка. {_NOT_ON}",
+                position=before,
+            ) from None
+        if against:
+            raise FactRefused(
+                f"У брокера {position_words(before)} по {ticker} и живая заявка не робота "
+                f"на её закрытие ({against}) — снимите её в приложении брокера и включите "
+                f"бой снова. {_NOT_ON}",
+                position=before,
+            )
+        return words
 
     def _seat_session(self) -> BrokerSession:
         session = self.session()

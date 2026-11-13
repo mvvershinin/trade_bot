@@ -925,7 +925,10 @@ def dropped_state(state: EngineState, at: datetime) -> tuple[EngineState, Journa
     entry = JournalEntry(
         at=at,
         event="Позиция закрыта владельцем",
-        reason=f"Кнопкой «Закрыть позицию»: {what}. Робот без позиции, ждёт следующий сигнал",
+        reason=(
+            f"Кнопкой «Закрыть позицию»: {what}. Робот без позиции и войдёт снова "
+            "по сигналу ближайшей свечи; чтобы остаться без позиции — сначала выключите бой"
+        ),
         level=JournalLevel.WARNING,
     )
     return replace(

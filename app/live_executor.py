@@ -1266,11 +1266,16 @@ class LiveExecutor:
                     "При снятии заявки робота исполнились: позиция по сделкам — "
                     f"{position_words(before + shift)}; закрывается только остаток."
                 )
-            # Позиция по сделкам — свежее чтение плюс исполненное при снятии:
-            # `_close_position` подаёт заявку, только если оба чтения портфеля
-            # с ней согласны (отставший портфель — отказ словами, а не шорт).
-            self._ledger = before + shift
-            notes.append(await self._close_position())
+            # Позиция по сделкам потока известна — она главнее чтения: портфель
+            # отстаёт до ~5 с, и тейк, исполнившийся перед нажатием, он ещё
+            # показывает лонгом (`/risk` 13.11.2026, п. 3). Исполненное при
+            # снятии в ней уже есть (`_count`). Неизвестна (исполнитель на одну
+            # команду) — свежее чтение плюс исполненное при снятии, и тогда
+            # `_close_position` верит только двум чтениям через паузу (К2).
+            trusted = self._ledger is not None
+            if not trusted:
+                self._ledger = before + shift
+            notes.append(await self._close_position(trusted=trusted))
         notes.append(await self._foreign_orders(handled))
         flat = not alive and not shift and not self._deals and self._ledger == 0
         return " ".join(note for note in notes if note), flat
@@ -1318,7 +1323,10 @@ class LiveExecutor:
             return ""
         self._flattened = tried
         self._flat_by_hand = True
-        return " Робот торгует дальше без позиции: ждёт следующий сигнал."
+        return (
+            " Робот торгует дальше и войдёт снова по сигналу ближайшей свечи; чтобы "
+            "остаться без позиции — сначала выключите бой."
+        )
 
     def _held_after_hand_close(self, order: OrderRequest) -> bool:
         """Заявка прежней позиции после «Закрыть позицию»; `True` — не подавать (0069).
@@ -1337,10 +1345,21 @@ class LiveExecutor:
             "владелец кнопкой «Закрыть позицию», робот принимает это до следующей свечи."
         )
 
-    async def foreign_orders(self) -> str:
-        """Живые заявки у брокера по инструменту не из журнала робота — словами; пусто — нет."""
+    async def foreign_closing(self, position: int) -> tuple[str, str]:
+        """Живые заявки не робота при подхвате позиции `position` (0070, `/risk` п. 1).
+
+        Возврат — заявки на закрывающей стороне словами (пусто — нет) и все
+        живые заявки не робота словами. Сторона не названа брокером — считается
+        закрывающей: второй тейк хуже отказа. Отказ чтения списка — `BrokerError`.
+        """
+        closing = CommandSide.SELL if position > 0 else CommandSide.BUY
         async with self._lock:
-            return await self._foreign_orders(())
+            foreign, more = await self._foreign_listed(())
+        against = [one for one in foreign if _listed_side(one) in (closing, None)]
+        return (
+            "; ".join(_listed_words(one) for one in against),
+            self._foreign_words(foreign, more),
+        )
 
     async def _foreign_orders(self, handled: Sequence[StoredCommand]) -> str:
         """Живые заявки у брокера по инструменту, не найденные в журнале робота (Р2).
@@ -1355,14 +1374,22 @@ class LiveExecutor:
         """
         ticker = self._instrument.ticker
         try:
-            page = await self._session.search_orders(OrdersQuery(
-                statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,),
-            ))
+            foreign, more = await self._foreign_listed(handled)
         except BrokerError as error:
             return (
                 f"Список заявок у брокера не прочитан ({error.human}) — проверьте в "
                 f"приложении брокера, нет ли по {ticker} живых заявок не робота."
             )
+        return self._foreign_words(foreign, more)
+
+    async def _foreign_listed(
+        self, handled: Sequence[StoredCommand]
+    ) -> tuple[list[ListedOrder], bool]:
+        """Живые заявки по инструменту не из журнала робота и «список не весь». `BrokerError`."""
+        ticker = self._instrument.ticker
+        page = await self._session.search_orders(OrdersQuery(
+            statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,),
+        ))
         ours = {
             (row.command.side, row.command.price, row.command.volume)
             for row in [*handled, *await self._robot_rows(ticker)]
@@ -1372,13 +1399,17 @@ class LiveExecutor:
             if one.status is ListedOrderStatus.ACTIVE and one.ticker in (None, ticker)
             and (_listed_side(one), one.price, one.order_quantity) not in ours
         ]
+        return foreign, (page.total_pages or 1) > 1
+
+    def _foreign_words(self, foreign: Sequence[ListedOrder], more: bool) -> str:
         if not foreign:
             return ""
         listed = "; ".join(_listed_words(one) for one in foreign)
-        more = "" if (page.total_pages or 1) <= 1 else " (показана первая страница списка)"
+        page = " (показана первая страница списка)" if more else ""
         return (
-            f"У брокера по {ticker} живы заявки, не найденные в журнале робота: {listed}"
-            f"{more} — они могут открыть позицию снова. Программа их не снимает."
+            f"У брокера по {self._instrument.ticker} живы заявки, не найденные в журнале "
+            f"робота: {listed}{page} — они могут открыть позицию снова. Программа их "
+            "не снимает."
         )
 
     async def _robot_rows(self, ticker: str | None) -> list[StoredCommand]:
@@ -2727,7 +2758,7 @@ class LiveExecutor:
             notes.append(f"Заявка ({ticket.what}) {done}.")
         return notes
 
-    async def _close_position(self) -> str:
+    async def _close_position(self, *, trusted: bool | None = None) -> str:
         """Одна заявка FOK на всё, что у брокера, — только по согласным сведениям (С2, К2).
 
         Цена — `_fok_now`: от свежей минутки, иначе по планке биржи, иначе
@@ -2738,27 +2769,42 @@ class LiveExecutor:
         стреляющая закрывающими заявками на каждой сверке, хуже остановленной
         (С2). Не ушла — следующая попытка разрешена.
 
-        Объём — из двух чтений портфеля подряд, и оба обязаны совпасть между
-        собой и с позицией по исполнениям потока (`_ledger`), если она известна.
-        Портфель брокера отстаёт от потока сделок (13.11.2026 — около 5 с),
-        и продажа по отставшему чтению — шорт без сигнала. Не сошлось —
-        заявка не подаётся, человек получает обе цифры. Исключение одно —
-        в `_disagreement`: последнее чтение и сделки сходятся на нуле.
+        Объём — чтение портфеля, согласное с позицией по исполнениям потока
+        (`_ledger`). Портфель брокера отстаёт от потока сделок (13.11.2026 —
+        около 5 с), и продажа по отставшему чтению — шорт без сигнала.
+
+        * позиция по сделкам потока известна (`trusted`) — портфель
+          перечитывается шагом `_SETTLE_STEP`, пока не сойдётся с ней, но
+          не дольше `position_settle` (`/risk` 13.11.2026, п. 2: сплошная
+          пауза держала позицию без тейка 30 с);
+        * неизвестна — два чтения через всю паузу, равные между собой и
+          с позицией по сделкам, если она есть (К2).
+
+        Не сошлось — заявка не подаётся, человек получает цифры. Исключение
+        одно — в `_disagreement`: последнее чтение и сделки сходятся на нуле.
+
+        :param trusted: позиция по сделкам — из потока, а не из одного чтения;
+            `None` — известна ли она сейчас.
         """
+        if trusted is None:
+            trusted = self._ledger is not None
         # Планка — до чтений позиции (`/risk` 10.11.2026, находка 1): иначе
         # объём закрытия — из чтения за `band_wait` до подачи, и сделка,
         # сделанная руками за это время, превратила бы закрытие в шорт.
         band = await self._fetch_band()
         try:
-            first = await self._position_now()
-            await asyncio.sleep(self._limits.position_settle)
-            position = await self._position_now()
+            if trusted:
+                first, position = await self._read_until(lambda now: now == self._ledger)
+            else:
+                first = await self._position_now()
+                await asyncio.sleep(self._limits.position_settle)
+                position = await self._position_now()
         except BrokerError as error:
             return (
                 f"Позицию у брокера прочитать не удалось ({error.human}) — закрывающая "
                 "заявка не подана, закройте позицию сами."
             )
-        doubt = self._disagreement(first, position)
+        doubt = self._disagreement(first, position, trusted=trusted)
         if doubt is not None:
             return doubt
         if position == 0:
@@ -2791,6 +2837,22 @@ class LiveExecutor:
             )
         return await self._closed_words(position, ticket)
 
+    async def _read_until(self, agreed: Callable[[int], bool]) -> tuple[int, int]:
+        """Перечитывать портфель шагом `_SETTLE_STEP`, пока чтение не `agreed` (B-099).
+
+        В сумме пауз не дольше `position_settle`; пауза 0 — одно перечитывание.
+        Возврат — первое и последнее чтение. Отказ чтения — `BrokerError`.
+        """
+        first = position = await self._position_now()
+        pause = self._limits.position_settle
+        steps = max(1, math.ceil(pause / _SETTLE_STEP))
+        for _ in range(steps):
+            if agreed(position):
+                break
+            await asyncio.sleep(pause / steps)
+            position = await self._position_now()
+        return first, position
+
     def _forget_unfilled(self) -> None:
         """Позиции у брокера нет — неотданные «уровень не исполнился» забыть.
 
@@ -2800,11 +2862,12 @@ class LiveExecutor:
         """
         self._unfilled.clear()
 
-    def _disagreement(self, first: int, second: int) -> str | None:
+    def _disagreement(self, first: int, second: int, *, trusted: bool) -> str | None:
         """Почему объём закрытия не назван надёжно; `None` — чтения и сделки согласны.
 
-        Согласие — два чтения подряд равны и совпали с позицией по сделкам,
-        если она известна. Исключение — последнее чтение ноль и позиция по
+        Позиция по сделкам потока известна (`trusted`) — согласие это последнее
+        чтение, равное ей. Иначе — два чтения подряд равны и совпали с позицией
+        по сделкам, если она известна. Исключение — последнее чтение ноль и позиция по
         сделкам ноль, а раннее чтение другое (B-099, 13.11.2026 14:55): это
         портфель, догнавший поток после исполненного выхода. Прежде здесь
         было «не сходится… закройте её сами» при нулевой позиции — ложный
@@ -2814,7 +2877,9 @@ class LiveExecutor:
         known = self._ledger
         if second == 0 and known == 0:
             return None
-        if first == second and (known is None or known == second):
+        if trusted and known == second:
+            return None
+        if not trusted and first == second and (known is None or known == second):
             return None
         by_deals = "неизвестна" if known is None else position_words(known)
         return (
@@ -2829,10 +2894,7 @@ class LiveExecutor:
         price = ticket.mean_price()
         at = "" if price is None else f" по {price:g}"
         try:
-            after = await self._position_now()
-            if after != 0:
-                await asyncio.sleep(self._limits.position_settle)
-                after = await self._position_now()
+            _, after = await self._read_until(lambda now: now == 0)
         except BrokerError as error:
             return (
                 f"Закрывающая заявка ({position_words(position)}) исполнена{at}, а позицию "

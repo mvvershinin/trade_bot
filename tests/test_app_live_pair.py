@@ -552,6 +552,38 @@ def test_live_adopts_a_short_at_the_broker_with_a_take_from_its_average(
     assert "Шорт 1" in said, said
 
 
+def test_live_refuses_to_adopt_a_position_with_a_foreign_take_at_the_broker(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker
+) -> None:
+    """Стережёт `/risk` 13.11.2026, п. 1: чужая живая заявка на закрытие — отказ, а не подхват.
+
+    Шорт 1 и лимитная покупка, поданная мимо программы (тейк владельца).
+    Подхват поставил бы второй тейк, при касании исполнились бы оба — лонг 1.
+    Бой не включён, брокеру ни одной команды, отказ называет заявку.
+    """
+    values = dataclasses.replace(FIXED_TAKE, window_start=time(9, 0))
+
+    async def go() -> tuple[LiveStatus, str]:
+        bench, session = await _bench(tmp_path, broker, values)
+        try:
+            broker.foreign_trade("2", 1, 249_650.0, ticker=SYMBOL)
+            broker.orders.append(BookOrder(
+                key="00000000-0000-4000-8000-0000000000ff", side="1", order_type="2",
+                quantity=1, ticker=SYMBOL, class_code="SPBFUT", price=248_400.0,
+                exchange_id="FAKE-EXCH-OWNER", time_in_force="1",
+            ))
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=16))
+            return bench.port.live_status(), bench.said("Бой не включён")
+        finally:
+            await _close(bench, session)
+
+    status, refused = loop.run_until_complete(go())
+    assert not status.on, "бой включён при чужом тейке у брокера"
+    assert not [one for one in broker.commands if one[0] == "create"], broker.commands
+    assert "не робота" in refused and "248400" in refused, refused
+
+
 def test_live_is_refused_with_an_unsettled_command(
     loop, tmp_path: pathlib.Path, broker: FakeBroker
 ) -> None:

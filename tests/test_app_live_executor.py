@@ -2671,8 +2671,9 @@ def test_a_reversal_whose_portfolio_lags_longer_than_settle_stops_as_before(
             assert rig.broker.position(TICKER) == 0, "вход по отставшему портфелю дал шорт"
             assert len(rig.sells()) == 1
             # Перед входом: чтение и три перечитывания (0,03 с шагом 0,01);
-            # в «закрыть всё» — ещё два.
-            assert _reads(rig, ("GET", PORTFOLIO_PATH)) - before == 1 + 3 + 2
+            # в «закрыть всё» — так же, до схода с позицией по сделкам
+            # (`/risk` 13.11.2026, п. 2): чтение и три перечитывания.
+            assert _reads(rig, ("GET", PORTFOLIO_PATH)) - before == 1 + 3 + 1 + 3
             text = halted.value.human
             assert "не сошёлся" in text and "не сходится" in text, text
             assert not [note for note in rig.notices if "отстал" in note], rig.notices

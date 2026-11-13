@@ -52,6 +52,7 @@ from market import CandleStore, MarketWorker
 from market.commands import BrokerCommand, CommandAction, CommandSide
 from market.journal import RunOrigin, SessionRecord
 from tests.fake_broker import CANCEL, CREATE, STATUS, FakeBroker, _unavailable
+from tests.test_app_hand_actions import _StalePortfolio
 from tests.test_app_live_executor import (
     BAR0,
     TICKER,
@@ -590,6 +591,74 @@ def test_close_position_in_combat_leaves_the_robot_trading_without_a_position(
     assert not after.halted and after.on, f"робот после ручного закрытия стоит: {after.halted}"
     assert broker.position(SYMBOL) == -1, "вход по сигналу после ручного закрытия не подан"
     assert not later.halted, later.halted
+
+
+def test_close_in_combat_does_not_wait_the_whole_settle_pause(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стережёт `/risk` 13.11.2026, п. 2: тейк снят — закрывающая уходит без паузы 30 с.
+
+    Пауза сверки позиции 30 с, как у владельца. Портфель сразу согласен
+    с позицией по сделкам потока: закрытие не ждёт паузу целиком — позиция
+    не стоит без тейка полминуты.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+    values = dataclasses.replace(FIXED_TAKE, live_position_settle_sec=30.0)
+
+    async def go() -> tuple[str, float]:
+        bench, session = await _bench(tmp_path, broker, values)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
+            started = asyncio.get_running_loop().time()
+            bench.port.close_position()
+            await bench.port.wait()
+            spent = asyncio.get_running_loop().time() - started
+            return bench.said("Закрытие позиции руками"), spent
+        finally:
+            await _close(bench, session)
+
+    said, spent = loop.run_until_complete(go())
+    assert broker.position(SYMBOL) == 0, said
+    assert spent < 10.0, f"закрытие ждало {spent:.0f} с при согласном портфеле: {said}"
+
+
+def test_close_in_combat_after_a_take_fill_does_not_sell_by_a_lagging_portfolio(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стережёт `/risk` 13.11.2026, п. 3: тейк исполнился, портфель отстал — второй продажи нет.
+
+    Лонг «факта», тейк у брокера исполнился (поток это знает), портфель ещё
+    показывает лонг 1. «Закрыть позицию» сразу после: позиция по сделкам
+    потока — ноль, и чтение отставшего портфеля её не перетирает. Продажа
+    по лонгу 1 дала бы шорт 1.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[str, int]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
+            (take,) = broker.live()
+            _StalePortfolio(broker, after=1)
+            await session.read(PORTFOLIO_PATH)  # портфель застыл на «лонг 1»
+            broker.execute(take.key, 1, take.price or 0.0)
+            await asyncio.sleep(0.2)
+            await bench.port.wait()
+            sent = len([one for one in broker.commands if one[0] == "create"])
+            bench.port.close_position()
+            await bench.port.wait()
+            after = len([one for one in broker.commands if one[0] == "create"])
+            return bench.said("Закрытие позиции руками"), after - sent
+        finally:
+            await _close(bench, session)
+
+    said, sent = loop.run_until_complete(go())
+    assert sent == 0, f"после исполнения тейка подана продажа по отставшему портфелю: {said}"
+    assert broker.position(SYMBOL) == 0, said
 
 
 def test_cancel_take_in_combat_leaves_the_robot_trading_by_signal_without_a_new_take(
