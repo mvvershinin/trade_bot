@@ -91,6 +91,12 @@ def _any_real_money(rows: Iterable[TradeRow | DecisionRow]) -> bool:
 #: при любом кегле, включая системный крупный шрифт на машине владельца.
 LONGEST_REASON = "обратный сигнал средней"
 
+#: Подсказка на строке сделки прежнего захода боя (B-100).
+EARLIER_RUN_HINT = (
+    "Сделка прежнего захода боя — из базы. Приглушённые строки — прежние "
+    "заходы, яркие — текущий."
+)
+
 
 class TradesModel(QAbstractTableModel):
     """Журнал сделок: что реально произошло."""
@@ -186,6 +192,11 @@ class TradesModel(QAbstractTableModel):
         # на соседнюю колонку молча.
         if role == Qt.ItemDataRole.TextAlignmentRole and column in _TRADE_NUMERIC:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.ForegroundRole and trade.earlier_run:
+            # Прежний заход боя — приглушённым целиком, включая результат:
+            # знак виден минусом, а яркими остаются только сделки текущего
+            # захода (B-100). Тот же приём у меток графика.
+            return QColor(self._theme.text_dim)
         if (
             role == Qt.ItemDataRole.ForegroundRole
             and column in _TRADE_SIGNED
@@ -195,6 +206,8 @@ class TradesModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ToolTipRole and column == _TRADE_WIDE:
             # Длинный текст режется по ширине колонки — подсказка отдаёт его целиком.
             return trade.exit_reason
+        if role == Qt.ItemDataRole.ToolTipRole and trade.earlier_run:
+            return EARLIER_RUN_HINT
         return None
 
 
@@ -806,11 +819,16 @@ class JournalTabs(QWidget):
         # (`ui.formatting.SUMMARY_FIELDS`). Второй потребитель этой же
         # таблицы — итог выделенного участка графика: два разных набора
         # слов про одни и те же деньги были бы новой путаницей.
-        parts = summary_parts(summary, SUMMARY_FIELDS)
         colour = self._theme.text
         if summary.net_profit_rub is not None:
             colour = self._theme.success if summary.net_profit_rub >= 0 else self._theme.danger
-        self.summary_label.setText("Итог за период — " + " · ".join(parts))
+        # В бою строк две: вся история боя и текущий заход (B-100).
+        lines = [summary, *(() if summary.current is None else (summary.current,))]
+        self.summary_label.setText("\n".join(
+            f"{one.title or 'Итог за период'} — "
+            + " · ".join(summary_parts(one, SUMMARY_FIELDS))
+            for one in lines
+        ))
         self.summary_label.setStyleSheet(f"color: {colour}; font-weight: 600;")
         self._show_assumptions(summary.headline)
 

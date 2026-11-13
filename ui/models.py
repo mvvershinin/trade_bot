@@ -596,6 +596,10 @@ class Marker:
     text: str = ""
     tooltip: str = ""
     pair_id: str | None = None
+    #: Сделка прежнего захода боя, прочитанная из базы (`app/live_history.py`,
+    #: B-100). График рисует её приглушённой — так же, как таблица «Сделки»
+    #: приглушает её строку: одно решение на оба места.
+    earlier_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,6 +613,8 @@ class TradePath:
     side: Side
     layer: Layer = Layer.FACT
     profitable: bool | None = None
+    #: Сделка прежнего захода боя — линия приглушена, как её метки (`Marker.earlier_run`).
+    earlier_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -961,6 +967,9 @@ class TradeRow:
     #: Движение цены в пользу позиции, в пунктах (`backtest.Deal.points`).
     #: `None` — источник пунктов не передал.
     profit_points: float | None = None
+    #: Сделка прежнего захода боя, прочитанная из базы (B-100): у текущего
+    #: движка «факта» её нет — он прогрет с нуля. Таблица приглушает строку.
+    earlier_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,6 +1008,12 @@ class TradesSummary:
     #: единого слова о том, что проскальзывание не учтено. Пусто бывает
     #: только там, где нет и числа.
     headline: str = ""
+    #: Чей это итог — словами, в начало строки под таблицей. Пусто — «Итог
+    #: за период». В бою: «Итог за всю историю боя» (B-100).
+    title: str = ""
+    #: Итог текущего захода боя — второй строкой под итогом всей истории.
+    #: `None` — не бой: строка одна.
+    current: TradesSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -49,7 +49,7 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
 
 from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
-from app import contract_view, convert, debug_feed, paper_report, stitched_view
+from app import contract_view, convert, debug_feed, live_history, paper_report, stitched_view
 from app.fact import (
     FactDesk,
     FactDesks,
@@ -167,6 +167,7 @@ from ui.models import (
     TimeExitKind,
     TradePath,
     TradeRow,
+    TradesSummary,
     live_limit_rule,
     switch_blocked_reason,
 )
@@ -787,6 +788,16 @@ class _Live:
     #: Строка открытой позиции, показанная последним проходом (`_open_row`):
     #: «Отдать журналы» без прогона её не теряет (ревью 13.11.2026).
     open_row: tuple[TradeRow, ...] = ()
+    #: Когда открыт прогон текущего захода боя — для подписи его итога (B-100).
+    since: datetime | None = None
+    #: Закрытые боевые сделки всех прогонов из базы (`_read_live_history`, B-100)
+    #: и номер прогона «факта», для которого они прочитаны. Прежние прогоны
+    #: закрыты и не меняются: чтение одно на заход.
+    history: live_history.Earlier = live_history.Earlier()
+    history_for: int | None = None
+    #: Сделки боя, показанные последним проходом: «Отдать журналы» берёт их,
+    #: а не собирает заново. `None` — показан не бой.
+    shown: live_history.LiveTrades | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2097,14 +2108,7 @@ class HistoryPort(TerminalPort):
         """Отдать то, что уже посчитано. Прогон заново не гоняется."""
         self._send(self.decisions_replaced, self._journal)
         if self._run is not None:
-            self._send(
-                self.trades_replaced,
-                tuple(
-                    convert.trade_row(deal, origin=self._origin)
-                    for deal in self._run.deals
-                ) + self._live.open_row,
-                convert.trades_summary(self._run),
-            )
+            self._send(self.trades_replaced, *self._trades_of(self._run, self._live.shown))
 
     # -------------------------------------------- прогон на истории по кнопке
 
@@ -3809,6 +3813,7 @@ class HistoryPort(TerminalPort):
             else:
                 self._stitched = None
                 run = await self._advance(frame, symbol, candles)
+                await self._read_live_history()
                 self._context = await self._contract_context(symbol, timeframe, candles)
             self._run = run
             self._show(frame, symbol, timeframe, candles, run)
@@ -5356,6 +5361,7 @@ class HistoryPort(TerminalPort):
         manager = self._runs.around(record)
         entry = await manager.__aenter__()
         self._live.record, self._live.entry = manager, entry
+        self._live.since = self._clock()
         return entry.id
 
     async def _close_live_run(self, note: str) -> None:
@@ -6291,6 +6297,10 @@ class HistoryPort(TerminalPort):
             if forecast is None
             else _live_overlay(run, forecast, timeframe, ruble_per_point=rubles, pending=pending)
         )
+        # Бой: сделки прежних заходов — тем же списком, что у таблицы (B-100).
+        live = self._live.shown = self._live_trades(run, symbol, timeframe)
+        if live is not None:
+            markers, paths = markers + live.markers, paths + live.paths
         before = self._edge
         context = self._context
         drawn, seams = contract_view.split_shown(context, candles)
@@ -6312,13 +6322,7 @@ class HistoryPort(TerminalPort):
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
         )
         self._live.open_row = _open_row(run, candles, rubles, self._origin)
-        self._send(
-            self.trades_replaced,
-            self._seam_rows(
-                tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals)
-            ) + self._live.open_row,
-            convert.trades_summary(run),
-        )
+        self._send(self.trades_replaced, *self._trades_of(run, live))
         # Прогон по склейке называет все контракты периода, а не код из настроек.
         named = (
             " → ".join(one.piece.symbol for one in self._stitched.pieces)
@@ -6391,6 +6395,79 @@ class HistoryPort(TerminalPort):
                 basis=self._basis,
             )
         self._send(self.backtest_finished, report)
+
+    def _live_trades(
+        self, run: HistoryRun, symbol: str, timeframe: Timeframe
+    ) -> live_history.LiveTrades | None:
+        """Бой: сделки прежних заходов из базы плюс текущего (B-100). `None` — не бой."""
+        if self._origin is not RunOrigin.LIVE:
+            return None
+        return live_history.compose(
+            run, self._live.history, symbol=symbol, timeframe=timeframe, since=self._live.since,
+        )
+
+    def _trades_of(
+        self, run: HistoryRun, live: live_history.LiveTrades | None
+    ) -> tuple[tuple[TradeRow, ...], TradesSummary]:
+        """Строки «Сделок» и итог: в бою — все заходы, иначе — прогон. Плюс открытая позиция."""
+        if live is not None:
+            return live.rows + self._live.open_row, live.summary
+        rows = self._seam_rows(
+            tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals)
+        )
+        return rows + self._live.open_row, convert.trades_summary(run)
+
+    async def _read_live_history(self) -> None:
+        """Закрытые боевые сделки всех прогонов — из базы, один раз на заход (B-100).
+
+        Движок «факта» каждого захода прогрет с нуля и прежних сделок не знает;
+        без этого чтения «Сделки» пустели после любой остановки. Прежние прогоны
+        закрыты и не меняются, поэтому чтение повторяется только со сменой
+        прогона «факта» или после отказа. Сделки текущего захода в выдаче тоже
+        есть — их пишет `PaperLog`, — и дубль снимает `live_history.compose`.
+
+        Отказ — не пустая таблица (правило 13): строка журнала один раз
+        на причину, причина в подписи итога, текущий заход показан.
+        """
+        if self._origin is not RunOrigin.LIVE:
+            return
+        entry = self._live.entry
+        current = None if entry is None else entry.id
+        live = self._live
+        if current is not None and current == live.history_for and not live.history.trouble:
+            return
+        try:
+            page = await self._worker.trades(
+                origin=convert.stored_origin(RunOrigin.LIVE), all_runs=True,
+                limit=_PAPER_LIMIT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.exception("боевые сделки прежних заходов не прочитаны", extra={"panel": False})
+            why = f"база {self._worker.path} не ответила: {_plain(error)}."
+            if why != live.history.trouble:
+                self.note(
+                    "Сделки прежних заходов боя не прочитаны",
+                    f"Причина: {why} «Сделки» и график показывают только текущий "
+                    "заход; чтение повторится на следующем проходе.",
+                    DecisionLevel.WARNING,
+                )
+            live.history, live.history_for = live_history.Earlier(trouble=why), None
+            return
+        if live.history.trouble:
+            self.note(
+                "Сделки прежних заходов боя прочитаны",
+                "База ответила: «Сделки» и график снова показывают все заходы боя.",
+            )
+        live.history, live.history_for = live_history.Earlier(page.rows), current
+        if page.truncated:
+            self.note(
+                "Сделки прежних заходов боя прочитаны не все",
+                f"В базе больше {_PAPER_LIMIT} боевых сделок — показаны последние "
+                f"{_PAPER_LIMIT}, итог за всю историю неполон.",
+                DecisionLevel.WARNING,
+            )
 
     def _seam_rows(self, rows: tuple[TradeRow, ...]) -> tuple[TradeRow, ...]:
         """Строки сделок; у сделки на стыке — «смена контракта», а не «конец отрезка»."""
