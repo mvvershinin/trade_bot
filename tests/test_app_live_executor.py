@@ -2544,45 +2544,138 @@ def test_a_trailing_touch_without_the_stream_is_told_to_the_human(
         run(scenario())
 
 
+def _lag_after_exit(rig: Rig, reads: int) -> None:
+    """Выход исполняется, а следующие `reads` чтений портфеля ещё показывают прежний лонг.
+
+    Так портфель БКС отставал 13.11.2026 (B-099): поток уже сказал
+    «исполнена», портфель — ещё нет, около 5 с. Вход после выхода — по 104.
+    """
+    lag = {"reads": 0}
+
+    def lagging(request: httpx.Request) -> httpx.Response:
+        if lag["reads"] > 0:
+            lag["reads"] -= 1
+            rig.broker.outside += 1
+            try:
+                return honest_portfolio(request)
+            finally:
+                rig.broker.outside -= 1
+        return honest_portfolio(request)
+
+    honest_portfolio = rig.broker.replace_route(("GET", PORTFOLIO_PATH), lagging)
+
+    def close_then_lag(fake: FakeBroker, order: BookOrder) -> None:
+        fake.execute(order.key, 1, 104.0)
+        lag["reads"] = reads
+
+    rig.exchange.plans.extend([close_then_lag, filled((1, 104.0))])
+
+
 def test_a_reversal_with_a_portfolio_lagging_past_settle_does_not_open_a_short(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """К2 (S5): выход исполнен, портфель отстаёт дольше `position_settle` — второй продажи нет.
+    """К2 (S5), B-099: портфель догнал сделки только в «закрыть всё» — ни шорта, ни «закройте».
 
-    Вход в шорт видит в портфеле прежний лонг: робот встаёт, но «закрыть
-    всё» не продаёт — чтения портфеля и сделки программы расходятся.
-    Позиция у брокера — ноль, а не шорт.
+    Пауза 0: перед входом в шорт одно перечитывание, оба чтения — прежний
+    лонг, робот встаёт. В «закрыть всё» раннее чтение ещё лонг 1, последнее —
+    ноль, и по сделкам программы ноль (13.11.2026 14:55).
+
+    Стережёт: при нулевой позиции, на которой сошлись последнее чтение
+    и сделки программы, «закрыть всё» не продаёт и не советует человеку
+    закрыть несуществующую позицию — пишет «закрывать нечего».
     """
 
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             await long_open(rig)
-            lag = {"reads": 0}
-
-            def lagging(request: httpx.Request) -> httpx.Response:
-                if lag["reads"] > 0:
-                    lag["reads"] -= 1
-                    rig.broker.outside += 1
-                    try:
-                        return honest_portfolio(request)
-                    finally:
-                        rig.broker.outside -= 1
-                return honest_portfolio(request)
-
-            honest_portfolio = rig.broker.replace_route(("GET", PORTFOLIO_PATH), lagging)
-
-            def close_then_lag(fake: FakeBroker, order: BookOrder) -> None:
-                fake.execute(order.key, 1, 104.0)
-                lag["reads"] = 3
-
-            rig.exchange.plans.extend([close_then_lag, filled((1, 104.0))])
+            _lag_after_exit(rig, reads=3)
             rig.clock.now = BAR1 + timedelta(seconds=5)
             await submit_on_signal(rig, leave())
             with pytest.raises(ExecutionHalted) as halted:
                 await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
             assert rig.broker.position(TICKER) == 0, "переворот с отставшим портфелем дал шорт"
             assert len(rig.sells()) == 1
-            assert "не сходится" in halted.value.human
+            text = halted.value.human
+            assert "закрывать нечего" in text and "чтением раньше было лонг 1" in text, text
+            assert "закройте" not in text, f"совет закрыть позицию, которой нет: {text}"
+            assert "не сходится" not in text, text
+
+    run(scenario())
+
+
+def test_a_reversal_whose_portfolio_lags_within_settle_opens_the_short(
+    tmp_path: pathlib.Path,
+    store: TokenStore,
+    broker: FakeBroker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-099: портфель отстаёт на три чтения после выхода — вход подан, остановки нет.
+
+    Стережёт: перед входом позиция у брокера перечитывается шагами, пока
+    не сойдётся, и заявка уходит сразу после схода — без доживания паузы;
+    в журнал решений — строка INFO «портфель брокера отстал». Прежде было
+    одно перечитывание, и каждый переворот кончался «закрыть всё».
+    """
+    monkeypatch.setattr(live_executor, "_SETTLE_STEP", 0.01)
+    limits = replace(FAST, position_settle=5.0)
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker, limits=limits) as rig:
+            await long_open(rig)
+            _lag_after_exit(rig, reads=3)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+            loop = asyncio.get_running_loop()
+            before, started = _reads(rig, ("GET", PORTFOLIO_PATH)), loop.time()
+            await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
+            spent = loop.time() - started
+            await heard()
+            assert rig.executor.halted is None, rig.executor.halted
+            assert rig.broker.position(TICKER) == -1, "шорт после схода портфеля не открыт"
+            assert len(rig.sells()) == 2
+            # Три отставших чтения и одно сошедшееся: дальше схода не читали.
+            assert _reads(rig, ("GET", PORTFOLIO_PATH)) - before == 4
+            assert spent < limits.position_settle / 2, f"пауза дожита после схода: {spent:.2f} с"
+            lagged = [level for text, level in rig.levels if "Портфель брокера отстал" in text]
+            assert lagged == [DecisionLevel.INFO], rig.levels
+
+    run(scenario())
+
+
+def test_a_reversal_whose_portfolio_lags_longer_than_settle_stops_as_before(
+    tmp_path: pathlib.Path,
+    store: TokenStore,
+    broker: FakeBroker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-099: портфель отстаёт дольше паузы — остановка, как прежде; шорта и продажи нет.
+
+    Стережёт: перечитывание перед заявкой ограничено `position_settle`
+    в сумме — не сошлось за паузу, значит «закрыть всё» и остановка (0020),
+    а не бесконечный опрос и не вход по отставшему портфелю. Оба чтения
+    в «закрыть всё» ещё отстают — объём не назван, продажи нет.
+    """
+    monkeypatch.setattr(live_executor, "_SETTLE_STEP", 0.01)
+    limits = replace(FAST, position_settle=0.03)
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker, limits=limits) as rig:
+            await long_open(rig)
+            _lag_after_exit(rig, reads=50)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+            before = _reads(rig, ("GET", PORTFOLIO_PATH))
+            with pytest.raises(ExecutionHalted) as halted:
+                await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
+            await heard()
+            assert rig.broker.position(TICKER) == 0, "вход по отставшему портфелю дал шорт"
+            assert len(rig.sells()) == 1
+            # Перед входом: чтение и три перечитывания (0,03 с шагом 0,01);
+            # в «закрыть всё» — ещё два.
+            assert _reads(rig, ("GET", PORTFOLIO_PATH)) - before == 1 + 3 + 2
+            text = halted.value.human
+            assert "не сошёлся" in text and "не сходится" in text, text
+            assert not [note for note in rig.notices if "отстал" in note], rig.notices
 
     run(scenario())
 

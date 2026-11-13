@@ -81,6 +81,7 @@ import asyncio
 import contextlib
 import enum
 import logging
+import math
 import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
@@ -218,6 +219,17 @@ _FOREIGN_TEXT_LIMIT: Final[int] = 200
 #: чтением портфеля — не больше одной на паузу. В окно не выведено; если
 #: владелец захочет крутить — одно поле `LiveLimits` (`app/fact.py`).
 _LINK_SETTLE: Final[float] = 10.0
+
+#: Шаг перечитывания портфеля перед заявкой, пока позиция у брокера не сойдётся
+#: с позицией робота (`_require_position`, B-099). Сумма пауз — не больше
+#: `LiveLimits.position_settle`, шаги делят её поровну.
+#:
+#: ⚠️ Число техническое, не торговое: частота запросов, а не цена, объём или
+#: окно. Портфель у БКС — 10 запросов в секунду на счёт
+#: (`.docs/broker-api/29-restrictions.md`, сверено с сайтом 13.11.2026): шаг
+#: в секунду в десять раз ниже предела, а опоздание портфеля (около 5 с
+#: 13.11.2026) видно с точностью до секунды. В окно не выведено.
+_SETTLE_STEP: Final[float] = 1.0
 _CONTROL: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]+")
 
 #: Насколько назад искать последнюю записанную минутку — «текущую» у «закрыть
@@ -1604,17 +1616,40 @@ class LiveExecutor:
         )
 
     async def _require_position(self, expected: int, order: OrderRequest) -> None:
-        """Позиция у брокера свежим запросом. Расхождение — закрыть всё и остановиться."""
+        """Позиция у брокера свежим запросом; расхождение — перечитать до схода, потом стоп.
+
+        Портфель брокера отстаёт от потока исполнений: 13.11.2026 после выхода
+        FOK, исполненного по потоку, портфель ещё около 5 с показывал прежний
+        лонг, и каждый переворот кончался «закрыть всё» (B-099, выбор
+        владельца — «перечитывать до схода»). Чтения идут шагом `_SETTLE_STEP`,
+        пока позиция не сойдётся, но в сумме пауз не дольше `position_settle`.
+        Сошлось — дальше сразу, без доживания паузы, и строка INFO в журнал
+        решений: на сколько портфель отстал. Не сошлось за паузу — закрыть всё
+        и остановиться (0020). Пауза 0 — одно перечитывание сразу.
+        """
         actual = await self._read_position()
-        if actual != expected:
-            await asyncio.sleep(self._limits.position_settle)
-            actual = await self._read_position()
         if actual == expected:
             self._ledger = actual
             return
+        pause = self._limits.position_settle
+        steps = max(1, math.ceil(pause / _SETTLE_STEP))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for _ in range(steps):
+            await asyncio.sleep(pause / steps)
+            actual = await self._read_position()
+            if actual == expected:
+                self._ledger = actual
+                self._say(
+                    f"Портфель брокера отстал на {loop.time() - started:.0f} с: перед "
+                    f"заявкой ({_order_words(order)}) позиция у брокера сошлась с позицией "
+                    f"робота ({position_words(expected)})."
+                )
+                return
+        waited = f"; портфель перечитывался {pause:g} с и не сошёлся" if pause > 0 else ""
         why = (
             f"Перед заявкой ({_order_words(order)}) у брокера {position_words(actual)}, "
-            f"а робот считает {position_words(expected)}."
+            f"а робот считает {position_words(expected)}{waited}."
         )
         raise ExecutionHalted(await self._flatten(why))
 
@@ -2607,9 +2642,10 @@ class LiveExecutor:
 
         Объём — из двух чтений портфеля подряд, и оба обязаны совпасть между
         собой и с позицией по исполнениям потока (`_ledger`), если она известна.
-        Портфель брокера отстаёт от потока сделок (насколько — первый боевой
-        день), и продажа по отставшему чтению — шорт без сигнала. Не сошлось —
-        заявка не подаётся, человек получает обе цифры.
+        Портфель брокера отстаёт от потока сделок (13.11.2026 — около 5 с),
+        и продажа по отставшему чтению — шорт без сигнала. Не сошлось —
+        заявка не подаётся, человек получает обе цифры. Исключение одно —
+        в `_disagreement`: последнее чтение и сделки сходятся на нуле.
         """
         # Планка — до чтений позиции (`/risk` 10.11.2026, находка 1): иначе
         # объём закрытия — из чтения за `band_wait` до подачи, и сделка,
@@ -2629,7 +2665,13 @@ class LiveExecutor:
             return doubt
         if position == 0:
             self._forget_unfilled()
-            return "Позиции у брокера нет — закрывать нечего."
+            if first == 0:
+                return "Позиции у брокера нет — закрывать нечего."
+            return (
+                f"Позиции у брокера нет — закрывать нечего: чтением раньше было "
+                f"{position_words(first)}, но по сделкам программы позиции тоже нет — "
+                "портфель брокера отставал от сделок."
+            )
         side = OrderSide.SELL if position > 0 else OrderSide.BUY
         what = f"закрыть всё: {position_words(position)}"
         known = set(self._tickets)
@@ -2661,8 +2703,19 @@ class LiveExecutor:
         self._unfilled.clear()
 
     def _disagreement(self, first: int, second: int) -> str | None:
-        """Почему объём закрытия не назван надёжно; `None` — два чтения и сделки согласны."""
+        """Почему объём закрытия не назван надёжно; `None` — чтения и сделки согласны.
+
+        Согласие — два чтения подряд равны и совпали с позицией по сделкам,
+        если она известна. Исключение — последнее чтение ноль и позиция по
+        сделкам ноль, а раннее чтение другое (B-099, 13.11.2026 14:55): это
+        портфель, догнавший поток после исполненного выхода. Прежде здесь
+        было «не сходится… закройте её сами» при нулевой позиции — ложный
+        совет. Заявки этот вывод не подаёт: закрывать нечего. Для ненулевой
+        позиции правило двух чтений прежнее (К2) — по нему уходит продажа.
+        """
         known = self._ledger
+        if second == 0 and known == 0:
+            return None
         if first == second and (known is None or known == second):
             return None
         by_deals = "неизвестна" if known is None else position_words(known)
