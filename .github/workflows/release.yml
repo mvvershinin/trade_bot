@@ -131,7 +131,7 @@ jobs:
   # ------------------------------------------------------------------
   build-linux:
     name: Сборка — Linux (AppImage)
-    needs: [version, test]
+    needs: [version]  # только ветка preview/e4: сборка не ждёт тестов (владелец 13.11, B-089)
     runs-on: ubuntu-latest
     container:
       image: ubuntu:22.04
@@ -183,7 +183,7 @@ jobs:
   # ------------------------------------------------------------------
   build-windows:
     name: Сборка — Windows
-    needs: [version, test]
+    needs: [version]  # только ветка preview/e4: сборка не ждёт тестов (владелец 13.11, B-089)
     runs-on: windows-latest
     timeout-minutes: 45
     defaults:
