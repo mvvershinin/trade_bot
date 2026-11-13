@@ -112,6 +112,7 @@ from broker.order_stream import order_events
 from broker.orders import (
     FINAL_STATUSES,
     STATUS_WORDS,
+    ConditionalTake,
     ListedOrder,
     ListedOrderStatus,
     NewOrder,
@@ -122,6 +123,7 @@ from broker.orders import (
     OrdersQuery,
     OrderStatus,
     OrderType,
+    PlacedOrder,
     TimeInForce,
 )
 from broker.session import PORTFOLIO_PATH, BrokerSession
@@ -426,7 +428,7 @@ class _Ticket:
     key: UUID
     name: str
     what: str
-    order: NewOrder
+    order: PlacedOrder
     answer: _Answer = _Answer.NONE
     status: OrderStatus | None = None
     executed: int = 0
@@ -564,6 +566,14 @@ class _Take:
     #: Заявку тейка снял владелец кнопкой «Снять заявку» (0069): вооружение
     #: под этим именем — пустая операция, снятие — «сторожа нет».
     dropped: bool = False
+    #: Уровень программы, о котором уже сказано рядом с условной у брокера
+    #: (`D-196`): одна строка на включение, а не на каждую свечу.
+    program_level: float | None = None
+
+    @property
+    def conditional(self) -> bool:
+        """Уровень ведёт брокер условной заявкой (`D-196`), а не лимитная и не сторож."""
+        return self.ticket is not None and isinstance(self.ticket.order, ConditionalTake)
 
     @property
     def fired(self) -> bool:
@@ -585,7 +595,7 @@ class _Priced(NamedTuple):
     слова без заявки — цену, которой у брокера нет.
     """
 
-    order: NewOrder
+    order: PlacedOrder
     words: str
     #: «Текущая» цена, от которой судят исполнение (владелец 10.11.2026):
     #: строка «исполнена по X, текущая была Y» — у каждой исполненной заявки,
@@ -627,6 +637,9 @@ def _order_words(order: OrderRequest) -> str:
     if order.action is OrderAction.CLOSE:
         limit = "" if order.limit_price is None else f" с пределом {order.limit_price:g}"
         return f"выход из {_GENITIVE[order.side]}{limit}"
+    if order.action is OrderAction.ARM_TAKE_PROFIT and order.trail_offset is not None:
+        side = _GENITIVE[order.side]
+        return f"скользящий тейк {side} у брокера, включение на {order.price or 0:g}"
     if order.action is OrderAction.ARM_TAKE_PROFIT:
         return f"уровень {_GENITIVE[order.side]} {order.price or 0:g}"
     return f"снятие уровня {order.target_id or ''}".rstrip()
@@ -739,7 +752,11 @@ def _fok_tail(ticket: _Ticket) -> str:
     движок тейк снял, а сторож трейлинга снят вместе с касанием (6.2).
     """
     order = ticket.order
-    if order.time_in_force is not TimeInForce.FILL_OR_KILL or not ticket.killed:
+    if (
+        not isinstance(order, NewOrder)
+        or order.time_in_force is not TimeInForce.FILL_OR_KILL
+        or not ticket.killed
+    ):
         return ""
     left = (
         " Позиция у брокера открыта без тейка — закройте её сами в приложении брокера."
@@ -1552,15 +1569,26 @@ class LiveExecutor:
         self._limit_exits.append(_LimitExit(order, deal, ticket))
 
     async def _arm(self, order: OrderRequest) -> None:
-        """Вооружение — состояние: тот же уровень тем же механизмом — пустая операция."""
+        """Вооружение — состояние: тот же уровень тем же механизмом — пустая операция.
+
+        Скользящий тейк (`D-196`): вооружение с `trail_offset` ставит у брокера
+        условную заявку; пока она жива, **любое** вооружение этого имени —
+        и повтор условной, и уровень программы после порога — к брокеру
+        не идёт: уровень ведёт брокер, робот его не двигает.
+        """
         take = self._takes.get(order.order_id)
         at_broker = (order.side, order.touch) in _AT_BROKER
         if take is not None and take.dropped:
             return  # тейк снял владелец: заново не ставится (0069)
+        if take is not None and take.conditional and not take.fired:
+            ticket = take.ticket
+            if ticket is not None and not ticket.final:
+                self._level_aside(take, order)
+                return
         if take is not None:
             if take.fired:
                 raise _already(take.order)
-            if take.ticket is None and not at_broker:
+            if take.ticket is None and not at_broker and order.trail_offset is None:
                 # Сторож двигается: новый уровень судит минутки с момента подачи.
                 self._refuse_stale(order)
                 take.order = order
@@ -1578,11 +1606,42 @@ class LiveExecutor:
             await self._require_stream()
             await self._tear_down(take)
             del self._takes[order.order_id]
-        if at_broker:
+        if at_broker or order.trail_offset is not None:
             await self._place_take(order)
             return
         self._refuse_stale(order)
         self._takes[order.order_id] = _Take(order, checked_from=order.submitted_at)
+        # Новый сторож программы — значит, условной у брокера под этим уровнем
+        # нет (`D-196`): не принята при входе или исполнитель собран после порога.
+        # Молчать нельзя (правило 13): владелец считает, что тейк у брокера.
+        self._tell(
+            f"Скользящий тейк {_GENITIVE[order.side]} сторожит программа по минуткам, "
+            f"уровень {order.price or 0:g}: условной заявки у брокера под ним нет "
+            "(не принята при входе или программа перезапущена после порога). "
+            "Выход — по касанию, с закрытием минутки; без связи — не сработает."
+        )
+
+    def _level_aside(self, take: _Take, order: OrderRequest) -> None:
+        """Вооружение при живой условной у брокера: к брокеру не идёт (`D-196`).
+
+        Уровень программы после порога — для сравнения с брокером: одной
+        строкой человеку при включении, дальше — в технический лог. Повтор
+        самой условной (до порога, каждую свечу) — молча: состояние то же.
+        """
+        if order.trail_offset is not None or order.price is None:
+            return
+        first = take.program_level is None
+        take.program_level = order.price
+        log.info(
+            "тейк %s: уровень программы %s, у брокера ведёт условная %s",
+            order.order_id, order.price, take.ticket.key if take.ticket else "?",
+        )
+        if first:
+            self._say(
+                f"Скользящий тейк {_GENITIVE[order.side]} включился по расчёту программы, "
+                f"уровень {order.price:g}. У брокера уровень ведёт условная заявка — "
+                "робот его не двигает; уровень брокера может отличаться."
+            )
 
     async def _cancel(self, order: OrderRequest) -> None:
         """Возврат — сторожа больше нет. Сработал — `ALREADY_TRIGGERED`, а не возврат."""
@@ -1615,20 +1674,46 @@ class LiveExecutor:
             await self._require_stream()
         else:
             await self._admit(order, expected=None)
-        request = NewOrder(
+        if order.trail_offset is not None:
+            priced = self._conditional(order, volume)
+            what = f"скользящий тейк {_GENITIVE[order.side]}"
+        else:
+            priced = _Priced(NewOrder(
+                side=_CLOSING[order.side],
+                order_type=OrderType.LIMIT,
+                quantity=volume,
+                ticker=self._instrument.ticker,
+                class_code=self._instrument.class_code,
+                price=order.price,
+            ), f"по цене {order.price or 0:g}: уровень тейка движка, до конца дня")
+            what = f"тейк {_GENITIVE[order.side]}"
+        ticket = await self._send(order.order_id, what, priced)
+        self._takes[order.order_id] = _Take(order, ticket)
+        await self._accepted(ticket)
+
+    def _conditional(self, order: OrderRequest, volume: int) -> _Priced:
+        """Скользящий тейк у брокера — условная заявка закрывающей стороны (`D-196`).
+
+        Цена включения — `price` вооружения как есть (вход ± порог, к сетке шага
+        положил движок); отступ — `trail_offset`; спред — из настроек «Бой».
+        """
+        spread = self._limits.trailing_spread_percent
+        offset = order.trail_offset or 0.0
+        request = ConditionalTake(
             side=_CLOSING[order.side],
-            order_type=OrderType.LIMIT,
             quantity=volume,
             ticker=self._instrument.ticker,
             class_code=self._instrument.class_code,
-            price=order.price,
+            take_price=order.price or 0.0,
+            offset=offset,
+            spread=spread,
         )
-        words = f"по цене {order.price or 0:g}: уровень тейка движка, до конца дня"
-        ticket = await self._send(
-            order.order_id, f"тейк {_GENITIVE[order.side]}", _Priced(request, words)
+        words = (
+            f"условной заявкой у брокера: включение на {order.price or 0:g}, отступ "
+            f"{offset:g} % от лучшей цены, выход лимитной по срабатыванию "
+            f"{'−' if order.side is Side.LONG else '+'} {spread:g} %"
         )
-        self._takes[order.order_id] = _Take(order, ticket)
-        await self._accepted(ticket)
+        return _Priced(request, words)
 
     async def _tear_down(self, take: _Take) -> None:
         """Снять прежний механизм уровня. Исполнилось хоть что-то — довести, `ALREADY_TRIGGERED`."""
@@ -2074,7 +2159,11 @@ class LiveExecutor:
 
     def _command_row(self, key: UUID, name: str, command: OrderCommand) -> BrokerCommand:
         """Команда сессии → строка журнала: что увидит брокер, а не намерение движка."""
-        if isinstance(command, NewOrder):
+        if isinstance(command, NewOrder | ConditionalTake):
+            # У условной своей цены нет: в журнал — цена включения. Типа заявки
+            # у строки журнала нет вовсе (`D-196`, вторая очередь), и «по рынку»
+            # о ней было бы неправдой дальше, чем цена включения.
+            price = command.take_price if isinstance(command, ConditionalTake) else command.price
             return BrokerCommand(
                 client_order_id=str(key),
                 action=CommandAction.CREATE,
@@ -2082,7 +2171,7 @@ class LiveExecutor:
                 symbol=command.ticker,
                 side=_JOURNAL_SIDE[command.side],
                 volume=command.quantity,
-                price=command.price,
+                price=price,
                 account=self._instrument.account,
             )
         return BrokerCommand(
@@ -3508,8 +3597,10 @@ def _technical(error: BaseException) -> str:
     return error.technical if isinstance(error, BrokerError) else type(error).__name__
 
 
-def _immediate(order: NewOrder) -> bool:
-    """Заявка немедленного исполнения: FOK или рыночная (Р-7)."""
+def _immediate(order: PlacedOrder) -> bool:
+    """Заявка немедленного исполнения: FOK или рыночная (Р-7). Условная — нет."""
+    if not isinstance(order, NewOrder):
+        return False
     return order.time_in_force is TimeInForce.FILL_OR_KILL or order.order_type is OrderType.MARKET
 
 

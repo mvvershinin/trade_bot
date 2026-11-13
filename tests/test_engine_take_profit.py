@@ -1630,16 +1630,40 @@ TRAILING = WORKING.replace(
 
 
 def test_below_the_threshold_the_trailing_take_has_no_level_at_all() -> None:
-    """Пока прибыль меньше порога, позицию держит переворот по средней.
+    """Пока прибыль меньше порога, уровня выхода нет — у брокера стоит условная.
 
-    Уровня нет **вовсе** — это не «уровень далеко». Сторожить нечего,
-    и заявка не подаётся.
+    Уровня выхода нет **вовсе** — это не «уровень далеко». Единственная
+    заявка — условная у брокера (`D-196`): цена включения = вход + порог,
+    к сетке шага от рынка, отступ — из плана позиции. Стережёт и то, что
+    до порога движок не подаёт обычного вооружения: прогон его исполнил бы.
     """
     entered = unarmed(plan=TRAILING.plan().initial(PRICE, 1))
     outcome = run(EngineState(position=entered), settings=TRAILING, close=PRICE * 1.004)
-    assert outcome.orders == ()
+    assert [(o.action, o.price, o.trail_offset) for o in outcome.orders] == [
+        (OrderAction.ARM_TAKE_PROFIT, fixed_level(PRICE, 1, 0.5, TRAILING.price_step), 0.2)
+    ]
     assert outcome.state.position is not None
     assert outcome.state.position.take_profit is None
+
+
+def test_a_signal_exit_below_the_threshold_cancels_the_conditional_first() -> None:
+    """(б) До порога условная у брокера жива — выход по сигналу сначала снимает её (`D-196`).
+
+    Стережёт: принятая условная делает позицию «вооружённой», и выход по
+    обратному сигналу подаёт снятие **раньше** заявки на выход. Без снятия
+    условная пережила бы позицию и сработала бы на пустом счёте — шорт без
+    сигнала.
+    """
+    entered = unarmed(plan=TRAILING.plan().initial(PRICE, 1))
+    placed = run(EngineState(position=entered), settings=TRAILING, close=PRICE * 1.004)
+    assert placed.state.position is not None
+    assert placed.state.position.take.activation is not None, "условная не принята движком"
+    outcome = run(
+        placed.state, settings=TRAILING, intent=Intent.SHORT, close=PRICE * 0.999,
+        when=(10, 15),
+    )
+    assert actions(outcome) == [OrderAction.CANCEL_TAKE_PROFIT, OrderAction.CLOSE]
+    assert outcome.orders[0].target_id == take_order_id(entered)
 
 
 def test_at_the_threshold_the_level_appears_at_the_offset_from_the_best_price() -> None:

@@ -106,6 +106,15 @@ OLD_TAKE_NAME = "take:long:прошлый"
 #: Вход прошлого запуска, о котором брокер не отвечает. Ключ выдуманный, в форме UUID.
 MUTE_ENTRY = "00000000-0000-4000-8000-0000000000e1"
 
+#: Причина пропуска сторожей запрета D-141: запрет снят `D-196` (владелец
+#: 13.11.2026) — скользящий тейк в бою ведёт брокер. Механизм удержания
+#: настроек, который они заодно стерегли, перевести на нецелый объём
+#: (`BACKLOG.md`, D-196, вторая очередь).
+D141_LIFTED = (
+    "D-141 снят D-196 (владелец 13.11.2026): скользящий тейк в бою ведёт брокер, "
+    "запрета больше нет. Механизм удержания перевести на нецелый объём — BACKLOG D-196"
+)
+
 
 @pytest.fixture
 def broker(monkeypatch: pytest.MonkeyPatch) -> FakeBroker:
@@ -419,8 +428,8 @@ class Change:
 
 
 CHANGES = [
-    pytest.param(Change("minute_bar_limit", MinuteBarLimit.FIFTEEN), id="minute-bar-limit"),
-    pytest.param(Change("timeframe", "5 минут"), id="timeframe"),
+    # Смена порога минуток и свечи при скользящем уровне запрещалась D-141 —
+    # запрет снят D-196 (13.11.2026): в бою скользящий тейк ведёт брокер.
     # Окно объём дробным не шлёт; порт — публичная команда, и шаблон или файл
     # могут принести что угодно. Дробная заявка у брокера остановила бы робота.
     pytest.param(Change("volume", 1.5), id="fractional-volume"),
@@ -1014,6 +1023,7 @@ def test_a_refusal_without_a_fresh_zero_keeps_the_remembered_position(
         pytest.param(MinuteBarLimit.FIVE, MinuteBarLimit.FIFTEEN, id="new-limit-forbids"),
     ],
 )
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_apply_in_combat_checks_the_held_series_at_both_minute_limits(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
     *, was: MinuteBarLimit, now: MinuteBarLimit,
@@ -1074,6 +1084,7 @@ def _no_apply_gate(_self: object, _settings: object) -> None:
     """
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_force(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1112,6 +1123,7 @@ def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_forc
     assert takes, "у входа нет неподвижного тейка у брокера: «факт» пошёл скользящим на 15 минутах"
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_the_live(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1163,6 +1175,7 @@ def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_t
 # --------------------------------------------- четвёртый /risk 2в: мутации Н6–Н8
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_an_engine_change_past_apply_does_not_reach_the_live_and_is_said_once(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1205,6 +1218,7 @@ def test_an_engine_change_past_apply_does_not_reach_the_live_and_is_said_once(
     assert "D-141" in kept[0], kept
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_command_seen_only_on_the_second_read_keeps_the_engine_change_out_of_the_live(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1450,6 +1464,7 @@ def test_turning_on_while_the_live_side_closes_is_a_new_enable_not_a_cancelled_o
     assert status.on and status.wanted, status
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_apply_while_a_rebuild_is_already_held_checks_the_held_series(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1522,6 +1537,7 @@ def _not_reached(name: str, status: LiveStatus, takes: list[tuple[str, float | N
 
 
 @pytest.mark.parametrize("case", _REACHES, ids=[name for name, *_ in _REACHES])
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_forbidden_trailing_holds_back_only_itself_the_rest_reaches_the_fact(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
     case: tuple[str, object, str],
@@ -1611,6 +1627,7 @@ def test_a_fractional_volume_past_apply_stays_out_of_the_live_and_is_said(
         pytest.param(("30 минут", 1), id="held-rebuild"),
     ],
 )
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_the_trailing_forbidden_again_after_it_was_dropped_is_said_again(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
     case: tuple[str, int],

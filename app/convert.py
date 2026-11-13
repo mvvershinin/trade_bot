@@ -1259,6 +1259,8 @@ _LIVE_FROM_WINDOW: Final[dict[str, str]] = {
     # Решение 0067, Р-5: отступ цены FOK (проценты) и ожидание планки (секунды).
     "fok_percent": "live_fok_pct",
     "band_wait": "live_band_wait_sec",
+    # D-196: защитный спред условной заявки скользящего тейка (проценты).
+    "trailing_spread_percent": "live_trailing_spread_pct",
 }
 
 

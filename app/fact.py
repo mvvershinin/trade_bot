@@ -102,6 +102,9 @@ class LiveLimits:
     :param band_wait: сколько секунд ждать ответа MOEX ISS о планке цены
         дня, прежде чем подать выход с пределом движка по проценту (0067).
         Пять секунд — временное значение, замеров нет.
+    :param trailing_spread_percent: защитный спред условной заявки скользящего
+        тейка у брокера, **в процентах** (`D-196`): сработав, брокер подаёт
+        лимитную по «срабатывание ∓ спред». 0,1 % — владелец счёта 13.11.2026.
     """
 
     stale_after: float = 60.0
@@ -113,10 +116,14 @@ class LiveLimits:
     reconnect_pauses: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
     fok_percent: float = 2.0
     band_wait: float = 5.0
+    trailing_spread_percent: float = 0.1
 
     def __post_init__(self) -> None:
         if not _finite(self.fok_percent) or self.fok_percent <= 0:
             raise ValueError(f"отступ цены заявки — положительный процент: {self.fok_percent!r}")
+        spread = self.trailing_spread_percent
+        if not _finite(spread) or spread <= 0:
+            raise ValueError(f"защитный спред условной заявки — положительный процент: {spread!r}")
         waits = (
             self.stale_after, self.event_wait, self.fill_wait, self.cancel_wait, self.band_wait
         )

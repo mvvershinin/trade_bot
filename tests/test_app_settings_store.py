@@ -102,6 +102,7 @@ DIFFERENT = Settings(
     live_reconnect_pauses_sec=(2, 4, 8),
     live_fok_pct=3.5,
     live_band_wait_sec=12,
+    live_trailing_spread_pct=0.25,
     log_directory="/tmp/терминал-логи",
     # Оба вида отметки сразу: «не торгуем» на будний день и «торгуем»
     # на субботу. Один вид проверял бы половину: перевод «да/нет» в файл
@@ -564,6 +565,7 @@ OWNER_FILE = """{
       30
     ],
     "live_stale_after_sec": 60,
+    "live_trailing_spread_pct": 0.1,
     "log_directory": "",
     "minute_bar_limit": 5,
     "minute_order": "near_first",

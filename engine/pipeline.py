@@ -417,6 +417,14 @@ def _after_arm(state: EngineState, order: OrderRequest) -> EngineState:
     position = state.position
     if position is None or take_order_id(position) != order.order_id:
         return state
+    if order.trail_offset is not None:
+        # Условная у брокера (`D-196`): цена включения, а не уровень выхода.
+        # Уровня у позиции по-прежнему нет — его ведёт брокер, а движок
+        # заведёт свой на пороге (`TakeProfit.advance`).
+        return replace(
+            state,
+            position=replace(position, take=replace(position.take, activation=order.price)),
+        )
     return replace(
         state, position=replace(position, take=replace(position.take, level=order.price))
     )
@@ -509,7 +517,9 @@ def _after_cancel(state: EngineState, order: OrderRequest) -> EngineState:
     pending = _without_order(state.pending, order.target_id or "")
     position = state.position
     if position is not None and take_order_id(position) == order.target_id:
-        position = replace(position, take=replace(position.take, level=None))
+        position = replace(
+            position, take=replace(position.take, level=None, activation=None)
+        )
         return replace(state, pending=pending, position=position)
     return replace(state, pending=pending)
 
@@ -888,11 +898,16 @@ def adopted_state(
     plan = settings.plan().initial(price, position.side_sign)
     position = replace(position, take=replace(plan, level=None))
     words = _no_take_reason(plan)
-    take = (
-        f"тейк {_price(plan.level)} встанет у брокера на закрытии ближайшей свечи"
-        if plan.level is not None
-        else words[:1].lower() + words[1:]
-    )
+    activation = plan.activation_level(price, position.side_sign)
+    if plan.level is not None:
+        take = f"тейк {_price(plan.level)} встанет у брокера на закрытии ближайшей свечи"
+    elif activation is not None:
+        take = (
+            "скользящий тейк встанет у брокера условной заявкой (включение на "
+            f"{_price(activation)}) на закрытии ближайшей свечи"
+        )
+    else:
+        take = words[:1].lower() + words[1:]
     entry = JournalEntry(
         at=at,
         event="Подхвачена позиция у брокера",
@@ -1417,7 +1432,15 @@ def _opened(
         # кандидат съесть весь результат (DOMAIN.md §5).
         day=_day_after(state, fill.at, -(fill.commission or 0.0)),
     )
-    if level is not None:
+    activation = plan.activation_level(fill.price, position.side_sign)
+    if activation is not None:
+        # Скользящий тейк (`D-196`): с первой минуты позиции — условная заявка
+        # у брокера с включением на пороге. Подаётся и в прогоне, и в бою
+        # (правило 1); прогон её не исполняет, бой ставит у брокера.
+        order = _conditional_order(position, fill.at, activation)
+        orders = (order,)
+        entries.append((order.order_id, _conditional_line(position, activation, fill.at)))
+    elif level is not None:
         # ⚠️ `after_submit` здесь НЕ зовётся. Заявка подаётся раньше, чем движок
         # себе что-то запишет: применит её тот, кто её подал и получил ответ.
         # Иначе отказ в вооружении оставил бы движок с уровнем, которого
@@ -1746,6 +1769,51 @@ def _arm_order(position: Position, at: datetime, level: float) -> OrderRequest:
     )
 
 
+def _conditional_order(position: Position, at: datetime, activation: float) -> OrderRequest:
+    """Заявка «скользящий тейк ведёт брокер»: включение на `activation` (`D-196`).
+
+    Сторона касания — та, с которой цена дойдёт до цены включения, то есть
+    сторона неподвижного тейка (`_TOUCH_SIDE`, первый столбец): до порога
+    цена идёт в прибыль. Причина выхода — скользящий уровень.
+    """
+    take = position.take
+    return OrderRequest(
+        action=OrderAction.ARM_TAKE_PROFIT,
+        side=position.side,
+        volume=position.volume,
+        submitted_at=at,
+        reason=(
+            f"Скользящий тейк {position.side.label.lower()}а объёмом "
+            f"{_volume(position.volume)} — условной заявкой у брокера: включение "
+            f"на {_price(activation)}, отступ {percent(take.offset_percent)}% "
+            "от лучшей цены"
+        ),
+        order_id=take_order_id(position),
+        price=activation,
+        touch=_TOUCH_SIDE[(False, position.side)],
+        exit_reason=_LEVEL_REASON[True],
+        trail_offset=take.offset_percent,
+    )
+
+
+def _conditional_line(position: Position, activation: float, at: datetime) -> JournalEntry:
+    """Строка журнала: скользящий тейк поставлен у брокера условной заявкой."""
+    take = position.take
+    sign = "+" if position.side is Side.LONG else "−"
+    return JournalEntry(
+        at=at,
+        event="Скользящий тейк выставлен у брокера",
+        reason=(
+            f"Условная заявка: включение на {_price(activation)} = цена входа "
+            f"{_price(position.entry_price)} {sign} {percent(take.start_percent)}%"
+            f"{_grid_words(position)}. После сделки по этой цене уровень едет "
+            f"за лучшей ценой на отступе {percent(take.offset_percent)}% и закрывает "
+            "позицию на откате. В бою его ведёт брокер, робот его не двигает; "
+            "уровень на графике — расчёт программы, у брокера он может отличаться"
+        ),
+    )
+
+
 def _cancel_order(position: Position, at: datetime, why: str) -> OrderRequest:
     """Заявка «перестань сторожить». Подаётся ДО заявки на закрытие, всегда."""
     return OrderRequest(
@@ -1827,6 +1895,18 @@ def _rearm_take_profit(
         position = replace(position, take=replace(position.take, peak=plan.peak))
         state = replace(state, position=position)
     refused = state
+    activation = plan.activation_level(position.entry_price, position.side_sign)
+    if managed and plan.level is None and plan.peak is None and activation is not None:
+        # До порога скользящий тейк стоит у брокера условной заявкой (`D-196`):
+        # перестановка — то же «состояние, а не событие», что у неподвижного
+        # тейка. Строка журнала — только если условной у позиции не было
+        # (снята не нами или отклонена): иначе свеча за свечой одно и то же.
+        order = _conditional_order(position, closes_at, activation)
+        state = _submitted(orders, state, order)
+        if position.take.activation != activation:
+            line = _conditional_line(position, activation, closes_at)
+            writer.note(line.event, line.reason, line.level, key=order.order_id)
+        return state, refused, ""
     if not managed or plan.level is None:
         return state, refused, ""
     order = _arm_order(position, closes_at, plan.level)
@@ -2100,6 +2180,14 @@ def _grid_words(position: Position) -> str:
     return f", к сетке шага {_price(step)} {way} — от рынка"
 
 
+def _take_words(position: Position) -> str:
+    """Что стоит у брокера, словами: «тейк 250 100» или условная до порога (`D-196`)."""
+    take = position.take
+    if take.level is None and take.activation is not None:
+        return f"скользящий тейк (условная заявка, включение на {_price(take.activation)})"
+    return f"тейк {_price(take.level or 0.0)}"
+
+
 def _take_line(
     position: Position, settings: EngineSettings, *, level: float, at: datetime,
 ) -> JournalEntry:
@@ -2159,7 +2247,7 @@ def _exit(
     if armed_before:
         state = _submitted(orders, state, _cancel_order(position, at, why))
         text = (
-            f"{why}. Сначала снимаем тейк {_price(position.take.level or 0.0)}, "
+            f"{why}. Сначала снимаем {_take_words(position)}, "
             "и только потом подаём заявку на выход"
         )
         position = state.position if state.position is not None else position
@@ -3061,7 +3149,7 @@ def _armed_note(position: Position) -> str:
             "к ней больше не применяются"
         )
     return (
-        f". ⚠️ Но выставленный тейк {_price(position.take.level or 0.0)} "
+        f". ⚠️ Но выставленный {_take_words(position)} "
         "остаётся у брокера и может сработать: это заявка на его стороне, "
         "а не расчёт внутри программы. Снять её можно в приложении брокера"
     )

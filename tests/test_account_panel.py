@@ -16,7 +16,6 @@ from app.port import _settings_blocks
 from broker.account import Account
 from broker.orders import ListedOrder, ListedOrderStatus, OrderSide, OrdersPage, OrdersQuery
 from broker.session import PORTFOLIO_PATH
-from ui.formatting import headline
 from ui.models import MinuteBarLimit, Settings
 from ui.settings_dialog import trailing_in_live
 
@@ -111,19 +110,15 @@ def test_the_account_line_tells_position_and_take_from_the_broker() -> None:
     ], "заявки спрошены не живые или не по инструменту"
 
 
-def test_trailing_in_live_words_name_the_bar_size() -> None:
-    """Стережёт: в бою про скользящий тейк сказано, что он двигается раз в свечу — её размером.
+def test_trailing_in_live_is_not_forbidden_and_the_words_name_the_broker() -> None:
+    """Стережёт снятие D-141 (`D-196`, владелец 13.11.2026): скользящий тейк в бою разрешён.
 
-    Дополнение владельца 13.11.2026: первая строка отказа D-141 и подпись
-    в настройках. Строка журнала при включении боя здесь не проверена.
+    В бою его ведёт брокер условной заявкой, и запрет «свеча не крупнее порога
+    минуток» больше не о чем. Подпись в настройках говорит, кто ведёт уровень.
     """
-    blocked = Settings(
+    trailing = Settings(
         timeframe="15 минут", trailing_enabled=True, take_profit_enabled=True,
         minute_bar_limit=MinuteBarLimit.FIFTEEN, price_step=25.0,
     )
-    blocks = _settings_blocks(blocked, blocked)
-    assert blocks, "скользящий на свече не крупнее порога в бою не запрещён"
-    short = headline(blocks[0][1])
-    assert "раз в 15 мин" in short, short
-
-    assert "5 минут" in trailing_in_live("5 минут")
+    assert _settings_blocks(trailing, trailing) == (), "скользящий уровень в бою снова запрещён"
+    assert "брокер" in trailing_in_live(), trailing_in_live()

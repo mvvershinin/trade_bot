@@ -264,6 +264,7 @@ PLACEMENT: tuple[tuple[str, str, str], ...] = (
     ("live_reconnect_pauses_sec", "Бой", "live_reconnect_pauses_sec"),
     ("live_fok_pct", "Бой", "live_fok_pct"),
     ("live_band_wait_sec", "Бой", "live_band_wait_sec"),
+    ("live_trailing_spread_pct", "Бой", "live_trailing_spread_pct"),
     ("log_directory", "Программа", "log_directory"),
 )
 
@@ -284,6 +285,7 @@ _LIVE_WHOLE: tuple[str, ...] = (
 _LIVE_ORDER: tuple[str, ...] = (
     "live_fok_pct",
     "live_band_wait_sec",
+    "live_trailing_spread_pct",
     "live_stale_after_sec",
     "live_event_wait_sec",
     "live_fill_wait_sec",
@@ -371,6 +373,15 @@ _LIVE_HINTS: dict[str, str] = {
         "без планки надёжнее исполняется при резком движении, но может "
         "исполниться хуже. Проверка на истории этот процент не читает: "
         "там сделки идут по расчётной цене.",
+    "live_trailing_spread_pct":
+        "Скользящий тейк в бою держит брокер: сразу после входа робот ставит у него "
+        "условную заявку. Когда цена пройдёт «Порог включения», брокер сам ведёт "
+        "уровень на «Отступе» от лучшей цены и на откате подаёт лимитную заявку "
+        "на выход — по цене срабатывания минус этот процент при продаже, плюс — "
+        "при покупке. Работает, даже если программа закрыта или нет связи. "
+        "Больше процент — выход надёжнее исполняется при резком движении, но "
+        "может исполниться хуже уровня. Проверка на истории его не читает: там "
+        "уровень ведёт программа по минуткам, а выход идёт по самому уровню.",
     "live_band_wait_sec":
         "Заявки робота в бою — «исполнить целиком или снять» и выход по концу "
         "окна с предельной ценой — уходят по планке: крайней цене, которую "
@@ -541,16 +552,17 @@ def _decimal(
 ALERT_ROLE = "терминал-тревога"
 
 
-def trailing_in_live(timeframe: str) -> str:
-    """Как часто скользящий тейк двигается в бою — по размеру свечи из поля.
+def trailing_in_live() -> str:
+    """Кто ведёт скользящий тейк в бою — брокер (`D-196`, владелец 13.11.2026).
 
-    Дополнение владельца счёта 13.11.2026: следствие запрета D-141 должно
-    быть видно всё время, а не только в отказе. В бою уровень едет лишь
-    на закрытии свечи.
+    Прежде здесь стояло следствие запрета D-141 («в бою раз в свечу»); запрет
+    снят: в бою уровень ведёт брокер условной заявкой по каждой сделке.
     """
     return (
-        f"⚠️ В бою скользящий тейк двигается раз в свечу ({timeframe}) — "
-        "на её закрытии, а не каждую минуту."
+        "В бою скользящий тейк держит брокер: условная заявка ставится сразу "
+        "после входа, и уровень за ценой ведёт брокер, даже если программа "
+        "закрыта. Проверка на истории ведёт уровень по минуткам — шаг подтяжки "
+        "действует только там."
     )
 
 
@@ -987,8 +999,6 @@ class SettingsDialog(QDialog):
         # которых ещё нет.
         self.take_fixed.setChecked(True)
         self.take_method.buttonToggled.connect(self._sync_take)
-        # Строка про бой называет размер свечи — сменили свечу, строка следом.
-        self.timeframe.currentTextChanged.connect(self._sync_take)
 
         # ⚠️ Нижняя граница обоих полей — ноль, хотя ноль отступа негоден.
         # Границей поля это правило не выражается: Qt подрезал бы пришедшее
@@ -1162,6 +1172,10 @@ class SettingsDialog(QDialog):
         # Отступ цены боевой заявки — проценты, а не секунды (правка 5.1 гейта
         # 04.11.2026): единица поля берётся из той же таблицы, что и границы.
         self.live_fok_pct = _live_decimal("live_fok_pct", 0.1, decimals=2)
+        # D-196: защитный спред условной заявки скользящего тейка — проценты.
+        self.live_trailing_spread_pct = _live_decimal(
+            "live_trailing_spread_pct", 0.01, decimals=2
+        )
         # Список пауз — строкой: число пауз от одной до десяти, и десять полей
         # ради одного списка — это окно, которое никто не дочитает. Буквы
         # не вводятся вовсе; негодное число говорится строкой под полем.
@@ -1554,7 +1568,10 @@ class SettingsDialog(QDialog):
             ("", self.trailing_enabled,
              "Скользящий уровень: появляется не сразу, а когда прибыль дойдёт "
              "до порога, и дальше едет за ценой вслед — забирает больше, если "
-             "движение продолжилось. ⚠️ Выбрали его — неподвижная цель "
+             "движение продолжилось. В бою его держит брокер: сразу после входа "
+             "робот ставит у брокера условную заявку, и дальше уровень ведёт "
+             "брокер — даже если программа закрыта или нет связи. ⚠️ Выбрали "
+             "его — неподвижная цель "
              "не сторожится вовсе, число ниже не читается. ⚠️ Замеров по "
              "скользящему уровню у проекта нет ни одного: он не воспроизводит "
              "поведение вашего нынешнего робота, а добавляет новое."),
@@ -1573,9 +1590,9 @@ class SettingsDialog(QDialog):
              "величину — позиция закрывается. Назад уровень не едет никогда."),
             ("Шаг подтяжки", self.trailing_step,
              "Число способа «скользящий уровень». Насколько цена должна "
-             "пройти, чтобы уровень сдвинулся. Не украшение: без шага каждая "
-             "свеча с новой лучшей ценой — это отдельное обращение к брокеру, "
-             "до двенадцати за час позиции."),
+             "пройти, чтобы уровень сдвинулся. Действует только в проверке "
+             "на истории: в бою уровень ведёт брокер, и шага у него нет — "
+             "уровень едет за каждой новой лучшей ценой."),
             (FIELD_CAPTIONS["reenter_after_disconnect"], self.reenter_after_disconnect,
              REENTER_HINT),
         ])
@@ -2357,6 +2374,7 @@ class SettingsDialog(QDialog):
             getattr(self, name).setValue(getattr(settings, name))
         self.live_position_settle_sec.setValue(settings.live_position_settle_sec)
         self.live_fok_pct.setValue(settings.live_fok_pct)
+        self.live_trailing_spread_pct.setValue(settings.live_trailing_spread_pct)
         self.live_reconnect_pauses_sec.setText(
             _pauses_text(settings.live_reconnect_pauses_sec)
         )
@@ -2495,6 +2513,7 @@ class SettingsDialog(QDialog):
             slippage_steps=self.slippage_steps.value(),
             live_position_settle_sec=self.live_position_settle_sec.value(),
             live_fok_pct=self.live_fok_pct.value(),
+            live_trailing_spread_pct=self.live_trailing_spread_pct.value(),
             live_reconnect_pauses_sec=_pauses_of(self.live_reconnect_pauses_sec.text()),
             log_directory=self.log_directory.text().strip(),
             volume=self.volume.value(),
@@ -2979,7 +2998,7 @@ class SettingsDialog(QDialog):
                 "назад он не поедет никогда. Пока порог не пройден, уровня "
                 "выхода нет совсем. Замеров по скользящему уровню у проекта "
                 "нет — сравнивать его будет не с чем. "
-                + trailing_in_live(self.timeframe.currentText())
+                + trailing_in_live()
             )
         if self.take_profit.value() <= 0:
             return (

@@ -442,8 +442,16 @@ class FakeBroker:
 
     # --- что делает тест ---
 
-    def execute(self, key: str, quantity: int, price: float) -> None:
-        """Биржа исполнила `quantity` контрактов заявки `key` по `price`."""
+    def execute(
+        self, key: str, quantity: int, price: float, *, execution_type: str | None = None
+    ) -> None:
+        """Биржа исполнила `quantity` контрактов заявки `key` по `price`.
+
+        Условная заявка (тип `5`, `D-196`) исполняется тем же вызовом: живой
+        брокер 13.11.2026 прислал исполнение порождённой заявки **по ключу
+        условной** — `orderStatus` `2`, `executionType` `11` (`execution_type`).
+        Слежения за ценой подделка не ведёт: когда сработать, решает тест.
+        """
         order = self.order(key)
         if order is None or not order.live:
             raise AssertionError(f"исполнять нечего: заявка {key} не жива в книге")
@@ -455,7 +463,7 @@ class FakeBroker:
         order.status = "2" if full else "1"
         self._emit(
             order,
-            execution_type="2" if full else "1",
+            execution_type=execution_type or ("2" if full else "1"),
             execution={"executionId": f"FAKE-EXEC-{next(self._numbers)}", "lastQuantity": quantity},
         )
         self._note_live()

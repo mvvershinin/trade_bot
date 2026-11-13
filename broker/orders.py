@@ -64,9 +64,11 @@ class OrderType(enum.Enum):
     CONDITIONAL = "5"
 
 
-#: Что программа вправе подать. Права торгового токена (`broker-api/00`)
-#: называют рыночные и лимитные заявки; условная описана в 13, но годится ли
-#: она нашему токену, выясняется только на живом счёте (план §2.3, Р1, Р2).
+#: Что программа вправе подать **командой `NewOrder`**: рыночная и лимитная.
+#: Условная (`5`) этой командой не подаётся никогда — у неё свои поля
+#: и своя команда `ConditionalTake`, где тип зашит, а не выбирается.
+#: Торговый токен условную принимает: живая проба 13.11.2026 на SPBFUT
+#: (`broker-api/13`, «Пробы 13.11.2026», `D-196`).
 SUBMITTABLE_TYPES: Final[frozenset[OrderType]] = frozenset(
     {OrderType.MARKET, OrderType.LIMIT}
 )
@@ -279,6 +281,101 @@ _NEW_ORDER_CHECKS: Final[tuple[tuple[Callable[[NewOrder], bool], str], ...]] = (
 )
 
 
+#: Поля условной заявки (13), которые программа шлёт всегда одними:
+#: отступ и спред — **в процентах** (`offsetType`/`spreadType` `1`),
+#: исполнение порождённой заявки — **лимитное** (`executionTakeProfitType` `2`,
+#: цена = срабатывание ∓ спред). Ровно так прошли обе живые пробы 13.11.2026
+#: (лонг и шорт, `broker-api/13`). Числами, а не строками, — как в пробе:
+#: другой записи сервер не видел.
+CONDITIONAL_PERCENT: Final[int] = 1
+CONDITIONAL_LIMIT_EXECUTION: Final[int] = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionalTake:
+    """Условная заявка (13, `orderType` `5`) — скользящий тейк, который ведёт брокер.
+
+    Что она делает, установлено живыми пробами 13.11.2026 (`broker-api/13`):
+    до сделки по `take_price` и дальше стоит со статусом `0`; после неё брокер
+    считает лучшую цену и при откате от неё на `offset` % подаёт лимитную
+    заявку по «срабатывание ∓ `spread` %». Исполнение приходит **по тому же
+    ключу** (`orderStatus` `2`, `executionType` `11`, `averagePrice`).
+    Снимается, как любая, отменой (12).
+
+    Ключ сюда не входит — его даёт сессия, как у `NewOrder`. `timeInForce`
+    не шлётся: страница 13 определяет его только рыночной, лимитной
+    и алгоритмической, и проба прошла без него.
+    """
+
+    side: OrderSide
+    quantity: int
+    ticker: str
+    class_code: str
+    #: Цена включения: брокер начинает вести уровень после сделки по ней.
+    take_price: float
+    #: Отступ уровня от лучшей цены после включения, в процентах.
+    offset: float
+    #: Защитный спред цены порождённой лимитной заявки, в процентах.
+    spread: float
+
+    def __post_init__(self) -> None:
+        for broken, why in _CONDITIONAL_CHECKS:
+            if broken(self):
+                raise ValueError(f"условная заявка не годится к подаче: {why}")
+
+    @property
+    def order_type(self) -> OrderType:
+        """Тип заявки у брокера — всегда условная; другим эта команда не бывает."""
+        return OrderType.CONDITIONAL
+
+    def body(self, key: UUID) -> dict[str, object]:
+        """Тело `POST` создания (13) — поле в поле как у живой пробы 13.11.2026."""
+        return {
+            "clientOrderId": str(key),
+            "side": self.side.value,
+            "orderType": OrderType.CONDITIONAL.value,
+            "orderQuantity": self.quantity,
+            "ticker": self.ticker,
+            "classCode": self.class_code,
+            "takePrice": self.take_price,
+            "offset": self.offset,
+            "offsetType": CONDITIONAL_PERCENT,
+            "executionTakeProfitType": CONDITIONAL_LIMIT_EXECUTION,
+            "spread": self.spread,
+            "spreadType": CONDITIONAL_PERCENT,
+        }
+
+
+def _not_positive(value: object) -> bool:
+    return (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+    )
+
+
+#: Проверки условной заявки — та же цепочка «условие → отказ», что у `NewOrder`.
+_CONDITIONAL_CHECKS: Final[
+    tuple[tuple[Callable[[ConditionalTake], bool], str], ...]
+] = (
+    (
+        lambda order: isinstance(order.quantity, bool)
+        or not isinstance(order.quantity, int)
+        or order.quantity < 1,
+        "количество — целое число не меньше единицы",
+    ),
+    (lambda order: _not_text(order.ticker), "тикер пуст или с пробелами по краям"),
+    (lambda order: _not_text(order.class_code), "код класса пуст или с пробелами по краям"),
+    (lambda order: _not_positive(order.take_price), "цена включения — число больше нуля"),
+    (lambda order: _not_positive(order.offset), "отступ — процент больше нуля"),
+    (lambda order: _not_positive(order.spread), "защитный спред — процент больше нуля"),
+)
+
+#: Заявка, которую создаёт пишущий путь (13): рыночная/лимитная или условная.
+PlacedOrder = NewOrder | ConditionalTake
+
+
 @dataclass(frozen=True, slots=True)
 class CancelOrder:
     """Отмена заявки (12) по **нашему** ключу исходной заявки.
@@ -300,7 +397,7 @@ class CancelOrder:
 
 
 #: Команда, меняющая счёт: то, что пишется в журнал до отправки.
-OrderCommand = NewOrder | CancelOrder
+OrderCommand = NewOrder | ConditionalTake | CancelOrder
 
 #: Запись журнала команд, которую передаёт `app/` (план §11, контракт С5).
 #: Вызывается с ключом и командой **до** отправки; успешный возврат значит

@@ -243,51 +243,21 @@ REDRAW_GAP = 0.2
 
 log = logging.getLogger(__name__)
 
-#: Почему бой не включается со скользящим уровнем на малой свече (`D-141`).
-_TRAILING_ON_MINUTES = (
-    "Скользящий уровень на свече {bar} мин не крупнее порога проверки по минуткам "
-    "({limit} мин): симуляция двигает уровень каждую минуту, а бой — только "
-    "на закрытии свечи, сделки разошлись бы (D-141). {fix}"
+#: Строка журнала при включении боя со скользящим тейком (`D-196`, владелец
+#: 13.11.2026): в бою уровень ведёт брокер условной заявкой, робот его не двигает.
+#: Прежний запрет D-141 (бой двигал уровень раз в свечу, прогон — по минуткам)
+#: снят: брокер ведёт уровень по сделкам, это ближе к прогону по минуткам,
+#: чем к шагу в свечу.
+_TRAILING_IN_LIVE = (
+    "Скользящий тейк в бою держит брокер: сразу после входа робот ставит у него "
+    "условную заявку с включением на пороге, дальше уровень на отступе от лучшей "
+    "цены ведёт брокер — робот его не двигает."
 )
-
-#: Как включить скользящий уровень в бою без смены свечи (владелец 13.11.2026).
-_TRAILING_FIX = (
-    "Как включить: вкладка «Деньги» → «Наибольшая свеча для проверки по минуткам» "
-    "= 1 минута — тогда и симуляция, и бой двигают уровень только на закрытии свечи. "
-    "Или выключите скользящий уровень."
-)
-
-#: Свеча в 1 минуту: порога меньше неё нет, остаётся свеча крупнее.
-_TRAILING_FIX_ONE = "Возьмите свечу крупнее 1 минуты или выключите скользящий уровень."
-
-#: Одной строкой — что переключить и что из этого выйдет (B-101, владелец
-#: 13.11.2026 15:15 и дополнение того же дня).
-_TRAILING_SHORT = (
-    "поставьте «Наибольшая свеча для проверки по минуткам» = 1 минута (вкладка «Деньги») "
-    "или выберите «Неподвижная цель»; в бою скользящий тейк передвигается раз в {bar} мин "
-    "— на закрытии свечи, не каждую минуту"
-)
-_TRAILING_SHORT_ONE = (
-    "выберите «Неподвижная цель» (вкладка «Вход и выход») или свечу крупнее 1 минуты"
-)
-
-#: Строка журнала при включении боя со скользящим тейком (дополнение владельца
-#: 13.11.2026): в бою уровень двигается только на закрытии свечи (D-141).
-_TRAILING_IN_LIVE = "Скользящий тейк в бою двигается раз в {bar} мин (на закрытии свечи)."
 
 #: Почему загрузка истории и бой не идут вместе (решение владельца 01.11.2026, 0066).
 _LOAD_IN_LIVE = (
     "Загрузка истории в бою недоступна: выключите бой. Загрузка занимает поток данных "
     "и откладывает решения робота — заявка ушла бы к брокеру с опозданием на всю загрузку."
-)
-
-#: Как в бою сменить свечу и включить скользящий уровень (`/risk` 2в З10, D-141).
-_TWO_STEPS = (
-    "В бою размер свечи и скользящий уровень меняйте в два шага: сначала свечу "
-    "({now}) — бой пересоберётся на ней, затем скользящий уровень. Пока бой не "
-    "пересобран (его держат открытая позиция или незакрытая заявка, если они есть), "
-    "«факт» идёт прежним рядом — свечой {was}, а на ней скользящий уровень при пороге "
-    "проверки по минуткам {limit} мин запрещён (D-141). Бой идёт по прежним настройкам."
 )
 
 #: Почему бой не включается без шага цены (`D-147`, `D-148`).
@@ -1519,20 +1489,11 @@ class HistoryPort(TerminalPort):
         self.refresh("выключение боя")
 
     def _say_trailing_in_live(self) -> None:
-        """Бой включается со скользящим тейком — строкой, как часто он двигается.
-
-        Запрет D-141 сюда не дошёл бы (`_live_blockers`), значит скользящий
-        уровень в бою разрешён: порог минуток меньше свечи, и уровень едет
-        только на закрытии свечи — раз в её размер, а не каждую минуту.
-        """
+        """Бой включается со скользящим тейком — строкой, кто его ведёт (`D-196`)."""
         values = self._values
         if not (values.take_profit_enabled and values.trailing_enabled):
             return
-        try:
-            bar = convert.timeframe_of(values.timeframe).minutes
-        except convert.SettingsRefused:
-            return
-        self.note("Скользящий тейк в бою", _TRAILING_IN_LIVE.format(bar=bar))
+        self.note("Скользящий тейк в бою", _TRAILING_IN_LIVE)
 
     def live_status(self) -> LiveStatus:
         """Снимок боя для окна. Ни одно число здесь не считается заново."""
@@ -4728,44 +4689,21 @@ class HistoryPort(TerminalPort):
     def _fits_live(self, settings: Settings) -> None:
         """В бою «Применить» проверяет те же запреты, что включение (0066, `/risk` 2в R1).
 
-        Трейлинг на свече не крупнее порога минуток (D-141), шаг цены 0,
-        нецелый объём — отказ под полем, бой идёт по прежним настройкам.
-        Без боя проверять нечего: запреты — у включения.
+        Шаг цены 0, нецелый объём — отказ под полем, бой идёт по прежним
+        настройкам. Без боя проверять нечего: запреты — у включения.
+
+        Прежний ряд «факта» (свеча и инструмент до пересборки) здесь больше
+        не проверяется: его запрещал только D-141, снятый `D-196`, а шаг цены
+        и объём на прежнем ряду те же, что в новых настройках.
         """
         if not self._live.wanted and self._live.desk is None:
             return
-        variants: list[tuple[Settings, str]] = [(settings, "")]
-        built, observer = self._watch.frame, self._watch.observer
-        if (
-            built is not None and observer is not None and observer.paired
-            and (built.values.timeframe, built.values.instrument)
-            != (settings.timeframe, settings.instrument)
-        ):
-            # Пересборка может отложиться (позиция): тогда «факт» пойдёт прежним
-            # рядом с новыми настройками движка — и запреты обязаны пройти и на нём
-            # (`/risk` 2в Н1), при новом пороге минуток и при прежнем.
-            series = settings.replace(
-                timeframe=built.values.timeframe, instrument=built.values.instrument
+        blocks = _settings_blocks(settings, self._values)
+        if blocks:
+            field, words = blocks[0]
+            raise convert.SettingsRefused(
+                f"В бою так нельзя: {words} Бой идёт по прежним настройкам.", field=field,
             )
-            # Отказ и при пустом «факте»: незакрытую команду, которая отложит
-            # пересборку, из окна не видно (B-084). Слова — без выдуманной причины:
-            # что делать в два шага и почему (`/risk` 2в З10).
-            hint = "В бою сначала смените свечу, затем — скользящий уровень\n" + _TWO_STEPS.format(
-                now=settings.timeframe, was=built.values.timeframe,
-                limit=convert.minute_bar_limit_of(built.values),
-            )
-            variants += [
-                (series, hint),
-                (series.replace(minute_bar_limit=built.values.minute_bar_limit), hint),
-            ]
-        for values, hint in variants:
-            blocks = _settings_blocks(values, self._values)
-            if blocks:
-                field, words = blocks[0]
-                raise convert.SettingsRefused(
-                    hint or f"В бою так нельзя: {words} Бой идёт по прежним настройкам.",
-                    field=field,
-                )
 
     def _publish_live(self) -> None:
         """Снимок боя — в окно, тем же рубежом чистки (`_send`)."""
@@ -6751,48 +6689,29 @@ def _live_overlay(
     return markers, tuple(path for path in paths if path.layer is Layer.FACT) + planned
 
 
-_TRAILING_FIELDS: Final[tuple[str, ...]] = (
-    "trailing_take_profit", "trailing_start_percent", "trailing_offset_percent",
-    "trailing_step_percent",
-)
-
 #: Поле окна, нарушившее запрет боя (`_settings_blocks`) → поля движка, которые
 #: остаются у «факта» прежними (Н9). Прочие настройки движка идут сразу.
 _ENGINE_OF_BLOCK: Final[dict[str, tuple[str, ...]]] = {
-    "trailing_enabled": _TRAILING_FIELDS,
-    "minute_bar_limit": _TRAILING_FIELDS,
-    "timeframe": _TRAILING_FIELDS,
     "volume": ("volume",),
     "instrument": ("price_step",),
 }
 
 
-def _settings_blocks(values: Settings, was: Settings) -> tuple[tuple[str, str], ...]:
+def _settings_blocks(values: Settings, _was: Settings) -> tuple[tuple[str, str], ...]:
     """Запреты боя, которые решают настройки: (поле окна, причина словами).
 
     Одна таблица на два места — включение боя (`_live_blockers`) и «Применить»
     в бою (`_fits_live`): разойдись они, «Применить» пропускало бы то, на чём
-    включение отказывает (`/risk` 2в R1). Порог проверки по минуткам —
-    в том же запрете, что скользящий уровень (D-141): поле отказа — то, что
-    сменилось из трёх (`was` — настройки в силе).
+    включение отказывает (`/risk` 2в R1). `_was` — настройки в силе; нужны
+    были запрету D-141, снятому `D-196`, и оставлены вызывающим ради формы.
 
-    :raises convert.SettingsRefused: размер свечи не переводится.
+    Скользящего уровня здесь нет: в бою его ведёт брокер условной заявкой
+    (`D-196`), прогон — по минуткам, и запрет D-141 «бой — раз в свечу,
+    прогон — каждую минуту» больше не о чем.
     """
-    timeframe = convert.timeframe_of(values.timeframe)
-    trailing = minute_plan(values, timeframe).order is not None
     volume = float(values.volume)
-    moved = [
-        name for name in ("trailing_enabled", "minute_bar_limit", "timeframe")
-        if getattr(values, name) != getattr(was, name)
-    ]
     # Первая строка — что поменять (B-101), дальше — почему.
     checks = (
-        (trailing, moved[0] if moved else "trailing_enabled",
-         (_TRAILING_SHORT if timeframe.minutes > 1 else _TRAILING_SHORT_ONE).format(
-             bar=timeframe.minutes) + "\n"
-         + _TRAILING_ON_MINUTES.format(
-             bar=timeframe.minutes, limit=convert.minute_bar_limit_of(values),
-             fix=_TRAILING_FIX if timeframe.minutes > 1 else _TRAILING_FIX_ONE)),
         (values.price_step <= 0, "instrument", f"дождитесь шага цены от биржи\n{_NO_STEP}"),
         (not volume.is_integer() or volume < 1, "volume",
          "объём — целое число контрактов, не меньше 1\n"

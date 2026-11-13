@@ -67,11 +67,11 @@ from broker.orders import (
     ORDER_ID_BY_CLIENT,
     CancelOrder,
     CommandAccepted,
-    NewOrder,
     OrderCommand,
     OrdersPage,
     OrdersQuery,
     OrderState,
+    PlacedOrder,
     RecordCommand,
     TradesPage,
     TradesQuery,
@@ -866,9 +866,12 @@ class BrokerSession:
     # --- заявки: команды ---
 
     async def create_order(
-        self, order: NewOrder, *, record: RecordCommand
+        self, order: PlacedOrder, *, record: RecordCommand
     ) -> CommandAccepted:
         """Подать заявку (`13-create-order.md`). Порядок шагов — `_command`.
+
+        Заявка — `NewOrder` (рыночная, лимитная) или `ConditionalTake`
+        (условная, `D-196`): адрес и шесть шагов у обеих одни.
 
         Возврат значит «брокер принял», а не «исполнена»: факт приходит
         потоком статусов или запросом `order_status` по `CommandAccepted.key`.

@@ -55,6 +55,7 @@ WINDOW_TO_LIMITS: dict[str, str] = {
     "live_reconnect_pauses_sec": "reconnect_pauses",
     "live_fok_pct": "fok_percent",
     "live_band_wait_sec": "band_wait",
+    "live_trailing_spread_pct": "trailing_spread_percent",
 }
 
 #: Поле исполнителя без своего поля в окне — и откуда оно берётся.
@@ -70,6 +71,7 @@ OTHER: dict[str, object] = {
     "live_reconnect_pauses_sec": (2, 4, 8),
     "live_fok_pct": 3.5,
     "live_band_wait_sec": 12,
+    "live_trailing_spread_pct": 0.25,
 }
 
 #: Поле → негодные значения. Ноль и NaN — из задания; «да» — `bool` есть
@@ -78,7 +80,7 @@ BAD: list[tuple[str, object]] = [
     *((name, value) for name in (
         "live_stale_after_sec", "live_event_wait_sec",
         "live_fill_wait_sec", "live_cancel_wait_sec", "live_position_settle_sec",
-        "live_fok_pct", "live_band_wait_sec",
+        "live_fok_pct", "live_band_wait_sec", "live_trailing_spread_pct",
     ) for value in (0, -5, math.nan, math.inf, True)),
     *((name, LIVE_LIMITS_BOUNDS[name].high * 2) for name in LIVE_LIMITS_BOUNDS
       if name != "live_reconnect_pauses_sec"),

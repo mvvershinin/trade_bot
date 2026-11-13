@@ -367,6 +367,8 @@ class ProgramFields:
     #: Отступ цены боевой заявки и ожидание планки биржи (решение 0067, Р-5).
     live_fok_pct: float = _DEFAULTS.live_fok_pct
     live_band_wait_sec: int = _DEFAULTS.live_band_wait_sec
+    #: Защитный спред условной заявки скользящего тейка у брокера (`D-196`).
+    live_trailing_spread_pct: float = _DEFAULTS.live_trailing_spread_pct
 
     @classmethod
     def of(cls, values: Settings) -> ProgramFields:

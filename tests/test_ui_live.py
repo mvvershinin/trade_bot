@@ -549,7 +549,7 @@ def test_every_live_field_hint_says_when_the_value_takes_effect(qapp) -> None:
         for name in (
             "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
             "live_cancel_wait_sec", "live_position_settle_sec", "live_reconnect_pauses_sec",
-            "live_fok_pct", "live_band_wait_sec",
+            "live_fok_pct", "live_band_wait_sec", "live_trailing_spread_pct",
         ):
             widget = getattr(dialog, name)
             assert LIVE_WHEN in widget.toolTip(), FIELD_CAPTIONS[name]

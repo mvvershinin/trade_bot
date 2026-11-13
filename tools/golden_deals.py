@@ -269,7 +269,11 @@ def counted_arms() -> Iterator[list[HistoryExecutor]]:
             made.append(self)
 
         async def submit(self, order: OrderRequest) -> None:
-            if order.action is OrderAction.ARM_TAKE_PROFIT:
+            # Условная у брокера (`D-196`, `trail_offset`) не считается: прогон
+            # её не сторожит, а подаётся она каждую свечу до порога. Счёт —
+            # вооружения, которые прогон исполняет; с ним образцы скользящего
+            # уровня сверяют ещё и то, что условная не сдвинула ни одного.
+            if order.action is OrderAction.ARM_TAKE_PROFIT and order.trail_offset is None:
                 self.arms += 1
             await super().submit(order)
 

@@ -2527,7 +2527,9 @@ def test_a_trailing_touch_without_the_stream_is_told_to_the_human(
                 assert await rig.executor.fills_at(bar(start)) == []
             await heard()
             assert rig.executor.halted is None
-            [told] = rig.warnings()
+            # Без условной у брокера (`D-196`) сторож программы говорит о себе
+            # отдельной строкой — здесь стережётся строка ожидания.
+            [told] = [text for text in rig.warnings() if "уровень трейлинга" in text]
             assert "уровень трейлинга 95" in told
             assert "ждёт" in told and "связи" in told
             assert any(
@@ -3057,7 +3059,7 @@ def test_a_trailing_exit_waiting_for_the_portfolio_is_told_once(
             await heard()
             assert rig.executor.halted is None
             assert rig.sells() == []
-            [told] = rig.warnings()
+            [told] = [text for text in rig.warnings() if "уровень трейлинга" in text]
             assert "уровень трейлинга 95" in told
             assert "прочитать не удалось" in told
 
@@ -3088,7 +3090,8 @@ def test_the_link_back_calls_for_a_pass_when_a_trailing_exit_waits(
             rig.minutes.append(minute(BAR0 + timedelta(minutes=1), low=94.0))
             await rig.executor.watch()
             await heard()
-            assert rig.sells() == [] and len(rig.warnings()) == 1
+            waiting = [text for text in rig.warnings() if "уровень трейлинга" in text]
+            assert rig.sells() == [] and len(waiting) == 1
             called.clear()
             rig.exchange.plans.append(filled((1, 94.0)))
             gate.set()
