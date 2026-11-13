@@ -1357,6 +1357,9 @@ class FakePort:
         self.desks: object | None = None
         #: Снимки счёта, пришедшие от опроса (`HistoryPort.account_read`, Э4 2г).
         self.accounts: list[tuple[str, object]] = []
+        #: Настройки порта (`HistoryPort.values`): звено читает отсюда порог
+        #: сторожа отставания потока (`LiveLink._lag_after`).
+        self.values = Settings()
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))
