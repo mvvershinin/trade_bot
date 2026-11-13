@@ -68,6 +68,11 @@ DEFAULT_VISIBLE = 90
 # на соседние свечи. Сам пропуск при этом виден — там пусто.
 GAP_CAPTION_WIDTH = 34
 
+# Непрозрачность меток и линий сделок прежних заходов боя (B-100): видны,
+# но читаются фоном рядом с яркими метками текущего захода. Оформление,
+# а не торговое число.
+EARLIER_RUN_OPACITY = 0.4
+
 # Протяжка короче этого — щелчок, а не выделение. Рука дрожит на любом нажатии,
 # и без порога каждый щелчок правой кнопкой давал бы отрезок случайной ширины.
 CLICK_SLACK = 5.0
@@ -1123,6 +1128,7 @@ class PainterChartSurface(QWidget, ChartSurface):
                     Qt.PenStyle.DashLine if layer is Layer.PLAN else Qt.PenStyle.SolidLine
                 )
                 painter.setPen(pen)
+                painter.setOpacity(EARLIER_RUN_OPACITY if path.earlier_run else 1.0)
                 painter.drawLine(
                     QPointF(
                         self._x_of_index(self._index_of_time(path.entry_time), plot),
@@ -1133,6 +1139,7 @@ class PainterChartSurface(QWidget, ChartSurface):
                         self._y_of_price(path.exit_price, plot, low, high),
                     ),
                 )
+        painter.setOpacity(1.0)
 
     def _draw_levels(self, painter: QPainter, plot: QRectF, low: float, high: float) -> None:
         font = QFont(self.font())
@@ -1189,7 +1196,10 @@ class PainterChartSurface(QWidget, ChartSurface):
         оставляла вторую старой, и рядом на экране оказывались метка и значок
         легенды, изображающие разное (`ui/chart/glyphs.py`).
         """
+        # Сделка прежнего захода боя — приглушённой, как её строка в «Сделках» (B-100).
+        painter.setOpacity(EARLIER_RUN_OPACITY if marker.earlier_run else 1.0)
         draw_marker(painter, point, marker.kind, layer, GlyphStyle(self._theme, self.font()))
+        painter.setOpacity(1.0)
 
     def _time_ticks(self, plot: QRectF) -> list[int]:
         """Индексы свечей, у которых подписано время. Реже, чем каждая свеча.
