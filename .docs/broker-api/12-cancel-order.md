@@ -4,8 +4,10 @@ URL: https://trade-api.bcs.ru/http/operations/cancel-order
 
 ```
 POST
-## https://be.broker.ru/trade-api-bff-order-details /api/v1/orders/cancel
+## https://be.broker.ru/trade-api-bff-operations /api/v1/orders/cancel
 ```
+
+> ⚠️ **Живой сервер 13.11.2026 (`B-094`):** адрес выше — рабочий, ответ 200 `{"clientOrderId", "status": "OK"}`. Сайт на 04.09.2026 называл сервис `trade-api-bff-order-details` — там 404 страницей HTML.
 
 Метод позволяет отменить собственную заявку по идентификатору. Поддерживаются заявки,
 поданные через Trade API и МИ, со статусами `0` (Новая), `1` (Частично исполнена),
@@ -30,7 +32,7 @@ POST
 
 **400 / 401 / 403 / 404 / 422 / 429 / 500** — общая форма отказа плюс `USER_NOT_FOUND`.
 
-Base URL `https://be.broker.ru/trade-api-bff-order-details`, Bearer JWT.
+Base URL `https://be.broker.ru/trade-api-bff-operations`, Bearer JWT (живьём 13.11.2026; сайт — `bff-order-details`).
 
 ---
 

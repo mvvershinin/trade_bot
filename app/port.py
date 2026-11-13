@@ -56,6 +56,7 @@ from app.fact import (
     FactPosition,
     FactRefused,
     FactRequest,
+    HandDesks,
     LiveLimits,
     LiveStatus,
     position_words,
@@ -70,8 +71,25 @@ from app.runs import (
     result_note,
     settings_text,
 )
-from backtest import HistoryRun, Plan, Summary, pairs, replay, reversal_entries, summarise
-from engine import MSK, AccountFunds, EngineSettings, PositionState, close_time, in_moscow
+from backtest import (
+    Deal,
+    HistoryRun,
+    Plan,
+    Summary,
+    pairs,
+    replay,
+    reversal_entries,
+    summarise,
+)
+from engine import (
+    MSK,
+    AccountFunds,
+    EngineSettings,
+    ExitReason,
+    PositionState,
+    close_time,
+    in_moscow,
+)
 from engine import Side as EngineSide
 from market import (
     FUTURES,
@@ -94,6 +112,7 @@ from market import (
     LegDays,
     MarketWorker,
     PointValue,
+    SessionRecord,
     StoredHalt,
     Timeframe,
     WorkerClosed,
@@ -139,6 +158,8 @@ from ui.models import (
     Mode,
     Position,
     PriceLevel,
+    RobotOrder,
+    RobotOrders,
     RobotState,
     RunOrigin,
     Settings,
@@ -423,6 +444,8 @@ _WORKS: tuple[_Work, ...] = (
     _Work("retire", "закрытие живого хода робота", STUCK_AFTER),
     _Work("halt", "запись остановки робота в базу", STUCK_AFTER),
     _Work("watch", "проверка уровня трейлинга по записанной минутке", STUCK_AFTER_ONLINE),
+    _Work("orders", "чтение заявок робота из журнала команд", STUCK_AFTER),
+    _Work("hand", "снятие заявки или закрытие позиции у брокера", STUCK_AFTER_ONLINE),
 )
 
 #: Как часто часы смотрят, не сменились ли сутки с последнего уточнения
@@ -755,6 +778,15 @@ class _Live:
     #: по истории и вошёл бы, ни разу не узнав размера счёта (решение 0037).
     #: Снимается отключением потока (`_observe`): «с подключения», а не «когда-то».
     funds: tuple[str, AccountFunds] | None = None
+    #: Чтение заявок робота для «Снять заявку» и само ручное действие
+    #: владельца (снять заявку, закрыть позицию; задача владельца 13.11.2026).
+    #: Пока идёт `hand`, бой не включается: сверка при сборке снимала бы
+    #: те же заявки вторым исполнителем.
+    listing: asyncio.Task[None] | None = None
+    hand: asyncio.Task[None] | None = None
+    #: Строка открытой позиции, показанная последним проходом (`_open_row`):
+    #: «Отдать журналы» без прогона её не теряет (ревью 13.11.2026).
+    open_row: tuple[TradeRow, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1470,6 +1502,7 @@ class HistoryPort(TerminalPort):
             take_note="" if paired else self._live.left_take,
             fact=None if observer is None else observer.fact_run,
             forecast=observer.run if observer is not None and paired else None,
+            hand_refused=self._hand_refusal(),
         )
 
     def _fact_position(self) -> FactPosition | None:
@@ -1669,22 +1702,178 @@ class HistoryPort(TerminalPort):
             f"Останавливать нечего: {NO_LIVE}",
         )
 
+    # -------------------------------------- руками владельца (13.11.2026)
+
     def close_position(self) -> None:
-        """«Закрыть позицию». Закрытия заявкой программы нет — сказать, что делать."""
-        position = self._fact_position()
-        if position is None:
-            self._refuse(
-                "Закрытие позиции",
-                "Закрывать нечего: у робота нет позиции у брокера — позиция в окне, "
-                "если она есть, расчётная (наблюдение или прогон по истории).",
+        """«Закрыть позицию»: снять заявки робота по инструменту, закрыть заявкой FOK.
+
+        Задача владельца после первого боевого дня: робот встал с позицией
+        и тейком, а закрыть их из программы было нечем. Работает при
+        включённом бое, при остановленном роботе и при выключенном бое —
+        была бы связь и торговый токен. Собран бой — закрывает его
+        исполнитель, и робот останавливается (0020); не собран —
+        исполнитель на одну команду (`LiveDesks.close_by_hand`).
+        """
+        self._by_hand("Закрытие позиции руками", lambda hand, request, desk: (
+            hand.close_by_hand(request, desk)
+        ))
+
+    def cancel_robot_order(self, key: str) -> None:
+        """«Снять заявку»: одна заявка робота по ключу — тем же путём, что закрытие."""
+        self._by_hand("Снятие заявки руками", lambda hand, request, desk: (
+            hand.cancel_by_hand(request, key, desk)
+        ))
+
+    def request_robot_orders(self) -> None:
+        """Заявки робота для «Снять заявку». Ответ — `robot_orders_ready`, **всегда**.
+
+        Только незакрытые команды журнала этого счёта: ручных заявок владельца
+        программа не подавала, и в списке их нет. Счёт — из снимка счёта
+        с подключения (`account_read`), брокер не спрашивается.
+        """
+        hand, refusal = self._hand()
+        seen = self._live.funds
+        if hand is not None and refusal is None and seen is None:
+            refusal = (
+                "Счёт у брокера ещё не прочитан с подключения: без номера счёта "
+                "программа не знает, какие заявки журнала — этого счёта. Счёт "
+                "читается сразу после подключения и затем раз в полминуты — "
+                "повторите чуть позже."
             )
+        if hand is None or refusal is not None or seen is None:
+            reason = refusal or "Ручные действия в этой сборке программы не подключены."
+            self.note("Снятие заявки руками", reason, DecisionLevel.WARNING)
+            self._send(self.robot_orders_ready, RobotOrders(trouble=reason))
             return
-        self._refuse(
-            "Закрытие позиции",
-            f"У брокера позиция робота — {position_words(position.signed)}. Закрыть её "
-            "заявкой из программы нельзя: сначала «Выключить бой», затем закройте позицию "
-            "в приложении брокера. Закрытая руками при включённом бое, она остановит "
-            "робота на ближайшей заявке — позиция у брокера разойдётся с роботом.",
+        account = seen[0]
+
+        async def read() -> None:
+            try:
+                rows = await hand.robot_orders(account)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # окно ждёт ответа — ответ будет и при беде
+                log.exception("заявки робота из журнала не прочитаны", extra={"panel": False})
+                why = f"Журнал команд не прочитан: {_plain(error)}."
+                self.note("Снятие заявки руками", why, DecisionLevel.WARNING)
+                self._send(self.robot_orders_ready, RobotOrders(trouble=why))
+                return
+            self._send(self.robot_orders_ready, RobotOrders(orders=tuple(
+                RobotOrder(key=key, words=words) for key, words in rows
+            )))
+
+        self._live.listing = self._begin("orders", read())
+
+    def _hand(self) -> tuple[HandDesks | None, str | None]:
+        """Чем действовать руками и почему нельзя; `None` — можно.
+
+        Проверка без вопроса брокеру: проводка есть, связь есть, токен торговый.
+        Остальное (поток статусов, номер счёта) — у самой команды, словами.
+        """
+        # `object`: проводка боя объявлена `FactDesks`, а ручные действия —
+        # отдельный протокол; сужение `isinstance` mypy иначе считает невозможным.
+        desks: object = self._live.desks
+        if not isinstance(desks, HandDesks):
+            return None, "Подача заявок в этой сборке программы не подключена."
+        return desks, desks.refusal()
+
+    def _hand_refusal(self) -> str:
+        """Почему кнопки ручных действий погашены — для снимка боя; пусто — горят.
+
+        Пока ручное действие идёт, кнопки погашены (`/risk` 13.11.2026, Р1):
+        второе нажатие по портфелю, ещё не показавшему первое, — двойная сделка.
+        """
+        hand = self._live.hand
+        if hand is not None and not hand.done():
+            return "Идёт снятие заявки или закрытие позиции: дождитесь его итога в журнале."
+        _, refusal = self._hand()
+        return refusal or ""
+
+    def _by_hand(
+        self, event: str,
+        act: Callable[[HandDesks, FactRequest, FactDesk | None], Awaitable[str]],
+    ) -> None:
+        """Ручное действие владельца: одно за раз, итог — строкой журнала решений."""
+        hand, refusal = self._hand()
+        busy = self._live.hand
+        checks = (
+            (refusal is not None, refusal or ""),
+            (busy is not None and not busy.done(),
+             "Предыдущее ручное действие ещё идёт: дождитесь его итога в журнале решений."),
+            (self._live.opening,
+             "Идёт включение боя (сверка с брокером): дождитесь его итога и повторите."),
+        )
+        reasons = [words for failed, words in checks if failed]
+        if hand is None or reasons:
+            self._refuse(event, " ".join(reasons))
+            return
+        self.note(event, "Команда принята, итог — следующей строкой.")
+        self._live.hand = self._begin("hand", self._hand_work(event, hand, act))
+        self._publish_live()
+
+    async def _hand_work(
+        self, event: str, hand: HandDesks,
+        act: Callable[[HandDesks, FactRequest, FactDesk | None], Awaitable[str]],
+    ) -> None:
+        """Сделать ручное действие и сказать итог. Беда — словами, а не трассировкой."""
+        desk = self._live.desk
+        record: AbstractAsyncContextManager[RunEntry] | None = None
+        try:
+            frame = self._watch.frame or _Frame(_in_force(self._values), self._engine_settings)
+            symbol = convert.instrument_of(frame.values.instrument)
+            session_id: int | None = None if self._live.entry is None else self._live.entry.id
+            if desk is None:
+                record = self._runs.around(SessionRecord(
+                    origin=convert.stored_origin(RunOrigin.LIVE), symbol=symbol,
+                    timeframe=frame.values.timeframe, app_version=version(),
+                    note=f"{event}: команда владельца из окна, не прогон робота.",
+                ))
+                session_id = (await record.__aenter__()).id
+            if session_id is None:
+                raise FactRefused(
+                    "Запись в журнале прогонов не открылась: без неё журнал команд "
+                    "брокеру не пишется, а без журнала заявка не уходит."
+                )
+            text = await act(hand, self._hand_request(frame, symbol, session_id), desk)
+        except FactRefused as refusal:
+            self._refuse(event, f"Не сделано: {refusal.human}")
+        except convert.SettingsRefused as refusal:
+            self._refuse(event, f"Не сделано: {refusal}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # ручное действие — не повод ронять окно
+            log.exception("ручное действие владельца не выполнено", extra={"panel": False})
+            self._refuse(
+                event,
+                f"Не сделано: {_plain(error)}. Проверьте позицию и заявки в приложении "
+                "брокера; подробность — в выводе программы в консоли.",
+            )
+        else:
+            self.note(event, text, DecisionLevel.WARNING)
+            if desk is not None and desk.halted:
+                self._halt_fact(desk.halted)
+        finally:
+            if record is not None:
+                with contextlib.suppress(Exception):  # запись важна, итог человеку важнее
+                    await record.__aexit__(None, None, None)
+            # Действие кончилось: кнопки загораются этим же снимком, а задача
+            # ещё не `done()` — она здесь, в своём `finally`.
+            self._live.hand = None
+            self._publish_live()
+
+    def _hand_request(self, frame: _Frame, symbol: str, session_id: int) -> FactRequest:
+        """Просьба к исполнителю ручного действия — те же числа, что у боя (`_open_live`)."""
+        seen = self._live.funds
+        return FactRequest(
+            ticker=symbol,
+            bar_minutes=convert.timeframe_of(frame.values.timeframe).minutes,
+            ruble_per_point=frame.engine.ruble_per_point,
+            limits=_fact_limits(frame),
+            session_id=session_id,
+            on_news=_nothing,
+            notice=self._fact_notice,
+            funds_account="" if seen is None else seen[0],
+            price_step=frame.engine.price_step,
         )
 
     def set_mode(self, mode: Mode) -> None:
@@ -1913,7 +2102,7 @@ class HistoryPort(TerminalPort):
                 tuple(
                     convert.trade_row(deal, origin=self._origin)
                     for deal in self._run.deals
-                ),
+                ) + self._live.open_row,
                 convert.trades_summary(self._run),
             )
 
@@ -3286,6 +3475,8 @@ class HistoryPort(TerminalPort):
                 # запуске (`sync_contracts`): снимок экрана без неё ловил
                 # окно до перехода на действующий контракт.
                 self._history.load, self._live.watching,
+                # Ручные действия владельца (13.11.2026): список заявок и команда.
+                self._live.listing, self._live.hand,
             ):
                 if task is not None:
                     await _quiet(task)
@@ -3326,11 +3517,12 @@ class HistoryPort(TerminalPort):
             self._point.task, self._growing, self._draw, self._task,
             self._back.options, self._history.facts, self._history.load,
             self._history.contract, self._history.paper, self._live.watching,
+            self._live.listing, self._live.hand,
         ):
             if task is not None and not task.done():
                 task.cancel()
                 await _quiet(task)
-        self._live.watching = None
+        self._live.watching = self._live.listing = self._live.hand = None
         self._point.task = None
         self._growing = None
         self._draw = None
@@ -3414,6 +3606,8 @@ class HistoryPort(TerminalPort):
             "contract": self._history.contract,
             "halt": self._halt.saving,
             "watch": self._live.watching,
+            "orders": self._live.listing,
+            "hand": self._live.hand,
         }
 
     def _begin(self, key: str, work: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
@@ -4430,6 +4624,8 @@ class HistoryPort(TerminalPort):
             (self._history.term.holding,
              "Идёт первое уточнение контрактов у биржи: решения робота ждут его ответа. "
              "Включите бой после него."),
+            (self._live.hand is not None and not self._live.hand.done(),
+             "Идёт снятие заявки или закрытие позиции руками: включите бой после его итога."),
         )
         reasons = [words for failed, words in checks if failed]
         try:
@@ -5175,6 +5371,13 @@ class HistoryPort(TerminalPort):
         desk, self._live.desk = self._live.desk, None
         if observer is not None:
             await observer.aclose()
+        hand = self._live.hand
+        if desk is not None and hand is not None and not hand.done():
+            # Ручное действие идёт исполнителем боя («Выключить бой», остановка
+            # посреди него): закрыть исполнитель сейчас — оборвать поток статусов,
+            # которым придёт подтверждение снятия и закрытия (ревью 13.11.2026, 5).
+            # `close()` замка не берёт, поэтому ждёт порт.
+            await _quiet(hand)
         if desk is not None:
             try:
                 await desk.aclose()
@@ -6084,11 +6287,12 @@ class HistoryPort(TerminalPort):
         self._keep_forming(
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
         )
+        self._live.open_row = _open_row(run, candles, rubles, self._origin)
         self._send(
             self.trades_replaced,
             self._seam_rows(
                 tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals)
-            ),
+            ) + self._live.open_row,
             convert.trades_summary(run),
         )
         # Прогон по склейке называет все контракты периода, а не код из настроек.
@@ -6441,6 +6645,45 @@ def _waiting(was: Settings, now: Settings) -> str:
     if convert.run_costs(was) != convert.run_costs(now):
         lines.append("издержки «прогноза»")
     return "; ".join(lines)
+
+
+def _open_row(
+    run: HistoryRun, candles: Sequence[MarketCandle], ruble_per_point: float,
+    origin: RunOrigin | None,
+) -> tuple[TradeRow, ...]:
+    """Строка открытой позиции для таблицы «Сделки» — только окну (задача владельца 13.11.2026).
+
+    Позиция — та же, что у ячеек «Позиция» и «Позиция у брокера» на панели:
+    позиция движка прогона, чьи сделки в таблице (у пары — «факт»). Выхода
+    нет, результат — плавающий по закрытию последней свечи, без комиссии:
+    сделка не кончилась. Считает его та же сделка `backtest.Deal`, что
+    закрытые, — формула одна. В журнал сделок базы, итог под таблицей
+    и выгрузку строка не идёт: итог считается из `run.deals`, выгрузка
+    отбрасывает строки без выхода (`ui/main_window.py`).
+    """
+    position = run.position
+    if position is None or not candles:
+        return ()
+    last = candles[-1]
+    at = close_time(last)
+    deal = Deal(
+        side=position.side, volume=position.volume, entry_time=position.entry_time,
+        entry_price=position.entry_price, entry_order_id="", exit_time=at,
+        exit_price=last.close, exit_order_id="", exit_reason=ExitReason.SIGNAL,
+        ruble_per_point=ruble_per_point,
+    )
+    return (dataclasses.replace(
+        convert.trade_row(deal, origin=origin),
+        exit_time=None, exit_price=None, commission_rub=None,
+        exit_reason=(
+            f"Позиция открыта. Результат плавающий: по цене {last.close:g} "
+            f"на {in_moscow(at):%H:%M} МСК, без комиссии."
+        ),
+    ),)
+
+
+def _nothing() -> None:
+    """Новость исполнителя ручного действия: прохода по ней не нужно — хода нет."""
 
 
 def _fact_limits(frame: _Frame) -> LiveLimits:

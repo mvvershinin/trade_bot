@@ -589,7 +589,8 @@ def endpoint_from_docs(page: str) -> tuple[str, str]:
 ORDER_ENDPOINTS = (
     ("POST", "/trade-api-bff-operations/api/v1/orders"),  # 13-create-order.md
     ("POST", "/trade-api-bff-operations/api/v1/orders/edit"),  # 14-update-order.md
-    ("POST", "/trade-api-bff-order-details/api/v1/orders/cancel"),  # 12-cancel-order.md
+    # 12-cancel-order.md; адрес в снимке исправлен по живому серверу 13.11.2026 (`B-094`)
+    ("POST", "/trade-api-bff-operations/api/v1/orders/cancel"),
 )
 
 #: Страницы снимка, откуда взята каждая строка `ORDER_ENDPOINTS`. Порядок тот же.
@@ -602,7 +603,7 @@ ORDER_PAGES = ("13-create-order.md", "14-update-order.md", "12-cancel-order.md")
 #: с `ORDER_ENDPOINTS`, он разводит чтение и торговлю, а не ищет подстроку.
 READING_AROUND_ORDERS = (
     ("GET", "/trade-api-bff-operations/api/v1/orders"),  # 11-get-order-by-id.md
-    ("POST", "/trade-api-market-data-connector/api/v1/orders/search"),  # 15
+    ("POST", "/trade-api-bff-order-details/api/v1/orders/search"),  # 15, живьём 13.11 (`B-095`)
     ("POST", "/trade-api-bff-operations/api/v1/trades/search"),  # 16
 )
 READING_PAGES = ("11-get-order-by-id.md", "15-orders-search.md", "16-trades-search.md")
@@ -713,7 +714,7 @@ EXPECTED_REPEATABLE = {
     # со страниц снимка 11, 15, 16 (`READING_AROUND_ORDERS` ниже), а не
     # взяты из `broker/session.py`. Подачи и отмены здесь нет и не будет.
     ("GET", "/trade-api-bff-operations/api/v1/orders"),
-    ("POST", "/trade-api-market-data-connector/api/v1/orders/search"),
+    ("POST", "/trade-api-bff-order-details/api/v1/orders/search"),
     ("POST", "/trade-api-bff-operations/api/v1/trades/search"),
 }
 

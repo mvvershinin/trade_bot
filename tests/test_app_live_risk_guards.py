@@ -15,8 +15,9 @@
 * «Применить» в бою отказывает под **тем** полем, которое сменилось: порог
   проверки по минуткам, размер свечи, объём; вне боя то же принимается (R1);
 * «Позиция без управления» при отложенной пересборке сказана однажды (БЛОК 2);
-* «Закрыть позицию» при позиции «факта» называет её и советует «Выключить
-  бой»; «Старт» без боя говорит, как бой включается (замечания);
+* «Закрыть позицию» при позиции «факта» в бою закрывает её заявкой и
+  останавливает робота (задача владельца 13.11.2026); «Старт» без боя
+  говорит, как бой включается (замечания);
 * сверка после связи — одной операцией под замком: сторож, продавший, пока
   сверка читала портфель, не даёт «закрыть всё» (R2);
 * сверка после связи не идёт, пока поток закрыт (замечание к `relinked`);
@@ -552,34 +553,36 @@ def test_a_second_change_while_the_rebuild_is_held_is_said_and_shown(
 # --------------------------------------------------------------- замечания: слова кнопок
 
 
-def test_close_position_in_combat_names_the_position_and_says_turn_combat_off_first(
+def test_close_position_in_combat_closes_it_and_stops_the_robot(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """«Закрыть позицию» при лонге «факта»: позиция названа, совет — «Выключить бой».
+    """«Закрыть позицию» при лонге «факта» в бою: тейк снят, позиция закрыта, робот стоит.
 
-    Закрытия заявкой из программы нет; позиция, закрытая руками при
-    включённом бое, остановила бы робота. Отказ «закрывать нечего» здесь —
-    неправда о деньгах на счёте.
+    Задача владельца 13.11.2026: закрытие — заявкой из программы, а не советом
+    «закройте в приложении брокера». Закрывает исполнитель боя, и робот
+    после этого стоит до «Возобновить работу» (0020): позицию, которую он
+    вёл, закрыл не он.
     """
     monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
 
-    async def go() -> str:
+    async def go() -> tuple[str, LiveStatus]:
         bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
         try:
             await _connect(bench)
             await _ride(bench, LIVE_FROM + timedelta(minutes=50))
-            sent = len(broker.commands)
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
             bench.port.close_position()
             await bench.port.wait()
-            assert len(broker.commands) == sent, "«Закрыть позицию» подала команду брокеру"
-            return bench.said("Закрытие позиции")
+            return bench.said("Закрытие позиции руками"), bench.port.live_status()
         finally:
             await _close(bench, session)
 
-    said = loop.run_until_complete(go())
-    assert "лонг 1" in said, said
-    assert "«Выключить бой»" in said, said
-    assert "Закрывать нечего" not in said, said
+    said, status = loop.run_until_complete(go())
+    assert broker.position(SYMBOL) == 0, said
+    assert not broker.live(), f"у брокера осталась живая заявка: {said}"
+    assert "закрыта" in said, said
+    assert status.halted, "робот после ручного закрытия не остановлен"
+    assert not status.on
 
 
 def test_start_without_combat_says_how_combat_is_switched_on(

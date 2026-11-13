@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, runtime_checkable
 
 from backtest import HistoryRun
 from engine import AccountFunds, DayRecord, OrderExecutor, Side
@@ -46,6 +46,7 @@ __all__ = [
     "FactPosition",
     "FactRefused",
     "FactRequest",
+    "HandDesks",
     "LiveLimits",
     "LiveStatus",
     "day_record",
@@ -266,6 +267,36 @@ class FactDesks(Protocol):
         ...
 
 
+@runtime_checkable
+class HandDesks(Protocol):
+    """Ручные действия владельца из окна: снять заявку робота, закрыть позицию.
+
+    Задача владельца 13.11.2026 после первого боевого дня: робот встал
+    с позицией и тейком, а снять тейк и закрыть позицию из программы было
+    нечем. Отдельный протокол, а не два метода `FactDesks`: сборка, которая
+    их не даёт (заглушки проверок), остаётся сборкой боя, а порт говорит
+    словами, что руками из этой сборки нельзя.
+
+    Проверяется `isinstance` — по наличию методов (`runtime_checkable`).
+    """
+
+    def refusal(self) -> str | None:
+        """Почему нельзя без вопроса брокеру: нет связи, токен для чтения."""
+        ...
+
+    async def robot_orders(self, account: str) -> tuple[tuple[str, str], ...]:
+        """Заявки робота этого счёта из журнала команд: ключ у брокера и слова."""
+        ...
+
+    async def cancel_by_hand(self, request: FactRequest, key: str, desk: object) -> str:
+        """Снять заявку робота по ключу; итог словами. Отказ — `FactRefused`."""
+        ...
+
+    async def close_by_hand(self, request: FactRequest, desk: object) -> str:
+        """Снять заявки робота по инструменту и закрыть позицию; итог словами."""
+        ...
+
+
 # --------------------------------------------------------------- день до запуска
 
 
@@ -389,3 +420,7 @@ class LiveStatus:
     forecast: HistoryRun | None = None
     fact_origin: RunOrigin = RunOrigin.LIVE
     forecast_origin: RunOrigin = RunOrigin.PAPER
+    #: Почему «Снять заявку» и «Закрыть позицию» сейчас недоступны — словами;
+    #: пусто — доступны. Не зависит от боя: кнопки нужны и при остановленном
+    #: роботе, и при выключенном бое (задача владельца 13.11.2026).
+    hand_refused: str = "Ручные действия ещё не проверены: программа не ответила."

@@ -18,11 +18,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ui.formatting import fmt_price
-from ui.models import LiveView
-from ui.status_panel import position_head
+from ui.formatting import fmt_price, fmt_volume
+from ui.models import LiveView, Side
+from ui.status_panel import fact_side, position_head
 
 __all__ = [
+    "CANCEL_ORDER_HINT",
+    "CANCEL_ORDER_LABEL",
+    "CLOSE_POSITION_HINT",
+    "CLOSE_POSITION_LABEL",
     "LIVE_NO_PORT",
     "LIVE_OFF_LEAD",
     "LIVE_OFF_TAIL",
@@ -34,7 +38,11 @@ __all__ = [
     "TAKE_MAY_STAY",
     "TAKE_NONE",
     "LIVE_UNMANAGED",
+    "NO_ROBOT_ORDERS",
     "LiveLook",
+    "cancel_order_question",
+    "close_position_question",
+    "hand_hint",
     "live_look",
     "live_mode_off_question",
     "live_off_question",
@@ -312,4 +320,103 @@ def live_mode_off_question(view: LiveView) -> str:
         "не приводит к сделке; переворота по средней не будет.",
         "Выключить робота?",
         tail=LIVE_UNMANAGED,
+    )
+
+
+# ---------------------------------------------------------------- руками
+#
+# Задача владельца 13.11.2026 после первого боевого дня: робот встал
+# с позицией и тейком, а снять заявку и закрыть позицию из программы было
+# нечем — «зайдите снимите заявку руками через приложение» владелец назвал
+# негодным. Две кнопки рядом с «Боем»; доступность и причина погасшей —
+# из снимка порта (`LiveView.hand_refused`), заявки подаёт торговая часть.
+
+#: Подписи кнопок. Многоточие — обещание вопроса.
+CANCEL_ORDER_LABEL = "Снять заявку…"
+CLOSE_POSITION_LABEL = "Закрыть позицию…"
+
+CANCEL_ORDER_HINT = (
+    "Снять заявку робота у брокера: окно покажет заявки, поданные программой, "
+    "и спросит подтверждение. Заявки, поданные вами в приложении брокера, "
+    "в списке не появятся — программа их не трогает. Работает и когда робот "
+    "остановлен, и при выключенном бое: нужны связь и торговый токен. "
+    "При включённом бое робот после снятия остановится."
+)
+CLOSE_POSITION_HINT = (
+    "Закрыть позицию у брокера по инструменту из настроек: сначала снимаются "
+    "заявки робота по нему (тейк), затем подаётся закрывающая заявка FOK по "
+    "планке биржи. Объём — из позиции у брокера в момент закрытия. Работает "
+    "и когда робот остановлен, и при выключенном бое. При включённом бое "
+    "робот после закрытия остановится."
+)
+
+#: Что сказать, когда у робота нет ни одной незакрытой заявки по журналу.
+NO_ROBOT_ORDERS = (
+    "Незакрытых заявок робота по журналу команд нет — снимать нечего. "
+    "Заявки, поданные вами в приложении брокера, программа не видит и не снимает."
+)
+
+#: Сторона закрывающей заявки по стороне позиции — словами.
+_CLOSING_WORDS = {Side.LONG: "продажа", Side.SHORT: "покупка"}
+
+
+def hand_hint(view: LiveView | None, hint: str) -> str:
+    """Подсказка кнопки ручного действия: почему погашена — первым, иначе что делает."""
+    if view is None:
+        return f"{LIVE_NO_PORT}\n\n{hint}"
+    if view.hand_refused:
+        return f"Сейчас недоступно: {view.hand_refused}\n\n{hint}"
+    return hint
+
+
+def _robot_stops(view: LiveView | None, why: str) -> str:
+    """Хвост вопроса при включённом бое: робот остановится и почему. Без боя — пусто."""
+    if view is None or not view.wanted:
+        return ""
+    return (
+        f"\n\nБой включён: робот после этого остановится — {why}. "
+        "Продолжить — «Возобновить работу»."
+    )
+
+
+def cancel_order_question(words: str, view: LiveView | None) -> str:
+    """Вопрос перед снятием одной заявки робота: что снимается — словами порта."""
+    return (
+        f"Снимается заявка робота у брокера:\n\n{words}.\n\n"
+        "Если это тейк открытой позиции, позиция останется без тейка."
+        f"{_robot_stops(view, 'заявку, которую он считал своей, снимает не он')}"
+        "\n\nСнять заявку?"
+    )
+
+
+def close_position_question(view: LiveView | None, instrument: str) -> str:
+    """Вопрос перед закрытием позиции: сторона и объём — по тому, что знает окно.
+
+    Объём заявки берёт торговая часть из позиции у брокера в момент
+    закрытия, и вопрос говорит это прямо: позиция в окне могла устареть
+    (`position_note`) или быть неизвестна вовсе — после перезапуска программы.
+    """
+    position = None if view is None else view.position
+    note = "" if view is None or not view.position_note else (
+        f" Сведения о позиции: {view.position_note}."
+    )
+    if position is None:
+        head = (
+            f"Позиции робота по {instrument} окно сейчас не знает (например, после "
+            "перезапуска программы). Программа прочитает позицию у брокера и закроет "
+            f"её целиком, какой бы она ни была.{note}"
+        )
+    else:
+        side = fact_side(position)
+        head = (
+            f"У брокера позиция: {position_head(position)}.{note}\n"
+            f"Закрывающая заявка: {_CLOSING_WORDS[side]} {fmt_volume(position.volume)} "
+            f"{instrument}, FOK по планке биржи."
+        )
+    return (
+        f"{head}\n\nСначала снимаются заявки робота по {instrument} (тейк). Не снимется "
+        "хоть одна — позиция не закрывается. Объём заявки — из позиции у брокера "
+        "в момент закрытия: два чтения портфеля обязаны совпасть, иначе заявка "
+        f"не подаётся.{_robot_stops(view, 'позицию, которую он вёл, закрывает не он')}"
+        "\n\nЗакрыть позицию?"
     )

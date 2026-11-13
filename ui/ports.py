@@ -39,6 +39,7 @@ from ui.models import (
     DebugBatch,
     HistoryLoadRequest,
     Mode,
+    RobotOrders,
     Settings,
 )
 from ui.trade_story import PaperReport, PaperReportRequest
@@ -118,6 +119,9 @@ class TerminalPort(QObject):
     #: позиция «факта», происхождение данных. Окно зеркалит его кнопкой «Бой»
     #: и строкой рядом — как кнопку связи по `RobotState.connection`.
     live_changed = Signal(object)         # LiveView
+    #: Ответ на `request_robot_orders` — заявки робота или почему не прочитаны
+    #: (`ui.models.RobotOrders`). Приходит всегда, и при отказе тоже.
+    robot_orders_ready = Signal(object)   # RobotOrders
 
     # ⚠️ Два отказа — своими сигналами, а не одним `failed`, и это правило
     # 13 `CLAUDE.md`. `failed` — фраза в строку состояния на 15 секунд; окно
@@ -238,8 +242,30 @@ class TerminalPort(QObject):
         self._not_connected("Чтение журналов")
 
     def close_position(self) -> None:
-        """Закрыть позицию вручную. Заявку подаёт движок, не окно."""
+        """«Закрыть позицию»: снять заявки робота по инструменту и закрыть позицию у брокера.
+
+        Заявки подаёт торговая часть, не окно. Работает и при остановленном
+        роботе, и при выключенном бое — была бы связь и торговый токен
+        (`LiveView.hand_refused`). Подтверждение окно спрашивает **до**
+        команды; итог — строкой журнала решений.
+        """
         self._not_connected("Закрытие позиции")
+
+    def request_robot_orders(self) -> None:
+        """Попросить заявки робота для «Снять заявку». Ответ — `robot_orders_ready`.
+
+        Только заявки, поданные программой (журнал команд этого счёта):
+        ручных заявок владельца в списке нет. Ответ приходит всегда — окно,
+        ждущее списка, иначе ждало бы вечно.
+        """
+        self._not_connected("Чтение заявок робота")
+        self.robot_orders_ready.emit(RobotOrders(
+            trouble="Заявки робота не прочитаны: окно открыто без торговой части.",
+        ))
+
+    def cancel_robot_order(self, key: str) -> None:
+        """Снять заявку робота по ключу из `RobotOrder.key`. Итог — строкой журнала решений."""
+        self._not_connected(f"Снятие заявки (ключ {key})")
 
     def request_backtest_options(self) -> None:
         """Попросить, из чего выбирать в диалоге прогона.

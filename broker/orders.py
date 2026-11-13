@@ -9,8 +9,10 @@
 
 Источник каждого кода и поля — снимок документации `.docs/broker-api/`:
 11 (статус по ключу), 12 (отмена), 13 (создание), 15 (список заявок),
-16 (список сделок), 24 (поток статусов). С сайтом не сверено, **живьём
-не проверено ни одно поле**: токена с правами торговли в разработке нет.
+16 (список сделок), 24 (поток статусов). **Живьём 13.11.2026** проверены
+подача, отмена, статус по ключу (там `data` — объект, а не массив снимка)
+и список заявок (`side` и `orderStatus` числами, даты с миллисекундами);
+список сделок и поток статусов живьём не сверялись.
 
 Правила разбора — общие для слоя (`broker/parsing.py`) плюс два своих.
 
@@ -472,7 +474,15 @@ class TradesPage:
 
 
 def _utc_text(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    """Момент в UTC **с миллисекундами**: `2026-11-12T19:00:00.000Z`.
+
+    Живой список заявок 13.11.2026 (`B-095`) требует ровно
+    `yyyy-MM-dd'T'HH:mm:ss.SSSX`: без миллисекунд — 422 `INVALID_FORMAT`.
+    `isoformat()` без `timespec` их опускает при нулевых микросекундах
+    и пишет шесть знаков при ненулевых — обе формы брокер отвергает.
+    """
+    utc = moment.astimezone(timezone.utc)
+    return utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _check_window(start: datetime | None, end: datetime | None, page: int, size: int) -> None:
@@ -690,11 +700,31 @@ def parse_order_event(message: object) -> OrderEvent:
 
 
 def parse_order_state(payload: object) -> OrderState:
-    """Ответ статуса по ключу (11). Пустой `data` — отказ: «нет заявки» — это 404."""
+    """Ответ статуса по ключу (11). `data` — объект или массив; иначе отказ.
+
+    ⚠️ **Живой сервер 13.11.2026 шлёт `data` объектом** — одним, последним
+    сообщением о заявке, в той же форме, что событие потока (24). Снимок
+    сайта (11) обещает массив `object[]`. Принимаются оба вида.
+
+    До этой правки объект отвергался текстом «нет сообщений о заявке (data)»,
+    и ровно этот текст 13.11 в 09:55 читался как «брокер прислал 200 без
+    `data`» (`B-094`): тем же текстом разбор отвечал и на отсутствие поля,
+    и на объект. Теперь у трёх случаев три разных технических текста.
+
+    Отсутствие `data` остаётся отказом, а не «заявка жива, отчётов нет»:
+    страница 11 называет `data` обязательным, а «заявки нет» — это 404
+    `NOT_FOUND` (`order_status` → `None`). Пустой массив — тот же отказ.
+    """
     source = _mapping(payload, "ответ статуса заявки")
     data = source.get("data")
-    if not isinstance(data, list) or not data:
-        raise _unreadable("в ответе статуса нет сообщений о заявке (data)")
+    if data is None:
+        raise _unreadable("в ответе статуса нет поля data")
+    if isinstance(data, Mapping):
+        data = [data]
+    if not isinstance(data, list):
+        raise _unreadable(f"data ответа статуса не объект и не массив, {_shown(data)}")
+    if not data:
+        raise _unreadable("в ответе статуса пустой массив data")
     return OrderState(
         client_order_id=_key(pick(source, ("clientOrderId",))),
         original_client_order_id=_key(pick(source, ("originalClientOrderId",))),
@@ -720,16 +750,40 @@ def acceptance_doubt(payload: object, key: UUID) -> str | None:
     return None
 
 
+#: Где у ответа списка лежит массив строк — по порядку доверия. `records` —
+#: снимок (15, 16); `content` и `data` — имена, под которыми страницу отдают
+#: соседние сервисы брокера. Живой ответ 13.11.2026 ключ не записал (`B-095`),
+#: поэтому читается любой из трёх, а ни одного — отказ, не пустая страница.
+_ROWS_KEYS: Final[tuple[str, ...]] = ("records", "content", "data")
+
+
 def _records(payload: object) -> tuple[list[Mapping[str, object]], int | None, int | None]:
     source = _mapping(payload, "ответ списка")
-    records = source.get("records")
-    if not isinstance(records, list):
-        raise _unreadable("в ответе списка нет массива records")
-    return (
-        [_mapping(item, "строка списка") for item in records],
-        _whole(source, "totalRecords"),
-        _whole(source, "totalPages"),
+    rows = next(
+        (found for key in _ROWS_KEYS if isinstance(found := source.get(key), list)), None
     )
+    if rows is None:
+        raise _unreadable(f"в ответе списка нет массива ни под одним из {', '.join(_ROWS_KEYS)}")
+    total = _whole(source, "totalRecords")
+    if total is None:
+        total = _whole(source, "totalElements")
+    return [_mapping(item, "строка списка") for item in rows], total, _whole(source, "totalPages")
+
+
+def _exact_whole(source: Mapping[str, object], field: str) -> int | None:
+    """Целое без потери разрядов: номер заявки биржи — 19 цифр.
+
+    `_whole` идёт через `float`, а у него 15–16 значащих цифр: живой
+    `orderNum` вида `1984994564062258802` (13.11.2026) округлился бы
+    до чужого номера молча. Целое и строка цифр читаются точно, прочее —
+    общим путём `_whole` с его отказами.
+    """
+    raw = pick(source, (field,))
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return _whole(source, field)
 
 
 def parse_orders_page(payload: object) -> OrdersPage:
@@ -738,7 +792,7 @@ def parse_orders_page(payload: object) -> OrdersPage:
     records = tuple(
         ListedOrder(
             status=_required_code(row, "orderStatus", ListedOrderStatus),
-            order_num=_whole(row, "orderNum"),
+            order_num=_exact_whole(row, "orderNum"),
             exchange_order_id=text(pick(row, ("orderId",))),
             ticker=text(pick(row, ("ticker",))),
             class_code=text(pick(row, ("classCode",))),
@@ -765,8 +819,8 @@ def parse_trades_page(payload: object) -> TradesPage:
     rows, total_records, total_pages = _records(payload)
     records = tuple(
         TradeRecord(
-            trade_num=_whole(row, "tradeNum"),
-            order_num=_whole(row, "orderNum"),
+            trade_num=_exact_whole(row, "tradeNum"),
+            order_num=_exact_whole(row, "orderNum"),
             ticker=text(pick(row, ("ticker",))),
             class_code=text(pick(row, ("classCode",))),
             side=_code(row, "side", OrderSide),

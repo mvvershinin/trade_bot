@@ -611,7 +611,12 @@ def span_totals(rows: Sequence[TradeRow]) -> SpanTotals:
 
 def span_summary(facts: SpanFacts) -> SpanTotals | None:
     """Итог участка или `None`, если складывать нечего: сделок здесь нет."""
-    picked = trades_in_span(facts.span, facts.trades)
+    # Строка открытой позиции из журнала окна (выхода нет, результат плавающий,
+    # `app/port.py::_open_row`) — не сделка: в деньги участка она не идёт
+    # (ревью 13.11.2026). У «Отчётов» её нет вовсе (`JournalTabs.closed_trades`).
+    picked = [
+        row for row in trades_in_span(facts.span, facts.trades) if row.exit_time is not None
+    ]
     return span_totals(picked) if picked else None
 
 

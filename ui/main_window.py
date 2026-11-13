@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -67,8 +68,16 @@ from ui.formatting import MSK, fmt_time, fmt_volume
 from ui.history_dialog import HistoryDialog
 from ui.journals import JournalTabs
 from ui.live_control import (
+    CANCEL_ORDER_HINT,
+    CANCEL_ORDER_LABEL,
+    CLOSE_POSITION_HINT,
+    CLOSE_POSITION_LABEL,
     LIVE_OFF_LABEL,
     LIVE_ON_LABEL,
+    NO_ROBOT_ORDERS,
+    cancel_order_question,
+    close_position_question,
+    hand_hint,
     live_look,
     live_mode_off_question,
     live_off_question,
@@ -91,6 +100,8 @@ from ui.models import (
     Marker,
     Mode,
     PriceLevel,
+    RobotOrder,
+    RobotOrders,
     RobotState,
     Settings,
     Shade,
@@ -707,10 +718,23 @@ class MainWindow(QMainWindow):
         self.live_action = QAction(LIVE_ON_LABEL, self)
         self.live_action.setCheckable(True)
         self.live_action.triggered.connect(self.request_live)
+        #: Ручные действия владельца у брокера (задача владельца 13.11.2026):
+        #: рядом с «Боем», потому что действуют на тот же счёт. Горят и при
+        #: остановленном роботе, и при выключенном бое — погашены только
+        #: без связи или на токене для чтения, с причиной в подсказке.
+        self.cancel_order_action = QAction(CANCEL_ORDER_LABEL, self)
+        self.cancel_order_action.triggered.connect(self.request_cancel_order)
+        self.close_position_action = QAction(CLOSE_POSITION_LABEL, self)
+        self.close_position_action.triggered.connect(self.request_close_position)
+        #: Окно спросило заявки робота и ждёт ответа: чужой ответ (второе окно,
+        #: проверка) диалога не открывает.
+        self._orders_asked = False
         self.live_note = QLabel()
         self.live_note.setTextFormat(Qt.TextFormat.PlainText)
         bar.addSeparator()
         bar.addAction(self.live_action)
+        bar.addAction(self.cancel_order_action)
+        bar.addAction(self.close_position_action)
         bar.addWidget(self.live_note)
         self._mirror_live(None)
 
@@ -875,6 +899,7 @@ class MainWindow(QMainWindow):
         port.history_finished.connect(self.show_history_result)
         port.paper_report_ready.connect(self.show_paper_report)
         port.live_changed.connect(self.show_live)
+        port.robot_orders_ready.connect(self.show_robot_orders)
 
     # ---------------------------------------------------------------- показ
 
@@ -1321,6 +1346,13 @@ class MainWindow(QMainWindow):
             f"color: {getattr(self.theme, look.colour)}; padding-left: 6px;"
             + (" font-weight: 600;" if look.colour == "danger" else "")
         )
+        hand = view is not None and not view.hand_refused
+        for action, hint in (
+            (self.cancel_order_action, CANCEL_ORDER_HINT),
+            (self.close_position_action, CLOSE_POSITION_HINT),
+        ):
+            action.setEnabled(hand)
+            action.setToolTip(hand_hint(view, hint))
 
     def request_live(self, checked: bool) -> None:
         """Человек нажал «Бой». Включение — только после вопроса.
@@ -1348,6 +1380,71 @@ class MainWindow(QMainWindow):
         ):
             return
         self.port.set_live(False)
+
+    def request_cancel_order(self) -> None:
+        """«Снять заявку…»: спросить заявки робота; список и вопрос — по ответу порта.
+
+        Список читается из базы — асинхронно, ответ придёт `robot_orders_ready`.
+        """
+        self._orders_asked = True
+        self.statusBar().showMessage("Читаю заявки робота из журнала команд…", 5000)
+        self.port.request_robot_orders()
+
+    def show_robot_orders(self, orders: RobotOrders) -> None:
+        """Ответ порта: выбрать заявку, подтвердить, отправить команду.
+
+        Отказ и пустой список — словами в окне, а не молча (правило 13).
+
+        ⚠️ Всё модальное — через `_open_modal`, следующим оборотом цикла:
+        сигнал порт испускает изнутри корутины (`request_robot_orders`),
+        и выбор, вопрос или сообщение, поднятые прямо здесь, подняли бы
+        вложенный цикл Qt внутри шага задачи (`B-026`, ревью 13.11.2026).
+        """
+        if not self._orders_asked:
+            return
+        self._orders_asked = False
+        self._open_modal(lambda: self._pick_order(orders))
+
+    def _pick_order(self, orders: RobotOrders) -> None:
+        """Выбор, вопрос и команда — уже вне шага корутины порта (`show_robot_orders`)."""
+        if orders.trouble:
+            self.inform("Снять заявку", f"Заявки робота не прочитаны: {orders.trouble}")
+            return
+        if not orders.orders:
+            self.inform("Снять заявку", NO_ROBOT_ORDERS)
+            return
+        chosen = self.choose_order(orders.orders)
+        if chosen is None:
+            return
+        if self.ask(
+            "Снять заявку робота", cancel_order_question(chosen.words, self._live),
+            "Снять заявку",
+        ):
+            self.port.cancel_robot_order(chosen.key)
+
+    def request_close_position(self) -> None:
+        """«Закрыть позицию…»: вопрос со стороной и объёмом, затем команда порту."""
+        question = close_position_question(self._live, self._state.instrument)
+        if self.ask("Закрыть позицию у брокера", question, "Закрыть позицию"):
+            self.port.close_position()
+
+    def choose_order(self, orders: Sequence[RobotOrder]) -> RobotOrder | None:
+        """Выбор одной заявки из списка. `None` — отказались.
+
+        Отдельным методом — чтобы проверки подменяли его, а не модальное окно.
+        """
+        items = [order.words for order in orders]
+        text, ok = QInputDialog.getItem(
+            self, "Снять заявку", "Заявки робота у брокера (по журналу команд):",
+            items, 0, False,
+        )
+        if not ok or text not in items:
+            return None
+        return orders[items.index(text)]
+
+    def inform(self, title: str, text: str) -> None:
+        """Сообщение с одной кнопкой. Отдельным методом — чтобы проверки его подменяли."""
+        QMessageBox.information(self, title, text)
 
     def ask(self, title: str, text: str, yes: str) -> bool:
         """Вопрос с двумя кнопками: «{yes}» и «Отмена». По умолчанию — отмена.
@@ -1774,7 +1871,7 @@ class MainWindow(QMainWindow):
             return None
         first, last = self._chart_bounds or (None, None)
         return ShownRun(
-            trades=tuple(self.journals.trades_model.rows()),
+            trades=tuple(self.journals.closed_trades()),
             summary=self.journals.summary(),
             instrument=self._chart_instrument,
             first=first,
@@ -2080,7 +2177,7 @@ class MainWindow(QMainWindow):
         """
         stamp = datetime.now(MSK).strftime(STAMP_FORMAT)
         headers, rows = trades_table(
-            self.journals.trades_model.rows(), self.journals.summary()
+            self.journals.closed_trades(), self.journals.summary()
         )
         decision_headers, decision_rows = decisions_table(self.journals.decisions_model.rows())
         jobs: tuple[ExportJob, ...] = (

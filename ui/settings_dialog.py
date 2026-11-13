@@ -65,6 +65,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QTimeEdit,
@@ -691,6 +692,42 @@ class _Form(QFormLayout):
             super().heightForWidth(rect.width() - narrower)
         super().setGeometry(rect)
 
+    def wrap_long_rows(self) -> None:
+        """Строка, которой не хватает ширины, ставит поле под подпись.
+
+        Зовётся после того, как строки с подписями добавлены. Без переноса
+        наименьшая ширина группы — сумма самой длинной подписи и самого
+        широкого поля, даже если они в разных строках. `B-089`: на шрифте
+        бегунка GitHub (DejaVu Sans, 12 пт) в «Издержках» подпись «Наибольшая
+        свеча для проверки по минуткам» (393 точки) плюс список «Порядок цен
+        внутри минуты» (336) давали вкладке «Деньги» 783 точки при видимых
+        778: прокрутка снизу, пояснения срезаны. С переносом наименьшая
+        ширина — большее из двух. Пока ширины хватает, строки стоят как раньше.
+
+        ⚠️ Зазор между подписью и полем переезжает в правое поле подписи,
+        а промежуток формы становится нулевым. Причина — дефект Qt (6.11.1):
+        решая, переносить ли строку, `QFormLayout` сравнивает «подпись + поле»
+        с шириной **без** промежутка между ними, а ставит поле уже с ним.
+        В полосе шириной в промежуток поле получает на 5–6 точек меньше своего
+        наименьшего: замер 13.11.2026, список «Порядок цен внутри минуты»
+        331 точка из 336 при окне 820, текст упирается в стрелку. Зазор внутри
+        подписи Qt считает честно. Величина зазора — та же, что Qt взял бы сам.
+        """
+        gap = self.horizontalSpacing()
+        parent = self.parentWidget()
+        if gap < 0 and parent is not None:
+            gap = parent.style().combinedLayoutSpacing(
+                QSizePolicy.ControlType.Label, QSizePolicy.ControlType.LineEdit,
+                Qt.Orientation.Horizontal, None, parent,
+            )
+        self.setHorizontalSpacing(0)
+        for row in range(self.rowCount()):
+            item = self.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            label = item.widget() if item is not None else None
+            if label is not None:
+                label.setContentsMargins(0, 0, max(gap, 0), 0)
+        self.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
 
 #: Размер окна настроек, который оно просит при открытии; экран меньше —
 #: меньше (`resize_within_screen`). Именем, а не числами в вызове: по ширине
@@ -1274,6 +1311,7 @@ class SettingsDialog(QDialog):
                 # Подсказка занимает обе колонки: в узкой колонке поля она
                 # разъезжается на шесть строк, и окно перестаёт помещаться.
                 form.addRow(_hint(hint))
+        form.wrap_long_rows()
         return box
 
     def _build_contract_row(self) -> None:

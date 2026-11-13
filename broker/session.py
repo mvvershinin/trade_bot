@@ -170,18 +170,26 @@ TRADING_STATUS_PATH: Final[str] = (
 #: `POST` создаёт новую (`13-create-order.md`). Поэтому допуск и повтор
 #: у слоя заданы парой «глагол и адрес», а не адресом.
 #:
-#: ⚠️ **Живьём не проверялось: токена с правами торговли в разработке нет.**
+#: Оба глагола проверены живьём 13.11.2026: подача — 200 с нашим ключом,
+#: статус — 200, где `data` **объект**, а не массив снимка (`parse_order_state`).
 ORDERS_PATH: Final[str] = "/trade-api-bff-operations/api/v1/orders"
 
-#: Отмена заявки — **другой сервис**, `bff-order-details`, а не `bff-operations`
-#: (`12-cancel-order.md`). Пишущий адрес. Живьём не проверялось.
-CANCEL_ORDER_PATH: Final[str] = "/trade-api-bff-order-details/api/v1/orders/cancel"
+#: Отмена заявки — сервис `bff-operations`, тот же, что у подачи. Пишущий адрес.
+#:
+#: ⚠️ **Сайт неверен, проверено живьём 13.11.2026 (`B-094`).** Снимок сайта
+#: называл `bff-order-details`; там шлюз отвечает 404 страницей HTML, и тейк
+#: перед переворотом не снимался. На этом адресе брокер ответил 200
+#: `{"clientOrderId": <ключ отмены>, "status": "OK"}` с тем же телом (12).
+CANCEL_ORDER_PATH: Final[str] = "/trade-api-bff-operations/api/v1/orders/cancel"
 
-#: Список заявок с 26.01.2026. ⚠️ По снимку живёт на сервисе **рыночных
-#: данных**, а не операций (`15-orders-search.md`) — так и написано; прецедент
-#: неверного имени сервиса уже был (`CANDLES_PATH`), поэтому адрес стоит
-#: в `ADDRESS_SENSITIVE`. Запрос читающий: `POST` с телом-фильтром.
-ORDERS_SEARCH_PATH: Final[str] = "/trade-api-market-data-connector/api/v1/orders/search"
+#: Список заявок с 26.01.2026. Запрос читающий: `POST` с телом-фильтром.
+#:
+#: ⚠️ **Сайт неверен, проверено живьём 13.11.2026 (`B-095`).** Снимок называл
+#: сервис рыночных данных (`market-data-connector`), там 404 HTML; на
+#: `bff-operations` — тоже 404. Отвечает `bff-order-details` — тот сервис,
+#: который сайт приписывал отмене. Даты фильтра — строго с миллисекундами
+#: (`OrdersQuery.body`), без них 422. Адрес остаётся в `ADDRESS_SENSITIVE`.
+ORDERS_SEARCH_PATH: Final[str] = "/trade-api-bff-order-details/api/v1/orders/search"
 
 #: Список сделок с 26.01.2026 (`16-trades-search.md`). Читающий `POST`.
 TRADES_SEARCH_PATH: Final[str] = "/trade-api-bff-operations/api/v1/trades/search"

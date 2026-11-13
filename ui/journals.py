@@ -756,6 +756,15 @@ class JournalTabs(QWidget):
             index, QColor(self._theme.danger) if real else QColor()
         )
 
+    def closed_trades(self) -> list[TradeRow]:
+        """Сделки таблицы без строки открытой позиции — для выгрузки и «Отчётов».
+
+        Строка открытой позиции (выхода нет, результат плавающий) живёт только
+        в окне (задача владельца 13.11.2026): в файл и в отчёт идут сделки,
+        а не позиция, которая ещё не кончилась.
+        """
+        return [row for row in self.trades_model.rows() if row.exit_time is not None]
+
     def append_decision(self, row: DecisionRow) -> None:
         at_bottom = not self.decisions_table.verticalScrollBar().isVisible() or (
             self.decisions_table.verticalScrollBar().value()

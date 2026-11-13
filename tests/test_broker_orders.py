@@ -777,9 +777,13 @@ def test_an_unknown_status_in_the_status_answer_is_refused(store: TokenStore) ->
     [
         {"clientOrderId": "x", "data": []},
         {"clientOrderId": "x"},
+        {"clientOrderId": "x", "data": None},
+        {"clientOrderId": "x", "data": "0"},
+        # Объект — живой вид (13.11.2026) и читается, но без `executionType`
+        # сообщение не понять: отказ идёт из `parse_report`.
         {"clientOrderId": "x", "data": {"orderStatus": "0"}},
     ],
-    ids=["пустой-data", "без-data", "data-не-массив"],
+    ids=["пустой-data", "без-data", "data-null", "data-строка", "data-объект-без-вида"],
 )
 def test_a_status_answer_without_messages_is_refused_not_read_as_no_order(
     store: TokenStore, payload: dict[str, object]
@@ -977,8 +981,9 @@ def test_an_order_that_cannot_be_sent_is_refused_before_the_wire(
 def test_the_orders_search_sends_its_filter_and_reads_the_rows(store: TokenStore) -> None:
     """Список заявок: `POST` с фильтром в теле, страница — в строке запроса (15).
 
-    Сторона и состояние в теле — числа, время — UTC с `Z`. Мутация:
-    состояние строкой; страница в теле.
+    Сторона и состояние в теле — числа, время — UTC с миллисекундами и `Z`
+    (живой ответ 13.11.2026: без миллисекунд 422). Мутация: состояние
+    строкой; страница в теле.
     """
     rows = [
         {"orderNum": 7, "orderId": "261027-SPBFUT-7", "orderStatus": 3, "side": 2,
@@ -1004,7 +1009,7 @@ def test_the_orders_search_sends_its_filter_and_reads_the_rows(store: TokenStore
     assert len(asked) == 1
     assert dict(asked[0].url.params) == {"page": "0", "size": "100"}
     assert json.loads(asked[0].content) == {
-        "startDateTime": "2026-10-27T07:00:00Z",
+        "startDateTime": "2026-10-27T07:00:00.000Z",
         "side": 2,
         "orderStatus": [3],
         "tickers": ["MXZ6"],
