@@ -1205,8 +1205,8 @@ class BrokerSession:
         `redaction.RedactingSink`, который перекидывал записи слоя
         в `logging.lastResort`, то есть в stderr; перекидывание убрано там же.
 
-        Уровни: отказ — WARNING (техническому логу он важен), тело ответа —
-        DEBUG (оно длинное и нужно редко).
+        Уровни: отказ и тело ответа — оба WARNING (тело — с 13.11.2026, иначе
+        в файл оно не попадало); тело уже вычищено и обрезано до 500 символов.
         """
         if isinstance(error, OUTAGE):
             # Человеческую строку `went_offline` возвращает для журнала
@@ -1221,12 +1221,17 @@ class BrokerSession:
 
     @staticmethod
     def _note_technical(error: BrokerError, headline: str) -> None:
-        """Отказ в технический лог: тип, код, адрес, тело. Без текста человеку."""
+        """Отказ в технический лог: тип, код, адрес, тело. Без текста человеку.
+
+        Тело — WARNING, а не DEBUG (решение владельца 13.11.2026): на 503
+        портфеля в логе было «текст, 19 симв.», а что ответил брокер — нет.
+        `details` уже вычищено `scrub` и обрезано (`body_details`).
+        """
         log().warning(
             "%s: %s", headline, error.technical or type(error).__name__
         )
         if error.details:
-            log().debug("тело ответа брокера: %s", error.details)
+            log().warning("тело ответа брокера: %s", error.details)
 
     def _note_online(self) -> None:
         # `came_online` возвращает строку для журнала решений — человеческую,

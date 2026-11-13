@@ -1437,19 +1437,13 @@ def test_the_layer_logs_technical_only_and_never_the_human_text(
     assert opening not in written, f"начало человеческого текста в логе:\n{written}"
 
     loud = [record for record in caplog.records if record.levelno >= logging.WARNING]
-    quiet = [record for record in caplog.records if record.levelno < logging.WARNING]
     assert any(f"HTTP {status}" in record.getMessage() for record in loud), (
         "отказ не записан техническим текстом — разбирать его будет нечем"
     )
-    for record in caplog.records:
-        for piece in BODY_PIECES:
-            if piece in record.getMessage():
-                assert record.levelno < logging.WARNING, (
-                    f"тело ответа записано уровнем {record.levelname}: оно длинное "
-                    "и нужно редко, ему место на DEBUG"
-                )
-    assert any("404 Not Found" in record.getMessage() for record in quiet), (
-        "тело ответа не записано вовсе — разбирать отказ будет нечем"
+    # Тело — WARNING (решение владельца 13.11.2026): технический лог пишет
+    # с INFO, и на DEBUG тело 503 портфеля до файла не доходило вовсе.
+    assert any("404 Not Found" in record.getMessage() for record in loud), (
+        "тело ответа не дошло бы до файла технического лога — что ответил брокер, не узнать"
     )
 
 
@@ -1564,7 +1558,10 @@ def test_a_wrong_address_is_asked_about_once_per_session(
     said = [
         record.getMessage()
         for record in caplog.records
+        # Тело ответа — своей строкой WARNING рядом с отказом (13.11.2026);
+        # «сказано» — сам отказ, а не его тело.
         if record.levelno >= logging.WARNING
+        and not record.getMessage().startswith("тело ответа брокера")
     ]
     assert len(said) == 1, f"о неверном адресе сказано {len(said)} раз: {said}"
 
@@ -1633,7 +1630,10 @@ def test_two_requests_racing_into_the_same_wrong_address_say_it_once(
     said = [
         record.getMessage()
         for record in caplog.records
+        # Тело ответа — своей строкой WARNING рядом с отказом (13.11.2026);
+        # «сказано» — сам отказ, а не его тело.
         if record.levelno >= logging.WARNING
+        and not record.getMessage().startswith("тело ответа брокера")
     ]
     assert len(said) == 1, f"о неверном адресе сказано {len(said)} раз: {said}"
 
