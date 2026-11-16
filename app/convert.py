@@ -133,6 +133,8 @@ from ui.models import (
 from ui.trade_story import OrderStep, Phase, TradeStory
 
 __all__ = [
+    "BROKER_TRAILING",
+    "AtBroker",
     "MONEY_FIELDS",
     "SettingsRefused",
     "TIMEFRAMES",
@@ -2355,6 +2357,25 @@ def chart_time(closes_at: datetime, timeframe: Timeframe) -> datetime:
     return bar_open(closes_at - timeframe.delta, timeframe)
 
 
+#: Подпись причины выхода, когда скользящий тейк вёл брокер условной заявкой
+#: (`D-196`, B-104). Движок подписывает такой выход «скользящий уровень» —
+#: он не знает, кто вёл уровень; знает журнал команд (`app/live_history.py`).
+BROKER_TRAILING = "скользящий тейк у брокера"
+
+
+@dataclass(frozen=True, slots=True)
+class AtBroker:
+    """Что брокер сообщил о сделках боя сверх движка — для меток «Факта» (B-104).
+
+    `executed` — имя заявки → момент исполнения у брокера (секунда, а не свеча);
+    `trailing` — имена выходов, уровень которых вёл брокер условной заявкой.
+    Собирает `app/live_history.py::at_broker` из журнала команд.
+    """
+
+    executed: Mapping[str, datetime] = dataclasses.field(default_factory=dict)
+    trailing: frozenset[str] = frozenset()
+
+
 def markers_and_paths(
     run: HistoryRun,
     pairs: Sequence[Pair],
@@ -2362,6 +2383,7 @@ def markers_and_paths(
     timeframe: Timeframe,
     *,
     pending: Unfilled,
+    broker: AtBroker | None = None,
 ) -> tuple[tuple[Marker, ...], tuple[TradePath, ...]]:
     """Метки и линии обоих слоёв: «прогноз» и «факт» (DOMAIN.md §8).
 
@@ -2380,7 +2402,15 @@ def markers_and_paths(
       тоже ⊗, но со своей подсказкой: прогон кончился до исполнения
       (`Unfilled.CUT`);
     * **прогноза нет** — метка «сделка вне расчёта» на слое факта. Разбирается
-      как дефект, поэтому у неё своя форма и свой цвет, а не общая.
+      как дефект, поэтому у неё своя форма и свой цвет, а не общая;
+    * **бой: после выхода по условной у брокера** (`broker`, `D-196`, B-104)
+      сделки без пары — не дефект и не «сигнал пропущен»: брокер ведёт уровень
+      по сделкам и без шага, «прогноз» — сам, по минуткам с шагом, и дальше
+      слои идут разными сделками. Метка — обычная своего слоя, подсказка
+      объясняет расхождение словами.
+
+    :param broker: что брокер сообщил о сделках боя — время исполнения
+        и выходы по условной. `None` — не бой: метки как прежде.
 
     :param pending: что будет с заявками из `run.waiting` по сведениям
         **порта** — того, чего движок этого прогона не знает. Считает порт
@@ -2401,14 +2431,16 @@ def markers_and_paths(
     """
     fate = Unfilled.MISSED if run.halted else pending
     unfilled = {order_id: fate for order_id in run.waiting}
+    since = _broker_apart_since(run, broker)
     markers: list[Marker] = []
     for pair in pairs:
-        note = _divergence(pair, unfilled)
+        apart = _apart(pair, since, unfilled)
+        note = _divergence(pair, unfilled, broker=broker, since=since if apart else None)
         if pair.plan is not None:
             markers.append(Marker(
                 time=chart_time(pair.plan.decided_at, timeframe),
                 price=pair.plan.price,
-                kind=_plan_kind(pair, reversals, unfilled),
+                kind=_plan_kind(pair, reversals, unfilled, apart=apart),
                 layer=Layer.PLAN,
                 tooltip=note,
                 pair_id=pair.order_id,
@@ -2418,7 +2450,7 @@ def markers_and_paths(
                 time=bar_open(pair.fill.at, timeframe),
                 price=pair.fill.price,
                 kind=(
-                    MarkerKind.UNPLANNED if pair.plan is None
+                    MarkerKind.UNPLANNED if pair.plan is None and not apart
                     else _fill_kind(pair, reversals)
                 ),
                 layer=Layer.FACT,
@@ -2499,14 +2531,17 @@ _UNFILLED: Final[dict[Unfilled, tuple[MarkerKind, str]]] = {
 
 
 def _plan_kind(
-    pair: Pair, reversals: frozenset[str], unfilled: Mapping[str, Unfilled]
+    pair: Pair, reversals: frozenset[str], unfilled: Mapping[str, Unfilled],
+    *, apart: bool = False,
 ) -> MarkerKind:
     """Метка слоя «прогноз». Расчёт без сделки — по причине (`_UNFILLED`).
 
-    Ждущая заявка — «заявка подана»; прочее без сделки — ⊗.
+    Ждущая заявка — «заявка подана»; прочее без сделки — ⊗. Кроме сделки
+    «прогноза» после выхода по условной у брокера (`apart`, B-104): у боя
+    её нет штатно, и метка — обычная, а не «сигнал пропущен».
     """
     assert pair.plan is not None
-    if pair.fill is None:
+    if pair.fill is None and not apart:
         kind, _ = _UNFILLED[unfilled.get(pair.order_id, Unfilled.MISSED)]
         return kind
     if pair.plan.action is OrderAction.OPEN:
@@ -2522,7 +2557,59 @@ def _fill_kind(pair: Pair, reversals: frozenset[str]) -> MarkerKind:
     return MarkerKind.EXIT
 
 
-def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
+def _broker_apart_since(run: HistoryRun, broker: AtBroker | None) -> datetime | None:
+    """С какой свечи «факт» мог уйти от «прогноза» из-за уровня у брокера (B-104).
+
+    Первый выход по условной у брокера: до него у пары один ход и одни
+    имена заявок, после — у брокера и у тени разные выходы, а значит,
+    и разные следующие входы. `None` — таких выходов не было.
+    """
+    if broker is None or not broker.trailing:
+        return None
+    moments = [fill.at for fill in run.fills if fill.order_id in broker.trailing]
+    return min(moments) if moments else None
+
+
+def _apart(pair: Pair, since: datetime | None, unfilled: Mapping[str, Unfilled]) -> bool:
+    """Сделка без пары после выхода по условной у брокера — расхождение штатное.
+
+    Сделка «факта» без расчёта — на свече выхода брокера или позже. Расчёт
+    «прогноза» без сделки — решённый после неё и не ждущий исполнения:
+    поданная заявка по-прежнему «заявка подана» (`_UNFILLED`).
+    """
+    if since is None:
+        return False
+    if pair.plan is None:
+        return pair.fill is not None and pair.fill.at >= since
+    return pair.fill is None and pair.order_id not in unfilled and pair.plan.decided_at > since
+
+
+def _fill_moment(pair: Pair, broker: AtBroker | None) -> str:
+    """Когда исполнена сделка: секунда у брокера, если известна, иначе свеча движка."""
+    assert pair.fill is not None
+    executed = None if broker is None else broker.executed.get(pair.order_id)
+    if executed is not None:
+        return f"исполнена {fmt_datetime(executed, seconds=True)} МСК"
+    return f"свеча {fmt_datetime(pair.fill.at)} МСК"
+
+
+def _broker_apart_words(since: datetime) -> str:
+    """Почему у сделки нет пары — словами (B-104)."""
+    return (
+        f"Пары в другом слое нет — это штатно. Со свечи {fmt_datetime(since)} МСК "
+        "скользящий тейк боя вела условная заявка у брокера: брокер ведёт уровень "
+        "по сделкам и без шага, а «прогноз» — сам, по минуткам и с шагом подтяжки. "
+        "После выхода брокера слои идут разными сделками до конца дня."
+    )
+
+
+def _divergence(
+    pair: Pair,
+    unfilled: Mapping[str, Unfilled],
+    *,
+    broker: AtBroker | None = None,
+    since: datetime | None = None,
+) -> str:
     """Подсказка при наведении: расчёт, факт и расхождение (ТЗ §4.5).
 
     Оформление берётся у окна (`ui.formatting`), а не пишется здесь заново:
@@ -2531,13 +2618,32 @@ def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
     У поданной заявки без исполнения (`unfilled`, таблица `_UNFILLED`)
     подсказка говорит, что она подана, — а не «не состоялся»: ровно эти
     слова владелец счёта 12.10.2026 прочёл как «заявки не было».
+
+    `since` — пара разошлась штатно после выхода по условной у брокера
+    (`_apart`): подсказка объясняет это, а не называет дефектом (B-104).
+    Время сделки «факта» в бою — секунда исполнения у брокера (`broker`).
     """
     if pair.plan is None:
+        if since is not None and pair.fill is not None:
+            what = "Вход" if pair.fill.action is OrderAction.OPEN else "Выход"
+            return (
+                f"{what} боя: {fmt_price(pair.fill.price)}, {_fill_moment(pair, broker)}.\n"
+                f"{_broker_apart_words(since)}"
+            )
         return (
             "Сделка, которой расчёт не предполагал. Разбирается как дефект: "
             "в журнале решений должна быть строка о ней."
         )
     what = "Вход" if pair.plan.action is OrderAction.OPEN else "Выход"
+    if pair.fill is None and since is not None:
+        reason = (
+            f" ({pair.plan.exit_reason.label})"
+            if pair.plan.exit_reason is not None else ""
+        )
+        return (
+            f"{what} «прогноза»{reason}: {fmt_price(pair.plan.price)}. У боя такой "
+            f"сделки нет.\n{_broker_apart_words(since)}"
+        )
     if pair.fill is None:
         reason = (
             f" ({pair.plan.exit_reason.label})"
@@ -2545,15 +2651,25 @@ def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
         )
         _, tail = _UNFILLED[unfilled.get(pair.order_id, Unfilled.MISSED)]
         return f"{what} по расчёту{reason}: {fmt_price(pair.plan.price)}{tail}"
+    moment = (
+        _fill_moment(pair, broker) if broker is not None
+        else f"{fmt_datetime(pair.fill.at)} МСК"
+    )
     lines = [
         f"{what}. Расчётная цена: {fmt_price(pair.plan.price)}",
-        f"Фактическая: {fmt_price(pair.fill.price)}, {fmt_datetime(pair.fill.at)} МСК",
+        f"Фактическая: {fmt_price(pair.fill.price)}, {moment}",
     ]
     if pair.favour_points is not None and pair.favour_rubles is not None:
         better = "в пользу позиции" if pair.favour_points >= 0 else "против позиции"
         lines.append(
             f"Расхождение: {fmt_price(abs(pair.favour_points), 0)} пунктов, "
             f"{fmt_money(abs(pair.favour_rubles))} {better}"
+        )
+    if broker is not None and pair.order_id in broker.trailing:
+        lines.append(
+            "Выход — скользящий тейк у брокера: уровень вела условная заявка "
+            "по сделкам и без шага, «прогноз» ведёт его сам, по минуткам "
+            "с шагом. Расхождение выходов штатное."
         )
     return "\n".join(lines)
 

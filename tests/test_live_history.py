@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import pathlib
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
@@ -18,11 +19,18 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 
 from app import convert
-from app.live_history import Earlier, compose
+from app.live_history import Earlier, Executed, compose
 from backtest import Deal, HistoryRun, summarise
 from engine import ExitReason
 from engine import Side as EngineSide
-from market import CandleStore, MarketWorker, StoredTrade, TradeRecord, TradeSide
+from market import (
+    CandleStore,
+    MarketWorker,
+    OrderFillTimes,
+    StoredTrade,
+    TradeRecord,
+    TradeSide,
+)
 from market.journal import RunOrigin, SessionRecord
 from tests.fake_broker import FakeBroker
 from tests.test_app_live_pair import DAY, FIXED_TAKE, SYMBOL, _bench, _close, _connect
@@ -207,3 +215,78 @@ def test_earlier_rows_are_dimmed_and_both_totals_are_shown(qapp) -> None:
         assert "Итог за всю историю боя" in text and "Текущий заход боя с 09:00" in text, text
     finally:
         widget.deleteLater()
+
+
+def _times(session: int, name: str, placed: datetime, filled: datetime) -> OrderFillTimes:
+    return OrderFillTimes(
+        session_id=session, order_id=name, placed_at=placed, first_at=filled, last_at=filled
+    )
+
+
+def test_live_rows_show_the_broker_execution_time_not_the_engine_candle() -> None:
+    """Стережёт: время входа и выхода в «Сделках» боя — секунда исполнения у брокера.
+
+    Бой 16.11.2026: условная исполнена в 10:38:03 под свечой 10:35, вход —
+    в 10:35:05, а строка читалась «10:35 → 10:35». Сделка, чьих исполнений
+    в журнале команд нет, остаётся со временем свечи — честно, а не пусто.
+    """
+    candle_in, candle_out = DAY.replace(hour=10, minute=35), DAY.replace(hour=10, minute=35)
+    deal = Deal(
+        side=EngineSide.SHORT, volume=1.0, entry_time=candle_in, entry_price=247_425.0,
+        entry_order_id="open-7", exit_time=candle_out, exit_price=247_200.0,
+        exit_order_id="take-7", exit_reason=ExitReason.TRAILING_TAKE,
+    )
+    earlier = _stored(1, 381, DAY.replace(hour=7), DAY.replace(hour=7, minute=30))
+    executed = replace(Executed.of((
+        _times(471, "open-7", candle_in.replace(second=4), candle_in.replace(second=5)),
+        _times(471, "take-7", candle_in.replace(second=6), DAY.replace(hour=10, minute=38, second=3)),
+    )), current=471)
+
+    shown = compose(
+        HistoryRun(deals=(deal,), summary=summarise((deal,))), Earlier((earlier,)),
+        symbol=SYMBOL, timeframe=convert.timeframe_of("5 минут"), since=None,
+        executed=executed,
+    )
+
+    old, live = shown.rows
+    assert (old.entry_time, old.exit_time) == (earlier.entry_time, earlier.exit_time), old
+    assert live.entry_time == candle_in.replace(second=5), live
+    assert live.exit_time == DAY.replace(hour=10, minute=38, second=3), live
+
+
+@pytest.mark.parametrize(
+    ("placed_second", "filled_minute", "label"),
+    [
+        # Условная поставлена при входе и исполнена минутами позже — вёл брокер.
+        (6, 38, convert.BROKER_TRAILING),
+        # Выход программы по касанию: подан и исполнен в одной минуте (до D-196).
+        (1, 35, ExitReason.TRAILING_TAKE.label),
+    ],
+)
+def test_a_trailing_exit_led_by_the_broker_is_named_so(
+    placed_second: int, filled_minute: int, label: str
+) -> None:
+    """Стережёт: выход по условной у брокера подписан «скользящий тейк у брокера» (B-104).
+
+    Движок подписывает любой скользящий выход «скользящий уровень» — он не знает,
+    кто вёл уровень. Знает журнал команд: условная стоит у брокера с входа
+    и исполняется в другой минуте; выход программы подаётся по касанию
+    и исполняется сразу. Второй случай подписи «у брокера» не получает.
+    """
+    stored = replace(
+        _stored(1, 441, DAY.replace(hour=10, minute=35), DAY.replace(hour=10, minute=35)),
+        exit_reason=ExitReason.TRAILING_TAKE.label,
+    )
+    executed = Executed.of((
+        _times(441, "take-1", DAY.replace(hour=10, minute=35, second=placed_second),
+               DAY.replace(hour=10, minute=filled_minute, second=3)),
+    ))
+
+    shown = compose(
+        HistoryRun(), Earlier((stored,)), symbol=SYMBOL,
+        timeframe=convert.timeframe_of("5 минут"), since=None, executed=executed,
+    )
+
+    [row] = shown.rows
+    assert row.exit_reason == label, row
+    assert all(f"выход — {label}." in marker.tooltip for marker in shown.markers), shown.markers

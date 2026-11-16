@@ -18,6 +18,7 @@ import pathlib
 import sqlite3
 import uuid
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import timedelta
 from typing import Any
 
@@ -655,3 +656,26 @@ def test_a_base_of_the_previous_build_opens_without_alarm_and_keeps_its_number(
     assert version == SCHEMA_VERSION == 7
     assert stored.command.account == ACCOUNT
     assert opening == [(0,)]
+
+
+def test_fill_times_link_the_engine_order_name_to_the_broker_seconds(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Стережёт: имя заявки движка в прогоне → когда подана и когда исполнена у брокера.
+
+    Время сделки в «Сделках» боя берётся отсюда (бой 16.11.2026: условная
+    исполнена в 10:38:03, а строка показывала свечу 10:35). Команда без
+    исполнения и снятие строки не дают: сделки по ним не было.
+    """
+    placed = AT.replace(second=7)
+    executed = AT + timedelta(minutes=28, seconds=42)
+    with CandleStore(tmp_path / "times.sqlite3") as store:
+        run = open_run(store)
+        store.record_broker_command(run, create(1, order_id="take:1"), now=placed)
+        store.record_broker_command(run, create(2, order_id="open:2"), now=placed)
+        store.record_broker_execution(replace(fill("E-1"), at=executed))
+        times = store.order_fill_times()
+
+    assert [(one.session_id, one.order_id) for one in times] == [(run, "take:1")], times
+    [one] = times
+    assert (one.placed_at, one.first_at, one.last_at) == (placed, executed, executed), one

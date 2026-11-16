@@ -380,7 +380,9 @@ def test_mode_off_in_combat_asks_about_the_broker_position_and_cancel_keeps_the_
     assert len(asked.questions) == 1, "«Выключен» в бою при позиции без вопроса"
     _title, text, yes = asked.questions[0]
     assert LIVE_UNMANAGED in text and "Лонг 1" in text, text
-    assert "продолжает сторожить" in text and "аварийного стопа" in text.lower(), text
+    # D-196 (0071): скользящий тейк в бою — условная у брокера, её не снимают
+    # ни «Выключен», ни закрытие окна; прежний текст обещал сторож программы.
+    assert "у брокера условной" in text and "аварийного стопа" in text.lower(), text
     assert yes == "Выключить робота"
     assert port.modes == [], "«Отмена» переключила режим"
     assert window.mode_box.currentData() is Mode.REVERSE, "список не вернулся к режиму"

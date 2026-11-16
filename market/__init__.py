@@ -62,6 +62,7 @@ from market.commands import (
     CommandAction,
     CommandSide,
     CommandStatus,
+    OrderFillTimes,
     StoredCommand,
 )
 from market.contracts import (
@@ -334,6 +335,7 @@ __all__ = [
     "CommandAction",
     "CommandSide",
     "CommandStatus",
+    "OrderFillTimes",
     "StoredCommand",
     "OpeningFunds",
     "TradingDay",

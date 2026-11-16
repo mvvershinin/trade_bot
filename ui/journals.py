@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -109,9 +110,31 @@ class TradesModel(QAbstractTableModel):
     # --- содержимое ---------------------------------------------------------
 
     def set_rows(self, rows: Sequence[TradeRow]) -> None:
-        self.beginResetModel()
-        self._rows = list(rows)
-        self.endResetModel()
+        """Заменить строки. Те же строки с другими числами — без сброса таблицы.
+
+        Строка открытой позиции переоценивается по растущей свече (B-102):
+        сброс модели на каждый шаг цены снимал бы выделение и прокрутку,
+        пока человек читает таблицу. Число строк то же — меняются только
+        изменившиеся.
+        """
+        rows = list(rows)
+        if len(rows) != len(self._rows) or not rows:
+            self.beginResetModel()
+            self._rows = rows
+            self.endResetModel()
+            return
+        before = result_basis(self._rows)
+        changed = [
+            index for index, (old, new) in enumerate(zip(self._rows, rows, strict=True))
+            if old != new
+        ]
+        self._rows = rows
+        for index in changed:
+            self.dataChanged.emit(
+                self.index(index, 0), self.index(index, self.columnCount() - 1)
+            )
+        if result_basis(self._rows) is not before:
+            self.headerDataChanged.emit(Qt.Orientation.Horizontal, RESULT_COLUMN, RESULT_COLUMN)
 
     def append_row(self, row: TradeRow) -> None:
         """Дописать сделку — и переспросить заголовок колонки результата.
@@ -211,6 +234,16 @@ class TradesModel(QAbstractTableModel):
         return None
 
 
+def _trade_moment(moment: datetime | None) -> str:
+    """Время сделки: с секундами, если они есть.
+
+    У прогона время сделки — начало свечи, секунд в нём нет. У боя — секунда
+    исполнения у брокера (`app/live_history.py`): условная, сработавшая
+    в 10:38:03, без секунд читалась бы как свеча 10:35 (бой 16.11.2026).
+    """
+    return fmt_datetime(moment, seconds=moment is not None and moment.second != 0)
+
+
 @dataclass(frozen=True, slots=True)
 class _Column[RowT]:
     """Одна колонка таблицы целиком: текст, сортировка и вид — **в одной записи**.
@@ -279,11 +312,11 @@ def _wide_column[RowT](columns: Sequence[_Column[RowT]]) -> int:
 #: разошлись бы, и экран говорил бы одно, а выгруженный файл другое.
 _TRADE_CELLS: tuple[_Column[TradeRow], ...] = (
     _Column(
-        text=lambda trade: fmt_datetime(trade.entry_time),
+        text=lambda trade: _trade_moment(trade.entry_time),
         sort=lambda trade: trade.entry_time.timestamp(),
     ),
     _Column(
-        text=lambda trade: fmt_datetime(trade.exit_time),
+        text=lambda trade: _trade_moment(trade.exit_time),
         sort=lambda trade: trade.exit_time.timestamp() if trade.exit_time else 0.0,
     ),
     _Column(text=lambda trade: trade.side.label, sort=lambda trade: trade.side.label),

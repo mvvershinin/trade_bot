@@ -51,6 +51,7 @@ __all__ = [
     "CommandAction",
     "CommandSide",
     "CommandStatus",
+    "OrderFillTimes",
     "StoredCommand",
 ]
 
@@ -282,6 +283,28 @@ class StoredCommand:
     status: CommandStatus
     status_at: datetime
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class OrderFillTimes:
+    """Когда заявка движка ушла брокеру и когда исполнилась — по журналу команд.
+
+    Движок знает о сделке только свечу (`engine.Fill.at` — начало бара),
+    брокер — секунду. Окну нужна вторая: исполнение условной в 10:38:03
+    под свечой 10:35 читалось строкой «10:35 → 10:35» (бой 16.11.2026).
+
+    :param session_id: прогон, подавший команду.
+    :param order_id: имя заявки движка (`broker_command.order_id`).
+    :param placed_at: когда записана первая исполнившаяся команда этого имени.
+    :param first_at: первое исполнение по брокеру.
+    :param last_at: последнее исполнение по брокеру.
+    """
+
+    session_id: int
+    order_id: str
+    placed_at: datetime
+    first_at: datetime
+    last_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
