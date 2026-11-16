@@ -316,10 +316,16 @@ class AfterTakeProfit(enum.Enum):
     Прямо касается правила «всегда в позиции»: первый вариант его нарушает
     осознанно, третий соблюдает буквально и дороже всех по комиссии.
     Цифр по вариантам нет — они появятся в таблице Э1-19. Решение 0004.
+
+    `WAIT_THEN_STOP_ON_LOSS` — «ждать нового сигнала», но первая сделка дня,
+    закрытая в убыток с учётом комиссии внутри окна, закрывает день для
+    входов (`B-106`, решение 0072). В движке это два поля:
+    `stop_after_take_profit` снят, `stop_after_loss` стоит.
     """
 
     STOP_FOR_THE_DAY = "stop"
     WAIT_FOR_SIGNAL = "wait"
+    WAIT_THEN_STOP_ON_LOSS = "wait_stop_on_loss"
     RESTORE_AT_ONCE = "restore"
 
     @property
@@ -327,6 +333,9 @@ class AfterTakeProfit(enum.Enum):
         return {
             AfterTakeProfit.STOP_FOR_THE_DAY: "Не входить до конца дня (как сейчас)",
             AfterTakeProfit.WAIT_FOR_SIGNAL: "Ждать нового сигнала средней",
+            AfterTakeProfit.WAIT_THEN_STOP_ON_LOSS: (
+                "Ждать нового сигнала, но первый убыток за день — стоп до конца дня"
+            ),
             AfterTakeProfit.RESTORE_AT_ONCE: "Сразу восстановить позицию",
         }[self]
 

@@ -101,6 +101,14 @@ class Position:
     продажей, и у заявки на выход здесь всё равно стоит `LONG`. Для боевого
     адаптера это разные вещи, и перевод «сторона позиции + действие» в «купить
     или продать» — его работа, а не движка.
+
+    `entry_commission` — комиссия сделки входа, как её сообщил исполнитель
+    (`Fill.commission`). Нужна на выходе: результат сделки «чистыми» —
+    это пункты в рублях минус комиссия **обеих** сторон, а сделка выхода
+    несёт только свою (`B-106`, правило «первый убыток за день — стоп»).
+    `None` — исполнитель комиссию не сообщил. `repr=False` — чтобы строка
+    `position …` проверки-образца не менялась от поля, к сделкам отношения
+    не имеющего.
     """
 
     side: Side
@@ -109,10 +117,13 @@ class Position:
     entry_time: datetime
     state: PositionState = PositionState.OPEN
     take: TakeProfit = field(default_factory=TakeProfit)
+    entry_commission: float | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _check_volume(self.volume, "объём позиции")
         _check_price(self.entry_price, "цена входа")
+        if self.entry_commission is not None:
+            _check_price(self.entry_commission, "комиссия входа")
         if not isinstance(self.take, TakeProfit):
             raise TypeError(
                 f"план тейка — engine.TakeProfit, получено {self.take!r}"
@@ -997,6 +1008,13 @@ class EngineState:
     не исполниться, а позицию закрыли руками. Читает её шаг 9, и действует
     она независимо от «стопа после тейка» — это другое правило.
 
+    `losing_exit_date` — календарная дата последней сделки, закрытой
+    **в убыток чистыми** (после комиссии обеих сторон) по торговой причине
+    внутри окна (`B-106`, решение 0072). Выход по концу окна, перед нерабочим
+    днём и по концу ряда сюда не попадает. Читает её только шаг 9
+    при `EngineSettings.stop_after_loss`; пишется она на каждой такой сделке
+    независимо от настройки — по той же причине, что `last_exit_date`.
+
     `pending` — **заявки в полёте**: исполнитель их принял, а сделки по ним ещё
     не было. Держатся ради трёх вещей.
 
@@ -1069,6 +1087,7 @@ class EngineState:
     take_profit_date: date | None = None
     last_exit_date: date | None = None
     entries_closed_date: date | None = None
+    losing_exit_date: date | None = None
     pending: tuple[OrderRequest, ...] = ()
     closing_bars: int = 0
     exit_blocked_bars: int = 0

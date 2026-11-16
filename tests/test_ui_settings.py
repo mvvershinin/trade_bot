@@ -1516,7 +1516,7 @@ def test_all_four_forks_are_settings_not_constants() -> None:
     assert [kind.name for kind in AverageKind] == ["EMA", "SMA"]
     assert [moment.name for moment in ReversalMoment] == ["NEXT_BAR", "SAME_BAR"]
     assert [after.name for after in AfterTakeProfit] == [
-        "STOP_FOR_THE_DAY", "WAIT_FOR_SIGNAL", "RESTORE_AT_ONCE"
+        "STOP_FOR_THE_DAY", "WAIT_FOR_SIGNAL", "WAIT_THEN_STOP_ON_LOSS", "RESTORE_AT_ONCE"
     ]
 
     defaults = Settings()
@@ -2302,6 +2302,7 @@ def test_the_unfinished_variant_is_shown_but_not_offered(dialog) -> None:
     assert offered == {
         AfterTakeProfit.STOP_FOR_THE_DAY: True,
         AfterTakeProfit.WAIT_FOR_SIGNAL: True,
+        AfterTakeProfit.WAIT_THEN_STOP_ON_LOSS: True,
         AfterTakeProfit.RESTORE_AT_ONCE: False,
     }, f"выбирается не то, что умеет робот: {offered}"
     index = box.findData(AfterTakeProfit.RESTORE_AT_ONCE)

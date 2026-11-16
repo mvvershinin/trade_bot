@@ -27,6 +27,9 @@
 а прототипом он не воспроизводился и данными не подкреплён ничем. Писать его
 по догадке значило бы поставить непроверенную ветку на путь, по которому идут
 деньги. Вариант остаётся долгом Э1-19 и требует ответа заказчика.
+
+Вариант окна «Ждать нового сигнала, но первый убыток за день — стоп» — это
+`stop_after_take_profit` выключен плюс `stop_after_loss` включён (`B-106`).
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from __future__ import annotations
 import enum
 import math
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from engine.take_profit import TakeProfit
@@ -267,6 +270,21 @@ class EngineSettings:
     trailing_offset_percent: float = 0.2
     trailing_step_percent: float = 0.05
     stop_after_take_profit: bool = True
+    #: «Первый убыток за день — стоп до конца дня» (`B-106`, решение 0072).
+    #: Сделка, закрытая **в убыток чистыми** — пункты в рублях минус комиссия
+    #: обеих сторон меньше нуля, — по торговой причине внутри окна (обратный
+    #: сигнал, тейк, скользящий уровень) закрывает день для новых входов,
+    #: как «стоп после тейка». Выход по концу окна, перед нерабочим днём
+    #: и по концу ряда стопа не даёт (ответ владельца счёта 16.11.2026).
+    #: В окне это вариант «Ждать нового сигнала, но первый убыток за день —
+    #: стоп» списка «После сработавшего тейка».
+    #:
+    #: ⚠️ `repr=False` — не прятки, а условие задачи: строка `settings …`
+    #: проверки-образца печатает `repr` настроек, и новое поле переписало бы
+    #: образец без единой изменённой сделки. Значение образца названо явно
+    #: в `tools/golden_deals.py`; в снимок прогона и в журнал изменений поле
+    #: попадает обходом полей и таблицей `_CHANGE_ROWS`, а не через `repr`.
+    stop_after_loss: bool = field(default=False, repr=False)
     #: Порог выхода по обратному сигналу, **в комиссиях одной стороны**.
     #: Ноль — правила нет, и это умолчание: при нём поведение движка
     #: не отличается от прототипа ни на одну сделку, и сверка остаётся
@@ -535,10 +553,11 @@ class EngineSettings:
                 )
 
     def _check_bool_fields(self) -> None:
-        """Тип шести булевых полей — и только тип."""
+        """Тип семи булевых полей — и только тип."""
         for name in (
             "close_on_time_end", "trade_in_weekend", "stop_after_take_profit",
-            "take_profit", "trailing_take_profit", "hold_after_unfilled_level",
+            "stop_after_loss", "take_profit", "trailing_take_profit",
+            "hold_after_unfilled_level",
         ):
             if not isinstance(getattr(self, name), bool):
                 raise TypeError(f"настройка `{name}` — булево, получено {getattr(self, name)!r}")
@@ -936,6 +955,7 @@ _CHANGE_ROWS: tuple[tuple[str, str, bool, Callable[[Any], str]], ...] = (
     ("trailing_step_percent", "Скользящий тейк, шаг подтяжки, %", False, _percent),
     ("commission_per_side", "Комиссия за контракт на сторону", False, _money),
     ("stop_after_take_profit", "Стоп на день после тейка", False, _yes_no),
+    ("stop_after_loss", "Стоп на день после первого убытка", False, _yes_no),
     # ⚠️ Поля в окне у этого порога нет намеренно (прямые слова владельца
     # счёта 10.09.2026), и строка тем важнее: включить его может только тот,
     # кто соберёт `EngineSettings` сам, — а меняет он список сделок.
