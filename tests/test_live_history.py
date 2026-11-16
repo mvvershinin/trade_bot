@@ -239,7 +239,9 @@ def test_live_rows_show_the_broker_execution_time_not_the_engine_candle() -> Non
     earlier = _stored(1, 381, DAY.replace(hour=7), DAY.replace(hour=7, minute=30))
     executed = replace(Executed.of((
         _times(471, "open-7", candle_in.replace(second=4), candle_in.replace(second=5)),
-        _times(471, "take-7", candle_in.replace(second=6), DAY.replace(hour=10, minute=38, second=3)),
+        _times(
+            471, "take-7", candle_in.replace(second=6), DAY.replace(hour=10, minute=38, second=3)
+        ),
     )), current=471)
 
     shown = compose(

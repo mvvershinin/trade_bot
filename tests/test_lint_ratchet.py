@@ -132,7 +132,10 @@ THRESHOLD_FILE: Final[str] = "tests/test_lint_ratchet.py"
 #: `ruff --fix` по порядку импортов в пяти тронутых тестах.
 #: **530 с 01.11.2026:** у `HistoryPort.stop` появился докстринг (Э4 2в).
 #: **529 в тот же день:** докстринг у `HistoryPort.close_position` (`/risk` 2в).
-KNOWN_RUFF_FINDINGS: Final[int] = 529
+#: **530 с 16.11.2026:** три `PLR0913` (шесть аргументов) — время исполнения
+#: брокера и признак «уровень у брокера» протянуты в `convert.markers_and_paths`,
+#: `live_history.compose`, `port._live_overlay` (B-102/B-104); минус два `D102`.
+KNOWN_RUFF_FINDINGS: Final[int] = 530
 
 #: Порог `mypy`. Замер 09.09.2026: строка `Found 190 errors in 57 files`.
 #: Было 191 (замер 08.09.2026): число подняли под находку «Cannot find
