@@ -86,6 +86,7 @@ from engine import (
     AccountFunds,
     EngineSettings,
     ExitReason,
+    OrderAction,
     PositionState,
     close_time,
     in_moscow,
@@ -135,7 +136,7 @@ from market import (
     DecisionLevel as JournalLevel,
 )
 from market.contracts import monthly_assets
-from ui.formatting import fmt_datetime
+from ui.formatting import fmt_datetime, fmt_level, fmt_money
 from ui.models import (
     FIELD_CAPTIONS,
     LIVE_LIMITS_BOUNDS,
@@ -783,6 +784,15 @@ class _Live:
     #: Строка открытой позиции, показанная последним проходом (`_open_row`):
     #: «Отдать журналы» без прогона её не теряет (ревью 13.11.2026).
     open_row: tuple[TradeRow, ...] = ()
+    #: Открытая позиция последнего прохода — чтобы переоценивать строку
+    #: по растущей свече между проходами (B-102). `None` — позиции нет.
+    floating: _Floating | None = None
+    #: Исполнения заявок у брокера по журналу команд: время сделки в «Сделках»
+    #: и выход по условной у брокера (`live_history.Executed`). Читаются
+    #: каждый проход боя: исполнение текущего захода появляется в любой момент.
+    executed: live_history.Executed = dataclasses.field(
+        default_factory=live_history.Executed
+    )
     #: Когда открыт прогон текущего захода боя — для подписи его итога (B-100).
     since: datetime | None = None
     #: Закрытые боевые сделки всех прогонов из базы (`_read_live_history`, B-100)
@@ -3874,6 +3884,7 @@ class HistoryPort(TerminalPort):
                 self._stitched = None
                 run = await self._advance(frame, symbol, candles)
                 await self._read_live_history()
+                await self._read_fill_times()
                 self._context = await self._contract_context(symbol, timeframe, candles)
             self._run = run
             self._show(frame, symbol, timeframe, candles, run)
@@ -6013,6 +6024,42 @@ class HistoryPort(TerminalPort):
         elif candle.opens_at > edge.last and bar.unsettled:
             self._edge = now
             self._send(self.candle_appended, candle)
+        else:
+            return
+        self._reprice_open_row()
+
+    def _price_open_row(self) -> tuple[TradeRow, ...]:
+        """Строка открытой позиции по последней цене, что есть у порта (B-102).
+
+        Растущая свеча на краю графика того же инструмента — её закрытие,
+        то есть цена потока сейчас; нет её — закрытие последней закрытой свечи.
+        """
+        floating = self._live.floating
+        if floating is None:
+            return ()
+        edge = self._edge
+        forming = None
+        if (
+            edge is not None and edge.forming is not None
+            and (edge.instrument, edge.timeframe) == (floating.symbol, floating.timeframe)
+            and edge.forming.opens_at >= floating.last_open
+        ):
+            forming = edge.forming
+        return _open_row(floating, forming)
+
+    def _reprice_open_row(self) -> None:
+        """Растущая свеча сдвинула цену — переоценить строку открытой позиции.
+
+        Таблица уходит заново только при изменившейся строке: цена у фьючерса
+        меняется шагами, и одинаковую строку отдавать незачем.
+        """
+        if self._live.floating is None or self._run is None:
+            return
+        row = self._price_open_row()
+        if row == self._live.open_row:
+            return
+        self._live.open_row = row
+        self._send(self.trades_replaced, *self._trades_of(self._run, self._live.shown))
         # Прочее не рисуется, и оба случая намеренные. Свеча **левее** края
         # устарела: пока дорисовка читала базу, прогон успел показать её место
         # сам, и уточнение задним числом переставило бы последнюю свечу
@@ -6337,7 +6384,10 @@ class HistoryPort(TerminalPort):
                 pending=pending,
             )
             if forecast is None
-            else _live_overlay(run, forecast, timeframe, ruble_per_point=rubles, pending=pending)
+            else _live_overlay(
+                run, forecast, timeframe, ruble_per_point=rubles, pending=pending,
+                broker=live_history.at_broker(run, self._executed()),
+            )
         )
         # Бой просили, а «факт» не собран (остановка, сборка): показан прогон-
         # симуляция, и его сделки в бою — не сделки (решение 0070, владелец
@@ -6372,9 +6422,10 @@ class HistoryPort(TerminalPort):
         self._keep_forming(
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
         )
-        self._live.open_row = () if own is None else _open_row(
-            run, candles, rubles, self._origin
+        self._live.floating = (
+            None if own is None else _Floating.of(run, candles, frame, symbol, self._origin)
         )
+        self._live.open_row = self._price_open_row()
         self._send(self.trades_replaced, *self._trades_of(run, live))
         # Прогон по склейке называет все контракты периода, а не код из настроек.
         named = (
@@ -6467,6 +6518,14 @@ class HistoryPort(TerminalPort):
             return None
         return live_history.compose(
             run, self._live.history, symbol=symbol, timeframe=timeframe, since=self._live.since,
+            executed=self._executed(),
+        )
+
+    def _executed(self) -> live_history.Executed:
+        """Исполнения у брокера с номером прогона текущего захода боя — его сделкам."""
+        entry = self._live.entry
+        return dataclasses.replace(
+            self._live.executed, current=None if entry is None else entry.id
         )
 
     def _trades_of(
@@ -6531,6 +6590,27 @@ class HistoryPort(TerminalPort):
                 f"{_PAPER_LIMIT}, итог за всю историю неполон.",
                 DecisionLevel.WARNING,
             )
+
+    async def _read_fill_times(self) -> None:
+        """Исполнения заявок у брокера — для времени сделки и подписи условной (B-104).
+
+        Отказ базы — не остановка и не пустая таблица: строки остаются со временем
+        свечи, как до этого чтения, а причина — в технический лог. Торговых
+        решений по этим строкам нет.
+        """
+        if self._origin is not RunOrigin.LIVE and not self._live.wanted:
+            return
+        try:
+            rows = await self._worker.order_fill_times()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "исполнения заявок у брокера не прочитаны: в «Сделках» время свечи",
+                extra={"panel": False},
+            )
+            return
+        self._live.executed = live_history.Executed.of(rows)
 
     def _seam_rows(self, rows: tuple[TradeRow, ...]) -> tuple[TradeRow, ...]:
         """Строки сделок; у сделки на стыке — «смена контракта», а не «конец отрезка»."""
@@ -6677,6 +6757,7 @@ def _live_overlay(
     *,
     ruble_per_point: float,
     pending: convert.Unfilled,
+    broker: convert.AtBroker | None = None,
 ) -> tuple[tuple[Marker, ...], tuple[TradePath, ...]]:
     """Метки боя: «Прогноз» — исполнения тени, «Факт» — исполнения брокера (`DOMAIN.md` §8).
 
@@ -6690,6 +6771,10 @@ def _live_overlay(
     в пунктах и рублях, «сигнал пропущен» и «сделка вне расчёта» — по данным.
 
     Линии сделок: «Факт» — сделки брокера, «Прогноз» — сделки тени.
+
+    `broker` — время исполнения у брокера и выходы по условной (`D-196`): после
+    выхода брокера тень ведёт скользящий сама и расходится с боем штатно —
+    метки об этом говорят, а не называют сделки боя дефектом (B-104).
     """
     decided = {plan.order_id: plan for plan in forecast.plans}
     reasons = {name: plan.exit_reason for name, plan in decided.items()}
@@ -6708,7 +6793,7 @@ def _live_overlay(
     reversals = reversal_entries(fact.deals) | reversal_entries(forecast.deals)
     markers, paths = convert.markers_and_paths(
         overlay, pairs(overlay, ruble_per_point=ruble_per_point), reversals, timeframe,
-        pending=pending,
+        pending=pending, broker=broker,
     )
     _, shadow = convert.markers_and_paths(
         forecast, pairs(forecast, ruble_per_point=ruble_per_point), reversals, timeframe,
@@ -6798,38 +6883,113 @@ def _waiting(was: Settings, now: Settings) -> str:
     return "; ".join(lines)
 
 
-def _open_row(
-    run: HistoryRun, candles: Sequence[MarketCandle], ruble_per_point: float,
-    origin: RunOrigin | None,
-) -> tuple[TradeRow, ...]:
+@dataclass(frozen=True, slots=True)
+class _Floating:
+    """Открытая позиция прохода и всё, чем её переоценивать между проходами (B-102).
+
+    Комиссия — как у закрытых сделок: обе стороны. Вход — по сделке входа,
+    если исполнитель её назвал (у боя — комиссия брокера), иначе по тарифу;
+    выход ещё не случился — по тарифу из настроек. Тарифа нет — комиссия
+    неизвестна, и строка говорит это, а не подставляет ноль.
+    """
+
+    position: EnginePosition
+    ruble_per_point: float
+    origin: RunOrigin | None
+    entry_commission: float | None
+    per_side: float | None
+    symbol: str
+    timeframe: str
+    #: Последняя закрытая свеча прохода: цена по ней, если растущей нет.
+    last_open: datetime
+    last_close: float
+    last_closes_at: datetime
+
+    @classmethod
+    def of(
+        cls, run: HistoryRun, candles: Sequence[MarketCandle], frame: _Frame, symbol: str,
+        origin: RunOrigin | None,
+    ) -> _Floating | None:
+        """Позиция прохода `run` по свечам `candles`; `None` — позиции нет."""
+        position = run.position
+        if position is None or not candles:
+            return None
+        entry = next(
+            (
+                fill for fill in reversed(run.fills)
+                if fill.action is OrderAction.OPEN and fill.side is position.side
+                and fill.at == position.entry_time and fill.price == position.entry_price
+            ),
+            None,
+        )
+        last = candles[-1]
+        return cls(
+            position=position, ruble_per_point=frame.engine.ruble_per_point, origin=origin,
+            entry_commission=None if entry is None else entry.commission,
+            per_side=frame.values.commission_per_side_rub, symbol=symbol,
+            timeframe=frame.values.timeframe,
+            last_open=last.time, last_close=last.close, last_closes_at=close_time(last),
+        )
+
+    def commission(self) -> tuple[float, str] | None:
+        """Комиссия обеих сторон и откуда она: вход — брокер или тариф, выход — тариф."""
+        if self.per_side is None:
+            return None
+        exit_side = self.per_side * self.position.volume
+        if self.entry_commission is not None:
+            return self.entry_commission + exit_side, (
+                f"вход {fmt_money(self.entry_commission)} по сделке, "
+                f"выход {fmt_money(exit_side)} по тарифу"
+            )
+        return exit_side * 2, f"обе стороны по тарифу {fmt_money(self.per_side)} за контракт"
+
+
+def _open_row(floating: _Floating, forming: Candle | None) -> tuple[TradeRow, ...]:
     """Строка открытой позиции для таблицы «Сделки» — только окну (задача владельца 13.11.2026).
 
     Позиция — та же, что у ячеек «Позиция» и «Позиция у брокера» на панели:
     позиция движка прогона, чьи сделки в таблице (у пары — «факт»). Выхода
-    нет, результат — плавающий по закрытию последней свечи, без комиссии:
-    сделка не кончилась. Считает его та же сделка `backtest.Deal`, что
-    закрытые, — формула одна. В журнал сделок базы, итог под таблицей
-    и выгрузку строка не идёт: итог считается из `run.deals`, выгрузка
-    отбрасывает строки без выхода (`ui/main_window.py`).
+    нет, результат плавающий — по **текущей** цене потока (растущая свеча,
+    `forming`), а без неё по закрытию последней закрытой свечи, и **с комиссией**,
+    как у закрытых строк рядом (B-102: 16.11.2026 шорт от 248 500 стоял «+75 ₽»
+    по закрытию 09:05 при текущей ~248 575). Считает его та же сделка
+    `backtest.Deal`, что закрытые, — формула одна. В журнал сделок базы, итог
+    под таблицей и выгрузку строка не идёт: итог считается из `run.deals`,
+    выгрузка отбрасывает строки без выхода (`ui/main_window.py`).
+
+    Подпись — главное первым (ячейка режется по ширине): «открыта, по текущей X,
+    с комиссией»; разбор целиком — в подсказке ячейки.
     """
-    position = run.position
-    if position is None or not candles:
-        return ()
-    last = candles[-1]
-    at = close_time(last)
+    position = floating.position
+    if forming is not None:
+        price, at = forming.close, forming.opens_at
+        where = f"по текущей {fmt_level(price)}"
+        when = f"растущая свеча с {in_moscow(at):%H:%M} МСК"
+    else:
+        price, at = floating.last_close, floating.last_closes_at
+        where = f"по закрытию {fmt_level(price)}"
+        when = f"закрытие свечи {in_moscow(at):%H:%M} МСК"
+    costs = floating.commission()
     deal = Deal(
         side=position.side, volume=position.volume, entry_time=position.entry_time,
         entry_price=position.entry_price, entry_order_id="", exit_time=at,
-        exit_price=last.close, exit_order_id="", exit_reason=ExitReason.SIGNAL,
-        ruble_per_point=ruble_per_point,
+        exit_price=price, exit_order_id="", exit_reason=ExitReason.SIGNAL,
+        commission=None if costs is None else costs[0],
+        ruble_per_point=floating.ruble_per_point,
     )
+    if costs is None:
+        words = (
+            f"Позиция открыта, {where}, без комиссии: тариф не задан. "
+            f"Результат плавающий; цена — {when}."
+        )
+    else:
+        words = (
+            f"Позиция открыта, {where}, с комиссией. Результат плавающий; "
+            f"цена — {when}; комиссия {fmt_money(costs[0])}: {costs[1]}."
+        )
     return (dataclasses.replace(
-        convert.trade_row(deal, origin=origin),
-        exit_time=None, exit_price=None, commission_rub=None,
-        exit_reason=(
-            f"Позиция открыта. Результат плавающий: по цене {last.close:g} "
-            f"на {in_moscow(at):%H:%M} МСК, без комиссии."
-        ),
+        convert.trade_row(deal, origin=floating.origin),
+        exit_time=None, exit_price=None, exit_reason=words,
     ),)
 
 

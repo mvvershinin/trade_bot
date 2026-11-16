@@ -26,20 +26,35 @@
 ни одного совпадения, и каждая сделка текущего захода встала бы дважды —
 вместе с удвоенной прибылью в итоге.
 
+Время сделки и скользящий у брокера
+-----------------------------------
+Движок знает о сделке свечу (`engine.Fill.at` — начало бара), брокер — секунду.
+В строку таблицы идёт секунда исполнения по журналу команд (`broker_command`
+↔ `broker_execution`, связь — имя заявки движка в прогоне): условная, исполненная
+в 10:38:03 под свечой 10:35, иначе читалась «10:35 → 10:35» (бой 16.11.2026).
+Исполнения нет в журнале — время свечи, как было. Ключ «та же сделка» и база
+остаются при времени свечи: подмена — только в показе.
+
+С `D-196` скользящий тейк в бою ведёт брокер условной заявкой. Такой выход
+подписан «скользящий тейк у брокера» (`convert.BROKER_TRAILING`), а «прогноз»
+(тень боя) ведёт уровень сам, по минуткам и с шагом, — и после выхода брокера
+расходится с боем штатно, а не дефектом (`at_broker`, B-104).
+
 Решений здесь нет: числа сделок — записанные, итог считает `backtest.summarise`
 тем же счётом, что у любого прогона.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from app import convert
 from backtest import Deal, HistoryRun, reversal_entries, summarise
-from engine import ExitReason, in_moscow
+from engine import ExitReason, OrderAction, in_moscow
 from engine import Side as EngineSide
-from market import StoredTrade, Timeframe
+from market import OrderFillTimes, StoredTrade, Timeframe, floor_to_minute
 from ui.models import (
     Marker,
     MarkerKind,
@@ -50,7 +65,7 @@ from ui.models import (
     TradesSummary,
 )
 
-__all__ = ["Earlier", "LiveTrades", "compose"]
+__all__ = ["Earlier", "Executed", "LiveTrades", "at_broker", "compose"]
 
 #: Причина выхода по подписи: база хранит подпись (`convert.trade_record`).
 #: Нужна только счёту переворотов (`backtest.reversal_entries`); в строку
@@ -74,6 +89,86 @@ class Earlier:
 
 
 @dataclass(frozen=True, slots=True)
+class Executed:
+    """Исполнения заявок у брокера по журналу команд: (прогон, имя заявки) → времена.
+
+    Пусто — не прочитаны или исполнений нет; тогда в строках время свечи.
+    `current` — номер прогона текущего захода боя: сделки из памяти движка
+    номера прогона не несут, и их исполнения ищутся под ним.
+    """
+
+    times: Mapping[tuple[int, str], OrderFillTimes] = field(default_factory=dict)
+    current: int | None = None
+
+    @classmethod
+    def of(cls, rows: tuple[OrderFillTimes, ...]) -> Executed:
+        """Строки журнала команд → поиск по (прогон, имя заявки)."""
+        return cls({(row.session_id, row.order_id): row for row in rows})
+
+    def get(self, session: int | None, name: str) -> OrderFillTimes | None:
+        """Времена заявки `name` прогона `session`; `None` — исполнений не записано."""
+        return None if session is None or not name else self.times.get((session, name))
+
+
+def rested(times: OrderFillTimes) -> bool:
+    """Выход стоял у брокера заранее — значит, уровень вёл брокер, а не программа.
+
+    Условная (`D-196`) ставится сразу после входа и исполняется позже, в другой
+    минуте. Выход программы по касанию (запасной путь без условной и всё, что
+    было до `D-196`) подаётся по закрытию минутки и исполняется в ней же, за
+    секунды. Ошибка признака — в безопасную сторону: условная, сработавшая
+    в минуту постановки, останется подписанной «скользящий уровень», без
+    «у брокера».
+    """
+    return times.placed_at < floor_to_minute(times.last_at)
+
+
+def _reason(label: str, exit_times: OrderFillTimes | None) -> str:
+    """Подпись причины: скользящий, который вёл брокер, называется так (B-104)."""
+    if label == ExitReason.TRAILING_TAKE.label and exit_times is not None and rested(exit_times):
+        return convert.BROKER_TRAILING
+    return label
+
+
+def _timed(
+    row: TradeRow, executed: Executed, session: int | None, entry_name: str, exit_name: str
+) -> TradeRow:
+    """Строка с временем исполнения у брокера вместо свечи движка, если оно известно."""
+    entry = executed.get(session, entry_name)
+    exit_ = executed.get(session, exit_name)
+    if entry is None and exit_ is None:
+        return row
+    return replace(
+        row,
+        entry_time=entry.first_at if entry is not None else row.entry_time,
+        exit_time=exit_.last_at if exit_ is not None else row.exit_time,
+        exit_reason=_reason(row.exit_reason, exit_),
+    )
+
+
+def at_broker(run: HistoryRun, executed: Executed) -> convert.AtBroker:
+    """Что брокер сообщил о сделках текущего захода — для меток «Факта» (B-104).
+
+    Время исполнения по имени заявки и имена выходов, уровень которых вёл
+    брокер условной (`rested`). По ним метка и подсказка не называют дефектом
+    расхождение с «прогнозом», который ведёт скользящий сам.
+    """
+    session = executed.current
+    times: dict[str, datetime] = {}
+    trailing: set[str] = set()
+    for fill in run.fills:
+        found = executed.get(session, fill.order_id)
+        if found is None:
+            continue
+        times[fill.order_id] = found.first_at if fill.action is OrderAction.OPEN else found.last_at
+    for deal in run.deals:
+        found = executed.get(session, deal.exit_order_id)
+        if deal.exit_reason is ExitReason.TRAILING_TAKE and found is not None and rested(found):
+            trailing.add(deal.exit_order_id)
+    return convert.AtBroker(executed=times, trailing=frozenset(trailing))
+
+
+@dataclass(frozen=True, slots=True)
 class LiveTrades:
     """Что показать в бою: строки, итог и метки прежних заходов — из одного списка."""
 
@@ -90,14 +185,17 @@ def compose(
     symbol: str,
     timeframe: Timeframe,
     since: datetime | None,
+    executed: Executed | None = None,
 ) -> LiveTrades:
     """Сделки боя: прежние заходы из базы плюс текущий заход из памяти движка.
 
     `run` — ход «факта» текущего захода; `stored` — прочитанное из базы;
     `symbol` — инструмент текущего захода и графика: по нему ключ «та же
     сделка» и метки (сделки другого контракта — только строками таблицы);
-    `since` — начало текущего захода, `None` — неизвестно.
+    `since` — начало текущего захода, `None` — неизвестно; `executed` —
+    исполнения у брокера (время сделки в строке), `None` — не прочитаны.
     """
+    executed = executed if executed is not None else Executed()
     seen = {
         _key(symbol, deal.side.value, deal.entry_time, deal.exit_time) for deal in run.deals
     }
@@ -117,13 +215,23 @@ def compose(
             # На графике другого контракта метка легла бы на чужие цены;
             # в таблице сделка остаётся.
             continue
-        marks, path = _marks(trade, deal, reversals, timeframe)
+        marks, path = _marks(trade, deal, reversals, timeframe, executed)
         markers.extend(marks)
         paths.append(path)
     return LiveTrades(
         rows=tuple(
-            replace(convert.row_of_stored_trade(trade), earlier_run=True) for trade in earlier
-        ) + tuple(convert.trade_row(deal, origin=RunOrigin.LIVE) for deal in run.deals),
+            _timed(
+                replace(convert.row_of_stored_trade(trade), earlier_run=True), executed,
+                trade.session_id, trade.entry_order_id, trade.exit_order_id,
+            )
+            for trade in earlier
+        ) + tuple(
+            _timed(
+                convert.trade_row(deal, origin=RunOrigin.LIVE), executed, executed.current,
+                deal.entry_order_id, deal.exit_order_id,
+            )
+            for deal in run.deals
+        ),
         summary=replace(
             total,
             title=_total_title(stored.trouble),
@@ -169,7 +277,8 @@ def _deal_of(trade: StoredTrade) -> Deal:
 
 
 def _marks(
-    trade: StoredTrade, deal: Deal, reversals: frozenset[str], timeframe: Timeframe
+    trade: StoredTrade, deal: Deal, reversals: frozenset[str], timeframe: Timeframe,
+    executed: Executed,
 ) -> tuple[tuple[Marker, Marker], TradePath]:
     """Метки входа и выхода и линия сделки прежнего захода — слоем «Факт», приглушённо.
 
@@ -182,9 +291,10 @@ def _marks(
         entry_kind = (
             MarkerKind.ENTRY_LONG if deal.side is EngineSide.LONG else MarkerKind.ENTRY_SHORT
         )
+    reason = _reason(trade.exit_reason, executed.get(trade.session_id, trade.exit_order_id))
     note = (
         f"Прежний заход боя (прогон №{trade.session_id}): {trade.side.label.lower()}, "
-        f"выход — {trade.exit_reason}. Прогноза к прежним заходам на графике нет."
+        f"выход — {reason}. Прогноза к прежним заходам на графике нет."
     )
     entry_at = convert.bar_open(deal.entry_time, timeframe)
     exit_at = convert.bar_open(deal.exit_time, timeframe)

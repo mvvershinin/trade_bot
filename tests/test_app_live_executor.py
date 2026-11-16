@@ -3975,3 +3975,33 @@ def test_a_take_cancelled_outside_after_it_was_told_alive_is_still_reported(
     assert second is None, second
     assert len(told) == 1 and "продолжаю" in told[0], told
     assert live == 1, "тейк заново не поставлен"
+
+
+def test_a_take_filled_at_the_broker_writes_one_line_to_the_technical_log(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Стережёт: исполнение тейка у брокера — строка в техническом логе (B-104, правило 13).
+
+    Вход пишется «исполнена по …», а исполнение тейка и условной — ни строкой:
+    16.11.2026 о семи выходах условной узнавали только по базе. Строка одна
+    на исполнение и того же вида, что у входа.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            take_key = str(rig.creates()[-1]["clientOrderId"])
+            with caplog.at_level(logging.INFO, logger="app.live_executor"):
+                rig.broker.execute(take_key, 1, 110.0)
+                await heard()
+
+    run(scenario())
+    lines = [
+        record.getMessage() for record in caplog.records
+        if "исполнена по 110" in record.getMessage()
+    ]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("боевой исполнитель: Заявка (тейк лонга"), lines
+    assert "исполнение 10:00:04 МСК" in lines[0], lines

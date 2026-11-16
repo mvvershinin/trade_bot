@@ -3339,6 +3339,18 @@ class LiveExecutor:
             filled = self._fill_words(ticket)
             if filled is not None:
                 self._say(filled)
+            else:
+                # Тейк и условная «текущей» не судятся, и строки «исполнена по …»
+                # у них не было вовсе: 16.11.2026 об исполнениях узнавали только
+                # по базе (B-104, правило 13). Строка — в технический лог; в журнале
+                # решений о выходе уже говорит движок.
+                price = ticket.mean_price()
+                log.info(
+                    "боевой исполнитель: Заявка (%s) исполнена по %s%s.",
+                    ticket.what, "?" if price is None else f"{price:g}",
+                    "" if ticket.first_at is None
+                    else f", исполнение {in_moscow(ticket.first_at):%H:%M:%S} МСК",
+                )
             self._news()
             return
         if ticket.status is OrderStatus.CANCELLED and ticket.cancelling:

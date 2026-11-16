@@ -161,6 +161,7 @@ from market.commands import (
     CommandAction,
     CommandSide,
     CommandStatus,
+    OrderFillTimes,
     StoredCommand,
 )
 from market.day import (
@@ -4005,6 +4006,31 @@ class CandleStore:
                 "SELECT " + ", ".join(_EXECUTION_COLUMNS)
                 + " FROM broker_execution WHERE client_order_id = ? ORDER BY id",
                 (self._clean(client_order_id),),
+            )
+        )
+
+    def order_fill_times(self) -> tuple[OrderFillTimes, ...]:
+        """Подача и исполнения заявок движка по журналу команд — строка на имя в прогоне.
+
+        Только команды создания, у которых есть исполнения: снятие сделки
+        не даёт, неисполненная заявка времени сделки не имеет. Для показа
+        (время сделки в «Сделках», выход по условной у брокера); торговых
+        решений по этим строкам нет.
+        """
+        return tuple(
+            OrderFillTimes(
+                session_id=int(row[0]),
+                order_id=str(row[1]),
+                placed_at=_from_ts(int(row[2])),
+                first_at=_from_ts(int(row[3])),
+                last_at=_from_ts(int(row[4])),
+            )
+            for row in self._db.execute(
+                "SELECT c.session_id, c.order_id, MIN(c.at), MIN(e.at), MAX(e.at) "
+                "FROM broker_command AS c "
+                "JOIN broker_execution AS e ON e.client_order_id = c.client_order_id "
+                "WHERE c.action = ? GROUP BY c.session_id, c.order_id",
+                (CommandAction.CREATE.value,),
             )
         )
 

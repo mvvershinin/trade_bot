@@ -83,6 +83,7 @@ from typing import Any, TypeVar, cast
 
 from market.candles import Candle, Timeframe
 from market.chain import Leg
+from market.commands import OrderFillTimes
 from market.contracts import (
     ContractLoad,
     ContractRequest,
@@ -1192,6 +1193,10 @@ class MarketWorker:
                 all_runs=all_runs,
             )
         )
+
+    async def order_fill_times(self) -> tuple[OrderFillTimes, ...]:
+        """Подача и исполнения заявок движка у брокера — `CandleStore.order_fill_times`."""
+        return await self.call(lambda store: store.order_fill_times())
 
     async def orders(
         self, *, session_id: int, limit: int = 5000

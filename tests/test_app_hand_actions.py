@@ -20,13 +20,17 @@ from __future__ import annotations
 import json
 import pathlib
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
 import websockets
 
+from app.port import _Floating, _open_row
 from broker.session import PORTFOLIO_PATH, BrokerSession
+from engine import MSK
+from engine import Position as EnginePosition
+from engine import Side as EngineSide
 from market import CandleStore, MarketWorker
 from market.commands import BrokerCommand, CommandAction, CommandSide
 from market.journal import RunOrigin, SessionRecord
@@ -44,7 +48,9 @@ from tests.test_app_live_pair import (
     _connect,
     _ride,
 )
+from ui.models import Candle as WindowCandle
 from ui.models import RobotOrders, TradeRow
+from ui.models import RunOrigin as WindowOrigin
 
 #: Тейк прошлого запуска — в журнале команд этого счёта и живой у брокера.
 ROBOT_TAKE = "00000000-0000-4000-8000-00000000a001"
@@ -215,8 +221,10 @@ def test_open_position_row_is_shown_and_goes_away_when_the_position_closes(
         open_rows = _open_rows(rows)
         assert len(open_rows) == 1, rows
         row = open_rows[0]
-        assert row.exit_price is None and row.commission_rub is None, row
+        # B-102: плавающий результат — с комиссией обеих сторон, как у закрытых.
+        assert row.exit_price is None and row.commission_rub is not None, row
         assert row.profit_rub is not None and "плавающий" in row.exit_reason, row
+        assert "с комиссией" in row.exit_reason, row
     after = [rows for rows, held in seen[seen.index((holding[0], True)):] if not held]
     assert after, "позиция ни разу не закрылась — проверять нечего"
     assert all(not _open_rows(rows) for rows in after), after[-1]
@@ -465,3 +473,36 @@ def test_close_names_live_orders_that_are_not_the_robots(
     owner = broker.order(OWNER_ORDER)
     assert owner is not None and owner.live, "ручная заявка владельца снята"
     assert "не найденные в журнале робота" in said and "252000" in said, said
+
+
+def test_open_position_row_is_priced_by_the_forming_candle_with_commission() -> None:
+    """Стережёт: плавающий результат открытой позиции — по текущей цене и с комиссией (B-102).
+
+    Бой 16.11.2026, 09:08: шорт от 248 500, текущая ~248 575, а строка стояла
+    «+75 ₽» — по закрытию свечи 09:00–09:05 и без комиссии, рядом с закрытыми
+    строками с комиссией. Здесь: цена — закрытие растущей свечи, комиссия —
+    вход по сделке брокера плюс выход по тарифу; без растущей — закрытие
+    последней закрытой свечи.
+    """
+    entry = datetime(2026, 11, 16, 9, 5, tzinfo=MSK)
+    floating = _Floating(
+        position=EnginePosition(
+            side=EngineSide.SHORT, volume=1.0, entry_price=248_500.0, entry_time=entry
+        ),
+        ruble_per_point=1.0, origin=WindowOrigin.LIVE, entry_commission=16.52,
+        per_side=17.0, symbol="MXZ6", timeframe="5 минут",
+        last_open=datetime(2026, 11, 16, 9, 0, tzinfo=MSK), last_close=248_425.0,
+        last_closes_at=entry,
+    )
+    forming = WindowCandle(
+        opens_at=entry, open=248_450.0, high=248_600.0, low=248_425.0, close=248_575.0
+    )
+
+    [now] = _open_row(floating, forming)
+    [closed] = _open_row(floating, None)
+
+    assert now.commission_rub == pytest.approx(33.52), now
+    assert now.profit_rub == pytest.approx(-75.0 - 33.52), now
+    assert "по текущей" in now.exit_reason and "с комиссией" in now.exit_reason, now
+    assert closed.profit_rub == pytest.approx(75.0 - 33.52), closed
+    assert now.exit_time is None and now.exit_price is None, now

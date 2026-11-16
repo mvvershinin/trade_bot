@@ -1191,3 +1191,53 @@ def test_changing_the_minute_bar_limit_is_a_journal_line() -> None:
     assert lines == [
         "Наибольшая свеча для проверки по минуткам: 5 минут → 15 минут"
     ], lines
+
+
+def test_fact_trades_apart_from_the_forecast_after_a_broker_trailing_exit_are_not_defects() -> None:
+    """Стережёт: после выхода по условной у брокера сделка без пары — не «дефект» (B-104).
+
+    Бой 16.11.2026: условная брокера закрыла шорт в 09:33:49, «прогноз»
+    (тень, скользящий по минуткам с шагом) не вышел, и метки выхода и следующего
+    входа стояли «!» с подсказкой «Разбирается как дефект». Здесь: выход брокера
+    и вход после него — обычные метки с объяснением словами и секундой
+    исполнения; сделка «прогноза» без пары после выхода — не «сигнал пропущен».
+    Сделка без расчёта **до** выхода брокера по-прежнему дефект.
+    """
+    frame = Timeframe(5)
+    at = datetime(2026, 11, 16, 9, 0, tzinfo=MSK)
+
+    def fill(name: str, action: OrderAction, minute: int) -> Fill:
+        return Fill(
+            action=action, side=EngineSide.SHORT, volume=1.0, price=248_325.0,
+            at=at + timedelta(minutes=minute), order_id=name,
+        )
+
+    stray = fill("open:stray", OrderAction.OPEN, 0)
+    broker_exit = fill("take:1", OrderAction.CLOSE, 30)
+    after = fill("open:2", OrderAction.OPEN, 40)
+    shadow_only = Plan(
+        order_id="take:shadow", decided_at=at + timedelta(minutes=55), price=248_450.0,
+        side=EngineSide.SHORT, action=OrderAction.CLOSE, exit_reason=ExitReason.TRAILING_TAKE,
+    )
+    pairs_ = (
+        Pair(stray.order_id, None, stray), Pair(broker_exit.order_id, None, broker_exit),
+        Pair(after.order_id, None, after), Pair(shadow_only.order_id, shadow_only, None),
+    )
+    broker = convert.AtBroker(
+        executed={"take:1": at.replace(minute=33, second=49)}, trailing=frozenset({"take:1"})
+    )
+
+    markers, _ = convert.markers_and_paths(
+        HistoryRun(fills=(stray, broker_exit, after)), pairs_, frozenset(), frame,
+        pending=convert.Unfilled.WAITING, broker=broker,
+    )
+
+    shown = {marker.pair_id: marker for marker in markers}
+    assert shown["open:stray"].kind is MarkerKind.UNPLANNED, shown["open:stray"]
+    assert shown["take:1"].kind is MarkerKind.EXIT, shown["take:1"]
+    assert shown["open:2"].kind is MarkerKind.ENTRY_SHORT, shown["open:2"]
+    assert shown["take:shadow"].kind is MarkerKind.EXIT, shown["take:shadow"]
+    for name in ("take:1", "open:2", "take:shadow"):
+        tip = shown[name].tooltip
+        assert "дефект" not in tip and "условная заявка у брокера" in tip, (name, tip)
+    assert "09:33:49" in shown["take:1"].tooltip, shown["take:1"].tooltip
