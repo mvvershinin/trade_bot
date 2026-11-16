@@ -90,6 +90,7 @@ from engine import (
     close_time,
     in_moscow,
 )
+from engine import Position as EnginePosition
 from engine import Side as EngineSide
 from market import (
     FUTURES,
@@ -276,10 +277,10 @@ _NO_FUNDS = (
     "не уходит, в журнале выше сказано, почему брокер не ответил про счёт."
 )
 
-#: Почему «Старт» и «Стоп» без боя ничего не делают. Текст один на все места,
-#: где это надо сказать: расхождение формулировок читалось бы как разные причины.
+#: Почему «Стоп» без боя ничего не делает. «Старт» с 16.11.2026 — то же,
+#: что «Включить бой» (`HistoryPort.start`), и этого отказа больше не говорит.
 NO_LIVE = (
-    "боевого хода по этой кнопке нет: бой включается кнопкой «Включить бой» — "
+    "боевого хода нет: бой включается кнопкой «Старт» или «Включить бой» — "
     "после сверки с брокером, поверх живого потока котировок. Без боя робот "
     "идёт наблюдением или прогоном по истории: решения и расчётные сделки, "
     "заявок к брокеру нет."
@@ -792,6 +793,9 @@ class _Live:
     #: Сделки боя, показанные последним проходом: «Отдать журналы» берёт их,
     #: а не собирает заново. `None` — показан не бой.
     shown: live_history.LiveTrades | None = None
+    #: Причины недоступности «Включить бой», последними записанные
+    #: в технический лог (`_log_blockers`): строка — при смене, не на опрос.
+    blocked: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1500,6 +1504,8 @@ class HistoryPort(TerminalPort):
         observer = self._watch.observer
         paired = observer is not None and observer.paired
         reasons = () if self._live.wanted else self._live_blockers()
+        if not self._live.wanted:
+            self._log_blockers(reasons)
         return LiveStatus(
             available=not reasons,
             why_not=reasons,
@@ -1517,6 +1523,23 @@ class HistoryPort(TerminalPort):
             forecast=observer.run if observer is not None and paired else None,
             hand_refused=self._hand_refusal(),
         )
+
+    def _log_blockers(self, reasons: tuple[str, ...]) -> None:
+        """Почему «Включить бой» серая — строкой в технический лог, при смене причины.
+
+        В окне причина видна надписью у кнопки и пропадает, когда кнопка
+        оживает; разбору боя после нужна запись (бой 16.11.2026 08:57: какая
+        причина держала кнопку — не узнать). Снимок боя строится на каждом
+        проходе и опросе — строка только тогда, когда набор причин сменился.
+        """
+        if reasons == self._live.blocked:
+            return
+        self._live.blocked = reasons
+        if reasons:
+            said = "; ".join(" ".join(reason.split()) for reason in reasons)
+            log.info("«Включить бой» недоступна: %s", said)
+        else:
+            log.info("«Включить бой» доступна")
 
     def _fact_position(self) -> FactPosition | None:
         """Позиция «факта»: у собранной пары — её, после закрытия — оставшаяся у брокера."""
@@ -1706,7 +1729,14 @@ class HistoryPort(TerminalPort):
         )
 
     def start(self) -> None:
-        self._refuse("Запуск робота", f"Робот не запущен: {NO_LIVE}")
+        """«Старт» = «Включить бой» (владелец 16.11.2026: «старт жму и нихуя»).
+
+        Тот же путь, что у кнопки боя: `set_live(True)` — те же запреты
+        (`_live_blockers`) и те же строки отказа. Прежде «Старт» отвечал
+        отказом `NO_LIVE` в журнал, и нажатие выглядело ничем. Симметрично
+        «Стопу»: тот в бою выключает бой (решение 0066).
+        """
+        self.set_live(True)
 
     def stop(self) -> None:
         """«Стоп». В бою — выключить бой (решение владельца 01.11.2026, 0066).
@@ -6332,7 +6362,9 @@ class HistoryPort(TerminalPort):
             average_label=convert.average_label(frame.values),
             markers=markers,
             paths=paths,
-            levels=() if own is None else _levels(run),
+            levels=() if own is None else _levels(
+                run.position, live=self._origin is RunOrigin.LIVE
+            ),
             shades=convert.shades_of(candles, frame.engine),
             seams=seams,
             basis=self._basis,
@@ -6901,16 +6933,38 @@ def _pending_of(*, pinned: bool, halted: str) -> convert.Unfilled:
     return next((fate for hit, fate in chain if hit), convert.Unfilled.WAITING)
 
 
-def _levels(run: HistoryRun) -> tuple[PriceLevel, ...]:
-    """Горизонтальные линии открытой позиции — цена входа и уровень выхода."""
-    position = run.position
+#: Подпись линии включения скользящего тейка в бою (`B-103`): до порога
+#: уровня выхода нет, у брокера стоит условная заявка с этой ценой включения.
+ACTIVATION_LABEL = "Включение скользящего тейка — условная заявка у брокера"
+#: Подпись уровня программы после порога, пока условная у брокера жива
+#: (`D-196`): брокер ведёт свой уровень по сделкам, без шага, и он может
+#: отличаться от расчёта программы по минуткам.
+PROGRAM_LEVEL_LABEL = "Скользящий тейк по расчёту программы — у брокера уровень свой"
+
+
+def _levels(position: EnginePosition | None, *, live: bool) -> tuple[PriceLevel, ...]:
+    """Горизонтальные линии открытой позиции — цена входа и уровень выхода.
+
+    Скользящий тейк до порога уровня выхода не имеет, но цена включения
+    у него есть (`TakeProfit.activation`, `D-196`), и её видно линией
+    (`B-103`): иначе владелец не знает, где тейк включится. После порога —
+    уровень программы; `live` и живая условная — с оговоркой, что у брокера
+    уровень свой. Позиции нет — линий нет: после выхода они исчезают.
+    """
     if position is None:
         return ()
     levels = [PriceLevel(position.entry_price, LevelKind.ENTRY, "Цена входа")]
+    take = position.take
     level = position.take_profit
     if level is not None:
-        kind = LevelKind.TRAILING if position.take.trailing else LevelKind.TAKE
-        levels.append(PriceLevel(level, kind, kind.label))
+        kind = LevelKind.TRAILING if take.trailing else LevelKind.TAKE
+        aside = live and take.trailing and take.activation is not None
+        levels.append(PriceLevel(level, kind, PROGRAM_LEVEL_LABEL if aside else kind.label))
+    elif take.activation is not None:
+        kind = LevelKind.ACTIVATION
+        levels.append(
+            PriceLevel(take.activation, kind, ACTIVATION_LABEL if live else kind.label)
+        )
     return tuple(levels)
 
 

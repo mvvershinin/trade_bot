@@ -184,6 +184,10 @@ class LevelKind(enum.Enum):
     ENTRY = "entry"
     TAKE = "take"
     TRAILING = "trailing"
+    #: Цена включения скользящего тейка (`B-103`): до порога уровня выхода
+    #: ещё нет, а условная заявка у брокера уже стоит (`D-196`). Рисуется
+    #: штрихпунктиром — это не уровень выхода, а цена, с которой он появится.
+    ACTIVATION = "activation"
 
     @property
     def label(self) -> str:
@@ -191,6 +195,7 @@ class LevelKind(enum.Enum):
             LevelKind.ENTRY: "Цена входа",
             LevelKind.TAKE: "Тейк-профит",
             LevelKind.TRAILING: "Скользящий тейк",
+            LevelKind.ACTIVATION: "Включение скользящего тейка",
         }[self]
 
 

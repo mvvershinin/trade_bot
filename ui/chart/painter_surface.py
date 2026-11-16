@@ -46,6 +46,7 @@ from ui.models import (
     ChartSpan,
     ContractSeam,
     Layer,
+    LevelKind,
     LinePoint,
     Marker,
     MarkerKind,
@@ -111,6 +112,11 @@ DENSE_STEP = 2.0
 # (штрих вчетверо длиннее) и от границ пропуска — иначе три разных пунктира
 # на одном экране читаются как один.
 CROSSHAIR_DASH = (2.0, 3.0)
+
+#: Линия уровня по виду: уровень выхода — штрихом, цена включения скользящего
+#: тейка — штрихпунктиром (`B-103`). Включение — ещё не уровень, и два штриха
+#: одной формы читались бы как два уровня выхода.
+LEVEL_PEN: dict[LevelKind, Qt.PenStyle] = {LevelKind.ACTIVATION: Qt.PenStyle.DashDotLine}
 
 
 @dataclass(slots=True)
@@ -1151,7 +1157,7 @@ class PainterChartSurface(QWidget, ChartSurface):
             color = QColor(self._theme.level_color(level.kind))
             pen = QPen(color)
             pen.setWidthF(1.3)
-            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setStyle(LEVEL_PEN.get(level.kind, Qt.PenStyle.DashLine))
             painter.setPen(pen)
             painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
             chip = QRectF(plot.right() + 1, y - 8, AXIS_WIDTH - 3, 16)
@@ -1168,8 +1174,10 @@ class PainterChartSurface(QWidget, ChartSurface):
             painter.setPen(QPen(QColor(self._theme.text_dim)))
             # Подпись ниже линии: сверху у левого края стоит подпись инструмента,
             # и уровень, попавший под самый верх графика, перекрывал бы её.
+            # Ширина — по области графика: подпись «уровень программы, у брокера
+            # свой» (`B-103`) в прежние 200 точек не влезала и резалась молча.
             painter.drawText(
-                QRectF(plot.left() + 4, y + 2, 200, 14),
+                QRectF(plot.left() + 4, y + 2, max(plot.width() - 8, 0), 14),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                 level.label or level.kind.label,
             )

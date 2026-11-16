@@ -719,24 +719,31 @@ def test_cancel_take_in_combat_leaves_the_robot_trading_by_signal_without_a_new_
     assert broker.position(SYMBOL) == -1
 
 
-def test_start_without_combat_says_how_combat_is_switched_on(
+def test_start_without_combat_turns_the_combat_on(
     loop, tmp_path: pathlib.Path, broker: FakeBroker
 ) -> None:
-    """«Старт» без боя: отказ называет кнопку «Включить бой», а не «боевого хода ещё нет»."""
+    """«Старт» без боя включает бой (владелец 16.11.2026), а не отказывает «Запуском робота».
 
-    async def go() -> str:
+    Прежде здесь стерёгся отказ со словами «Включить бой» — «Старт» ничего
+    не включал, и владелец его не увидел («старт жму и нихуя»).
+    """
+
+    async def go() -> tuple[str, str, bool]:
         bench, session = await _bench(tmp_path, broker, OWNER)
         try:
             await _connect(bench, live=False)
             bench.port.start()
             await bench.port.wait()
-            return bench.said("Запуск робота")
+            return (
+                bench.said("Запуск робота"), bench.said("Бой включается"),
+                bench.port.live_status().wanted,
+            )
         finally:
             await _close(bench, session)
 
-    said = loop.run_until_complete(go())
-    assert "«Включить бой»" in said, said
-    assert "ещё нет" not in said, said
+    refused, asked, wanted = loop.run_until_complete(go())
+    assert refused == "", refused
+    assert asked and wanted, (asked, wanted)
 
 
 def test_bad_wait_limits_from_the_file_are_said_in_window_words_in_one_line(

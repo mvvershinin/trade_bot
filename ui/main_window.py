@@ -167,6 +167,23 @@ BACKTEST_IN_COMBAT = (
     "отрезок истории. Бой этим пунктом не прерывается."
 )
 
+#: «Старт» = «Включить бой» (владелец 16.11.2026). Подсказка доступной кнопки.
+START_HINT = (
+    "Включить бой — то же, что кнопка «Включить бой…»: робот сам подаёт заявки "
+    "брокеру на ваш счёт. Перед включением программа спросит подтверждение."
+)
+#: Токен только на чтение: заявки брокер не примет (ТЗ, опасные места окна).
+START_READ_ONLY = (
+    "Запуск недоступен: токен выдан только на чтение. Заявки по такому "
+    "токену брокер не примет. Нужен токен с правом торговли."
+)
+#: Робот остановлен: «Старт» этого не снимает, и окно не вправе обещать иное.
+START_HALTED = (
+    "Робот остановлен, и сам он из этого состояния не выйдет. "
+    "Причина — в красной плашке над графиком: разберитесь с ней "
+    "и проверьте счёт у брокера, прежде чем запускать снова."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class StreamLook:
@@ -664,9 +681,13 @@ class MainWindow(QMainWindow):
 
     def _build_robot_actions(self) -> None:
         """Старт, стоп и связь с брокером."""
+        #: «Старт» = «Включить бой» (владелец 16.11.2026): тот же вопрос
+        #: и тот же путь порта, серая — с той же причиной в подсказке
+        #: (`_gate_robot_buttons`). Прежде она отказывала строкой в журнал,
+        #: и нажатие выглядело ничем.
         self.start_action = QAction("Старт", self)
-        self.start_action.setToolTip("Запустить робота.")
-        self.start_action.triggered.connect(self.port.start)
+        self.start_action.setToolTip(START_HINT)
+        self.start_action.triggered.connect(self.request_start)
 
         self.stop_action = QAction("Стоп", self)
         self.stop_action.setToolTip(
@@ -986,25 +1007,8 @@ class MainWindow(QMainWindow):
             self.mode_box.setCurrentIndex(index)
             self.mode_box.blockSignals(False)
 
-        self.start_action.setEnabled(not state.running and not state.token_read_only)
-        self.stop_action.setEnabled(state.running)
+        self._gate_robot_buttons()
         self._mirror_stream(state.connection)
-        if state.token_read_only:
-            self.start_action.setToolTip(
-                "Запуск недоступен: токен выдан только на чтение. Заявки по такому "
-                "токену брокер не примет. Нужен токен с правом торговли."
-            )
-        elif state.halted:
-            # Кнопка намеренно НЕ гасится: что делает «Старт» с остановленным
-            # роботом, решает не окно. Но обещать, что нажатие поможет, оно
-            # тоже не вправе — отсюда прямая речь вместо умолчания.
-            self.start_action.setToolTip(
-                "Робот остановлен, и сам он из этого состояния не выйдет. "
-                "Причина — в красной плашке над графиком: разберитесь с ней "
-                "и проверьте счёт у брокера, прежде чем запускать снова."
-            )
-        else:
-            self.start_action.setToolTip("Запустить робота.")
 
         self._update_banners(state)
         title = f"{TITLE} {version()} — {state.instrument}"
@@ -1360,6 +1364,33 @@ class MainWindow(QMainWindow):
         ):
             action.setEnabled(hand)
             action.setToolTip(hand_hint(view, hint))
+        self._gate_robot_buttons()
+
+    def _gate_robot_buttons(self) -> None:
+        """«Старт» и «Стоп» — по снимку боя и состоянию, а не по нажатию.
+
+        «Старт» = «Включить бой»: горит, когда горела бы «Включить бой»
+        (порт сказал «доступен», бой не просили), серая — с той же причиной
+        в подсказке (`live_look`). «Стоп» = «Выключить бой» в бою (0066):
+        горит, пока бой просили — и пока исполнитель ещё собирается.
+
+        Зовут двое — снимок состояния и снимок боя, — и оба снимка берутся
+        последние запомненные: каждый приходит своим сигналом.
+        """
+        view, state = self._live, self._state
+        wanted = view is not None and view.wanted
+        ready = view is not None and view.available and not wanted
+        self.start_action.setEnabled(ready and not state.token_read_only)
+        self.stop_action.setEnabled(state.running or wanted)
+        if state.token_read_only:
+            self.start_action.setToolTip(START_READ_ONLY)
+        elif state.halted and not wanted:
+            # Обещать, что нажатие поможет, окно не вправе — отсюда прямая речь.
+            self.start_action.setToolTip(f"{START_HALTED}\n\n{live_look(view).tooltip}")
+        elif ready:
+            self.start_action.setToolTip(START_HINT)
+        else:
+            self.start_action.setToolTip(live_look(view).tooltip)
 
     def request_live(self, checked: bool) -> None:
         """Человек нажал «Бой». Включение — только после вопроса.
@@ -1370,13 +1401,7 @@ class MainWindow(QMainWindow):
         view = self._live
         self._mirror_live(view)
         if checked:
-            if view is None or not view.available:
-                return
-            question = live_on_question(
-                fmt_volume(float(self._settings.volume)) + " контр.",
-                self._state.instrument,
-            )
-            if self.ask("Включить бой", question, "Включить бой"):
+            if self._agree_live_on():
                 self.port.set_live(True)
             return
         concern = self._fact_concern()
@@ -1387,6 +1412,27 @@ class MainWindow(QMainWindow):
         ):
             return
         self.port.set_live(False)
+
+    def request_start(self) -> None:
+        """«Старт» — тот же вопрос, что у «Включить бой», и команда порту `start`.
+
+        Порт исполняет её как `set_live(True)` (`HistoryPort.start`): запреты
+        и строки отказа — те же. Кнопка до вопроса следует снимку, как у боя.
+        """
+        self._mirror_live(self._live)
+        if self._agree_live_on():
+            self.port.start()
+
+    def _agree_live_on(self) -> bool:
+        """Бой доступен и человек согласился в вопросе перед боем."""
+        view = self._live
+        if view is None or not view.available or view.wanted:
+            return False
+        question = live_on_question(
+            fmt_volume(float(self._settings.volume)) + " контр.",
+            self._state.instrument,
+        )
+        return self.ask("Включить бой", question, "Включить бой")
 
     def request_cancel_order(self) -> None:
         """«Снять заявку…»: спросить заявки робота; список и вопрос — по ответу порта.
