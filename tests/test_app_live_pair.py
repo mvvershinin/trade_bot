@@ -235,6 +235,8 @@ class Exchange:
                 return
             self.broker.execute(order.key, order.quantity, done)
             return
+        if order.order_type == "5":
+            return  # условная (`D-196`): уровень ведёт брокер, стенд его не ведёт
         assert order.price is not None
         if self._fits(order, low=price, high=price):
             self.broker.execute(order.key, order.quantity, price)

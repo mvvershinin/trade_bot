@@ -2183,7 +2183,9 @@ def _grid_words(position: Position) -> str:
 def _take_words(position: Position) -> str:
     """Что стоит у брокера, словами: «тейк 250 100» или условная до порога (`D-196`)."""
     take = position.take
-    if take.level is None and take.activation is not None:
+    if take.activation is not None:
+        # И после порога: уровень программы у позиции есть, но у брокера стоит
+        # условная, а не лимитная по этому уровню (/risk 14.11).
         return f"скользящий тейк (условная заявка, включение на {_price(take.activation)})"
     return f"тейк {_price(take.level or 0.0)}"
 

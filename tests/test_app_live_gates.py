@@ -201,11 +201,7 @@ GATES = [
              then=_halt),
         id="halted",
     ),
-    pytest.param(
-        Gate("Скользящий уровень на свече 5 мин не крупнее порога проверки по минуткам (5 мин)",
-             values=dataclasses.replace(OWNER, timeframe="5 минут")),
-        id="trailing-on-a-small-bar",
-    ),
+    # «trailing-on-a-small-bar» снят вместе с запретом D-141 (решение 0071).
     pytest.param(Gate("Шаг цены инструмента не известен", step=None), id="no-price-step"),
 ]
 

@@ -754,11 +754,30 @@ def _mapping(value: object, what: str) -> Mapping[str, object]:
     return value
 
 
+def _execution_kind(source: Mapping[str, object]) -> ExecutionType:
+    """`executionType`; у условной без него и без исполнения — смена статуса (`12`).
+
+    Кадр срабатывания условной заявки (`D-196`, проба Б 13.11.2026 18:35:12)
+    брокер шлёт **без** `executionType`: `orderStatus` `0`, `orderType` `5`,
+    новый `orderId`, `price` — предел порождённой лимитной, `lastQuantity` 0.
+    Отказ разбора рвал поток, и кадр исполнения, пришедший следом в ту же
+    миллисекунду, терялся. Послабление — только этому кадру: у прочих заявок
+    и у кадра с исполнением (`lastQuantity` > 0) без кода — отказ, как прежде.
+    """
+    if (
+        pick(source, ("executionType",)) is None
+        and text(pick(source, ("orderType",))) == OrderType.CONDITIONAL.value
+        and not _whole(source, "lastQuantity")
+    ):
+        return ExecutionType.ORDER_STATUS
+    return _required_code(source, "executionType", ExecutionType)
+
+
 def parse_report(data: object) -> OrderReport:
     """Сообщение о заявке (`data` в 11 и 24). Отказ — `UnexpectedAnswer`."""
     source = _mapping(data, "сообщение о заявке")
     status = _required_code(source, "orderStatus", OrderStatus)
-    kind = _required_code(source, "executionType", ExecutionType)
+    kind = _execution_kind(source)
     execution_id = text(pick(source, ("executionId",)))
     if kind in EXECUTIONS and execution_id is None:
         raise _unreadable(f"исполнение (executionType {kind.value}) без executionId")

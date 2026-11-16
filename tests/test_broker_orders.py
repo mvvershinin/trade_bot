@@ -1166,3 +1166,44 @@ def test_reading_around_orders_is_allowed_and_repeated(page: str) -> None:
     assert endpoint in READ_ENDPOINTS
     assert endpoint in REPEATABLE
     assert not set(WRITE_ENDPOINTS) & set(READ_ENDPOINTS)
+
+
+#: Кадры пробы Б 13.11.2026 18:35:12 (`D-196`, `broker-api/13`, «Пробы»):
+#: срабатывание условной — без `executionType`, затем исполнение по её ключу.
+#: `clientCode` заменён: в тестовые данные код клиента не кладём.
+_TRIGGER = {
+    "messageType": "8", "orderStatus": "0", "orderQuantity": 1, "executedQuantity": 0,
+    "lastQuantity": 0, "remainedQuantity": 1, "ticker": "MXZ6", "classCode": "SPBFUT",
+    "side": "2", "orderType": "5", "averagePrice": 0,
+    "orderId": "261113-SPBFUT-1984994564063182335",
+    "executionId": "261113-SPBFUT-fED8o-L-CQ057", "price": 249825, "currency": "RUB",
+    "clientCode": "TEST", "transactionTime": "2026-11-13T15:35:12.877Z",
+    "orderNumber": "609216886", "rejectReason": "", "stopPrice": 0, "takePrice": 250100,
+    "timeInForce": "1", "spread": 0.1, "spreadType": 1, "offset": 0.03, "offsetType": 1,
+}
+_TRIGGER_FILL = {
+    **_TRIGGER, "orderStatus": "2", "executionType": "11", "executedQuantity": 1,
+    "lastQuantity": 1, "remainedQuantity": 0, "averagePrice": 250075,
+    "executionId": "SPBFUT-2MdIMRrCZ9u-S-1-1-N", "commission": 16.58,
+}
+
+
+def test_the_trigger_frame_of_a_conditional_is_read_and_the_fill_after_it_counts() -> None:
+    """Стережёт: кадр срабатывания условной без `executionType` не рвёт поток.
+
+    Живой брокер 13.11.2026 прислал его перед исполнением; отказ разбора
+    закрывал поток, исполнение терялось, а сверка с отстающим портфелем
+    останавливала робота после штатного скользящего тейка (/risk 14.11).
+    Послабление узкое: у обычной заявки кадр без вида — отказ, как прежде.
+    """
+    key = "b7bbad81-ed5a-410b-a046-aa5ee5792142"
+    trigger = parse_order_event({"clientOrderId": key, "data": _TRIGGER})
+    assert trigger.key == key
+    assert trigger.report.status is OrderStatus.NEW
+    assert not trigger.report.is_execution
+    fill = parse_order_event({"clientOrderId": key, "data": _TRIGGER_FILL})
+    assert fill.report.is_execution and fill.report.last_quantity == 1
+    with pytest.raises(UnexpectedAnswer):
+        parse_order_event({"clientOrderId": key, "data": {**_TRIGGER, "orderType": "2"}})
+    with pytest.raises(UnexpectedAnswer):
+        parse_order_event({"clientOrderId": key, "data": {**_TRIGGER, "lastQuantity": 1}})

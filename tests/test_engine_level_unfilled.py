@@ -184,7 +184,9 @@ def test_hold_in_a_loss_keeps_the_position_and_starts_the_trailing_over() -> Non
         "план сброшен из настроек движка, а не из плана позиции"
     )
     assert held.take.peak is None and held.take.level is None
-    assert engine.state.order_in_flight(EVENT.order_id) is None
+    # Под тем же именем в ожидании — новая условная, а не снятый выход по уровню.
+    waiting = engine.state.order_in_flight(EVENT.order_id)
+    assert waiting is not None and waiting.trail_offset is not None, waiting
     assert engine.state.entries_closed_date is None
     assert any(e.event == "Уровень не исполнился — позиция остаётся" for e in lines)
 

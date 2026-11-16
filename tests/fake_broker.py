@@ -457,6 +457,10 @@ class FakeBroker:
             raise AssertionError(f"исполнять нечего: заявка {key} не жива в книге")
         if quantity < 1 or order.executed + quantity > order.quantity:
             raise AssertionError(f"исполнение {quantity} не помещается в заявку {key}")
+        if order.order_type == "5" and order.executed == 0:
+            # Кадр срабатывания условной — как у живого брокера 13.11.2026:
+            # **без** `executionType`, статус `0`, исполнения нет (/risk 14.11).
+            self._emit(order, execution_type=None, extra={"lastQuantity": 0})
         order.executed += quantity
         order.turnover += quantity * price
         full = order.executed == order.quantity
@@ -574,7 +578,7 @@ class FakeBroker:
         self,
         order: BookOrder,
         *,
-        execution_type: str,
+        execution_type: str | None,
         execution: dict[str, object] | None = None,
         extra: dict[str, object] | None = None,
     ) -> None:
@@ -586,7 +590,6 @@ class FakeBroker:
         data: dict[str, object] = {
             "messageType": "8",
             "orderStatus": order.status,
-            "executionType": execution_type,
             "orderId": order.exchange_id,
             "ticker": order.ticker,
             "classCode": order.class_code,
@@ -597,6 +600,8 @@ class FakeBroker:
             "remainedQuantity": order.quantity - order.executed,
             "transactionTime": moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
+        if execution_type is not None:
+            data["executionType"] = execution_type
         if order.price is not None:
             data["price"] = order.price
         if execution is not None:

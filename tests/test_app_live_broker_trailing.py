@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import logging
 import pathlib
 from datetime import datetime, timedelta
 
@@ -147,7 +148,8 @@ def test_a_signal_exit_cancels_the_conditional_before_the_exit_order(
 
 
 def test_the_conditional_filled_by_its_key_is_the_take_deal_and_the_robot_goes_on(
-    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """(в) Стережёт: исполнение условной по её ключу — сделка выхода по уровню движку.
 
@@ -172,4 +174,8 @@ def test_the_conditional_filled_by_its_key_is_the_take_deal_and_the_robot_goes_o
             assert rig.broker.position() == 0
             assert len(rig.creates()) == 2, rig.creates()
 
+    caplog.set_level(logging.WARNING)
     run(scenario())
+    # Кадр срабатывания (без `executionType`) поток не рвёт (/risk 14.11): обрыв
+    # терял исполнение, и сверка с отстающим портфелем останавливала робота.
+    assert "поток статусов заявок прервался" not in caplog.text, caplog.text

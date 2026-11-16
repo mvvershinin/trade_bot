@@ -2372,9 +2372,8 @@ class SettingsDialog(QDialog):
         self.time_exit_wait_bars.setValue(settings.time_exit_wait_bars)
         for name in _LIVE_WHOLE:
             getattr(self, name).setValue(getattr(settings, name))
-        self.live_position_settle_sec.setValue(settings.live_position_settle_sec)
-        self.live_fok_pct.setValue(settings.live_fok_pct)
-        self.live_trailing_spread_pct.setValue(settings.live_trailing_spread_pct)
+        for name in ("live_position_settle_sec", "live_fok_pct", "live_trailing_spread_pct"):
+            getattr(self, name).setValue(getattr(settings, name))
         self.live_reconnect_pauses_sec.setText(
             _pauses_text(settings.live_reconnect_pauses_sec)
         )
