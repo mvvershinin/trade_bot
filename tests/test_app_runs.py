@@ -341,6 +341,7 @@ _ANOTHER_ENGINE: dict[str, object] = {
     "trailing_offset_percent": 0.3,
     "trailing_step_percent": 0.07,
     "stop_after_take_profit": False,
+    "stop_after_loss": True,
     "min_exit_profit_sides": 2.0,
     "partial_candles": PartialCandles.SKIP,
     "commission_per_side": 7.0,

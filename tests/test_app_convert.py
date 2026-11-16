@@ -412,7 +412,7 @@ def test_every_engine_field_has_a_source() -> None:
         "mode", "window", "volume", "reversal", "take_profit",
         "take_profit_percent", "trailing_take_profit", "trailing_start_percent",
         "trailing_offset_percent", "trailing_step_percent",
-        "stop_after_take_profit", "commission_per_side",
+        "stop_after_take_profit", "stop_after_loss", "commission_per_side",
         # ⚠️ Переехало из `from_the_previous` 05.09.2026 (`B-021`): величину
         # спрашивают у биржи и кладут в поле окна, а не тащат у прежних
         # настроек, где она навсегда оставалась умолчанием 1,0.

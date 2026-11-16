@@ -134,6 +134,7 @@ FIXED_VALUES: dict[str, Any] = {
     "trailing_offset_percent": 0.10,
     "trailing_step_percent": 0.05,
     "stop_after_take_profit": True,
+    "stop_after_loss": False,
     "min_exit_profit_sides": 0.0,
     "partial_candles": PartialCandles.ACCEPT,
     "commission_per_side": COMMISSION,
