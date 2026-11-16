@@ -439,8 +439,8 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     "stop_after_take_profit": lambda values, _mode: (
         values.after_take_profit is AfterTakeProfit.STOP_FOR_THE_DAY
     ),
-    # Третий вариант списка «После сработавшего тейка» (`B-106`): «ждать
-    # нового сигнала», плюс первый убыток за день закрывает день для входов.
+    # Третий вариант списка «После сработавшего тейка» (`B-106`, `B-109`):
+    # «ждать нового сигнала», плюс первый убыток в окне закрывает окно для входов.
     "stop_after_loss": lambda values, _mode: (
         values.after_take_profit is AfterTakeProfit.WAIT_THEN_STOP_ON_LOSS
     ),
