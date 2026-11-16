@@ -186,7 +186,7 @@ import contextlib
 import dataclasses
 import enum
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -194,7 +194,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Final, Protocol
 
 from app import debug_feed
-from app.account_panel import AccountPanel, AccountSeen
+from app.account_panel import AccountPanel, AccountSeen, robot_live_orders
 from app.backfill import Backfiller
 from app.halt import halt_on_unknown_outcome
 from app.live_trading import LiveDesks
@@ -211,6 +211,7 @@ from broker.tokens import now_utc
 from engine import AccountFunds
 from market import MSK, MarketWorker, floor_to_minute
 from market import Candle as MarketCandle
+from market.commands import StoredCommand
 from market.storage import Source
 from ui.models import Connection, DecisionLevel, Settings
 
@@ -1874,6 +1875,10 @@ class FundsWatchers:
     #: снимок и живые заявки по инструменту, или почему не прочитано. `None` —
     #: строки нет, и список заявок не спрашивается вовсе. Возврат немедленный.
     account: Callable[[AccountSeen], None] | None = None
+    #: Незакрытые команды журнала — ключи заявок робота, о которых строка
+    #: спрашивает брокера по ключу (`B-105`: условную робота список заявок
+    #: может не показать). `None` — по ключу не спрашивать.
+    journal: Callable[[], Awaitable[Sequence[StoredCommand]]] | None = None
 
 
 class FundsWatch:
@@ -2058,21 +2063,42 @@ class FundsWatch:
         if isinstance(got, str):
             seen = AccountSeen(ticker, None, trouble=got)
         else:
+            seen = AccountSeen(ticker, got)
             try:
-                seen = AccountSeen(ticker, got, orders=await self._account.live_orders(ticker))
+                seen = dataclasses.replace(seen, orders=await self._account.live_orders(ticker))
             except asyncio.CancelledError:
                 raise
             except BrokerError as failure:
-                seen = AccountSeen(ticker, got, orders_trouble=failure.human)
+                seen = dataclasses.replace(seen, orders_trouble=failure.human)
             except Exception as error:  # трассировка уходит в log.exception
                 log.exception("список заявок для строки счёта упал", extra={"panel": False})
-                seen = AccountSeen(
-                    ticker, got, orders_trouble=f"ошибка программы: {type(error).__name__}"
+                seen = dataclasses.replace(
+                    seen, orders_trouble=f"ошибка программы: {type(error).__name__}"
                 )
+            seen = await self._robot_seen(seen, got.account)
         try:
             receiver(seen)
         except Exception:  # строка окна не роняет опрос денег
             log.exception("строка «Счёт у брокера» не собрана", extra={"panel": False})
+
+    async def _robot_seen(self, seen: AccountSeen, account: str | None) -> AccountSeen:
+        """Живые заявки робота по ключам журнала — в заход (`B-105`). Наружу не бросает."""
+        journal = self._watch.journal
+        if journal is None:
+            return seen
+        try:
+            robot, trouble = await robot_live_orders(
+                journal, self._account.order_state, ticker=seen.ticker, account=account
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # трассировка уходит в log.exception
+            log.exception("заявки робота для строки счёта не прочитаны", extra={"panel": False})
+            robot, trouble = (), (
+                f"заявки робота по журналу не прочитаны — ошибка программы: "
+                f"{type(error).__name__}"
+            )
+        return dataclasses.replace(seen, robot=robot, robot_trouble=trouble)
 
     async def _funds_once(self) -> AccountSnapshot | str:
         """Спросить, перевести, положить. Снимок — или почему его нет, словами.
@@ -2598,7 +2624,7 @@ class LiveLink:
             self._funds = FundsWatch(
                 Account(self._session, exchange=self._exchange),
                 ticker=self._ticker,
-                watchers=self._funds_watchers(self._funds_to),
+                watchers=self.funds_watchers(self._funds_to),
                 exchange_margin=self._exchange_margin,
             )
             # После каждой команды брокеру — внеочередной заход: строка
@@ -2631,10 +2657,10 @@ class LiveLink:
         """
         return float(self._port.values.live_stale_after_sec)
 
-    def _funds_watchers(
+    def funds_watchers(
         self, funds: Callable[[str, AccountFunds], None]
     ) -> FundsWatchers:
-        """Куда опрос счёта сообщает о себе. Отдельным методом — ради проверки.
+        """Куда опрос счёта сообщает о себе. Отдельным открытым методом — ради проверки.
 
         Выделено не ради красоты `_build`, а потому что иначе эту проводку
         не проверить ничем: `_build` строит сессию брокера и читает файл
@@ -2655,7 +2681,12 @@ class LiveLink:
             halted=lambda: bool(self._port.halted),
             position=self._port.position_read,
             account=self._account_seen,
+            journal=self._open_commands,
         )
+
+    async def _open_commands(self) -> tuple[StoredCommand, ...]:
+        """Незакрытые команды журнала — ключи заявок робота для строки счёта (`B-105`)."""
+        return await self._worker.call(lambda store: store.open_broker_commands())
 
     def _account_now(self) -> None:
         """Команда брокеру ушла — опрос счёта заходит сразу (решение 0070)."""

@@ -8,6 +8,7 @@
 Оснастка — `tests/test_app_live_executor.py`: подставной брокер
 (`tests/fake_broker.py`), журнал команд в настоящей базе во временной папке.
 Три сторожа — минимум по слову владельца; остальное — `BACKLOG.md`, D-196.
+Ещё два — `B-105` (условная в списке брокера своя) и `D-198` п. 3.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from broker.secret import Secret
 from broker.token_store import TokenStore
 from broker.tokens import TokenScope
 from engine.contracts import ExitReason, LevelTouch, OrderAction, OrderRequest, Side
-from tests.fake_broker import FakeBroker
+from tests.fake_broker import ACCEPT, Answer, FakeBroker
 from tests.test_app_live_executor import (
     BAR0,
     BAR1,
@@ -179,3 +180,53 @@ def test_the_conditional_filled_by_its_key_is_the_take_deal_and_the_robot_goes_o
     # Кадр срабатывания (без `executionType`) поток не рвёт (/risk 14.11): обрыв
     # терял исполнение, и сверка с отстающим портфелем останавливала робота.
     assert "поток статусов заявок прервался" not in caplog.text, caplog.text
+
+
+def test_a_conditional_left_by_close_position_is_not_called_foreign(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-105, `D-197` п. 8. Стережёт: условная робота в списке брокера узнаётся своей.
+
+    В списке заявок (15) своей цены у условной нет (`price` пуст), есть
+    `takePrice`; журнал пишет её ценой включения. «Закрыть позицию» снять её
+    не смогло — позиция не закрывается, а живая условная обязана читаться
+    заявкой робота, а не «заявкой, не найденной в журнале робота».
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(conditional())
+            rig.broker.cancel_answers.append(Answer(False, ACCEPT.reply))
+            text, sent = await rig.executor.close_by_hand(stop=False)
+            assert "Позиция не закрывается" in text, text
+            assert "не найденные в журнале робота" not in text, text
+            assert not sent, "закрывающая ушла поверх живой условной"
+            assert rig.broker.position() == 1
+
+    run(scenario())
+
+
+def test_a_halt_after_a_foreign_trade_names_the_live_conditional(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """D-198 п. 3. Стережёт: остановка после чужой сделки называет живую условную с ключом.
+
+    Робот встал и ничего не снимает, а условная у брокера живёт сама:
+    сработав, она откроет позицию и на пустом счёте. Текст остановки
+    называет её ключ и говорит снять.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(tmp_path, store, broker) as rig:
+            await long_open(rig)
+            await rig.executor.submit(conditional())
+            [body] = conditional_bodies(rig)
+            rig.broker.foreign_trade("2", 1, 100.0)
+            await heard()
+            text = rig.executor.halted or ""
+            assert "которой программа не подавала" in text, text
+            assert str(body["clientOrderId"]) in text, text
+            assert "Снять заявку" in text and "на пустом счёте" in text, text
+
+    run(scenario())

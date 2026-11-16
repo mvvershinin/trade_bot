@@ -170,6 +170,8 @@ class BookOrder:
     #: Срок заявки, `timeInForce` (13): `1` — до конца дня, `2` — исполнить
     #: целиком или снять (FOK). Ушло без поля — `None`: подделка не додумывает.
     time_in_force: str | None = None
+    #: Цена включения условной (`takePrice`, тип `5`); у прочих — `None`.
+    take_price: float | None = None
     status: str = "0"
     executed: int = 0
     turnover: float = 0.0
@@ -307,6 +309,7 @@ class FakeBroker:
                 price=body.get("price"),
                 exchange_id=f"FAKE-EXCH-{next(self._numbers)}",
                 time_in_force=None if "timeInForce" not in body else str(body["timeInForce"]),
+                take_price=body.get("takePrice"),
             )
             self.orders.append(order)
             self._note_live()
@@ -366,7 +369,7 @@ class FakeBroker:
                 "orderQuantity": float(order.quantity),
                 "executedQuantity": float(order.executed),
                 "remainedQuantity": float(order.quantity - order.executed),
-                "price": order.price, "orderStatus": listed,
+                "price": order.price, "takePrice": order.take_price, "orderStatus": listed,
             })
         return httpx.Response(
             200, json={"records": records, "totalRecords": len(records), "totalPages": 1}

@@ -417,6 +417,17 @@ class FakeWorker:
         self._closed = True
         self._open = False
 
+    async def call[T](self, work: Callable[[Any], T]) -> T:
+        """Работа над базой — над пустым журналом команд (`B-105`: строка счёта).
+
+        Оригинал открывает базу по требованию; у дублёра базы нет, и поток
+        просит через `call` только незакрытые команды журнала — их здесь нет.
+        После `close()` — тот же отказ, что у оригинала.
+        """
+        if self._closed:
+            raise RuntimeError("поток данных остановлен, база закрыта")
+        return work(SimpleNamespace(open_broker_commands=tuple))
+
     async def put_minutes(
         self, symbol: str, candles: Iterable[Candle], source: Source
     ) -> WriteStats:

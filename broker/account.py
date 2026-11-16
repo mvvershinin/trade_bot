@@ -46,9 +46,10 @@ import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final, Mapping
+from uuid import UUID
 
 from broker.errors import IncompleteAccountData, UnexpectedAnswer
-from broker.orders import ListedOrderStatus, OrdersPage, OrdersQuery
+from broker.orders import ListedOrderStatus, OrdersPage, OrdersQuery, OrderState
 from broker.parsing import first_mapping, moment, number, pick, text
 from broker.session import LIMITS_PATH, PORTFOLIO_PATH, BrokerSession
 from broker.tokens import now_utc
@@ -1064,3 +1065,13 @@ class Account:
         return await self._session.search_orders(
             OrdersQuery(statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,))
         )
+
+    async def order_state(self, key: UUID) -> OrderState | None:
+        """Статус заявки по нашему ключу (11) — для той же строки (`B-105`).
+
+        Условную заявку робота 16.11.2026 статус по ключу показал живой,
+        а проверочное чтение списка (15) — нет (разбор — `B-105`). Поэтому
+        живые заявки робота строка спрашивает и по ключу. `None` — 404:
+        заявки с этим ключом у брокера нет.
+        """
+        return await self._session.order_status(key)
