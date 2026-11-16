@@ -205,6 +205,13 @@ _HALT_TAIL: Final[str] = (
     "Робот остановлен. Прежде чем продолжать, проверьте позицию и заявки у брокера."
 )
 
+#: «Закрыть всё» без закрывающей заявки: своя заявка не снялась (D-198 п. 2).
+_KEPT_OPEN: Final[str] = (
+    "Позиция не закрывается, закрывающая заявка не подана: заявка робота осталась "
+    "у брокера и после закрытия исполнилась бы сама, открыв позицию заново. Снимите "
+    "её кнопкой «Снять заявку» или в приложении брокера, затем закройте позицию."
+)
+
 #: Чужой текст (причина отказа биржи) — без управляющих знаков и не длиннее этого.
 _FOREIGN_TEXT_LIMIT: Final[int] = 200
 
@@ -674,10 +681,14 @@ def _listed_side(order: ListedOrder) -> CommandSide | None:
 
 
 def _listed_words(order: ListedOrder) -> str:
-    """Живая заявка из списка брокера словами: сторона, остаток, цена."""
+    """Живая заявка из списка брокера словами: сторона, остаток, цена или включение."""
     side = _listed_side(order)
     volume = order.remained_quantity or order.order_quantity or "?"
-    price = "" if order.price is None else f" по {order.price:g}"
+    level = order.level
+    if order.conditional:
+        price = f" условная, включение {level or 0:g}"
+    else:
+        price = "" if level is None else f" по {level:g}"
     return f"{'?' if side is None else _HAND_SIDE[side]} {volume}{price}"
 
 
@@ -1402,7 +1413,15 @@ class LiveExecutor:
     async def _foreign_listed(
         self, handled: Sequence[StoredCommand]
     ) -> tuple[list[ListedOrder], bool]:
-        """Живые заявки по инструменту не из журнала робота и «список не весь». `BrokerError`."""
+        """Живые заявки по инструменту не из журнала робота и «список не весь». `BrokerError`.
+
+        Строка узнаётся своей по стороне, уровню и объёму. Уровень условной —
+        цена включения (`ListedOrder.level`): журнал пишет условную ценой
+        включения, а своей цены у неё до срабатывания нет (`B-105`, `D-197`
+        п. 8). По `price` условная робота читалась бы чужой — при подхвате
+        это ложный отказ «чужой тейк», после «Закрыть позицию» — ложное
+        «живы заявки не робота».
+        """
         ticker = self._instrument.ticker
         page = await self._session.search_orders(OrdersQuery(
             statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,),
@@ -1414,7 +1433,7 @@ class LiveExecutor:
         foreign = [
             one for one in page.records
             if one.status is ListedOrderStatus.ACTIVE and one.ticker in (None, ticker)
-            and (_listed_side(one), one.price, one.order_quantity) not in ours
+            and (_listed_side(one), one.level, one.order_quantity) not in ours
         ]
         return foreign, (page.total_pages or 1) > 1
 
@@ -2818,12 +2837,16 @@ class LiveExecutor:
         # Остановка — ДО закрывающей заявки: ни одна заявка движка больше не уйдёт.
         self._halt = f"{why} Робот остановлен, позиция закрывается."
         with self._permitted():
-            notes = await self._cancel_all()
+            notes, alive = await self._cancel_all()
             # Тейк, исполнившийся при снятии, — сделка, и движок о ней узнает
             # вместе с остановкой (`_stop`): забыть его вместе со сторожами нельзя.
             self._collect_takes()
             self._takes.clear()
-            notes.append(await self._close_position())
+            # Своя заявка не снялась — закрывающую не подавать, как у кнопки
+            # «Закрыть позицию» (`_hand_close`, `/risk` 14.11.2026 D-198 п. 2):
+            # тейк или условная, оставшись у брокера, после закрытия исполнились
+            # бы сами и открыли позицию заново — шорт без сигнала.
+            notes.append(_KEPT_OPEN if alive else await self._close_position())
         text = " ".join(
             [why, *notes, "Робот остановлен до вашего решения (решение 0020)."]
         )
@@ -2833,8 +2856,10 @@ class LiveExecutor:
         self._news()
         return text
 
-    async def _cancel_all(self) -> list[str]:
+    async def _cancel_all(self) -> tuple[list[str], bool]:
+        """Снять все свои живые заявки. Возврат — слова и «хоть одна осталась жива»."""
         notes: list[str] = []
+        alive = False
         for ticket in list(self._tickets.values()):
             if ticket.final or ticket.answer is _Answer.REFUSED:
                 continue
@@ -2842,10 +2867,11 @@ class LiveExecutor:
                 await self._cancel_ticket(ticket)
             except (ExecutionRefused, ExecutionHalted) as error:
                 notes.append(f"Заявку ({ticket.what}) снять не удалось: {error}")
+                alive = True
                 continue
             done = "успела исполниться" if ticket.status is OrderStatus.FILLED else "снята"
             notes.append(f"Заявка ({ticket.what}) {done}.")
-        return notes
+        return notes, alive
 
     async def _close_position(self, *, trusted: bool | None = None) -> str:
         """Одна заявка FOK на всё, что у брокера, — только по согласным сведениям (С2, К2).
@@ -3464,9 +3490,31 @@ class LiveExecutor:
         self._set_halt(
             f"По {ticker} прошла сделка, которой программа не подавала: {verb} {volume}{at}. "
             "Похоже, заявка подана руками из приложения брокера — позиция у брокера "
-            f"разошлась с роботом. {_HALT_TAIL}"
+            f"разошлась с роботом. {_HALT_TAIL}{self._left_alive_words()}"
         )
         self._notify()
+
+    def _left_alive_words(self) -> str:
+        """Свои живые заявки у брокера с ключами — хвост строки остановки (D-198 п. 3).
+
+        Робот остановлен и ничего не подаёт и не снимает (`_gate`), а условная
+        заявка у брокера живёт сама: сработав, она откроет позицию и на пустом
+        счёте. Срок её жизни у брокера не известен (`D-197` п. 6). Промолчать
+        о ней — оставить человека с уверенностью, что робот стоит и всё стоит.
+        """
+        alive = [
+            ticket for ticket in self._tickets.values()
+            if not ticket.final and not ticket.missing and ticket.answer is not _Answer.REFUSED
+        ]
+        if not alive:
+            return ""
+        listed = "; ".join(f"{ticket.what} (ключ {ticket.key})" for ticket in alive)
+        return (
+            f" У брокера живы заявки робота: {listed}. Робот их больше не ведёт — "
+            "снимите их кнопкой «Снять заявку» или в приложении брокера: иначе такая "
+            "заявка исполнится сама, а условная сработает и откроет позицию даже "
+            "на пустом счёте."
+        )
 
     # -- журнал и остановка ----------------------------------------------------
 

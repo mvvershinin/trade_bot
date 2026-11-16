@@ -6,16 +6,30 @@
 from __future__ import annotations
 
 import asyncio
+import pathlib
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
+from uuid import UUID
 
 from app.account_panel import AccountPanel, AccountSeen
-from app.live_feed import FundsWatch, FundsWatchers
+from app.live_feed import FundsWatch, FundsWatchers, LiveLink
 from app.port import _settings_blocks
 from broker.account import Account
-from broker.orders import ListedOrder, ListedOrderStatus, OrderSide, OrdersPage, OrdersQuery
+from broker.orders import (
+    ListedOrder,
+    ListedOrderStatus,
+    OrderSide,
+    OrdersPage,
+    OrdersQuery,
+    OrderState,
+    parse_order_state,
+)
 from broker.session import PORTFOLIO_PATH
+from market import CandleStore, MarketWorker
+from market.commands import BrokerCommand, CommandAction, CommandSide
+from market.journal import RunOrigin, SessionRecord
 from ui.models import MinuteBarLimit, Settings
 from ui.settings_dialog import trailing_in_live
 
@@ -53,17 +67,34 @@ def take_order() -> ListedOrder:
 
 
 class BrokerSession:
-    """Брокер: портфель, лимиты без рублей, список заявок. Помнит запросы списка."""
+    """Брокер: портфель, лимиты без рублей, список заявок, статус по ключу. Помнит запросы.
 
-    def __init__(self) -> None:
+    Статус по ключу — живая условная покупка, как 16.11.2026 в 10:03:
+    `NEW`, тип `5`, `price` 0.
+    """
+
+    def __init__(self, listed: tuple[ListedOrder, ...] | None = None) -> None:
         self.queries: list[OrdersQuery] = []
+        self.asked: list[UUID] = []
+        self._listed = (take_order(),) if listed is None else listed
 
     async def read(self, path: str, **_: object) -> object:
         return broker_portfolio() if path == PORTFOLIO_PATH else {"moneyLimits": []}
 
     async def search_orders(self, query: OrdersQuery) -> OrdersPage:
         self.queries.append(query)
-        return OrdersPage(records=(take_order(),), total_records=1, total_pages=1)
+        return OrdersPage(
+            records=self._listed, total_records=len(self._listed), total_pages=1
+        )
+
+    async def order_status(self, key: UUID) -> OrderState:
+        self.asked.append(key)
+        return parse_order_state({"clientOrderId": str(key), "data": {
+            "orderStatus": "0", "executionType": "0", "orderId": "1", "ticker": "MXZ6",
+            "classCode": "SPBFUT", "side": "1", "orderType": "5", "orderQuantity": 1,
+            "executedQuantity": 0, "remainedQuantity": 1, "price": 0,
+            "transactionTime": "2026-11-16T07:03:00.000Z",
+        }})
 
     def stored(self) -> SimpleNamespace:
         return SimpleNamespace(account="ACCOUNT-1")
@@ -122,3 +153,66 @@ def test_trailing_in_live_is_not_forbidden_and_the_words_name_the_broker() -> No
     )
     assert _settings_blocks(trailing, trailing) == (), "скользящий уровень в бою снова запрещён"
     assert "брокер" in trailing_in_live(), trailing_in_live()
+    # D-198 п. 3: «работает, даже если программа закрыта» — только в пределах
+    # сессии; переживает ли условная клиринг, живьём не проверено.
+    assert "клиринг не проверен" in trailing_in_live(), trailing_in_live()
+
+
+#: Ключ условной робота в журнале команд; цена в журнале — цена включения.
+CONDITIONAL_KEY = "00000000-0000-4000-8000-0000000b1050"
+
+
+def test_the_account_line_shows_the_robot_conditional_missing_from_the_list(
+    tmp_path: pathlib.Path,
+) -> None:
+    """B-105. Стережёт: живая условная робота в строке, даже если список брокера её не дал.
+
+    16.11.2026 10:03: проверочное чтение списка (15) — 0 активных, статус по
+    ключу (11) — условная `NEW`, тип `5`, `price` 0. Здесь список пуст,
+    в журнале команд — условная покупка (тейк шорта) ценой включения 248 150,
+    брокер по её ключу отвечает «жива». Проводка настоящая: журнал читает
+    `LiveLink.funds_watchers` из базы, по ключу спрашивает `Account`.
+    Строка обязана сказать «тейк стоит условной заявкой» с ценой включения,
+    а не «тейка у брокера нет».
+    """
+    session: Any = BrokerSession(listed=())
+    worker = MarketWorker(tmp_path / "base.sqlite3")
+    link = LiveLink(
+        cast("Any", SimpleNamespace(
+            note=lambda *_: None, halt=lambda *_: None, halted=None,
+            position_read=lambda *_: None,
+        )),
+        worker, userdata=tmp_path, ticker="MXZ6", class_code="SPBFUT",
+    )
+    seen: list[AccountSeen] = []
+    watchers = replace(link.funds_watchers(lambda *_: None), account=seen.append)
+
+    async def go() -> None:
+        def plant(base: CandleStore) -> None:
+            run = base.open_journal_session(
+                SessionRecord(RunOrigin.LIVE, symbol="MXZ6"), now=datetime.now(UTC)
+            )
+            base.record_broker_command(run.id, BrokerCommand(
+                client_order_id=CONDITIONAL_KEY, action=CommandAction.CREATE,
+                order_id="take:short:бой", symbol="MXZ6", side=CommandSide.BUY,
+                volume=1, price=248_150.0, account="AGREEMENT-1",
+            ))
+
+        await worker.call(plant)
+        watch = FundsWatch(Account(session), ticker="MXZ6", watchers=watchers)
+        watch.start()
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.005)
+        await watch.aclose()
+        await worker.close()
+
+    asyncio.run(go())
+
+    assert seen, "заход опроса не отдал прочитанное строке счёта"
+    assert session.asked == [UUID(CONDITIONAL_KEY)], "по ключу журнала брокера не спросили"
+    text = AccountPanel().line(seen[0], at=datetime.now(UTC), ruble_per_point=1.0).text
+    text = text.replace("\xa0", " ")
+    assert "тейк стоит условной заявкой, включение 248 150" in text, text
+    assert "тейка у брокера нет" not in text, text

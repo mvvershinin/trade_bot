@@ -188,6 +188,11 @@ ORDER_ID_BY_CLIENT: Final[str] = "1"
 #: документация не называет; любое другое — исход неизвестен.
 ACCEPTED_STATUS: Final[str] = "OK"
 
+#: Условные заявки в **своём** перечне типов списка (15): стоп-лимит `4`,
+#: тейк-профит `5` (порождает лимитную), стоп-лосс `6`, тейк-профит и
+#: стоп-лосс `7`, тейк-профит `11`. Их уровень — цена включения, а не `price`.
+LISTED_CONDITIONAL_TYPES: Final[frozenset[int]] = frozenset({4, 5, 6, 7, 11})
+
 #: Размер страницы списков (15, 16): умолчание и потолок документации.
 DEFAULT_PAGE_SIZE: Final[int] = 50
 MAX_PAGE_SIZE: Final[int] = 100
@@ -530,6 +535,24 @@ class ListedOrder:
     reject_reason: str | None
     ordered_at: datetime | None
     updated_at: datetime | None
+
+    @property
+    def conditional(self) -> bool:
+        """Условная заявка по перечню страницы 15 (`LISTED_CONDITIONAL_TYPES`)."""
+        return self.order_type in LISTED_CONDITIONAL_TYPES
+
+    @property
+    def level(self) -> float | None:
+        """Цена, по которой заявку узнают и показывают.
+
+        У условной это цена включения (`takePrice`, у стопа `stopPrice`):
+        своей цены до срабатывания у неё нет — статус по ключу (11) 16.11.2026
+        отдал у живой условной `price` 0. Пустая или нулевая `price` у любой
+        заявки — тоже не цена. У прочих — `price` как есть.
+        """
+        if self.conditional or not self.price:
+            return self.take_price or self.stop_price or None
+        return self.price
 
 
 @dataclass(frozen=True, slots=True)

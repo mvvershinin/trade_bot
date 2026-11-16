@@ -813,8 +813,8 @@ def test_a_close_all_names_the_take_it_could_not_cancel(
     Портфель (лонг 2) и сделки программы (лонг 1) расходятся, поэтому позиция
     не закрывается (К2), а лимитный тейк у брокера, возможно, жив: исполнившись,
     он продаст без робота. Промолчать об этом — оставить человека с уверенностью,
-    что заявок у брокера нет (правило 13). Случай «позиция закрыта, тейк жив» —
-    `test_a_close_all_that_closed_still_names_the_take_it_could_not_cancel`.
+    что заявок у брокера нет (правило 13). Случай «позиция и сделки согласны,
+    тейк жив» — `test_a_close_all_does_not_close_while_the_take_it_could_not_cancel_lives`.
     """
 
     async def scenario() -> None:
@@ -3166,21 +3166,23 @@ def test_a_close_all_does_not_say_closed_while_the_portfolio_lags_a_seen_trade(
     run(scenario())
 
 
-def test_a_close_all_that_closed_still_names_the_take_it_could_not_cancel(
+def test_a_close_all_does_not_close_while_the_take_it_could_not_cancel_lives(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """«Закрыть всё» закрыло позицию, а тейк снять не смогло — текст говорит и то, и другое.
+    """D-198 п. 2: свою заявку снять не удалось — «закрыть всё» закрывающую не подаёт.
 
-    Опасное сочетание: «закрыта» читается как «на счёте пусто», а
-    лимитный тейк, возможно, жив и, исполнившись, откроет шорт без робота.
-    Робот считает лонг 1, а портфель и сделки потока согласно говорят лонг 2:
-    объём закрытия подтверждён (К2), продажа на 2 прошла.
+    Как кнопка «Закрыть позицию» (`_hand_close`). Прежде здесь уходила
+    продажа на 2, а лимитный тейк на 2 оставался жив: исполнившись, он
+    открыл бы шорт 2 без робота. Портфель и сделки потока согласны (лонг 2),
+    так что заявку останавливает именно живой тейк, а не расхождение (К2).
+    Текст называет тейк с ключом и говорит, что позиция не закрывается.
     """
 
     async def scenario() -> None:
         async with make_rig(tmp_path, store, broker) as rig:
             await long_open(rig, volume=2)
             await rig.executor.submit(arm(110.0, LevelTouch.RISE, volume=2))
+            take_key = str(rig.creates()[-1]["clientOrderId"])
             rig.broker.cancel_answers.append(Answer(False, ACCEPT.reply))
             rig.exchange.plans.append(filled((2, 99.0)))
             rig.clock.now = BAR1 + timedelta(seconds=5)
@@ -3188,11 +3190,15 @@ def test_a_close_all_that_closed_still_names_the_take_it_could_not_cancel(
             with pytest.raises(ExecutionHalted) as halted:
                 await submit_on_signal(rig, leave(volume=1))
             text = halted.value.human
-            assert "закрыта заявкой FOK" in text
             assert "Заявку (тейк лонга, по цене 110" in text and "снять не удалось" in text
+            assert take_key in text, text
+            assert "Позиция не закрывается" in text, text
+            assert [body for body in rig.sells() if body["timeInForce"] == FOK] == [], (
+                "закрывающая FOK ушла поверх живого тейка"
+            )
             live = [(one.order_type, one.time_in_force) for one in rig.broker.live()]
             assert live == [("2", DAY)]
-            assert rig.broker.position(TICKER) == 0
+            assert rig.broker.position(TICKER) == 2
 
     run(scenario())
 
