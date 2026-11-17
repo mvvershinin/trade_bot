@@ -43,9 +43,10 @@ import enum
 import functools
 import math
 import typing
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from itertools import chain
 from typing import Any, Final
 
 from app.fact import LiveLimits
@@ -2218,6 +2219,27 @@ def trades_summary(run: HistoryRun) -> TradesSummary:
     )
 
 
+#: Насколько вперёд от последней свечи ряда продолжается разбор затенения.
+#: Константа показа, а не торговое число: на решения робота она не влияет,
+#: только на то, докуда вправо нарисована полоса. Суток хватает с запасом:
+#: в будний день полоса успевает дойти до ближайшего открытия окна, а дальше
+#: правого края экрана её всё равно не видно.
+_SHADE_AHEAD: Final = timedelta(days=1)
+
+
+def _bars_ahead(last: MarketCandle) -> Iterator[MarketCandle]:
+    """Воображаемые бары того же таймфрейма после `last` — на `_SHADE_AHEAD` вперёд.
+
+    Первый из них стоит на месте растущей свечи, которую порт дорисовывает
+    после прогона (`_keep_forming`), остальные — будущее справа. Цены у них
+    чужие и не читаются: нужно только время, и закрытие считается тем же
+    `close_time`, что у настоящих свечей.
+    """
+    step = last.timeframe.delta
+    for count in range(1, _SHADE_AHEAD // step + 1):
+        yield last.replace(time=last.time + count * step)
+
+
 def shades_of(
     candles: Sequence[MarketCandle], settings: EngineSettings
 ) -> tuple[Shade, ...]:
@@ -2248,6 +2270,14 @@ def shades_of(
     закрытая биржа, — и полоса называет ту, которая была. Различает их движок
     (`day_verdict`), не мы: вторая реализация правила разошлась бы с первой
     молча, и на графике была бы затенена не та половина.
+
+    ⚠️ Разбор не кончается на последней свече ряда. Справа от неё — растущая
+    свеча и будущее, и прежде полоса обрывалась на последней закрытой: в 07:22
+    при окне 09:10–11:00 правый край графика выглядел как идущее окно
+    (17.11.2026). Поэтому за рядом тот же разбор идёт по воображаемым барам
+    того же таймфрейма (`_bars_ahead`) — тем же закрытием и теми же
+    предикатами движка, — и полоса продолжается без шва. Продолжение живёт
+    здесь, а не у вызывающего: забыть его в проводке нельзя.
     """
     if not candles:
         return ()
@@ -2256,7 +2286,7 @@ def shades_of(
     end: datetime | None = None
     outside = False
     rules: set[DayRule] = set()
-    for candle in candles:
+    for candle in chain(candles, _bars_ahead(candles[-1])):
         closes_at = close_time(candle)
         # ⚠️ Окно «весь день» (начало равно концу) отдельной проверки не имеет
         # намеренно: `contains` для него возвращает True всегда, и единственной

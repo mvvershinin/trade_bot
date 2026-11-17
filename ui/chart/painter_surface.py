@@ -868,8 +868,11 @@ class PainterChartSurface(QWidget, ChartSurface):
             if box.width() > 90:
                 painter.setFont(font)
                 painter.setPen(QPen(self._theme.qcolor(self._theme.text_dim, 200)))
+                # Ниже подписи графика: `_draw_caption` занимает строку от
+                # top + 2 высотой 18 и кладёт под неё подложку, которая
+                # рисуется позже и закрывала подпись полосы.
                 painter.drawText(
-                    box.adjusted(4, 2, -4, 0),
+                    box.adjusted(4, 22, -4, 0),
                     int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter),
                     shade.note or shade.kind.label,
                 )

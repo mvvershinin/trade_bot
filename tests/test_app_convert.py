@@ -763,10 +763,15 @@ def test_the_shading_decides_by_closes_but_is_laid_out_by_starts() -> None:
         "робот торговал, либо оставила незатенённой свечу, на которой он молчал"
     )
 
+    # Полоса после окна уходит за последнюю свечу — в воображаемые бары того
+    # же таймфрейма, — поэтому её конец сверяется с сеткой оси, а не со
+    # свечами ряда. Ряд непрерывен: внутри него сетка и есть его свечи.
     starts = {each_candle.time for each_candle in candles}
+    step = candles[0].timeframe.delta
     for band in bands:
-        assert band.start in starts and band.end in starts, (
-            "граница полосы не совпадает ни с одной отметкой свечи на оси: "
+        assert band.start in starts, band.start
+        assert (band.end - candles[0].time) % step == timedelta(0), (
+            "граница полосы не совпадает ни с одной отметкой оси: "
             "полоса стоит между свечами"
         )
 
@@ -790,7 +795,10 @@ def test_a_non_trading_day_is_shaded_even_without_a_trading_window() -> None:
     assert bands, "выходной день не затенён — не видно, где робот молчал"
     assert "Нерабочий день" in bands[0].note, bands[0].note
     assert bands[0].start == datetime(2026, 6, 20, 10, 0, tzinfo=MSK)
-    assert bands[0].end == datetime(2026, 6, 20, 10, 55, tzinfo=MSK)
+    assert bands[0].end > saturday[-1].time, (
+        "полоса оборвалась на последней свече: суббота справа от неё "
+        "выглядит торговой"
+    )
 
 
 def test_trading_on_weekends_removes_the_weekend_shading() -> None:
@@ -801,6 +809,48 @@ def test_trading_on_weekends_removes_the_weekend_shading() -> None:
         trade_in_weekend=True,
     )
     assert convert.shades_of(saturday, configuration) == ()
+
+
+#: Окно владельца счёта 17.11.2026 и два положения последней закрытой свечи.
+#: 17.06.2026 — среда, следующий день тоже будний.
+_AHEAD_CASES = {
+    # 07:22: последняя закрытая 07:15, растёт 07:20. Полоса одна — от первой
+    # свечи ряда до 09:05 включительно: закрытие 09:05 в 09:10 в окно
+    # 09:10–11:00 не входит, закрытие 09:10 в 09:15 входит.
+    "до окна": (
+        _series(7, 0, 4, day=17),
+        datetime(2026, 6, 17, 7, 0, tzinfo=MSK),
+        datetime(2026, 6, 17, 9, 5, tzinfo=MSK),
+    ),
+    # В окне, последняя закрытая 10:30: будущее до 10:50 торговое, полоса
+    # начинается со свечи 10:55 — её закрытие 11:00 в окно не входит — и идёт
+    # до 09:05 следующего утра.
+    "в окне": (
+        _series(9, 10, 17, day=17),
+        datetime(2026, 6, 17, 10, 55, tzinfo=MSK),
+        datetime(2026, 6, 18, 9, 5, tzinfo=MSK),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_AHEAD_CASES))
+def test_the_shading_continues_past_the_last_closed_candle(case: str) -> None:
+    """Растущая свеча и будущее справа затенены по тому же правилу окна.
+
+    Жалоба владельца счёта 17.11.2026: бой включён в 07:22, окно 09:10–11:00
+    ещё не открылось, а график светлый справа от последней закрытой свечи —
+    читается как «окно идёт». Полоса обязана продолжаться за ряд без шва
+    и обрываться ровно там, где по закрытию бара открывается окно.
+    """
+    candles, start, end = _AHEAD_CASES[case]
+    configuration = EngineSettings(window=TradingWindow(start=time(9, 10), end=time(11, 0)))
+    bands = convert.shades_of(candles, configuration)
+    assert bands, "за последней свечой не затенено ничего"
+    assert (bands[0].start, bands[0].end) == (start, end), (
+        f"{case}: первая полоса {bands[0].start:%d.%m %H:%M}–{bands[0].end:%d.%m %H:%M}, "
+        f"ожидалась {start:%d.%m %H:%M}–{end:%d.%m %H:%M}: либо полоса оборвалась "
+        "на последней свече, либо граница окна взята не по закрытию бара"
+    )
 
 
 def test_the_band_label_never_promises_an_exit_that_will_not_happen() -> None:
@@ -881,24 +931,26 @@ def test_the_band_names_the_owner_mark_and_not_the_weekend() -> None:
     другим значит объяснять владельцу счёта его собственное решение чужой
     причиной (решение 0038).
     """
-    friday = _series(10, 0, 12, day=19)  # 19.06.2026 — пятница, обычный будний
+    # 17.06.2026 — среда: полоса уходит за последнюю свечу в следующий день,
+    # и после пятницы она захватила бы субботу, а с ней и «выходные» в подписи.
+    wednesday = _series(10, 0, 12, day=17)
     marked = EngineSettings(
         window=TradingWindow(start=time(10, 0), end=time(10, 0)),  # весь день
-        calendar=DayMarks.of({date(2026, 6, 19): False}),
+        calendar=DayMarks.of({date(2026, 6, 17): False}),
     )
-    bands = convert.shades_of(friday, marked)
+    bands = convert.shades_of(wednesday, marked)
     assert bands, "помеченный день не затенён — не видно, где робот молчал"
     assert "вы пометили эти дни нерабочими" in bands[0].note, bands[0].note
 
 
 def test_the_band_names_a_closed_exchange_in_its_own_words() -> None:
     """День, закрытый биржей, подписан биржей, а не выходными и не отметкой."""
-    friday = _series(10, 0, 12, day=19)
+    wednesday = _series(10, 0, 12, day=17)  # среда — разбор в тесте выше
     closed = EngineSettings(
         window=TradingWindow(start=time(10, 0), end=time(10, 0)),
-        exchange_days=DayMarks.of({date(2026, 6, 19): False}),
+        exchange_days=DayMarks.of({date(2026, 6, 17): False}),
     )
-    bands = convert.shades_of(friday, closed)
+    bands = convert.shades_of(wednesday, closed)
     assert bands
     assert "биржа в эти дни не работает" in bands[0].note, bands[0].note
 
