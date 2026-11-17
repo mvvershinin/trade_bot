@@ -2,7 +2,9 @@
 
 Панель только показывает то, что пришло в `RobotState`. Она не считает прибыль,
 не определяет, есть ли позиция, и не решает, боевой сейчас режим или симуляция:
-все ответы приходят готовыми.
+все ответы приходят готовыми. Одно место складывает два снимка: «бой просили»
+из снимка боя и «исполнитель собран» из состояния — пока второго нет, панель
+говорит «БОЙ: собирается», а не «СИМУЛЯЦИЯ» (`_assembling`).
 
 Два места, где оформление — не косметика:
 
@@ -119,6 +121,11 @@ class StatusPanel(QFrame):
         layout.addStretch(1)
         layout.addWidget(self.regime)
 
+        #: Последний снимок состояния и «бой просили» из последнего снимка боя:
+        #: панель между «Включить бой» и сборкой исполнителя складывает оба
+        #: (`_assembling`), а приходят они разными сигналами.
+        self._state = RobotState()
+        self._live_wanted = False
         self.apply_state(RobotState())
 
     def set_theme(self, theme: Theme) -> None:
@@ -129,25 +136,14 @@ class StatusPanel(QFrame):
 
     def apply_state(self, state: RobotState) -> None:
         theme = self._theme
+        self._state = state
         self.instrument.set(f"{state.instrument} · {state.timeframe}")
 
         self.connection.set(
             state.connection.label, _connection_color(theme, state.connection)
         )
 
-        # ⚠️ «Остановлен» и «стоит» — разные вещи, и путать их нельзя.
-        # «Робот стоит» — обычное состояние: его не запускали. «Остановлен» —
-        # движок перестал понимать, что происходит на счёте, и ждёт человека;
-        # сам он из этого состояния не выйдет. Подробности — крупной плашкой
-        # в главном окне, здесь только отметка, чтобы состояние было видно
-        # и после того, как плашку пролистали.
-        if state.halted:
-            self.mode.set(f"ОСТАНОВЛЕН · {state.mode.label}", theme.danger)
-            self.mode.value.setToolTip(state.halted)
-        else:
-            mode_text = state.mode.label + ("" if state.running else " · робот стоит")
-            self.mode.set(mode_text, theme.danger if state.mode.name == "OFF" else None)
-            self.mode.value.setToolTip(state.mode.hint)
+        self._show_mode()
 
         if state.position is None:
             self.position.set("Нет позиции", theme.text_dim)
@@ -187,8 +183,50 @@ class StatusPanel(QFrame):
         )
 
         self.commission.set(fmt_money(state.day_commission_rub), theme.text_dim)
+        self._show_regime()
 
-        if state.simulation:
+    def _assembling(self) -> bool:
+        """Бой просили, а исполнителя ещё нет: собирается на закрытии свечи.
+
+        Между «Включить бой» и сборкой состояние ещё от прогона-симуляции
+        (`running` ложно, `simulation` стоит), и панель говорила «робот стоит»
+        и «СИМУЛЯЦИЯ» рядом с «БОЙ: заявки уходят брокеру» (бой 16.11.2026,
+        08:58). Остановка главнее: остановленный бой не собирается.
+        """
+        state = self._state
+        return self._live_wanted and not state.running and not state.halted
+
+    def _show_mode(self) -> None:
+        """Ячейка «Режим»: остановлен, бой собирается или обычное «стоит/идёт»."""
+        theme, state = self._theme, self._state
+        # ⚠️ «Остановлен» и «стоит» — разные вещи, и путать их нельзя.
+        # «Робот стоит» — обычное состояние: его не запускали. «Остановлен» —
+        # движок перестал понимать, что происходит на счёте, и ждёт человека;
+        # сам он из этого состояния не выйдет. Подробности — крупной плашкой
+        # в главном окне, здесь только отметка, чтобы состояние было видно
+        # и после того, как плашку пролистали.
+        if state.halted:
+            self.mode.set(f"ОСТАНОВЛЕН · {state.mode.label}", theme.danger)
+            self.mode.value.setToolTip(state.halted)
+        elif self._assembling():
+            self.mode.set(f"{state.mode.label} · {ASSEMBLING_MODE}", theme.warning)
+            self.mode.value.setToolTip(f"{ASSEMBLING_HINT}\n\n{state.mode.hint}")
+        else:
+            mode_text = state.mode.label + ("" if state.running else " · робот стоит")
+            self.mode.set(mode_text, theme.danger if state.mode.name == "OFF" else None)
+            self.mode.value.setToolTip(state.mode.hint)
+
+    def _show_regime(self) -> None:
+        """Отметка справа: симуляция, бой собирается или боевой режим."""
+        theme, state = self._theme, self._state
+        if self._assembling():
+            self.regime.setText(f"  {ASSEMBLING_BADGE}  ")
+            self.regime.setStyleSheet(
+                f"color: {text_on(theme.warning)}; background: {theme.warning};"
+                " border-radius: 3px; padding: 4px 10px;"
+            )
+            self.regime.setToolTip(ASSEMBLING_HINT)
+        elif state.simulation:
             self.regime.setText("  СИМУЛЯЦИЯ  ")
             self.regime.setStyleSheet(
                 f"color: {theme.background}; background: {theme.badge_quiet};"
@@ -216,6 +254,9 @@ class StatusPanel(QFrame):
         остановки боя (аудит /risk 01.11.2026, R4): остановленный бой с лонгом
         у брокера, показанный пустым местом, читался бы как «позиции нет».
         """
+        self._live_wanted = view.wanted and not view.halted
+        self._show_mode()
+        self._show_regime()
         position = view.position
         note = view.position_note
         # Позиции нет, а оговорка есть — портфель у брокера не прочитан при
@@ -258,12 +299,24 @@ class StatusPanel(QFrame):
         self.fact_note.setStyleSheet(f"color: {self._theme.warning};")
 
 
+#: Бой включён, боевой исполнитель ещё собирается (бой 16.11.2026, 08:58):
+#: отметка справа, хвост ячейки «Режим» и подсказка обеих.
+ASSEMBLING_BADGE = "БОЙ: собирается"
+ASSEMBLING_MODE = "заявки пойдут с закрытия свечи"
+ASSEMBLING_HINT = (
+    "Бой включён, боевой исполнитель собирается: на закрытии ближайшей свечи "
+    "программа сверится с брокером (позиция, незакрытые заявки) и досчитает "
+    "среднюю. Заявки пойдут брокеру с закрытия свечи; до этого заявок нет."
+)
+
 #: Подсказка ячейки «Позиция у брокера».
 FACT_POSITION_HINT = (
     "Позиция боевого режима — то, что робот считает открытым у брокера "
     "на вашем счёте. Уровень — неподвижный тейк (лимитная заявка у брокера) "
-    "или скользящий уровень, который сторожит сама программа: пока она "
-    "закрыта или без связи, скользящий уровень не сторожит никто."
+    "или скользящий тейк (условная заявка у брокера: уровень ведёт брокер, "
+    "показан расчёт программы, у брокера он свой). Условную брокер не принял — "
+    "скользящий сторожит программа по минуткам, и журнал решений говорит это "
+    "строкой: тогда без программы и связи его не сторожит никто."
 )
 
 

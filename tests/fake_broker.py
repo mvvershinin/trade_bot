@@ -63,13 +63,16 @@ from uuid import UUID
 import httpx
 import websockets
 
-from broker.session import AUTH_URL, PORTFOLIO_PATH
+from broker.session import AUTH_URL, ORDERS_SEARCH_PATH, PORTFOLIO_PATH
 from tests.test_broker_session import ORDER_ENDPOINTS, READING_AROUND_ORDERS, good_auth
 
 #: Пары — со страниц снимка (через проверенные литералы `tests/test_broker_session.py`).
 CREATE = ORDER_ENDPOINTS[0]  # 13-create-order.md
 CANCEL = ORDER_ENDPOINTS[2]  # 12-cancel-order.md
 STATUS = READING_AROUND_ORDERS[0]  # 11-get-order-by-id.md
+
+#: Сроки расчётов, которыми живой портфель повторяет одну позицию (13.11.2026).
+PORTFOLIO_TERMS = ("T0", "T1", "T2", "T365")
 
 #: После этих состояний с заявкой ничего не случится (11, 24): «Полностью
 #: исполнена», «Отменена», «Отклонена». Остальные коды — живая заявка.
@@ -167,6 +170,8 @@ class BookOrder:
     #: Срок заявки, `timeInForce` (13): `1` — до конца дня, `2` — исполнить
     #: целиком или снять (FOK). Ушло без поля — `None`: подделка не додумывает.
     time_in_force: str | None = None
+    #: Цена включения условной (`takePrice`, тип `5`); у прочих — `None`.
+    take_price: float | None = None
     status: str = "0"
     executed: int = 0
     turnover: float = 0.0
@@ -263,6 +268,7 @@ class FakeBroker:
             CANCEL: self._cancel,
             STATUS: self._status,
             ("GET", PORTFOLIO_PATH): self._portfolio,
+            ("POST", ORDERS_SEARCH_PATH): self._search,
         }
 
     # --- HTTP ---
@@ -303,6 +309,7 @@ class FakeBroker:
                 price=body.get("price"),
                 exchange_id=f"FAKE-EXCH-{next(self._numbers)}",
                 time_in_force=None if "timeInForce" not in body else str(body["timeInForce"]),
+                take_price=body.get("takePrice"),
             )
             self.orders.append(order)
             self._note_live()
@@ -324,6 +331,12 @@ class FakeBroker:
         return answer.reply(request, key)
 
     def _status(self, request: httpx.Request) -> httpx.Response:
+        """Статус по ключу (11): `data` — **объект**, последнее сообщение о заявке.
+
+        Так отвечает живой сервер 13.11.2026, а не массивом всей истории, как
+        обещает снимок сайта. Отсюда худшая для нас сторона: исполнение,
+        потерянное в потоке и не последнее по заявке, по статусу не узнать.
+        """
         key = request.url.params["orderId"]
         scripted = self.status_answers.pop(0) if self.status_answers else None
         if scripted is not None:
@@ -333,11 +346,42 @@ class FakeBroker:
             return httpx.Response(404, json={"type": "NOT_FOUND", "traceId": "fake-trace"})
         return httpx.Response(
             200,
-            json={"clientOrderId": key, "originalClientOrderId": key, "data": order.reports},
+            json={"clientOrderId": key, "originalClientOrderId": "", "data": order.reports[-1]},
+        )
+
+    def _search(self, request: httpx.Request) -> httpx.Response:
+        """Список заявок (15) по книге: живая — «Активна» `3`, исполненная `2`, прочие `1`.
+
+        Фильтр тела — по тикерам и состояниям, как у живого брокера; страница одна.
+        """
+        body = json.loads(request.content or b"{}")
+        tickers = set(body.get("tickers") or ())
+        statuses = set(body.get("orderStatus") or ())
+        records = []
+        for order in self.orders:
+            listed = 3 if order.live else (2 if order.status == "2" else 1)
+            if (tickers and order.ticker not in tickers) or (statuses and listed not in statuses):
+                continue
+            records.append({
+                "orderNum": next(self._numbers), "orderId": order.exchange_id,
+                "ticker": order.ticker, "classCode": order.class_code,
+                "side": int(order.side), "orderType": int(order.order_type),
+                "orderQuantity": float(order.quantity),
+                "executedQuantity": float(order.executed),
+                "remainedQuantity": float(order.quantity - order.executed),
+                "price": order.price, "takePrice": order.take_price, "orderStatus": listed,
+            })
+        return httpx.Response(
+            200, json={"records": records, "totalRecords": len(records), "totalPages": 1}
         )
 
     def _portfolio(self, request: httpx.Request) -> httpx.Response:
-        """Портфель (04): денежная запись и позиция по каждому тикеру книги."""
+        """Портфель (04): денежная запись и позиция по каждому тикеру книги.
+
+        Позиция — строкой **на каждый срок расчётов**, как отдаёт живой сервер
+        13.11.2026 (`B-096`): `T0`, `T1`, `T2`, `T365` с одним и тем же
+        количеством. Кто сложит строки по тикеру, увидит вчетверо больше.
+        """
         rows: list[dict[str, object]] = [
             {
                 "type": "moneyLimit", "ticker": "RUB", "quantity": 1_000_000.0,
@@ -355,7 +399,7 @@ class FakeBroker:
                 average = self.average_price(ticker)
                 if average is not None:
                     row["averagePrice"] = average  # 04: средняя цена позиции
-                rows.append(row)
+                rows.extend({**row, "term": term} for term in PORTFOLIO_TERMS)
         return httpx.Response(200, json=rows)
 
     # --- поток статусов ---
@@ -401,20 +445,32 @@ class FakeBroker:
 
     # --- что делает тест ---
 
-    def execute(self, key: str, quantity: int, price: float) -> None:
-        """Биржа исполнила `quantity` контрактов заявки `key` по `price`."""
+    def execute(
+        self, key: str, quantity: int, price: float, *, execution_type: str | None = None
+    ) -> None:
+        """Биржа исполнила `quantity` контрактов заявки `key` по `price`.
+
+        Условная заявка (тип `5`, `D-196`) исполняется тем же вызовом: живой
+        брокер 13.11.2026 прислал исполнение порождённой заявки **по ключу
+        условной** — `orderStatus` `2`, `executionType` `11` (`execution_type`).
+        Слежения за ценой подделка не ведёт: когда сработать, решает тест.
+        """
         order = self.order(key)
         if order is None or not order.live:
             raise AssertionError(f"исполнять нечего: заявка {key} не жива в книге")
         if quantity < 1 or order.executed + quantity > order.quantity:
             raise AssertionError(f"исполнение {quantity} не помещается в заявку {key}")
+        if order.order_type == "5" and order.executed == 0:
+            # Кадр срабатывания условной — как у живого брокера 13.11.2026:
+            # **без** `executionType`, статус `0`, исполнения нет (/risk 14.11).
+            self._emit(order, execution_type=None, extra={"lastQuantity": 0})
         order.executed += quantity
         order.turnover += quantity * price
         full = order.executed == order.quantity
         order.status = "2" if full else "1"
         self._emit(
             order,
-            execution_type="2" if full else "1",
+            execution_type=execution_type or ("2" if full else "1"),
             execution={"executionId": f"FAKE-EXEC-{next(self._numbers)}", "lastQuantity": quantity},
         )
         self._note_live()
@@ -525,7 +581,7 @@ class FakeBroker:
         self,
         order: BookOrder,
         *,
-        execution_type: str,
+        execution_type: str | None,
         execution: dict[str, object] | None = None,
         extra: dict[str, object] | None = None,
     ) -> None:
@@ -537,7 +593,6 @@ class FakeBroker:
         data: dict[str, object] = {
             "messageType": "8",
             "orderStatus": order.status,
-            "executionType": execution_type,
             "orderId": order.exchange_id,
             "ticker": order.ticker,
             "classCode": order.class_code,
@@ -548,6 +603,8 @@ class FakeBroker:
             "remainedQuantity": order.quantity - order.executed,
             "transactionTime": moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
+        if execution_type is not None:
+            data["executionType"] = execution_type
         if order.price is not None:
             data["price"] = order.price
         if execution is not None:

@@ -30,7 +30,7 @@ from __future__ import annotations
 import math
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Final, Protocol
+from typing import Any, Final, Protocol, runtime_checkable
 
 from backtest import HistoryRun
 from engine import AccountFunds, DayRecord, OrderExecutor, Side
@@ -46,6 +46,7 @@ __all__ = [
     "FactPosition",
     "FactRefused",
     "FactRequest",
+    "HandDesks",
     "LiveLimits",
     "LiveStatus",
     "day_record",
@@ -75,7 +76,8 @@ class LiveLimits:
 
     :param stale_after: заявка, решённая раньше «сейчас − размер свечи − это»,
         к брокеру не подаётся (план §2.2 п. 1): догрузка после обрыва
-        прогнала бы через «факт» старые бары с настоящими заявками.
+        прогнала бы через «факт» старые бары с настоящими заявками. Вход
+        строже: свеча сигнала дошла позже закрытия + это — не подаётся.
     :param event_wait: сколько ждать первого события по заявке, прежде чем
         спросить статус по ключу (§2.2 п. 7–8).
     :param fill_wait: сколько ждать конца заявки «исполнить целиком или снять»
@@ -87,8 +89,10 @@ class LiveLimits:
         сборка исполнителя из `EngineSettings.time_exit_wait_bars`
         (`app/port.py::_fact_limits`). Иначе остановку раньше назовёт движок,
         и текст не скажет о живой заявке у брокера (С9).
-    :param position_settle: пауза перед вторым чтением позиции, прежде чем
-        объявить расхождение: портфель брокера может отставать от потока
+    :param position_settle: сколько секунд в сумме перечитывать позицию перед
+        заявкой (шагом около секунды), прежде чем объявить расхождение;
+        сошлось раньше — дальше сразу (B-099). Та же пауза — между двумя
+        чтениями перед «закрыть всё»: портфель брокера отстаёт от потока
         сделок, и «закрыть всё» по отставшему портфелю продало бы дважды.
     :param reconnect_pauses: паузы между попытками открыть поток статусов —
         по нарастающей, последняя повторяется.
@@ -98,6 +102,9 @@ class LiveLimits:
     :param band_wait: сколько секунд ждать ответа MOEX ISS о планке цены
         дня, прежде чем подать выход с пределом движка по проценту (0067).
         Пять секунд — временное значение, замеров нет.
+    :param trailing_spread_percent: защитный спред условной заявки скользящего
+        тейка у брокера, **в процентах** (`D-196`): сработав, брокер подаёт
+        лимитную по «срабатывание ∓ спред». 0,1 % — владелец счёта 13.11.2026.
     """
 
     stale_after: float = 60.0
@@ -109,10 +116,14 @@ class LiveLimits:
     reconnect_pauses: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 30.0)
     fok_percent: float = 2.0
     band_wait: float = 5.0
+    trailing_spread_percent: float = 0.1
 
     def __post_init__(self) -> None:
         if not _finite(self.fok_percent) or self.fok_percent <= 0:
             raise ValueError(f"отступ цены заявки — положительный процент: {self.fok_percent!r}")
+        spread = self.trailing_spread_percent
+        if not _finite(spread) or spread <= 0:
+            raise ValueError(f"защитный спред условной заявки — положительный процент: {spread!r}")
         waits = (
             self.stale_after, self.event_wait, self.fill_wait, self.cancel_wait, self.band_wait
         )
@@ -229,6 +240,20 @@ class FactDesk(Protocol):
         """Имена заявок, чьи сделки у брокера есть, а движку ещё не отданы."""
         ...
 
+    @property
+    def adopted(self) -> FactPosition | None:
+        """Позиция у брокера, подхваченная включением (0070); `None` — включён при нуле."""
+        ...
+
+    @property
+    def flat_by_hand(self) -> bool:
+        """Владелец закрыл позицию кнопкой, движок «факта» ещё не принял ноль (0069)."""
+        ...
+
+    def flat_taken(self) -> None:
+        """Движок «факта» принял ноль после ручного закрытия."""
+        ...
+
     async def watch(self) -> None:
         """Записана минутка: сторожа трейлинга по ней."""
         ...
@@ -263,6 +288,36 @@ class FactDesks(Protocol):
 
     def open(self, request: FactRequest) -> Awaitable[FactDesk]:
         """Собрать исполнитель после сверки. Отказ — `FactRefused` с причиной."""
+        ...
+
+
+@runtime_checkable
+class HandDesks(Protocol):
+    """Ручные действия владельца из окна: снять заявку робота, закрыть позицию.
+
+    Задача владельца 13.11.2026 после первого боевого дня: робот встал
+    с позицией и тейком, а снять тейк и закрыть позицию из программы было
+    нечем. Отдельный протокол, а не два метода `FactDesks`: сборка, которая
+    их не даёт (заглушки проверок), остаётся сборкой боя, а порт говорит
+    словами, что руками из этой сборки нельзя.
+
+    Проверяется `isinstance` — по наличию методов (`runtime_checkable`).
+    """
+
+    def refusal(self) -> str | None:
+        """Почему нельзя без вопроса брокеру: нет связи, токен для чтения."""
+        ...
+
+    async def robot_orders(self, account: str) -> tuple[tuple[str, str], ...]:
+        """Заявки робота этого счёта из журнала команд: ключ у брокера и слова."""
+        ...
+
+    async def cancel_by_hand(self, request: FactRequest, key: str, desk: object) -> str:
+        """Снять заявку робота по ключу; итог словами. Отказ — `FactRefused`."""
+        ...
+
+    async def close_by_hand(self, request: FactRequest, desk: object) -> str:
+        """Снять заявки робота по инструменту и закрыть позицию; итог словами."""
         ...
 
 
@@ -389,3 +444,7 @@ class LiveStatus:
     forecast: HistoryRun | None = None
     fact_origin: RunOrigin = RunOrigin.LIVE
     forecast_origin: RunOrigin = RunOrigin.PAPER
+    #: Почему «Снять заявку» и «Закрыть позицию» сейчас недоступны — словами;
+    #: пусто — доступны. Не зависит от боя: кнопки нужны и при остановленном
+    #: роботе, и при выключенном бое (задача владельца 13.11.2026).
+    hand_refused: str = "Ручные действия ещё не проверены: программа не ответила."

@@ -112,16 +112,19 @@ from engine.contracts import (
     OrderRequest,
     Position,
     PriceSeen,
+    Side,
 )
 from engine.pipeline import (
     FillOutcome,
     Outcome,
+    adopted_state,
     after_refused_cancel,
     after_refused_exit,
     after_submit,
     apply_fill,
     apply_price,
     apply_unfilled,
+    dropped_state,
     money,
     order_words,
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): `percent` держал дневной
@@ -787,6 +790,27 @@ class Engine:
             event="День до запуска принят",
             reason=self._day_words(record, stale),
         )
+        self._publish((entry,))
+        return (entry,)
+
+    def adopt_position(
+        self, held: tuple[Side, float, float], *, at: datetime
+    ) -> tuple[JournalEntry, ...]:
+        """Внешний мир сообщил позицию у брокера при включении боя (0070).
+
+        По образцу `on_day`: значение кладут внутрь, **движок за ним не ходит**.
+        Звать между свечами: внутри свечи `accept` переписал бы состояние.
+        Разбор — `engine.pipeline.adopted_state`.
+
+        :param held: сторона, объём, средняя цена брокера.
+        """
+        self._state, entry = adopted_state(self._state, held, at, self._settings)
+        self._publish((entry,))
+        return (entry,)
+
+    def drop_position(self, *, at: datetime) -> tuple[JournalEntry, ...]:
+        """Внешний мир сообщил: позицию закрыл владелец руками (0069). Между свечами."""
+        self._state, entry = dropped_state(self._state, at)
         self._publish((entry,))
         return (entry,)
 

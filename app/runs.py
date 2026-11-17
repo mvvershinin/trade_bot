@@ -274,6 +274,7 @@ _ENGINE_TITLES: Mapping[str, str] = {
     "trailing_offset_percent": "Скользящий тейк, отступ, %",
     "trailing_step_percent": "Скользящий тейк, шаг подтяжки, %",
     "stop_after_take_profit": "Стоп на день после тейка",
+    "stop_after_loss": "Стоп до конца окна после первого убытка",
     # Порога нет в окне настроек (прямые слова владельца счёта 10.09.2026),
     # но в снимок прогона он обязан попасть: он меняет список сделок, и два
     # прогона с одинаковыми на вид настройками дадут разные деньги.
@@ -367,6 +368,8 @@ class ProgramFields:
     #: Отступ цены боевой заявки и ожидание планки биржи (решение 0067, Р-5).
     live_fok_pct: float = _DEFAULTS.live_fok_pct
     live_band_wait_sec: int = _DEFAULTS.live_band_wait_sec
+    #: Защитный спред условной заявки скользящего тейка у брокера (`D-196`).
+    live_trailing_spread_pct: float = _DEFAULTS.live_trailing_spread_pct
 
     @classmethod
     def of(cls, values: Settings) -> ProgramFields:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 
 from PySide6.QtCore import (
     QAbstractTableModel,
@@ -91,6 +92,12 @@ def _any_real_money(rows: Iterable[TradeRow | DecisionRow]) -> bool:
 #: при любом кегле, включая системный крупный шрифт на машине владельца.
 LONGEST_REASON = "обратный сигнал средней"
 
+#: Подсказка на строке сделки прежнего захода боя (B-100).
+EARLIER_RUN_HINT = (
+    "Сделка прежнего захода боя — из базы. Приглушённые строки — прежние "
+    "заходы, яркие — текущий."
+)
+
 
 class TradesModel(QAbstractTableModel):
     """Журнал сделок: что реально произошло."""
@@ -103,9 +110,31 @@ class TradesModel(QAbstractTableModel):
     # --- содержимое ---------------------------------------------------------
 
     def set_rows(self, rows: Sequence[TradeRow]) -> None:
-        self.beginResetModel()
-        self._rows = list(rows)
-        self.endResetModel()
+        """Заменить строки. Те же строки с другими числами — без сброса таблицы.
+
+        Строка открытой позиции переоценивается по растущей свече (B-102):
+        сброс модели на каждый шаг цены снимал бы выделение и прокрутку,
+        пока человек читает таблицу. Число строк то же — меняются только
+        изменившиеся.
+        """
+        rows = list(rows)
+        if len(rows) != len(self._rows) or not rows:
+            self.beginResetModel()
+            self._rows = rows
+            self.endResetModel()
+            return
+        before = result_basis(self._rows)
+        changed = [
+            index for index, (old, new) in enumerate(zip(self._rows, rows, strict=True))
+            if old != new
+        ]
+        self._rows = rows
+        for index in changed:
+            self.dataChanged.emit(
+                self.index(index, 0), self.index(index, self.columnCount() - 1)
+            )
+        if result_basis(self._rows) is not before:
+            self.headerDataChanged.emit(Qt.Orientation.Horizontal, RESULT_COLUMN, RESULT_COLUMN)
 
     def append_row(self, row: TradeRow) -> None:
         """Дописать сделку — и переспросить заголовок колонки результата.
@@ -186,6 +215,11 @@ class TradesModel(QAbstractTableModel):
         # на соседнюю колонку молча.
         if role == Qt.ItemDataRole.TextAlignmentRole and column in _TRADE_NUMERIC:
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if role == Qt.ItemDataRole.ForegroundRole and trade.earlier_run:
+            # Прежний заход боя — приглушённым целиком, включая результат:
+            # знак виден минусом, а яркими остаются только сделки текущего
+            # захода (B-100). Тот же приём у меток графика.
+            return QColor(self._theme.text_dim)
         if (
             role == Qt.ItemDataRole.ForegroundRole
             and column in _TRADE_SIGNED
@@ -195,7 +229,19 @@ class TradesModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ToolTipRole and column == _TRADE_WIDE:
             # Длинный текст режется по ширине колонки — подсказка отдаёт его целиком.
             return trade.exit_reason
+        if role == Qt.ItemDataRole.ToolTipRole and trade.earlier_run:
+            return EARLIER_RUN_HINT
         return None
+
+
+def _trade_moment(moment: datetime | None) -> str:
+    """Время сделки: с секундами, если они есть.
+
+    У прогона время сделки — начало свечи, секунд в нём нет. У боя — секунда
+    исполнения у брокера (`app/live_history.py`): условная, сработавшая
+    в 10:38:03, без секунд читалась бы как свеча 10:35 (бой 16.11.2026).
+    """
+    return fmt_datetime(moment, seconds=moment is not None and moment.second != 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,11 +312,11 @@ def _wide_column[RowT](columns: Sequence[_Column[RowT]]) -> int:
 #: разошлись бы, и экран говорил бы одно, а выгруженный файл другое.
 _TRADE_CELLS: tuple[_Column[TradeRow], ...] = (
     _Column(
-        text=lambda trade: fmt_datetime(trade.entry_time),
+        text=lambda trade: _trade_moment(trade.entry_time),
         sort=lambda trade: trade.entry_time.timestamp(),
     ),
     _Column(
-        text=lambda trade: fmt_datetime(trade.exit_time),
+        text=lambda trade: _trade_moment(trade.exit_time),
         sort=lambda trade: trade.exit_time.timestamp() if trade.exit_time else 0.0,
     ),
     _Column(text=lambda trade: trade.side.label, sort=lambda trade: trade.side.label),
@@ -756,6 +802,15 @@ class JournalTabs(QWidget):
             index, QColor(self._theme.danger) if real else QColor()
         )
 
+    def closed_trades(self) -> list[TradeRow]:
+        """Сделки таблицы без строки открытой позиции — для выгрузки и «Отчётов».
+
+        Строка открытой позиции (выхода нет, результат плавающий) живёт только
+        в окне (задача владельца 13.11.2026): в файл и в отчёт идут сделки,
+        а не позиция, которая ещё не кончилась.
+        """
+        return [row for row in self.trades_model.rows() if row.exit_time is not None]
+
     def append_decision(self, row: DecisionRow) -> None:
         at_bottom = not self.decisions_table.verticalScrollBar().isVisible() or (
             self.decisions_table.verticalScrollBar().value()
@@ -797,11 +852,16 @@ class JournalTabs(QWidget):
         # (`ui.formatting.SUMMARY_FIELDS`). Второй потребитель этой же
         # таблицы — итог выделенного участка графика: два разных набора
         # слов про одни и те же деньги были бы новой путаницей.
-        parts = summary_parts(summary, SUMMARY_FIELDS)
         colour = self._theme.text
         if summary.net_profit_rub is not None:
             colour = self._theme.success if summary.net_profit_rub >= 0 else self._theme.danger
-        self.summary_label.setText("Итог за период — " + " · ".join(parts))
+        # В бою строк две: вся история боя и текущий заход (B-100).
+        lines = [summary, *(() if summary.current is None else (summary.current,))]
+        self.summary_label.setText("\n".join(
+            f"{one.title or 'Итог за период'} — "
+            + " · ".join(summary_parts(one, SUMMARY_FIELDS))
+            for one in lines
+        ))
         self.summary_label.setStyleSheet(f"color: {colour}; font-weight: 600;")
         self._show_assumptions(summary.headline)
 

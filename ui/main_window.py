@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui import backend
+from ui.account_bar import AccountBar
 from ui.background import busy_cursor
 from ui.backtest_dialog import BacktestDialog
 from ui.backtest_report import BacktestReportDialog
@@ -67,8 +69,16 @@ from ui.formatting import MSK, fmt_time, fmt_volume
 from ui.history_dialog import HistoryDialog
 from ui.journals import JournalTabs
 from ui.live_control import (
+    CANCEL_ORDER_HINT,
+    CANCEL_ORDER_LABEL,
+    CLOSE_POSITION_HINT,
+    CLOSE_POSITION_LABEL,
     LIVE_OFF_LABEL,
     LIVE_ON_LABEL,
+    NO_ROBOT_ORDERS,
+    cancel_order_question,
+    close_position_question,
+    hand_hint,
     live_look,
     live_mode_off_question,
     live_off_question,
@@ -91,6 +101,8 @@ from ui.models import (
     Marker,
     Mode,
     PriceLevel,
+    RobotOrder,
+    RobotOrders,
     RobotState,
     Settings,
     Shade,
@@ -153,6 +165,23 @@ BACKTEST_HINT = (
 BACKTEST_IN_COMBAT = (
     "Прогон на истории недоступен в бою: выключите бой, чтобы прогнать "
     "отрезок истории. Бой этим пунктом не прерывается."
+)
+
+#: «Старт» = «Включить бой» (владелец 16.11.2026). Подсказка доступной кнопки.
+START_HINT = (
+    "Включить бой — то же, что кнопка «Включить бой…»: робот сам подаёт заявки "
+    "брокеру на ваш счёт. Перед включением программа спросит подтверждение."
+)
+#: Токен только на чтение: заявки брокер не примет (ТЗ, опасные места окна).
+START_READ_ONLY = (
+    "Запуск недоступен: токен выдан только на чтение. Заявки по такому "
+    "токену брокер не примет. Нужен токен с правом торговли."
+)
+#: Робот остановлен: «Старт» этого не снимает, и окно не вправе обещать иное.
+START_HALTED = (
+    "Робот остановлен, и сам он из этого состояния не выйдет. "
+    "Причина — в красной плашке над графиком: разберитесь с ней "
+    "и проверьте счёт у брокера, прежде чем запускать снова."
 )
 
 
@@ -519,6 +548,8 @@ class MainWindow(QMainWindow):
         self.resize(1360, 900)
 
         self.status_panel = StatusPanel()
+        #: «Счёт у брокера» — по ответу брокера, а не программы (решение 0070).
+        self.account_bar = AccountBar()
         self._build_banners()
         #: Полоска идущего прогона. `None` — прогон не запрашивали.
         self._progress: QProgressDialog | None = None
@@ -540,6 +571,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
         layout.addWidget(self.status_panel)
+        layout.addWidget(self.account_bar)
         for bar in self._banner_column:
             layout.addWidget(bar)
         layout.addWidget(splitter, 1)
@@ -649,9 +681,13 @@ class MainWindow(QMainWindow):
 
     def _build_robot_actions(self) -> None:
         """Старт, стоп и связь с брокером."""
+        #: «Старт» = «Включить бой» (владелец 16.11.2026): тот же вопрос
+        #: и тот же путь порта, серая — с той же причиной в подсказке
+        #: (`_gate_robot_buttons`). Прежде она отказывала строкой в журнал,
+        #: и нажатие выглядело ничем.
         self.start_action = QAction("Старт", self)
-        self.start_action.setToolTip("Запустить робота.")
-        self.start_action.triggered.connect(self.port.start)
+        self.start_action.setToolTip(START_HINT)
+        self.start_action.triggered.connect(self.request_start)
 
         self.stop_action = QAction("Стоп", self)
         self.stop_action.setToolTip(
@@ -707,10 +743,23 @@ class MainWindow(QMainWindow):
         self.live_action = QAction(LIVE_ON_LABEL, self)
         self.live_action.setCheckable(True)
         self.live_action.triggered.connect(self.request_live)
+        #: Ручные действия владельца у брокера (задача владельца 13.11.2026):
+        #: рядом с «Боем», потому что действуют на тот же счёт. Горят и при
+        #: остановленном роботе, и при выключенном бое — погашены только
+        #: без связи или на токене для чтения, с причиной в подсказке.
+        self.cancel_order_action = QAction(CANCEL_ORDER_LABEL, self)
+        self.cancel_order_action.triggered.connect(self.request_cancel_order)
+        self.close_position_action = QAction(CLOSE_POSITION_LABEL, self)
+        self.close_position_action.triggered.connect(self.request_close_position)
+        #: Окно спросило заявки робота и ждёт ответа: чужой ответ (второе окно,
+        #: проверка) диалога не открывает.
+        self._orders_asked = False
         self.live_note = QLabel()
         self.live_note.setTextFormat(Qt.TextFormat.PlainText)
         bar.addSeparator()
         bar.addAction(self.live_action)
+        bar.addAction(self.cancel_order_action)
+        bar.addAction(self.close_position_action)
         bar.addWidget(self.live_note)
         self._mirror_live(None)
 
@@ -875,6 +924,8 @@ class MainWindow(QMainWindow):
         port.history_finished.connect(self.show_history_result)
         port.paper_report_ready.connect(self.show_paper_report)
         port.live_changed.connect(self.show_live)
+        port.robot_orders_ready.connect(self.show_robot_orders)
+        port.account_changed.connect(self.account_bar.show_line)
 
     # ---------------------------------------------------------------- показ
 
@@ -907,6 +958,7 @@ class MainWindow(QMainWindow):
         """Перечитать системную тему. Вызывается при старте и при её смене."""
         self.theme = current_theme()
         self.status_panel.set_theme(self.theme)
+        self.account_bar.set_theme(self.theme)
         self.chart.set_theme(self.theme)
         self.journals.set_theme(self.theme)
         self.debug_panel.set_theme(self.theme)
@@ -955,25 +1007,8 @@ class MainWindow(QMainWindow):
             self.mode_box.setCurrentIndex(index)
             self.mode_box.blockSignals(False)
 
-        self.start_action.setEnabled(not state.running and not state.token_read_only)
-        self.stop_action.setEnabled(state.running)
+        self._gate_robot_buttons()
         self._mirror_stream(state.connection)
-        if state.token_read_only:
-            self.start_action.setToolTip(
-                "Запуск недоступен: токен выдан только на чтение. Заявки по такому "
-                "токену брокер не примет. Нужен токен с правом торговли."
-            )
-        elif state.halted:
-            # Кнопка намеренно НЕ гасится: что делает «Старт» с остановленным
-            # роботом, решает не окно. Но обещать, что нажатие поможет, оно
-            # тоже не вправе — отсюда прямая речь вместо умолчания.
-            self.start_action.setToolTip(
-                "Робот остановлен, и сам он из этого состояния не выйдет. "
-                "Причина — в красной плашке над графиком: разберитесь с ней "
-                "и проверьте счёт у брокера, прежде чем запускать снова."
-            )
-        else:
-            self.start_action.setToolTip("Запустить робота.")
 
         self._update_banners(state)
         title = f"{TITLE} {version()} — {state.instrument}"
@@ -1291,6 +1326,7 @@ class MainWindow(QMainWindow):
         self._gate_history()
         self.status_panel.apply_live(view)
         self.chart.set_fact_origin(view.fact_origin if view.on else None)
+        self.chart.set_combat(view.wanted)
 
     def _mirror_live(self, view: LiveView | None) -> None:
         """Кнопка и строка — по снимку, а не по нажатию (как `_mirror_stream`).
@@ -1321,6 +1357,40 @@ class MainWindow(QMainWindow):
             f"color: {getattr(self.theme, look.colour)}; padding-left: 6px;"
             + (" font-weight: 600;" if look.colour == "danger" else "")
         )
+        hand = view is not None and not view.hand_refused
+        for action, hint in (
+            (self.cancel_order_action, CANCEL_ORDER_HINT),
+            (self.close_position_action, CLOSE_POSITION_HINT),
+        ):
+            action.setEnabled(hand)
+            action.setToolTip(hand_hint(view, hint))
+        self._gate_robot_buttons()
+
+    def _gate_robot_buttons(self) -> None:
+        """«Старт» и «Стоп» — по снимку боя и состоянию, а не по нажатию.
+
+        «Старт» = «Включить бой»: горит, когда горела бы «Включить бой»
+        (порт сказал «доступен», бой не просили), серая — с той же причиной
+        в подсказке (`live_look`). «Стоп» = «Выключить бой» в бою (0066):
+        горит, пока бой просили — и пока исполнитель ещё собирается.
+
+        Зовут двое — снимок состояния и снимок боя, — и оба снимка берутся
+        последние запомненные: каждый приходит своим сигналом.
+        """
+        view, state = self._live, self._state
+        wanted = view is not None and view.wanted
+        ready = view is not None and view.available and not wanted
+        self.start_action.setEnabled(ready and not state.token_read_only)
+        self.stop_action.setEnabled(state.running or wanted)
+        if state.token_read_only:
+            self.start_action.setToolTip(START_READ_ONLY)
+        elif state.halted and not wanted:
+            # Обещать, что нажатие поможет, окно не вправе — отсюда прямая речь.
+            self.start_action.setToolTip(f"{START_HALTED}\n\n{live_look(view).tooltip}")
+        elif ready:
+            self.start_action.setToolTip(START_HINT)
+        else:
+            self.start_action.setToolTip(live_look(view).tooltip)
 
     def request_live(self, checked: bool) -> None:
         """Человек нажал «Бой». Включение — только после вопроса.
@@ -1331,13 +1401,7 @@ class MainWindow(QMainWindow):
         view = self._live
         self._mirror_live(view)
         if checked:
-            if view is None or not view.available:
-                return
-            question = live_on_question(
-                fmt_volume(float(self._settings.volume)) + " контр.",
-                self._state.instrument,
-            )
-            if self.ask("Включить бой", question, "Включить бой"):
+            if self._agree_live_on():
                 self.port.set_live(True)
             return
         concern = self._fact_concern()
@@ -1348,6 +1412,92 @@ class MainWindow(QMainWindow):
         ):
             return
         self.port.set_live(False)
+
+    def request_start(self) -> None:
+        """«Старт» — тот же вопрос, что у «Включить бой», и команда порту `start`.
+
+        Порт исполняет её как `set_live(True)` (`HistoryPort.start`): запреты
+        и строки отказа — те же. Кнопка до вопроса следует снимку, как у боя.
+        """
+        self._mirror_live(self._live)
+        if self._agree_live_on():
+            self.port.start()
+
+    def _agree_live_on(self) -> bool:
+        """Бой доступен и человек согласился в вопросе перед боем."""
+        view = self._live
+        if view is None or not view.available or view.wanted:
+            return False
+        question = live_on_question(
+            fmt_volume(float(self._settings.volume)) + " контр.",
+            self._state.instrument,
+        )
+        return self.ask("Включить бой", question, "Включить бой")
+
+    def request_cancel_order(self) -> None:
+        """«Снять заявку…»: спросить заявки робота; список и вопрос — по ответу порта.
+
+        Список читается из базы — асинхронно, ответ придёт `robot_orders_ready`.
+        """
+        self._orders_asked = True
+        self.statusBar().showMessage("Читаю заявки робота из журнала команд…", 5000)
+        self.port.request_robot_orders()
+
+    def show_robot_orders(self, orders: RobotOrders) -> None:
+        """Ответ порта: выбрать заявку, подтвердить, отправить команду.
+
+        Отказ и пустой список — словами в окне, а не молча (правило 13).
+
+        ⚠️ Всё модальное — через `_open_modal`, следующим оборотом цикла:
+        сигнал порт испускает изнутри корутины (`request_robot_orders`),
+        и выбор, вопрос или сообщение, поднятые прямо здесь, подняли бы
+        вложенный цикл Qt внутри шага задачи (`B-026`, ревью 13.11.2026).
+        """
+        if not self._orders_asked:
+            return
+        self._orders_asked = False
+        self._open_modal(lambda: self._pick_order(orders))
+
+    def _pick_order(self, orders: RobotOrders) -> None:
+        """Выбор, вопрос и команда — уже вне шага корутины порта (`show_robot_orders`)."""
+        if orders.trouble:
+            self.inform("Снять заявку", f"Заявки робота не прочитаны: {orders.trouble}")
+            return
+        if not orders.orders:
+            self.inform("Снять заявку", NO_ROBOT_ORDERS)
+            return
+        chosen = self.choose_order(orders.orders)
+        if chosen is None:
+            return
+        if self.ask(
+            "Снять заявку робота", cancel_order_question(chosen.words, self._live),
+            "Снять заявку",
+        ):
+            self.port.cancel_robot_order(chosen.key)
+
+    def request_close_position(self) -> None:
+        """«Закрыть позицию…»: вопрос со стороной и объёмом, затем команда порту."""
+        question = close_position_question(self._live, self._state.instrument)
+        if self.ask("Закрыть позицию у брокера", question, "Закрыть позицию"):
+            self.port.close_position()
+
+    def choose_order(self, orders: Sequence[RobotOrder]) -> RobotOrder | None:
+        """Выбор одной заявки из списка. `None` — отказались.
+
+        Отдельным методом — чтобы проверки подменяли его, а не модальное окно.
+        """
+        items = [order.words for order in orders]
+        text, ok = QInputDialog.getItem(
+            self, "Снять заявку", "Заявки робота у брокера (по журналу команд):",
+            items, 0, False,
+        )
+        if not ok or text not in items:
+            return None
+        return orders[items.index(text)]
+
+    def inform(self, title: str, text: str) -> None:
+        """Сообщение с одной кнопкой. Отдельным методом — чтобы проверки его подменяли."""
+        QMessageBox.information(self, title, text)
 
     def ask(self, title: str, text: str, yes: str) -> bool:
         """Вопрос с двумя кнопками: «{yes}» и «Отмена». По умолчанию — отмена.
@@ -1774,7 +1924,7 @@ class MainWindow(QMainWindow):
             return None
         first, last = self._chart_bounds or (None, None)
         return ShownRun(
-            trades=tuple(self.journals.trades_model.rows()),
+            trades=tuple(self.journals.closed_trades()),
             summary=self.journals.summary(),
             instrument=self._chart_instrument,
             first=first,
@@ -2080,7 +2230,7 @@ class MainWindow(QMainWindow):
         """
         stamp = datetime.now(MSK).strftime(STAMP_FORMAT)
         headers, rows = trades_table(
-            self.journals.trades_model.rows(), self.journals.summary()
+            self.journals.closed_trades(), self.journals.summary()
         )
         decision_headers, decision_rows = decisions_table(self.journals.decisions_model.rows())
         jobs: tuple[ExportJob, ...] = (
@@ -2177,8 +2327,9 @@ class MainWindow(QMainWindow):
         и не закрывает позицию по концу окна, а позиция на счёте остаётся.
 
         В бою вопрос — про позицию **«факта»** из снимка боя (план §12, С8):
-        это позиция у брокера на настоящем счёте, и скользящий уровень у неё
-        сторожит программа, которую сейчас закрывают. Вопрос один — второй
+        это позиция у брокера на настоящем счёте. Скользящий тейк у неё — условная
+        заявка у брокера (0071), её закрытие не снимает; без неё (запасной путь)
+        уровень сторожит программа, которую сейчас закрывают. Вопрос один — второй
         про ту же позицию был бы повтором.
 
         ⚠️ Чего закрытие программы **не** отменяет — вооружённого тейка:

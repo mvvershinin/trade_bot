@@ -67,11 +67,11 @@ from broker.orders import (
     ORDER_ID_BY_CLIENT,
     CancelOrder,
     CommandAccepted,
-    NewOrder,
     OrderCommand,
     OrdersPage,
     OrdersQuery,
     OrderState,
+    PlacedOrder,
     RecordCommand,
     TradesPage,
     TradesQuery,
@@ -170,18 +170,26 @@ TRADING_STATUS_PATH: Final[str] = (
 #: `POST` создаёт новую (`13-create-order.md`). Поэтому допуск и повтор
 #: у слоя заданы парой «глагол и адрес», а не адресом.
 #:
-#: ⚠️ **Живьём не проверялось: токена с правами торговли в разработке нет.**
+#: Оба глагола проверены живьём 13.11.2026: подача — 200 с нашим ключом,
+#: статус — 200, где `data` **объект**, а не массив снимка (`parse_order_state`).
 ORDERS_PATH: Final[str] = "/trade-api-bff-operations/api/v1/orders"
 
-#: Отмена заявки — **другой сервис**, `bff-order-details`, а не `bff-operations`
-#: (`12-cancel-order.md`). Пишущий адрес. Живьём не проверялось.
-CANCEL_ORDER_PATH: Final[str] = "/trade-api-bff-order-details/api/v1/orders/cancel"
+#: Отмена заявки — сервис `bff-operations`, тот же, что у подачи. Пишущий адрес.
+#:
+#: ⚠️ **Сайт неверен, проверено живьём 13.11.2026 (`B-094`).** Снимок сайта
+#: называл `bff-order-details`; там шлюз отвечает 404 страницей HTML, и тейк
+#: перед переворотом не снимался. На этом адресе брокер ответил 200
+#: `{"clientOrderId": <ключ отмены>, "status": "OK"}` с тем же телом (12).
+CANCEL_ORDER_PATH: Final[str] = "/trade-api-bff-operations/api/v1/orders/cancel"
 
-#: Список заявок с 26.01.2026. ⚠️ По снимку живёт на сервисе **рыночных
-#: данных**, а не операций (`15-orders-search.md`) — так и написано; прецедент
-#: неверного имени сервиса уже был (`CANDLES_PATH`), поэтому адрес стоит
-#: в `ADDRESS_SENSITIVE`. Запрос читающий: `POST` с телом-фильтром.
-ORDERS_SEARCH_PATH: Final[str] = "/trade-api-market-data-connector/api/v1/orders/search"
+#: Список заявок с 26.01.2026. Запрос читающий: `POST` с телом-фильтром.
+#:
+#: ⚠️ **Сайт неверен, проверено живьём 13.11.2026 (`B-095`).** Снимок называл
+#: сервис рыночных данных (`market-data-connector`), там 404 HTML; на
+#: `bff-operations` — тоже 404. Отвечает `bff-order-details` — тот сервис,
+#: который сайт приписывал отмене. Даты фильтра — строго с миллисекундами
+#: (`OrdersQuery.body`), без них 422. Адрес остаётся в `ADDRESS_SENSITIVE`.
+ORDERS_SEARCH_PATH: Final[str] = "/trade-api-bff-order-details/api/v1/orders/search"
 
 #: Список сделок с 26.01.2026 (`16-trades-search.md`). Читающий `POST`.
 TRADES_SEARCH_PATH: Final[str] = "/trade-api-bff-operations/api/v1/trades/search"
@@ -525,8 +533,28 @@ class BrokerSession:
         #: Отказ `invalid_grant` на обмене токена: описание и технический текст.
         #: Пока он стоит, обмен к брокеру не идёт — до `allow_token_retry`.
         self._refused: tuple[str, str] | None = None
+        #: Кого позвать после каждой команды брокеру (`after_commands`).
+        self._after_command: list[Callable[[], None]] = []
 
     # --- жизненный цикл ---
+
+    def after_commands(self, listener: Callable[[], None]) -> None:
+        """Звать `listener` после каждой команды — подачи и снятия, удачной или нет.
+
+        Зачем: окно перечитывает счёт у брокера сразу после команды, а не через
+        полминуты опроса (решение 0070). Получатель обязан вернуться немедленно;
+        его исключение в команду не идёт — только в лог.
+        """
+        self._after_command.append(listener)
+
+    def _commanded(self) -> None:
+        """Позвать получателей `after_commands`; упавший — в лог, команде не мешает."""
+        logger = log()
+        for listener in self._after_command:
+            try:
+                listener()
+            except Exception:  # чужой получатель не ломает ответ на команду
+                logger.exception("получатель «после команды» упал")
 
     async def __aenter__(self) -> "BrokerSession":
         return self
@@ -838,14 +866,20 @@ class BrokerSession:
     # --- заявки: команды ---
 
     async def create_order(
-        self, order: NewOrder, *, record: RecordCommand
+        self, order: PlacedOrder, *, record: RecordCommand
     ) -> CommandAccepted:
         """Подать заявку (`13-create-order.md`). Порядок шагов — `_command`.
+
+        Заявка — `NewOrder` (рыночная, лимитная) или `ConditionalTake`
+        (условная, `D-196`): адрес и шесть шагов у обеих одни.
 
         Возврат значит «брокер принял», а не «исполнена»: факт приходит
         потоком статусов или запросом `order_status` по `CommandAccepted.key`.
         """
-        return await self._command(ORDERS_PATH, order, record)
+        try:
+            return await self._command(ORDERS_PATH, order, record)
+        finally:
+            self._commanded()
 
     async def cancel_order(
         self, target: UUID, *, record: RecordCommand
@@ -856,7 +890,10 @@ class BrokerSession:
         от `target`. Возврат значит «запрос на отмену принят», а не «снята»:
         снятой заявку делает событие `4` по исходной (план Э4 §2.7).
         """
-        return await self._command(CANCEL_ORDER_PATH, CancelOrder(target), record)
+        try:
+            return await self._command(CANCEL_ORDER_PATH, CancelOrder(target), record)
+        finally:
+            self._commanded()
 
     async def _command(
         self, path: str, request: OrderCommand, record: RecordCommand
@@ -1197,8 +1234,8 @@ class BrokerSession:
         `redaction.RedactingSink`, который перекидывал записи слоя
         в `logging.lastResort`, то есть в stderr; перекидывание убрано там же.
 
-        Уровни: отказ — WARNING (техническому логу он важен), тело ответа —
-        DEBUG (оно длинное и нужно редко).
+        Уровни: отказ и тело ответа — оба WARNING (тело — с 13.11.2026, иначе
+        в файл оно не попадало); тело уже вычищено и обрезано до 500 символов.
         """
         if isinstance(error, OUTAGE):
             # Человеческую строку `went_offline` возвращает для журнала
@@ -1213,12 +1250,17 @@ class BrokerSession:
 
     @staticmethod
     def _note_technical(error: BrokerError, headline: str) -> None:
-        """Отказ в технический лог: тип, код, адрес, тело. Без текста человеку."""
+        """Отказ в технический лог: тип, код, адрес, тело. Без текста человеку.
+
+        Тело — WARNING, а не DEBUG (решение владельца 13.11.2026): на 503
+        портфеля в логе было «текст, 19 симв.», а что ответил брокер — нет.
+        `details` уже вычищено `scrub` и обрезано (`body_details`).
+        """
         log().warning(
             "%s: %s", headline, error.technical or type(error).__name__
         )
         if error.details:
-            log().debug("тело ответа брокера: %s", error.details)
+            log().warning("тело ответа брокера: %s", error.details)
 
     def _note_online(self) -> None:
         # `came_online` возвращает строку для журнала решений — человеческую,

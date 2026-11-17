@@ -406,7 +406,7 @@ def test_the_account_poll_is_wired_to_ask_the_port_about_the_halt(
     владелец счёта «позиция под управлением» или «закройте её руками»,
     не была закреплена ничем.
 
-    Предмет здесь — `LiveLink._funds_watchers`: ни сессии брокера, ни файла
+    Предмет здесь — `LiveLink.funds_watchers`: ни сессии брокера, ни файла
     токена, ни сети. Порт подставной и ведёт себя как настоящий: сказали
     `halt` — `halted` перестал быть пустым.
     """
@@ -418,7 +418,7 @@ def test_the_account_poll_is_wired_to_ask_the_port_about_the_halt(
         ticker="MXU6",
         class_code="SPBFUT",
     )
-    watchers = link._funds_watchers(lambda _account, _money: None)  # noqa: SLF001 — предмет проверки
+    watchers = link.funds_watchers(lambda _account, _money: None)
     assert not watchers.halted(), (
         "опрос счёта считает робота остановленным до всякой остановки: "
         "жалоба про счёт станет гнать человека в терминал брокера без повода"
@@ -520,6 +520,9 @@ class _Reporter:
 
     def halt(self, event: str, reason: str) -> None:
         self.halts.append((event, reason))
+
+    def position_read(self, ticker: str, signed: int) -> None:
+        """Позиция из снимка счёта (`B-097`): проводке опроса нужен получатель."""
 
     @property
     def halted(self) -> str:

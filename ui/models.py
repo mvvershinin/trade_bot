@@ -184,6 +184,10 @@ class LevelKind(enum.Enum):
     ENTRY = "entry"
     TAKE = "take"
     TRAILING = "trailing"
+    #: Цена включения скользящего тейка (`B-103`): до порога уровня выхода
+    #: ещё нет, а условная заявка у брокера уже стоит (`D-196`). Рисуется
+    #: штрихпунктиром — это не уровень выхода, а цена, с которой он появится.
+    ACTIVATION = "activation"
 
     @property
     def label(self) -> str:
@@ -191,6 +195,7 @@ class LevelKind(enum.Enum):
             LevelKind.ENTRY: "Цена входа",
             LevelKind.TAKE: "Тейк-профит",
             LevelKind.TRAILING: "Скользящий тейк",
+            LevelKind.ACTIVATION: "Включение скользящего тейка",
         }[self]
 
 
@@ -316,10 +321,16 @@ class AfterTakeProfit(enum.Enum):
     Прямо касается правила «всегда в позиции»: первый вариант его нарушает
     осознанно, третий соблюдает буквально и дороже всех по комиссии.
     Цифр по вариантам нет — они появятся в таблице Э1-19. Решение 0004.
+
+    `WAIT_THEN_STOP_ON_LOSS` — «ждать нового сигнала», но первая сделка окна,
+    закрытая в убыток с учётом комиссии, закрывает это окно для входов
+    (`B-106`, `B-109`, решение 0072). В движке это два поля:
+    `stop_after_take_profit` снят, `stop_after_loss` стоит.
     """
 
     STOP_FOR_THE_DAY = "stop"
     WAIT_FOR_SIGNAL = "wait"
+    WAIT_THEN_STOP_ON_LOSS = "wait_stop_on_loss"
     RESTORE_AT_ONCE = "restore"
 
     @property
@@ -327,6 +338,9 @@ class AfterTakeProfit(enum.Enum):
         return {
             AfterTakeProfit.STOP_FOR_THE_DAY: "Не входить до конца дня (как сейчас)",
             AfterTakeProfit.WAIT_FOR_SIGNAL: "Ждать нового сигнала средней",
+            AfterTakeProfit.WAIT_THEN_STOP_ON_LOSS: (
+                "Ждать нового сигнала, но первый убыток в окне — стоп до конца окна"
+            ),
             AfterTakeProfit.RESTORE_AT_ONCE: "Сразу восстановить позицию",
         }[self]
 
@@ -596,6 +610,10 @@ class Marker:
     text: str = ""
     tooltip: str = ""
     pair_id: str | None = None
+    #: Сделка прежнего захода боя, прочитанная из базы (`app/live_history.py`,
+    #: B-100). График рисует её приглушённой — так же, как таблица «Сделки»
+    #: приглушает её строку: одно решение на оба места.
+    earlier_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -609,6 +627,8 @@ class TradePath:
     side: Side
     layer: Layer = Layer.FACT
     profitable: bool | None = None
+    #: Сделка прежнего захода боя — линия приглушена, как её метки (`Marker.earlier_run`).
+    earlier_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -898,6 +918,52 @@ class LiveView(Protocol):
     @property
     def forecast_origin(self) -> RunOrigin:
         """Откуда данные «прогноза»."""
+    @property
+    def hand_refused(self) -> str:
+        """Почему «Снять заявку» и «Закрыть позицию» недоступны; пусто — доступны."""
+
+
+@dataclass(frozen=True, slots=True)
+class AccountLine:
+    """Строка «Счёт у брокера» (решение 0070) — готовые слова порта.
+
+    По ответу брокера, а не по памяти программы: позиция по инструменту,
+    живые заявки, рубли, время чтения. Окно ничего не считает.
+
+    :param text: сама строка; пусто — показывать нечего (связи не было).
+    :param tooltip: подробность — откуда числа или почему не прочитано.
+    :param trouble: последнее чтение не удалось целиком или частью —
+        строка показывается цветом тревоги.
+    """
+
+    text: str
+    tooltip: str = ""
+    trouble: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RobotOrder:
+    """Заявка робота у брокера — незакрытая команда журнала этого счёта.
+
+    `key` — ключ заявки у брокера: по нему окно просит её снять. `words` —
+    готовые слова порта (сторона, объём, инструмент, цена, чья): окно
+    показывает их в списке и **ими же** спрашивает подтверждение.
+    """
+
+    key: str
+    words: str
+
+
+@dataclass(frozen=True, slots=True)
+class RobotOrders:
+    """Ответ на «Снять заявку»: заявки робота или почему список не прочитан.
+
+    Ответ приходит всегда: окно, ждущее списка, иначе ждало бы вечно,
+    а пустой список читался бы как «заявок нет» (правило 13).
+    """
+
+    orders: tuple[RobotOrder, ...] = ()
+    trouble: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -933,6 +999,9 @@ class TradeRow:
     #: Движение цены в пользу позиции, в пунктах (`backtest.Deal.points`).
     #: `None` — источник пунктов не передал.
     profit_points: float | None = None
+    #: Сделка прежнего захода боя, прочитанная из базы (B-100): у текущего
+    #: движка «факта» её нет — он прогрет с нуля. Таблица приглушает строку.
+    earlier_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -971,6 +1040,12 @@ class TradesSummary:
     #: единого слова о том, что проскальзывание не учтено. Пусто бывает
     #: только там, где нет и числа.
     headline: str = ""
+    #: Чей это итог — словами, в начало строки под таблицей. Пусто — «Итог
+    #: за период». В бою: «Итог за всю историю боя» (B-100).
+    title: str = ""
+    #: Итог текущего захода боя — второй строкой под итогом всей истории.
+    #: `None` — не бой: строка одна.
+    current: TradesSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1208,6 +1283,10 @@ LIVE_LIMITS_BOUNDS: dict[str, LiveBound] = {
     "live_reconnect_pauses_sec": LiveBound(1, 600),
     "live_fok_pct": LiveBound(0.1, 20.0, LIVE_PERCENT),
     "live_band_wait_sec": LiveBound(1, 30),
+    # D-196: защитный спред условной заявки скользящего тейка у брокера.
+    # Умолчание 0,1 % — владелец счёта 13.11.2026; границы — выбор
+    # исполнителя (не уже шага цены и не дальше разумного), замеров нет.
+    "live_trailing_spread_pct": LiveBound(0.01, 5.0, LIVE_PERCENT),
 }
 
 #: Сколько пауз переподключения можно задать. Последняя повторяется, пока
@@ -1562,6 +1641,11 @@ class Settings:
     #: чем подать выход по концу окна с пределом по проценту (решение 0067).
     #: `LiveLimits.band_wait`. Пять секунд — временное значение, замеров нет.
     live_band_wait_sec: int = 5
+    #: Защитный спред условной заявки скользящего тейка у брокера, в процентах
+    #: (`D-196`): сработав, брокер подаёт лимитную заявку по цене срабатывания
+    #: минус спред (продажа) или плюс (покупка). `LiveLimits.trailing_spread_percent`.
+    #: 0,1 % — владелец счёта 13.11.2026.
+    live_trailing_spread_pct: float = 0.1
     #: Куда писать технический лог. Пусто — умолчание программы (`userdata/logs`).
     #: Это настройка программы, а не торговли: в `EngineSettings` ей места нет
     #: по той же причине, что и глубине показа (`D-021`).
@@ -1622,6 +1706,7 @@ FIELD_CAPTIONS: dict[str, str] = {
     "live_reconnect_pauses_sec": "Паузы между попытками восстановить связь",
     "live_fok_pct": "Отступ цены боевой заявки",
     "live_band_wait_sec": "Ждать ответа биржи о планке цены",
+    "live_trailing_spread_pct": "Защитный спред скользящего тейка у брокера",
     "log_directory": "Куда писать журнал работы",
 }
 

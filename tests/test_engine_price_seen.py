@@ -135,7 +135,15 @@ def drive(
 
 
 def arms(talker: Talker) -> list[OrderRequest]:
-    return [o for o in talker.submitted if o.action is OrderAction.ARM_TAKE_PROFIT]
+    """Вооружения уровня выхода — без условной у брокера.
+
+    Условная (`D-196`, `trail_offset`) подаётся от входа до порога и уровня
+    выхода не несёт.
+    """
+    return [
+        o for o in talker.submitted
+        if o.action is OrderAction.ARM_TAKE_PROFIT and o.trail_offset is None
+    ]
 
 
 # --------------------------------------------------------------------------

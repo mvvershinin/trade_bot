@@ -380,7 +380,9 @@ def test_mode_off_in_combat_asks_about_the_broker_position_and_cancel_keeps_the_
     assert len(asked.questions) == 1, "«Выключен» в бою при позиции без вопроса"
     _title, text, yes = asked.questions[0]
     assert LIVE_UNMANAGED in text and "Лонг 1" in text, text
-    assert "продолжает сторожить" in text and "аварийного стопа" in text.lower(), text
+    # D-196 (0071): скользящий тейк в бою — условная у брокера, её не снимают
+    # ни «Выключен», ни закрытие окна; прежний текст обещал сторож программы.
+    assert "у брокера условной" in text and "аварийного стопа" in text.lower(), text
     assert yes == "Выключить робота"
     assert port.modes == [], "«Отмена» переключила режим"
     assert window.mode_box.currentData() is Mode.REVERSE, "список не вернулся к режиму"
@@ -478,7 +480,6 @@ def test_the_fact_layer_is_named_by_the_data_and_not_by_the_mode(setup) -> None:
     assert not any(MarkerKind.WAITING.label in text for text in texts), (
         "в бою легенда обещает «исполнится по открытию следующей свечи» (D-172)"
     )
-    assert any("Прогноз" in text for text in texts), "в легенде нет «Прогноза»"
 
     _show(window, _combat(origin=RunOrigin.PAPER))
     assert RunOrigin.PAPER.label in chart.fact_box.text()
@@ -486,6 +487,34 @@ def test_the_fact_layer_is_named_by_the_data_and_not_by_the_mode(setup) -> None:
 
     _show(window, LiveStatus(available=True))
     assert chart.fact_box.text() == "Факт", "без боя подпись утверждает происхождение"
+
+
+def test_the_forecast_is_hidden_in_combat_until_the_owner_turns_it_on(setup) -> None:
+    """Стережёт: в бою слой «Прогноз» снят по умолчанию, галочкой возвращается (0070).
+
+    Владелец 13.11.2026: «бой включён и заявки из симуляции отображены» —
+    полые метки модели он принимал за заявки. Вне боя слой включён, как был;
+    включённый в бою рукой — следующим снимком боя не гасится.
+    """
+    window, _port, _asked = setup
+    chart = window.chart
+
+    def legend() -> list[str]:
+        return [text.text() for _icon, text in chart.legend.rows]
+
+    assert chart.plan_box.isChecked(), "вне боя «Прогноз» снят — так не было"
+    _show(window, _combat())
+    assert not chart.plan_box.isChecked(), "в бою «Прогноз» показан по умолчанию"
+    assert not any("Прогноз" in text for text in legend()), legend()
+
+    _show(window, LiveStatus(available=True))
+    assert chart.plan_box.isChecked(), "бой выключен, а «Прогноз» остался снят"
+
+    _show(window, _combat())
+    chart.plan_box.setChecked(True)
+    _show(window, _combat())
+    assert chart.plan_box.isChecked(), "снимок боя погасил «Прогноз», включённый рукой"
+    assert any("Прогноз" in text for text in legend()), legend()
 
 
 def _row(origin: RunOrigin | None) -> DecisionRow:
@@ -522,7 +551,7 @@ def test_every_live_field_hint_says_when_the_value_takes_effect(qapp) -> None:
         for name in (
             "live_stale_after_sec", "live_event_wait_sec", "live_fill_wait_sec",
             "live_cancel_wait_sec", "live_position_settle_sec", "live_reconnect_pauses_sec",
-            "live_fok_pct", "live_band_wait_sec",
+            "live_fok_pct", "live_band_wait_sec", "live_trailing_spread_pct",
         ):
             widget = getattr(dialog, name)
             assert LIVE_WHEN in widget.toolTip(), FIELD_CAPTIONS[name]

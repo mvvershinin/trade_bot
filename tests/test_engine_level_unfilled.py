@@ -170,16 +170,23 @@ def test_hold_in_a_loss_keeps_the_position_and_starts_the_trailing_over() -> Non
     _run(engine, executor, _bar_t(992.0))
 
     assert engine.halted == ""
-    assert executor.submitted == [], "в убытке с включённой настройкой заявок нет"
+    # Скользящий начинается заново — значит, и условная у брокера ставится
+    # заново от цены входа (`D-196`), а не уровень от старой вершины.
+    activation = PLAN.activation_level(ENTRY, 1)
+    assert [(o.action, o.price, o.trail_offset) for o in executor.submitted] == [
+        (OrderAction.ARM_TAKE_PROFIT, activation, PLAN.offset_percent)
+    ], "в убытке с включённой настройкой — только условная заново, без выхода"
     held = engine.position
     assert held is not None and held.is_open
     assert (held.side, held.entry_price, held.volume) == (Side.LONG, ENTRY, 1.0)
-    assert held.take == replace(PLAN.initial(ENTRY, 1), level=None)
+    assert held.take == replace(PLAN.initial(ENTRY, 1), level=None, activation=activation)
     assert (held.take.start_percent, held.take.offset_percent) == (0.5, 0.2), (
         "план сброшен из настроек движка, а не из плана позиции"
     )
     assert held.take.peak is None and held.take.level is None
-    assert engine.state.order_in_flight(EVENT.order_id) is None
+    # Под тем же именем в ожидании — новая условная, а не снятый выход по уровню.
+    waiting = engine.state.order_in_flight(EVENT.order_id)
+    assert waiting is not None and waiting.trail_offset is not None, waiting
     assert engine.state.entries_closed_date is None
     assert any(e.event == "Уровень не исполнился — позиция остаётся" for e in lines)
 

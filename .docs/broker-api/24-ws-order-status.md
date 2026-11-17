@@ -74,7 +74,7 @@ Authorization: Bearer <ACCESS_TOKEN>
 | `remainedQuantity` | number | Оставшееся количество (шт.) |
 | `ticker` / `classCode` | string | Инструмент и класс |
 | `side` | string (enum) | `1` Покупка, `2` Продажа |
-| `orderType` | string (enum) | `1` Рыночная, `2` Лимитная |
+| `orderType` | string (enum) | `1` Рыночная, `2` Лимитная. ⚠️ Условной (`5`) в перечне потока нет — её события не описаны (сайт 13.11.2026, `D-196`) |
 | `averagePrice` | number | Средняя цена исполнения |
 | `orderId` | string | Уникальный идентификатор заявки |
 | **`executionId`** | string | **Уникальный идентификатор сделки** |

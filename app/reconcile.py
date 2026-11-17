@@ -60,7 +60,7 @@ async def reconcile(executor: LiveExecutor, expected: int) -> Reconciliation:
     :param expected: позиция робота со знаком (`app.fact.signed_position`), как её
         знает движок; сделки, ещё не отданные ему исполнителем, сверка учтёт сама.
     """
-    notes = await executor.settle_open_commands()
+    notes = await executor.settle_open_commands(expected)
     # Заметки сверки — человеку (правило 13): вызывающий возвращает только остановку.
     for note in notes:
         executor.tell(f"Сверка с брокером: {note}")

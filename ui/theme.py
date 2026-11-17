@@ -77,6 +77,9 @@ class Theme:
             LevelKind.ENTRY: self.level_entry,
             LevelKind.TAKE: self.level_take,
             LevelKind.TRAILING: self.level_trailing,
+            # Тот же цвет, что у скользящего: это один и тот же тейк до и после
+            # порога. Отличие — штрихпунктир (`painter_surface.LEVEL_PEN`).
+            LevelKind.ACTIVATION: self.level_trailing,
         }[kind]
 
     def shade_color(self, kind: ShadeKind) -> str:

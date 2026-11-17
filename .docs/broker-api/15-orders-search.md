@@ -4,11 +4,16 @@ URL: https://trade-api.bcs.ru/http/operations/all-order-list
 
 ```
 POST
-## https://be.broker.ru/trade-api-market-data-connector /api/v1/orders/search
+## https://be.broker.ru/trade-api-bff-order-details /api/v1/orders/search
 ```
+
+> ⚠️ **Живой сервер 13.11.2026 (`B-095`):** адрес выше — рабочий. Сайт называл `trade-api-market-data-connector` — 404 HTML; `bff-operations` — тоже 404. Даты фильтра — строго `yyyy-MM-dd'T'HH:mm:ss.SSSX` (`2026-11-12T19:00:00.000Z`), без миллисекунд — 422 `INVALID_FORMAT`. `side` и `orderStatus` в строках — числа.
+
+> ⚠️ **Условная (тип `5`) в списке — живьём не проверено (16.11.2026, `B-105` → `D-200`).** «0 активных» при живой условной в 10:03 дал проверочный скрипт, сравнивавший состояние строки (`1`/`2`/`3`) с именами статусов 11 — это не ответ брокера. Наш запрос `orderTypes` не шлёт; у условной статус 11 даёт `price` 0, уровень — `takePrice`. Программа поэтому узнаёт условную по `takePrice` и живые заявки робота спрашивает ещё и по ключу (11).
 
 > ⚠️ **Внимание!** В списке заявок отображаются заявки, поданные начиная
 > с **26.01.2026**. Заявки, созданные ранее этой даты, в список не включены.
+> Список содержит не более **1000** последних заявок (сайт, 13.11.2026; в снимке 04.09 не было).
 
 ## Request
 
@@ -52,7 +57,7 @@ POST
 
 ## 429 — общая форма отказа, см. `03-limits.md`
 
-Base URL `https://be.broker.ru/trade-api-market-data-connector`, Bearer JWT. 10 RPS.
+Base URL `https://be.broker.ru/trade-api-bff-order-details`, Bearer JWT. 10 RPS (живьём 13.11.2026; сайт к 13.11.2026 исправлен и называет этот же адрес).
 
 ---
 

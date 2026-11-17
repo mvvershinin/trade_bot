@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 
 from engine.take_profit import TakeProfit
+from engine.window import WindowDay
 
 __all__ = [
     "Side",
@@ -101,6 +102,14 @@ class Position:
     продажей, и у заявки на выход здесь всё равно стоит `LONG`. Для боевого
     адаптера это разные вещи, и перевод «сторона позиции + действие» в «купить
     или продать» — его работа, а не движка.
+
+    `entry_commission` — комиссия сделки входа, как её сообщил исполнитель
+    (`Fill.commission`). Нужна на выходе: результат сделки «чистыми» —
+    это пункты в рублях минус комиссия **обеих** сторон, а сделка выхода
+    несёт только свою (`B-106`, правило «первый убыток в окне — стоп»).
+    `None` — исполнитель комиссию не сообщил. `repr=False` — чтобы строка
+    `position …` проверки-образца не менялась от поля, к сделкам отношения
+    не имеющего.
     """
 
     side: Side
@@ -109,10 +118,13 @@ class Position:
     entry_time: datetime
     state: PositionState = PositionState.OPEN
     take: TakeProfit = field(default_factory=TakeProfit)
+    entry_commission: float | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _check_volume(self.volume, "объём позиции")
         _check_price(self.entry_price, "цена входа")
+        if self.entry_commission is not None:
+            _check_price(self.entry_commission, "комиссия входа")
         if not isinstance(self.take, TakeProfit):
             raise TypeError(
                 f"план тейка — engine.TakeProfit, получено {self.take!r}"
@@ -609,6 +621,19 @@ FIELD_RULES: tuple[FieldRule, ...] = (
             "неисполненного уровня"
         ),
     ),
+    # Отступ уровня, который ведёт брокер (`D-196`): только у вооружения
+    # и необязательно — у неподвижного тейка и у скользящего после порога
+    # его нет. Само число (конечное, больше нуля) проверяет `__post_init__`.
+    FieldRule(
+        field="trail_offset",
+        required=frozenset(),
+        forbidden=frozenset(OrderAction) - {OrderAction.ARM_TAKE_PROFIT},
+        missing="",
+        extra=(
+            "у заявки `{action}` задан отступ скользящего уровня {value!r}: "
+            "уровень у брокера ставит только вооружение тейка"
+        ),
+    ),
 )
 
 
@@ -679,6 +704,17 @@ class OrderRequest:
     Прототипом лимитные заявки не воспроизводились (PROTOTYPE.md §9),
     и сверка с ним на этой форме не обещается.
 
+    `trail_offset` — **скользящий уровень ведёт брокер** (`D-196`): у такого
+    вооружения `price` — цена включения (вход ± порог), а не уровень выхода,
+    и сторожить его по касанию нельзя. Брокер после сделки по `price` сам
+    ведёт уровень на этом отступе (в процентах) от лучшей цены. Подаётся
+    движком от входа до порога включения скользящего тейка — и в бою,
+    и в прогоне одинаково (правило 1). Модель прогона такое вооружение
+    не исполняет: до порога у неё уровня нет, после порога его ведёт
+    обычное вооружение движка по минуткам. Боевой исполнитель ставит
+    условную заявку у брокера, а дальнейшие вооружения этого имени
+    к брокеру не несёт.
+
     `touch` — с какой стороны цена доходит до уровня (`LevelTouch`). Только
     у вооружения тейка и обязательно у него: без стороны касания исполнитель
     вынужден её додумывать, а из этой догадки и вырос `B-046`. Считает
@@ -705,6 +741,7 @@ class OrderRequest:
     target_id: str | None = None
     touch: "LevelTouch | None" = None
     limit_price: float | None = None
+    trail_offset: float | None = None
 
     def __post_init__(self) -> None:
         for rule in FIELD_RULES:
@@ -713,6 +750,12 @@ class OrderRequest:
             # Уровень уже признан таблицей уместным — осталось проверить само
             # число. Заявка не-вооружения сюда не доходит: цена ей запрещена.
             _check_price(self.price, "уровень тейка")
+        if self.trail_offset is not None:
+            _check_price(self.trail_offset, "отступ скользящего уровня")
+            if self.trail_offset <= 0:
+                raise ValueError(
+                    f"отступ скользящего уровня должен быть больше нуля: {self.trail_offset!r}"
+                )
         if self.limit_price is not None:
             _check_price(self.limit_price, "предельная цена")
             if self.limit_price <= 0:
@@ -966,6 +1009,16 @@ class EngineState:
     не исполниться, а позицию закрыли руками. Читает её шаг 9, и действует
     она независимо от «стопа после тейка» — это другое правило.
 
+    `losing_window` — окно (дата открытия и границы), в котором сделка
+    закрылась **в убыток чистыми** (после комиссии обеих сторон) по торговой
+    причине (`B-106`, `B-109`, решение 0072). Выход по концу окна, перед
+    нерабочим днём и по концу ряда сюда не попадает. Пишется на каждой такой
+    сделке независимо от настройки — по той же причине, что `last_exit_date`, —
+    и ещё **в момент решения** при перевороте «в той же свече», если выход
+    по оценке на закрытии свечи убыточен (`B-108`). Читает его только шаг 9
+    при `EngineSettings.stop_after_loss`: то же окно — входов нет; другое,
+    в том числе изменённое в настройках, — счёт заново.
+
     `pending` — **заявки в полёте**: исполнитель их принял, а сделки по ним ещё
     не было. Держатся ради трёх вещей.
 
@@ -1038,6 +1091,7 @@ class EngineState:
     take_profit_date: date | None = None
     last_exit_date: date | None = None
     entries_closed_date: date | None = None
+    losing_window: WindowDay | None = None
     pending: tuple[OrderRequest, ...] = ()
     closing_bars: int = 0
     exit_blocked_bars: int = 0

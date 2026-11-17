@@ -264,11 +264,29 @@ class TakeProfit:
     #: ⚠️ Скользящий уровень к сетке не приводится: его сторожит программа
     #: и выходит по рынку (решение 0066, Р2), цена на бирже от него не зависит.
     price_step: float = 0.0
+    #: Цена включения условной заявки, которую **принял исполнитель** (`D-196`):
+    #: скользящий тейк до порога стоит у брокера условной заявкой, и уровня
+    #: выхода у него ещё нет (`level` пуст), а снимать перед выходом есть что.
+    #: Ставит её принятое вооружение с `trail_offset` (`pipeline._after_arm`),
+    #: гасит принятое снятие.
+    activation: float | None = None
 
     @property
     def armed(self) -> bool:
-        """Есть ли уровень, который кто-то сторожит."""
-        return self.level is not None
+        """Есть ли что-то, что кто-то сторожит: уровень выхода или условная у брокера."""
+        return self.level is not None or self.activation is not None
+
+    def activation_level(self, entry_price: float, side_sign: int) -> float | None:
+        """Цена включения скользящего тейка у брокера: вход ± порог, к сетке шага от рынка.
+
+        Арифметика неподвижного уровня (`fixed_level`) с порогом вместо цели:
+        брокер включает уровень сделкой по этой цене, движок — ценой, прошедшей
+        порог (`advance`). Сетка — от рынка, как у неподвижного тейка: цена
+        включения не ближе порога. `None` — скользящий тейк не включён.
+        """
+        if not self.trailing:
+            return None
+        return fixed_level(entry_price, side_sign, self.start_percent, self.price_step)
 
     @property
     def moving(self) -> bool:
@@ -283,7 +301,7 @@ class TakeProfit:
         и позицию держит переворот по средней (ТЗ §4.4 В).
         """
         if self.trailing:
-            return replace(self, level=None, peak=None)
+            return replace(self, level=None, peak=None, activation=None)
         return replace(
             self, level=fixed_level(entry_price, side_sign, self.percent, self.price_step)
         )

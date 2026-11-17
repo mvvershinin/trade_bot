@@ -65,7 +65,6 @@ KNOWN: dict[str, int] = {
     "ui/notices.py::guard_note": 109,
     "broker/session.py::BrokerSession._exchange": 95,
     "market/sync.py::sync_minutes": 93,
-    "ui/status_panel.py::StatusPanel.apply_state": 83,
 }
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent

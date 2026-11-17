@@ -29,8 +29,11 @@
   целиком — остановка словами статуса с хвостом «FOK» (Р-6); частичная без
   конца за предел — страховка: остаток снимается, `ExecutionHalted`.
 * **Неподвижный тейк** — лимитная заявка у брокера по цене из заявки движка,
-  как есть: к шагу её приводит движок (Р1). Снятие ждёт `4`. Снята не нами —
-  остановка. Исполнилась частично к снятию — остаток закрывается FOK,
+  как есть: к шагу её приводит движок (Р1). Снятие ждёт `4`. Снята не нами
+  (биржей, брокером, руками) без исполнения — решает позиция у брокера
+  (владелец 13.11.2026, `_resolve_outside`): сходится — строка «продолжаю»
+  и тейк заново по уровню движка; не сходится — «закрыть всё» (0020).
+  Исполнилась частично к снятию — остаток закрывается FOK,
   движку одна сделка на весь объём и `ALREADY_TRIGGERED`.
 * **Скользящий тейк** — сторож здесь, в программе (Р2). Касание судится по
   high/low **записанных минуток**, уровнем, поданным не позже начала минутки, —
@@ -78,6 +81,7 @@ import asyncio
 import contextlib
 import enum
 import logging
+import math
 import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
@@ -90,7 +94,7 @@ from uuid import UUID
 
 from app.fact import LiveLimits, position_words, signed_position
 from app.halt import halt_reason
-from broker.account import parse_positions
+from broker.account import read_holdings
 from broker.errors import (
     AuthFailed,
     BadRequest,
@@ -108,13 +112,18 @@ from broker.order_stream import order_events
 from broker.orders import (
     FINAL_STATUSES,
     STATUS_WORDS,
+    ConditionalTake,
+    ListedOrder,
+    ListedOrderStatus,
     NewOrder,
     OrderCommand,
     OrderEvent,
     OrderReport,
     OrderSide,
+    OrdersQuery,
     OrderStatus,
     OrderType,
+    PlacedOrder,
     TimeInForce,
 )
 from broker.session import PORTFOLIO_PATH, BrokerSession
@@ -149,6 +158,7 @@ __all__ = [
     "LiveLimits",
     "StoreBook",
     "Wiring",
+    "hand_words",
     "position_words",
     "signed_position",
 ]
@@ -195,6 +205,13 @@ _HALT_TAIL: Final[str] = (
     "Робот остановлен. Прежде чем продолжать, проверьте позицию и заявки у брокера."
 )
 
+#: «Закрыть всё» без закрывающей заявки: своя заявка не снялась (D-198 п. 2).
+_KEPT_OPEN: Final[str] = (
+    "Позиция не закрывается, закрывающая заявка не подана: заявка робота осталась "
+    "у брокера и после закрытия исполнилась бы сама, открыв позицию заново. Снимите "
+    "её кнопкой «Снять заявку» или в приложении брокера, затем закройте позицию."
+)
+
 #: Чужой текст (причина отказа биржи) — без управляющих знаков и не длиннее этого.
 _FOREIGN_TEXT_LIMIT: Final[int] = 200
 
@@ -211,6 +228,17 @@ _FOREIGN_TEXT_LIMIT: Final[int] = 200
 #: чтением портфеля — не больше одной на паузу. В окно не выведено; если
 #: владелец захочет крутить — одно поле `LiveLimits` (`app/fact.py`).
 _LINK_SETTLE: Final[float] = 10.0
+
+#: Шаг перечитывания портфеля перед заявкой, пока позиция у брокера не сойдётся
+#: с позицией робота (`_require_position`, B-099). Сумма пауз — не больше
+#: `LiveLimits.position_settle`, шаги делят её поровну.
+#:
+#: ⚠️ Число техническое, не торговое: частота запросов, а не цена, объём или
+#: окно. Портфель у БКС — 10 запросов в секунду на счёт
+#: (`.docs/broker-api/29-restrictions.md`, сверено с сайтом 13.11.2026): шаг
+#: в секунду в десять раз ниже предела, а опоздание портфеля (около 5 с
+#: 13.11.2026) видно с точностью до секунды. В окно не выведено.
+_SETTLE_STEP: Final[float] = 1.0
 _CONTROL: Final[re.Pattern[str]] = re.compile(r"[\x00-\x1f\x7f]+")
 
 #: Насколько назад искать последнюю записанную минутку — «текущую» у «закрыть
@@ -407,7 +435,7 @@ class _Ticket:
     key: UUID
     name: str
     what: str
-    order: NewOrder
+    order: PlacedOrder
     answer: _Answer = _Answer.NONE
     status: OrderStatus | None = None
     executed: int = 0
@@ -435,6 +463,9 @@ class _Ticket:
     #: Снятая целиком — не остановка: решает движок (`LevelUnfilled`, Р-10).
     #: Только у выхода по касанию трейлинга, поданного позже порога свежести.
     spared: bool = False
+    #: Снята не командой программы, а робот не остановлен: судьбу решает
+    #: позиция у брокера (`_resolve_outside`, владелец 13.11.2026).
+    outside: bool = False
     executions: dict[str, BrokerExecution] = field(default_factory=dict)
     cancels: list[_Cancel] = field(default_factory=list)
 
@@ -539,6 +570,17 @@ class _Take:
     checked_from: datetime | None = None
     deal: _Deal | None = None
     told: bool = False
+    #: Заявку тейка снял владелец кнопкой «Снять заявку» (0069): вооружение
+    #: под этим именем — пустая операция, снятие — «сторожа нет».
+    dropped: bool = False
+    #: Уровень программы, о котором уже сказано рядом с условной у брокера
+    #: (`D-196`): одна строка на включение, а не на каждую свечу.
+    program_level: float | None = None
+
+    @property
+    def conditional(self) -> bool:
+        """Уровень ведёт брокер условной заявкой (`D-196`), а не лимитная и не сторож."""
+        return self.ticket is not None and isinstance(self.ticket.order, ConditionalTake)
 
     @property
     def fired(self) -> bool:
@@ -560,7 +602,7 @@ class _Priced(NamedTuple):
     слова без заявки — цену, которой у брокера нет.
     """
 
-    order: NewOrder
+    order: PlacedOrder
     words: str
     #: «Текущая» цена, от которой судят исполнение (владелец 10.11.2026):
     #: строка «исполнена по X, текущая была Y» — у каждой исполненной заявки,
@@ -602,9 +644,68 @@ def _order_words(order: OrderRequest) -> str:
     if order.action is OrderAction.CLOSE:
         limit = "" if order.limit_price is None else f" с пределом {order.limit_price:g}"
         return f"выход из {_GENITIVE[order.side]}{limit}"
+    if order.action is OrderAction.ARM_TAKE_PROFIT and order.trail_offset is not None:
+        side = _GENITIVE[order.side]
+        return f"скользящий тейк {side} у брокера, включение на {order.price or 0:g}"
     if order.action is OrderAction.ARM_TAKE_PROFIT:
         return f"уровень {_GENITIVE[order.side]} {order.price or 0:g}"
     return f"снятие уровня {order.target_id or ''}".rstrip()
+
+
+#: Сторона команды журнала словами — для списка заявок робота в окне.
+_HAND_SIDE: Final[dict[CommandSide, str]] = {
+    CommandSide.BUY: "покупка",
+    CommandSide.SELL: "продажа",
+}
+
+
+class _HandCancel(NamedTuple):
+    """Итог снятия одной заявки руками: слова, «у брокера её нет», сдвиг позиции."""
+
+    text: str
+    ended: bool
+    #: Исполненное по заявке за время снятия — со знаком: покупка плюс, продажа минус.
+    shift: int = 0
+
+
+#: Сторона строки списка заявок брокера (15) — сторона команды журнала.
+_LISTED_SIDE: Final[dict[OrderSide, CommandSide]] = {
+    OrderSide.BUY: CommandSide.BUY,
+    OrderSide.SELL: CommandSide.SELL,
+}
+
+
+def _listed_side(order: ListedOrder) -> CommandSide | None:
+    """Сторона строки списка заявок брокера — как в журнале; не названа — `None`."""
+    return None if order.side is None else _LISTED_SIDE[order.side]
+
+
+def _listed_words(order: ListedOrder) -> str:
+    """Живая заявка из списка брокера словами: сторона, остаток, цена или включение."""
+    side = _listed_side(order)
+    volume = order.remained_quantity or order.order_quantity or "?"
+    level = order.level
+    if order.conditional:
+        price = f" условная, включение {level or 0:g}"
+    else:
+        price = "" if level is None else f" по {level:g}"
+    return f"{'?' if side is None else _HAND_SIDE[side]} {volume}{price}"
+
+
+def hand_words(row: StoredCommand) -> str:
+    """Заявка робота из журнала словами: сторона, объём, инструмент, цена, чья.
+
+    Одни слова на список в окне, вопрос перед снятием и строку итога:
+    человек подтверждает ровно то, что потом прочитает в журнале.
+    """
+    command = row.command
+    side = "?" if command.side is None else _HAND_SIDE[command.side]
+    price = "по рынку" if command.price is None else f"по {command.price:g}"
+    placed = in_moscow(row.at).strftime("%d.%m %H:%M")
+    return (
+        f"{side} {command.volume or '?'} {command.symbol} {price}; заявка робота "
+        f"«{command.order_id}», записана {placed} МСК"
+    )
 
 
 def _bars_words(count: int) -> str:
@@ -662,7 +763,11 @@ def _fok_tail(ticket: _Ticket) -> str:
     движок тейк снял, а сторож трейлинга снят вместе с касанием (6.2).
     """
     order = ticket.order
-    if order.time_in_force is not TimeInForce.FILL_OR_KILL or not ticket.killed:
+    if (
+        not isinstance(order, NewOrder)
+        or order.time_in_force is not TimeInForce.FILL_OR_KILL
+        or not ticket.killed
+    ):
         return ""
     left = (
         " Позиция у брокера открыта без тейка — закройте её сами в приложении брокера."
@@ -764,6 +869,10 @@ class LiveExecutor:
         #: Свеча последнего `fills_at` — только закрытая: её закрытие —
         #: «текущая» у заявок движка этой свечи (Р-2, путь А гейта 0.2).
         self._signal: MarketCandle | None = None
+        #: Когда свеча сигнала дошла до исполнителя (`fills_at`). По нему, а не
+        #: по моменту подачи, меряется опоздание входа: на перевороте вход ждёт
+        #: снятия тейка и закрытия, и это время робота, а не свечи (`/risk` 13.11).
+        self._signal_arrived: datetime | None = None
         self._halt: str | None = None
         self._flattened = False
         #: Позиция по нашим сведениям: последнее чтение портфеля, совпавшее
@@ -779,6 +888,13 @@ class LiveExecutor:
         #: Сколько раз поток статусов открывался: по росту 2в узнаёт «связь
         #: вернулась» и сверяет позицию до следующей заявки (0017, 0020).
         self._links = 0
+        #: Свои заявки, снятые не командой программы и ещё не сверенные
+        #: с позицией у брокера (`_ended` → `_resolve_outside`).
+        self._outside: list[_Ticket] = []
+        #: Позицию закрыл владелец кнопкой, а движок «факта» узнает об этом
+        #: только до своей следующей свечи (`flat_taken`): до тех пор заявки
+        #: прежней позиции не подаются (`_held_after_hand_close`).
+        self._flat_by_hand = False
 
     # -- жизнь -----------------------------------------------------------------
 
@@ -841,6 +957,15 @@ class LiveExecutor:
         return tuple(deal.name for deal in self._deals)
 
     @property
+    def flat_by_hand(self) -> bool:
+        """Позицию закрыл владелец, движок «факта» этого ещё не принял (0069)."""
+        return self._flat_by_hand
+
+    def flat_taken(self) -> None:
+        """Движок «факта» принял «позиции нет» — заявки снова идут как обычно."""
+        self._flat_by_hand = False
+
+    @property
     def links(self) -> int:
         """Сколько раз поток статусов открылся. Рост после первого — связь вернулась."""
         return self._links
@@ -866,6 +991,8 @@ class LiveExecutor:
             self._raise_if_halted()
             await self._sweep()
             self._raise_if_halted()
+            if self._flat_by_hand and self._held_after_hand_close(order):
+                return
             # Действие движка → обработчик: таблица, а не четыре ветки (правило 9).
             action = {
                 OrderAction.OPEN: self._open,
@@ -890,9 +1017,10 @@ class LiveExecutor:
         движок подаст по ней следом (`engine/ports.py`, «Когда подаются
         заявки свечи»). Незакрытая не запоминается: по ней движок не решает.
         """
+        arrived = self._clock()  # до замка: ожидание замка — время робота, не свечи
         async with self._lock:
             if not getattr(candle, "unsettled", False):
-                self._signal = candle
+                self._signal, self._signal_arrived = candle, arrived
             await self._sweep()
             await self._flush()
             self._count_limit_exits(candle)
@@ -980,7 +1108,8 @@ class LiveExecutor:
         :raises BrokerError: портфель не прочитан.
         """
         async with self._lock:
-            robot = expected + self._undelivered()
+            # Позицию закрыл владелец, движок ещё не принял: у робота ноль (0069).
+            robot = (0 if self._flat_by_hand else expected) + self._undelivered()
             actual = await self._position_now()
             if actual == robot:
                 self._ledger = actual
@@ -1005,11 +1134,17 @@ class LiveExecutor:
             with self._permitted():
                 return await self._flatten(why)
 
-    async def settle_open_commands(self) -> tuple[str, ...]:
+    async def settle_open_commands(self, expected: int | None = None) -> tuple[str, ...]:
         """Решение 0017: незакрытые команды журнала — статусом по ключу; живые — снять.
 
         Зовётся при старте и после связи (2в, `app/reconcile.py`). Строка
         `recorded` — не «не подана» (`D-177`): её судьбу решает брокер.
+
+        Своя заявка, которую сняли не мы, — не остановка, если позиция у брокера
+        сходится с позицией робота (владелец 13.11.2026, `_resolve_outside`).
+
+        :param expected: позиция робота со знаком, как её знает движок; `None` —
+            не названа, и снятую не нами заявку прошлого запуска сверить не с чем.
         """
         async with self._lock:
             # Команды другого счёта (второй токен в `userdata/`) сверяет не этот
@@ -1029,8 +1164,367 @@ class LiveExecutor:
             for row in stored:
                 if row.command.action is CommandAction.CANCEL:
                     self._settle_cancel(row)
+            notes.extend(await self._resolve_outside(expected))
             await self._flush()
             return tuple(notes)
+
+    # -- руками владельца (задача владельца 13.11.2026) ------------------------
+
+    async def cancel_by_hand(self, key: str, *, stop: bool) -> str:
+        """«Снять заявку» из окна: одна незакрытая заявка робота этого счёта.
+
+        Снимается только команда создания из журнала команд этого счёта:
+        ручных заявок владельца в журнале нет, и программа их не видит.
+        Подача после остановки разрешена (`_permitted`): ради этого кнопка
+        и заведена — робот стоит, заявка висит.
+
+        :param stop: исполнитель ведёт бой. Снят тейк позиции движка чисто —
+            робот торгует дальше, тейк заново не ставит (0069, 0070); иначе
+            останавливается (`_after_hand_cancel`). Пока идёт снятие, замок
+            исполнителя держит заявки движка.
+        :returns: итог словами — в журнал решений.
+        """
+        async with self._lock:
+            rows = {row.command.client_order_id: row for row in await self._robot_rows(None)}
+            row = rows.get(key)
+            if row is None:
+                return (
+                    "Этой заявки нет среди незакрытых заявок робота по этому счёту — "
+                    "снимать нечего: она уже кончилась или подана не роботом."
+                )
+            with self._permitted():
+                done = await self._hand_cancel(row)
+            text = done.text
+            if stop:
+                text += self._after_hand_cancel(row, done)
+            await self._flush()
+        if stop:
+            self._news()
+        return text
+
+    async def close_by_hand(self, *, stop: bool, awaiting: int | None = None) -> tuple[str, bool]:
+        """«Закрыть позицию» из окна: позиция, заявки робота по инструменту, закрытие FOK.
+
+        Как «закрыть всё» (0020), но по команде владельца и при остановленном
+        роботе тоже. Порядок и отличия — `_hand_close`. В бою (`stop`) робот
+        после чистого закрытия торгует дальше без позиции (0069), иначе стоит
+        (`_after_hand_close`).
+
+        :param awaiting: закрывающая заявка уже подана этой кнопкой, и портфель
+            обязан показать эту позицию; пока показывает другую — второе
+            нажатие отказывает словами (`/risk` 13.11.2026, Р1). `None` — не ждём.
+        :returns: итог словами и «закрывающая заявка ушла к брокеру».
+        """
+        async with self._lock:
+            tried = self._flattened
+            with self._permitted():
+                known = set(self._tickets)
+                text, flat = await self._hand_close(awaiting)
+                sent = any(
+                    one.closing and one.answer is not _Answer.REFUSED
+                    for key, one in self._tickets.items() if key not in known
+                )
+            if stop:
+                text += self._after_hand_close(flat=flat, tried=tried)
+            await self._flush()
+        if stop:
+            self._news()
+        return text, sent
+
+    async def _hand_close(self, awaiting: int | None) -> tuple[str, bool | None]:
+        """Ручное закрытие по шагам; каждый шаг против денег (`/risk` 13.11.2026).
+
+        Возврат — слова и итог: `True` — закрыто чисто (заявки робота сняты без
+        исполнений, неотданных движку сделок нет, позиция по сделкам — ноль),
+        `False` — нет, `None` — ничего не тронуто (позиция не прочиталась,
+        закрытие уже ждёт портфель).
+
+        1. **Позиция — первой** (Р3): не прочиталась — ничего не трогать,
+           иначе позиция осталась бы без тейка.
+        2. Закрытие уже подано, а портфель ещё не показал его (`awaiting`) —
+           отказ словами, ничего не трогать (Р1): второе закрытие по отставшему
+           портфелю — шорт.
+        3. Снять заявки робота **из журнала команд** (у исполнителя на одну
+           команду памяти нет). Не снялась хоть одна — не закрывать: тейк,
+           оставшийся у брокера, открыл бы позицию снова.
+        4. Исполнившееся при снятии (`executedQuantity` по статусу) — в позицию
+           по сделкам (`_ledger`): закрывающая заявка подаётся, только если
+           два чтения портфеля показывают **остаток**; ноль — не подаётся (Р1).
+        5. Живые заявки у брокера по инструменту, которых нет в журнале робота
+           (ручные заявки владельца), — назвать, не снимая (Р2).
+
+        «Уже пыталась» (`_flattened`) здесь не держит: второе нажатие — решение
+        человека, а не программа, стреляющая закрытиями (С2).
+        """
+        try:
+            before = await self._position_now()
+        except BrokerError as error:
+            return (
+                f"Позицию у брокера прочитать не удалось ({error.human}): заявки робота "
+                "не тронуты, закрывающая заявка не подана. Повторите позже."
+            ), None
+        if awaiting is not None and before != awaiting:
+            return (
+                "Закрытие уже подано, ждём портфель: брокер ещё показывает "
+                f"{position_words(before)}, после закрытия ждём {position_words(awaiting)}. "
+                "Заявки не тронуты, вторая закрывающая не подана."
+            ), None
+        notes: list[str] = []
+        alive, shift = False, 0
+        handled: list[StoredCommand] = []
+        for row in await self._robot_rows(self._instrument.ticker):
+            done = await self._hand_cancel(row)
+            notes.append(done.text)
+            alive = alive or not done.ended
+            shift += done.shift
+            handled.append(row)
+        # Тейк, исполнившийся при снятии, — сделка: движок узнает о ней
+        # вместе с остановкой (`_stop`), как у `_flatten`.
+        self._collect_takes()
+        self._takes.clear()
+        if alive:
+            notes.append(
+                "Позиция не закрывается: заявка робота осталась у брокера и после "
+                "закрытия исполнилась бы сама, открыв позицию заново. Снимите её "
+                "в приложении брокера и нажмите «Закрыть позицию» ещё раз."
+            )
+        else:
+            if shift:
+                notes.append(
+                    "При снятии заявки робота исполнились: позиция по сделкам — "
+                    f"{position_words(before + shift)}; закрывается только остаток."
+                )
+            # Позиция по сделкам потока известна — она главнее чтения: портфель
+            # отстаёт до ~5 с, и тейк, исполнившийся перед нажатием, он ещё
+            # показывает лонгом (`/risk` 13.11.2026, п. 3). Исполненное при
+            # снятии в ней уже есть (`_count`). Неизвестна (исполнитель на одну
+            # команду) — свежее чтение плюс исполненное при снятии, и тогда
+            # `_close_position` верит только двум чтениям через паузу (К2).
+            trusted = self._ledger is not None
+            if not trusted:
+                self._ledger = before + shift
+            notes.append(await self._close_position(trusted=trusted))
+        notes.append(await self._foreign_orders(handled))
+        flat = not alive and not shift and not self._deals and self._ledger == 0
+        return " ".join(note for note in notes if note), flat
+
+    def _after_hand_cancel(self, row: StoredCommand, done: _HandCancel) -> str:
+        """Бой после «Снять заявку»: тейк позиции снят чисто — дальше; иначе стоп (0069).
+
+        Чисто — это заявка тейка позиции движка, у брокера её больше нет и при
+        снятии ничего не исполнилось. Тогда тейк помечается снятым владельцем:
+        движок выйдет по сигналу, а уровня заново исполнитель не поставит.
+        Исполнилась целиком — тоже дальше: сделку по тейку движок получит
+        обычным путём (`_collect_takes`). Остальное — частичное исполнение,
+        неподтверждённое снятие, заявка не тейка — прежняя остановка.
+        """
+        ticket = self._tickets.get(row.command.client_order_id)
+        take = None if ticket is None else self._take_of(ticket)
+        if ticket is None or take is None or not done.ended:
+            self._hand_halt()
+            return ""
+        if ticket.status is OrderStatus.FILLED:
+            return " Робот торгует дальше: сделку по тейку получит движок."
+        if done.shift or take.deal is not None:
+            self._hand_halt()
+            return ""
+        take.dropped = True
+        return (
+            " Робот торгует дальше: позицию ведёт по сигналам, тейк заново не ставит."
+        )
+
+    def _after_hand_close(self, *, flat: bool | None, tried: bool) -> str:
+        """Бой после «Закрыть позицию»: чисто — дальше без позиции; не тронуто — как было.
+
+        Иначе (заявка не снялась, исполнилось при снятии, позиция не сошлась
+        с нулём) — прежняя остановка.
+
+        Движку «факта» «позиции нет» передаёт порт до его следующей свечи
+        (`flat_by_hand` → `LiveObserver.fact_flat`); до тех пор заявки прежней
+        позиции не подаются (`_held_after_hand_close`). «Уже пыталась»
+        (`_flattened`) возвращается прежним: закрывал человек, а не программа (С2).
+        """
+        if flat is None:
+            return ""
+        if not flat:
+            self._hand_halt()
+            return ""
+        self._flattened = tried
+        self._flat_by_hand = True
+        return (
+            " Робот торгует дальше и войдёт снова по сигналу ближайшей свечи; чтобы "
+            "остаться без позиции — сначала выключите бой."
+        )
+
+    def _held_after_hand_close(self, order: OrderRequest) -> bool:
+        """Заявка прежней позиции после «Закрыть позицию»; `True` — не подавать (0069).
+
+        Движок узнаёт «позиции нет» до своей следующей свечи, а заявка, стоявшая
+        в очереди на замок, ещё про прежнюю позицию. Вооружение на пустом счёте
+        стало бы заявкой на открытие, выход — позицией без сигнала. Поэтому
+        снятие и вооружение — пустая операция (сторожа и правда нет), выход
+        и вход — определённый отказ: вход — по сигналу после того, как движок
+        принял ноль.
+        """
+        if order.action in (OrderAction.ARM_TAKE_PROFIT, OrderAction.CANCEL_TAKE_PROFIT):
+            return True
+        raise ExecutionRefused(
+            f"Заявка ({_order_words(order)}) не подана: позицию только что закрыл "
+            "владелец кнопкой «Закрыть позицию», робот принимает это до следующей свечи."
+        )
+
+    async def foreign_closing(self, position: int) -> tuple[str, str]:
+        """Живые заявки не робота при подхвате позиции `position` (0070, `/risk` п. 1).
+
+        Возврат — заявки на закрывающей стороне словами (пусто — нет) и все
+        живые заявки не робота словами. Сторона не названа брокером — считается
+        закрывающей: второй тейк хуже отказа. Отказ чтения списка — `BrokerError`.
+        """
+        closing = CommandSide.SELL if position > 0 else CommandSide.BUY
+        async with self._lock:
+            foreign, more = await self._foreign_listed(())
+        against = [one for one in foreign if _listed_side(one) in (closing, None)]
+        return (
+            "; ".join(_listed_words(one) for one in against),
+            self._foreign_words(foreign, more),
+        )
+
+    async def _foreign_orders(self, handled: Sequence[StoredCommand]) -> str:
+        """Живые заявки у брокера по инструменту, не найденные в журнале робота (Р2).
+
+        Снимать их программа не вправе — решение владельца: только заявки
+        робота. Но промолчать о них после «позиция закрыта» нельзя: такая
+        заявка исполнится и откроет позицию снова. Связать строку списка
+        с журналом можно только по стороне, цене и объёму: биржевого номера
+        в журнале нет, поэтому и слова осторожные — «не найдены в журнале».
+        Снятые сейчас заявки робота (`handled`) тоже свои: список брокера
+        может ещё показывать их живыми.
+        """
+        ticker = self._instrument.ticker
+        try:
+            foreign, more = await self._foreign_listed(handled)
+        except BrokerError as error:
+            return (
+                f"Список заявок у брокера не прочитан ({error.human}) — проверьте в "
+                f"приложении брокера, нет ли по {ticker} живых заявок не робота."
+            )
+        return self._foreign_words(foreign, more)
+
+    async def _foreign_listed(
+        self, handled: Sequence[StoredCommand]
+    ) -> tuple[list[ListedOrder], bool]:
+        """Живые заявки по инструменту не из журнала робота и «список не весь». `BrokerError`.
+
+        Строка узнаётся своей по стороне, уровню и объёму. Уровень условной —
+        цена включения (`ListedOrder.level`): журнал пишет условную ценой
+        включения, а своей цены у неё до срабатывания нет (`B-105`, `D-197`
+        п. 8). По `price` условная робота читалась бы чужой — при подхвате
+        это ложный отказ «чужой тейк», после «Закрыть позицию» — ложное
+        «живы заявки не робота».
+        """
+        ticker = self._instrument.ticker
+        page = await self._session.search_orders(OrdersQuery(
+            statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,),
+        ))
+        ours = {
+            (row.command.side, row.command.price, row.command.volume)
+            for row in [*handled, *await self._robot_rows(ticker)]
+        }
+        foreign = [
+            one for one in page.records
+            if one.status is ListedOrderStatus.ACTIVE and one.ticker in (None, ticker)
+            and (_listed_side(one), one.level, one.order_quantity) not in ours
+        ]
+        return foreign, (page.total_pages or 1) > 1
+
+    def _foreign_words(self, foreign: Sequence[ListedOrder], more: bool) -> str:
+        if not foreign:
+            return ""
+        listed = "; ".join(_listed_words(one) for one in foreign)
+        page = " (показана первая страница списка)" if more else ""
+        return (
+            f"У брокера по {self._instrument.ticker} живы заявки, не найденные в журнале "
+            f"робота: {listed}{page} — они могут открыть позицию снова. Программа их "
+            "не снимает."
+        )
+
+    async def _robot_rows(self, ticker: str | None) -> list[StoredCommand]:
+        """Незакрытые команды создания этого счёта — заявки робота; `ticker` — по инструменту."""
+        account = self._instrument.account
+        return [
+            row for row in await self._book.open_commands()
+            if row.command.account == account
+            and row.command.action is CommandAction.CREATE
+            and (ticker is None or row.command.symbol == ticker)
+        ]
+
+    def _hand_halt(self) -> None:
+        """Робот стоит, пока владелец действует руками. Прежняя причина остаётся."""
+        if self._halt is None:
+            self._halt = (
+                "Владелец снимает заявки или закрывает позицию робота руками из окна. "
+                f"{_HALT_TAIL}"
+            )
+            log.warning("боевой исполнитель остановлен: ручное действие владельца")
+
+    async def _hand_cancel(self, row: StoredCommand) -> _HandCancel:
+        """Снять одну заявку робота: слова, «у брокера её больше нет», сдвиг позиции.
+
+        Сдвиг — исполненное по заявке с первого ответа о ней до конца снятия
+        (`executedQuantity`): тейк, исполнившийся при снятии, — продажа,
+        и закрывать после него надо остаток (`/risk` 13.11.2026, Р1).
+        Исполненное до первого ответа уже в чтении позиции перед снятием.
+
+        Статус по ключу — только чтобы не снимать кончившуюся. Брокер про
+        статус не ответил — снятие уходит всё равно: подтвердит его поток
+        (`_cancel_keys`), а неподтверждённое `_cancel_ticket` и так считает
+        отказом (ревью 13.11.2026, находка 3).
+
+        ⚠️ 404 по ключу у команды, ответа на подачу которой программа
+        не получила (`recorded`, `unknown`), — не «заявки нет» (С1,
+        `BrokerSession.order_status`): «у брокера её больше нет» здесь
+        не утверждается, и позиция за ней не закрывается (находка 2, 0069).
+        """
+        ticket = self._tickets.get(row.command.client_order_id) or self._adopt(row)
+        what = hand_words(row)
+        answered = await self._ask(ticket)
+        first = ticket.done_volume
+        if answered and ticket.missing and ticket.status is None:
+            if row.status in (CommandStatus.RECORDED, CommandStatus.UNKNOWN):
+                return _HandCancel(
+                    f"Заявку ({what}) брокер по ключу не находит, но ответа на её подачу "
+                    "программа не получила, а «не найдена» сразу после потерянного ответа "
+                    "не доказывает, что заявки нет. Снятие не подтверждено — проверьте "
+                    "заявку в приложении брокера.",
+                    ended=False,
+                )
+            ticket.answer = _Answer.REFUSED
+            ticket.note = "снятие руками: брокер заявки с этим ключом не знает"
+            self._sync(ticket)
+            return _HandCancel(
+                f"Заявки ({what}) у брокера нет — снимать нечего; в журнале команд она "
+                "закрыта как не поданная.",
+                ended=True,
+            )
+        if ticket.status is not None and ticket.final:
+            return _HandCancel(
+                f"Заявка ({what}) у брокера уже {STATUS_WORDS[ticket.status]}.", ended=True
+            )
+        try:
+            await self._cancel_ticket(ticket)
+        except (ExecutionRefused, ExecutionHalted) as error:
+            text, ended = f"Заявку ({what}) снять не удалось: {error}", False
+        else:
+            done = "снята"
+            if ticket.done_volume > first:
+                done = f"исполнилась на {ticket.done_volume - first} при снятии, остаток снят"
+            if ticket.status is OrderStatus.FILLED:
+                done = "успела исполниться до снятия"
+            text, ended = f"Заявка ({what}) {done}.", True
+        filled = ticket.done_volume - first
+        return _HandCancel(text, ended=ended, shift=signed_position(
+            Side.LONG if ticket.order.side is OrderSide.BUY else Side.SHORT, filled
+        ) if filled else 0)
 
     # -- действия --------------------------------------------------------------
 
@@ -1094,13 +1588,26 @@ class LiveExecutor:
         self._limit_exits.append(_LimitExit(order, deal, ticket))
 
     async def _arm(self, order: OrderRequest) -> None:
-        """Вооружение — состояние: тот же уровень тем же механизмом — пустая операция."""
+        """Вооружение — состояние: тот же уровень тем же механизмом — пустая операция.
+
+        Скользящий тейк (`D-196`): вооружение с `trail_offset` ставит у брокера
+        условную заявку; пока она жива, **любое** вооружение этого имени —
+        и повтор условной, и уровень программы после порога — к брокеру
+        не идёт: уровень ведёт брокер, робот его не двигает.
+        """
         take = self._takes.get(order.order_id)
         at_broker = (order.side, order.touch) in _AT_BROKER
+        if take is not None and take.dropped:
+            return  # тейк снял владелец: заново не ставится (0069)
+        if take is not None and take.conditional and not take.fired:
+            ticket = take.ticket
+            if ticket is not None and not ticket.final:
+                self._level_aside(take, order)
+                return
         if take is not None:
             if take.fired:
                 raise _already(take.order)
-            if take.ticket is None and not at_broker:
+            if take.ticket is None and not at_broker and order.trail_offset is None:
                 # Сторож двигается: новый уровень судит минутки с момента подачи.
                 self._refuse_stale(order)
                 take.order = order
@@ -1108,8 +1615,9 @@ class LiveExecutor:
             same = take.ticket is not None and at_broker and take.order.price == order.price
             if same and take.ticket is not None and not take.ticket.final:
                 # Тот же уровень и заявка у брокера жива. Кончившаяся без
-                # исполнения — не «то же состояние»: после `B-079` так бывает
-                # только при снятии не нами, а оно уже остановило робота.
+                # исполнения — не «то же состояние»: так бывает только при
+                # снятии не нами, и его уже разобрал `_resolve_outside`
+                # в `_sweep` (тейк заново) — или робот стоит.
                 return
             # Проверки — ДО снятия прежнего: снятый уровень плюс отказ в новом
             # оставили бы позицию без тейка, а движок считал бы прежний живым.
@@ -1117,11 +1625,42 @@ class LiveExecutor:
             await self._require_stream()
             await self._tear_down(take)
             del self._takes[order.order_id]
-        if at_broker:
+        if at_broker or order.trail_offset is not None:
             await self._place_take(order)
             return
         self._refuse_stale(order)
         self._takes[order.order_id] = _Take(order, checked_from=order.submitted_at)
+        # Новый сторож программы — значит, условной у брокера под этим уровнем
+        # нет (`D-196`): не принята при входе или исполнитель собран после порога.
+        # Молчать нельзя (правило 13): владелец считает, что тейк у брокера.
+        self._tell(
+            f"Скользящий тейк {_GENITIVE[order.side]} сторожит программа по минуткам, "
+            f"уровень {order.price or 0:g}: условной заявки у брокера под ним нет "
+            "(не принята при входе или программа перезапущена после порога). "
+            "Выход — по касанию, с закрытием минутки; без связи — не сработает."
+        )
+
+    def _level_aside(self, take: _Take, order: OrderRequest) -> None:
+        """Вооружение при живой условной у брокера: к брокеру не идёт (`D-196`).
+
+        Уровень программы после порога — для сравнения с брокером: одной
+        строкой человеку при включении, дальше — в технический лог. Повтор
+        самой условной (до порога, каждую свечу) — молча: состояние то же.
+        """
+        if order.trail_offset is not None or order.price is None:
+            return
+        first = take.program_level is None
+        take.program_level = order.price
+        log.info(
+            "тейк %s: уровень программы %s, у брокера ведёт условная %s",
+            order.order_id, order.price, take.ticket.key if take.ticket else "?",
+        )
+        if first:
+            self._say(
+                f"Скользящий тейк {_GENITIVE[order.side]} включился по расчёту программы, "
+                f"уровень {order.price:g}. У брокера уровень ведёт условная заявка — "
+                "робот его не двигает; уровень брокера может отличаться."
+            )
 
     async def _cancel(self, order: OrderRequest) -> None:
         """Возврат — сторожа больше нет. Сработал — `ALREADY_TRIGGERED`, а не возврат."""
@@ -1133,31 +1672,67 @@ class LiveExecutor:
             )
         if take.deal is not None:
             raise _already(take.order)
-        if take.ticket is not None:
+        if take.ticket is not None and not take.dropped:
             self._refuse_stale(order)
             self._require_rights()
             await self._require_stream()
             await self._tear_down(take)
         del self._takes[name]
 
-    async def _place_take(self, order: OrderRequest) -> None:
-        """Неподвижный тейк — лимитная у брокера по цене заявки, как есть (Р1)."""
+    async def _place_take(self, order: OrderRequest, *, again: bool = False) -> None:
+        """Неподвижный тейк — лимитная у брокера по цене заявки, как есть (Р1).
+
+        :param again: тот же уровень движка заново — прежний сняли не мы
+            (`_resolve_outside`). Свежесть заявки движка не судится: уровень —
+            действующий план движка, а не решение, догруженное после обрыва.
+            Права и поток — как у любой заявки.
+        """
         volume = self._contracts(order)
-        await self._admit(order, expected=None)
-        request = NewOrder(
+        if again:
+            self._require_rights()
+            await self._require_stream()
+        else:
+            await self._admit(order, expected=None)
+        if order.trail_offset is not None:
+            priced = self._conditional(order, volume)
+            what = f"скользящий тейк {_GENITIVE[order.side]}"
+        else:
+            priced = _Priced(NewOrder(
+                side=_CLOSING[order.side],
+                order_type=OrderType.LIMIT,
+                quantity=volume,
+                ticker=self._instrument.ticker,
+                class_code=self._instrument.class_code,
+                price=order.price,
+            ), f"по цене {order.price or 0:g}: уровень тейка движка, до конца дня")
+            what = f"тейк {_GENITIVE[order.side]}"
+        ticket = await self._send(order.order_id, what, priced)
+        self._takes[order.order_id] = _Take(order, ticket)
+        await self._accepted(ticket)
+
+    def _conditional(self, order: OrderRequest, volume: int) -> _Priced:
+        """Скользящий тейк у брокера — условная заявка закрывающей стороны (`D-196`).
+
+        Цена включения — `price` вооружения как есть (вход ± порог, к сетке шага
+        положил движок); отступ — `trail_offset`; спред — из настроек «Бой».
+        """
+        spread = self._limits.trailing_spread_percent
+        offset = order.trail_offset or 0.0
+        request = ConditionalTake(
             side=_CLOSING[order.side],
-            order_type=OrderType.LIMIT,
             quantity=volume,
             ticker=self._instrument.ticker,
             class_code=self._instrument.class_code,
-            price=order.price,
+            take_price=order.price or 0.0,
+            offset=offset,
+            spread=spread,
         )
-        words = f"по цене {order.price or 0:g}: уровень тейка движка, до конца дня"
-        ticket = await self._send(
-            order.order_id, f"тейк {_GENITIVE[order.side]}", _Priced(request, words)
+        words = (
+            f"условной заявкой у брокера: включение на {order.price or 0:g}, отступ "
+            f"{offset:g} % от лучшей цены, выход лимитной по срабатыванию "
+            f"{'−' if order.side is Side.LONG else '+'} {spread:g} %"
         )
-        self._takes[order.order_id] = _Take(order, ticket)
-        await self._accepted(ticket)
+        return _Priced(request, words)
 
     async def _tear_down(self, take: _Take) -> None:
         """Снять прежний механизм уровня. Исполнилось хоть что-то — довести, `ALREADY_TRIGGERED`."""
@@ -1214,7 +1789,36 @@ class LiveExecutor:
         return timedelta(minutes=self._instrument.bar_minutes, seconds=self._limits.stale_after)
 
     def _refuse_stale(self, order: OrderRequest) -> None:
+        """Несвежее решение к брокеру не идёт; вход — строже прочих заявок.
+
+        Вход решён в момент закрытия свечи сигнала (`engine/pipeline.py`,
+        `_open_order`), и подаётся он только в пределах порога от этого
+        момента, без запаса на размер свечи. 13.11.2026 поток отставал
+        на 2–4 минуты, и робот вошёл по свече, дошедшей с опозданием
+        (решение владельца — отсекать). Тейки, снятия и выходы идут в прежнем
+        окне: отказ в них оставил бы позицию без сторожа. Отказ во входе
+        последствий не имеет (`engine/runner.py`, `_apply_decline`): позиция
+        не открылась, на перевороте прежняя уже закрыта — робот без позиции.
+
+        Опоздание меряется по приходу свечи сигнала (`_signal_arrived`), а не
+        по «сейчас»: на перевороте вход ждёт снятия тейка и закрытия.
+        """
         now = self._clock()
+        arrived = now
+        signal = self._signal
+        if signal is not None and close_time(signal) == order.submitted_at:
+            arrived = self._signal_arrived or now
+        lateness = arrived - order.submitted_at
+        allowed = timedelta(seconds=self._limits.stale_after)
+        if order.action is OrderAction.OPEN and lateness > allowed:
+            raise ExecutionRefused(
+                f"Вход ({_order_words(order)}) не подан, сигнал пропущен: свеча закрылась "
+                f"в {_msk(order.submitted_at)}, а дошла до робота в "
+                f"{in_moscow(arrived):%H:%M:%S} — опоздание "
+                f"{lateness.total_seconds():.0f} с при допустимом "
+                f"{allowed.total_seconds():.0f} с (поле «Допустимое опоздание заявки»). "
+                "Похоже на отставание потока свечей."
+            )
         oldest = now - self._freshness()
         if order.submitted_at < oldest:
             raise ExecutionRefused(
@@ -1245,17 +1849,40 @@ class LiveExecutor:
         )
 
     async def _require_position(self, expected: int, order: OrderRequest) -> None:
-        """Позиция у брокера свежим запросом. Расхождение — закрыть всё и остановиться."""
+        """Позиция у брокера свежим запросом; расхождение — перечитать до схода, потом стоп.
+
+        Портфель брокера отстаёт от потока исполнений: 13.11.2026 после выхода
+        FOK, исполненного по потоку, портфель ещё около 5 с показывал прежний
+        лонг, и каждый переворот кончался «закрыть всё» (B-099, выбор
+        владельца — «перечитывать до схода»). Чтения идут шагом `_SETTLE_STEP`,
+        пока позиция не сойдётся, но в сумме пауз не дольше `position_settle`.
+        Сошлось — дальше сразу, без доживания паузы, и строка INFO в журнал
+        решений: на сколько портфель отстал. Не сошлось за паузу — закрыть всё
+        и остановиться (0020). Пауза 0 — одно перечитывание сразу.
+        """
         actual = await self._read_position()
-        if actual != expected:
-            await asyncio.sleep(self._limits.position_settle)
-            actual = await self._read_position()
         if actual == expected:
             self._ledger = actual
             return
+        pause = self._limits.position_settle
+        steps = max(1, math.ceil(pause / _SETTLE_STEP))
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for _ in range(steps):
+            await asyncio.sleep(pause / steps)
+            actual = await self._read_position()
+            if actual == expected:
+                self._ledger = actual
+                self._say(
+                    f"Портфель брокера отстал на {loop.time() - started:.0f} с: перед "
+                    f"заявкой ({_order_words(order)}) позиция у брокера сошлась с позицией "
+                    f"робота ({position_words(expected)})."
+                )
+                return
+        waited = f"; портфель перечитывался {pause:g} с и не сошёлся" if pause > 0 else ""
         why = (
             f"Перед заявкой ({_order_words(order)}) у брокера {position_words(actual)}, "
-            f"а робот считает {position_words(expected)}."
+            f"а робот считает {position_words(expected)}{waited}."
         )
         raise ExecutionHalted(await self._flatten(why))
 
@@ -1273,9 +1900,11 @@ class LiveExecutor:
 
     async def _position_now(self) -> int:
         payload = await self._session.read(PORTFOLIO_PATH)
-        positions, _ = parse_positions(payload)
         ticker = self._instrument.ticker
-        quantity = sum(one.quantity for one in positions if one.ticker == ticker)
+        # По одному тикеру (broker-expert 13.11.2026, B-096): строка срока
+        # портфеля, а не сумма сроков; отказ — только по своему тикеру.
+        mine = read_holdings(payload).position(ticker)
+        quantity = mine.quantity if mine is not None else 0.0
         if not float(quantity).is_integer():
             raise UnexpectedAnswer(
                 "позиция у брокера пришла дробным числом контрактов",
@@ -1549,7 +2178,11 @@ class LiveExecutor:
 
     def _command_row(self, key: UUID, name: str, command: OrderCommand) -> BrokerCommand:
         """Команда сессии → строка журнала: что увидит брокер, а не намерение движка."""
-        if isinstance(command, NewOrder):
+        if isinstance(command, NewOrder | ConditionalTake):
+            # У условной своей цены нет: в журнал — цена включения. Типа заявки
+            # у строки журнала нет вовсе (`D-196`, вторая очередь), и «по рынку»
+            # о ней было бы неправдой дальше, чем цена включения.
+            price = command.take_price if isinstance(command, ConditionalTake) else command.price
             return BrokerCommand(
                 client_order_id=str(key),
                 action=CommandAction.CREATE,
@@ -1557,7 +2190,7 @@ class LiveExecutor:
                 symbol=command.ticker,
                 side=_JOURNAL_SIDE[command.side],
                 volume=command.quantity,
-                price=command.price,
+                price=price,
                 account=self._instrument.account,
             )
         return BrokerCommand(
@@ -1880,8 +2513,11 @@ class LiveExecutor:
         """Все сторожа программы — по минуткам, записанным с прошлого раза.
 
         Сработавший, чей выход ещё не подан (связи не было), подаётся здесь же:
-        это первый проход сторожа после связи.
+        это первый проход сторожа после связи. Здесь же — свои заявки, снятые
+        не нами (`_resolve_outside`): проход идёт под замком до любой заявки.
         """
+        for line in await self._resolve_outside(None):
+            self._tell(line)
         for take in list(self._takes.values()):
             if take.ticket is not None:
                 continue
@@ -2201,12 +2837,16 @@ class LiveExecutor:
         # Остановка — ДО закрывающей заявки: ни одна заявка движка больше не уйдёт.
         self._halt = f"{why} Робот остановлен, позиция закрывается."
         with self._permitted():
-            notes = await self._cancel_all()
+            notes, alive = await self._cancel_all()
             # Тейк, исполнившийся при снятии, — сделка, и движок о ней узнает
             # вместе с остановкой (`_stop`): забыть его вместе со сторожами нельзя.
             self._collect_takes()
             self._takes.clear()
-            notes.append(await self._close_position())
+            # Своя заявка не снялась — закрывающую не подавать, как у кнопки
+            # «Закрыть позицию» (`_hand_close`, `/risk` 14.11.2026 D-198 п. 2):
+            # тейк или условная, оставшись у брокера, после закрытия исполнились
+            # бы сами и открыли позицию заново — шорт без сигнала.
+            notes.append(_KEPT_OPEN if alive else await self._close_position())
         text = " ".join(
             [why, *notes, "Робот остановлен до вашего решения (решение 0020)."]
         )
@@ -2216,8 +2856,10 @@ class LiveExecutor:
         self._news()
         return text
 
-    async def _cancel_all(self) -> list[str]:
+    async def _cancel_all(self) -> tuple[list[str], bool]:
+        """Снять все свои живые заявки. Возврат — слова и «хоть одна осталась жива»."""
         notes: list[str] = []
+        alive = False
         for ticket in list(self._tickets.values()):
             if ticket.final or ticket.answer is _Answer.REFUSED:
                 continue
@@ -2225,12 +2867,13 @@ class LiveExecutor:
                 await self._cancel_ticket(ticket)
             except (ExecutionRefused, ExecutionHalted) as error:
                 notes.append(f"Заявку ({ticket.what}) снять не удалось: {error}")
+                alive = True
                 continue
             done = "успела исполниться" if ticket.status is OrderStatus.FILLED else "снята"
             notes.append(f"Заявка ({ticket.what}) {done}.")
-        return notes
+        return notes, alive
 
-    async def _close_position(self) -> str:
+    async def _close_position(self, *, trusted: bool | None = None) -> str:
         """Одна заявка FOK на всё, что у брокера, — только по согласным сведениям (С2, К2).
 
         Цена — `_fok_now`: от свежей минутки, иначе по планке биржи, иначе
@@ -2241,31 +2884,53 @@ class LiveExecutor:
         стреляющая закрывающими заявками на каждой сверке, хуже остановленной
         (С2). Не ушла — следующая попытка разрешена.
 
-        Объём — из двух чтений портфеля подряд, и оба обязаны совпасть между
-        собой и с позицией по исполнениям потока (`_ledger`), если она известна.
-        Портфель брокера отстаёт от потока сделок (насколько — первый боевой
-        день), и продажа по отставшему чтению — шорт без сигнала. Не сошлось —
-        заявка не подаётся, человек получает обе цифры.
+        Объём — чтение портфеля, согласное с позицией по исполнениям потока
+        (`_ledger`). Портфель брокера отстаёт от потока сделок (13.11.2026 —
+        около 5 с), и продажа по отставшему чтению — шорт без сигнала.
+
+        * позиция по сделкам потока известна (`trusted`) — портфель
+          перечитывается шагом `_SETTLE_STEP`, пока не сойдётся с ней, но
+          не дольше `position_settle` (`/risk` 13.11.2026, п. 2: сплошная
+          пауза держала позицию без тейка 30 с);
+        * неизвестна — два чтения через всю паузу, равные между собой и
+          с позицией по сделкам, если она есть (К2).
+
+        Не сошлось — заявка не подаётся, человек получает цифры. Исключение
+        одно — в `_disagreement`: последнее чтение и сделки сходятся на нуле.
+
+        :param trusted: позиция по сделкам — из потока, а не из одного чтения;
+            `None` — известна ли она сейчас.
         """
+        if trusted is None:
+            trusted = self._ledger is not None
         # Планка — до чтений позиции (`/risk` 10.11.2026, находка 1): иначе
         # объём закрытия — из чтения за `band_wait` до подачи, и сделка,
         # сделанная руками за это время, превратила бы закрытие в шорт.
         band = await self._fetch_band()
         try:
-            first = await self._position_now()
-            await asyncio.sleep(self._limits.position_settle)
-            position = await self._position_now()
+            if trusted:
+                first, position = await self._read_until(lambda now: now == self._ledger)
+            else:
+                first = await self._position_now()
+                await asyncio.sleep(self._limits.position_settle)
+                position = await self._position_now()
         except BrokerError as error:
             return (
                 f"Позицию у брокера прочитать не удалось ({error.human}) — закрывающая "
                 "заявка не подана, закройте позицию сами."
             )
-        doubt = self._disagreement(first, position)
+        doubt = self._disagreement(first, position, trusted=trusted)
         if doubt is not None:
             return doubt
         if position == 0:
             self._forget_unfilled()
-            return "Позиции у брокера нет — закрывать нечего."
+            if first == 0:
+                return "Позиции у брокера нет — закрывать нечего."
+            return (
+                f"Позиции у брокера нет — закрывать нечего: чтением раньше было "
+                f"{position_words(first)}, но по сделкам программы позиции тоже нет — "
+                "портфель брокера отставал от сделок."
+            )
         side = OrderSide.SELL if position > 0 else OrderSide.BUY
         what = f"закрыть всё: {position_words(position)}"
         known = set(self._tickets)
@@ -2287,6 +2952,22 @@ class LiveExecutor:
             )
         return await self._closed_words(position, ticket)
 
+    async def _read_until(self, agreed: Callable[[int], bool]) -> tuple[int, int]:
+        """Перечитывать портфель шагом `_SETTLE_STEP`, пока чтение не `agreed` (B-099).
+
+        В сумме пауз не дольше `position_settle`; пауза 0 — одно перечитывание.
+        Возврат — первое и последнее чтение. Отказ чтения — `BrokerError`.
+        """
+        first = position = await self._position_now()
+        pause = self._limits.position_settle
+        steps = max(1, math.ceil(pause / _SETTLE_STEP))
+        for _ in range(steps):
+            if agreed(position):
+                break
+            await asyncio.sleep(pause / steps)
+            position = await self._position_now()
+        return first, position
+
     def _forget_unfilled(self) -> None:
         """Позиции у брокера нет — неотданные «уровень не исполнился» забыть.
 
@@ -2296,10 +2977,24 @@ class LiveExecutor:
         """
         self._unfilled.clear()
 
-    def _disagreement(self, first: int, second: int) -> str | None:
-        """Почему объём закрытия не назван надёжно; `None` — два чтения и сделки согласны."""
+    def _disagreement(self, first: int, second: int, *, trusted: bool) -> str | None:
+        """Почему объём закрытия не назван надёжно; `None` — чтения и сделки согласны.
+
+        Позиция по сделкам потока известна (`trusted`) — согласие это последнее
+        чтение, равное ей. Иначе — два чтения подряд равны и совпали с позицией
+        по сделкам, если она известна. Исключение — последнее чтение ноль и позиция по
+        сделкам ноль, а раннее чтение другое (B-099, 13.11.2026 14:55): это
+        портфель, догнавший поток после исполненного выхода. Прежде здесь
+        было «не сходится… закройте её сами» при нулевой позиции — ложный
+        совет. Заявки этот вывод не подаёт: закрывать нечего. Для ненулевой
+        позиции правило двух чтений прежнее (К2) — по нему уходит продажа.
+        """
         known = self._ledger
-        if first == second and (known is None or known == second):
+        if second == 0 and known == 0:
+            return None
+        if trusted and known == second:
+            return None
+        if not trusted and first == second and (known is None or known == second):
             return None
         by_deals = "неизвестна" if known is None else position_words(known)
         return (
@@ -2314,10 +3009,7 @@ class LiveExecutor:
         price = ticket.mean_price()
         at = "" if price is None else f" по {price:g}"
         try:
-            after = await self._position_now()
-            if after != 0:
-                await asyncio.sleep(self._limits.position_settle)
-                after = await self._position_now()
+            _, after = await self._read_until(lambda now: now == 0)
         except BrokerError as error:
             return (
                 f"Закрывающая заявка ({position_words(position)}) исполнена{at}, а позицию "
@@ -2388,7 +3080,8 @@ class LiveExecutor:
                 "движку."
             )
         if ticket.final:
-            return self._end_words(ticket)
+            # Снятую не нами скажет `_resolve_outside` в конце сверки.
+            return None if ticket.outside else self._end_words(ticket)
         # Живая заявка: сказать один раз на состояние, а не на каждое
         # переоткрытие потока (Н5) — при частых обрывах это строка в секунду.
         state = (ticket.status, ticket.done_volume)
@@ -2405,7 +3098,7 @@ class LiveExecutor:
             "движок получит одну сделку, когда заявка кончится."
         )
 
-    async def _settle_ticket(self, ticket: _Ticket) -> str:
+    async def _settle_ticket(self, ticket: _Ticket) -> str | None:
         await self._ask(ticket)
         if ticket.missing and ticket.status is None:
             ticket.answer = _Answer.REFUSED
@@ -2418,6 +3111,8 @@ class LiveExecutor:
                 "не ответил. Она может быть жива и исполниться без робота. "
                 f"{_HALT_TAIL}"
             )
+        if ticket.outside:
+            return None  # строку скажет `_resolve_outside` в конце сверки
         if ticket.final:
             return f"Заявка ({ticket.what}) у брокера {STATUS_WORDS[ticket.status]}."
         try:
@@ -2636,19 +3331,147 @@ class LiveExecutor:
         """Заявка кончилась. Исполнена — новость; снята не нами или отклонена — стоп.
 
         Кроме FOK, чьё снятие целиком решает движок (`spared`, Р-10): её конец
-        разбирает ждущий её `_send_fire`, и остановки здесь нет.
+        разбирает ждущий её `_send_fire`, и остановки здесь нет. И кроме своей
+        стоящей заявки, снятой не нами (`_spare_outside`): её решает позиция
+        у брокера (`_resolve_outside`), здесь — только пометка и проход.
         """
         if ticket.status is OrderStatus.FILLED:
             filled = self._fill_words(ticket)
             if filled is not None:
                 self._say(filled)
+            else:
+                # Тейк и условная «текущей» не судятся, и строки «исполнена по …»
+                # у них не было вовсе: 16.11.2026 об исполнениях узнавали только
+                # по базе (B-104, правило 13). Строка — в технический лог; в журнале
+                # решений о выходе уже говорит движок.
+                price = ticket.mean_price()
+                log.info(
+                    "боевой исполнитель: Заявка (%s) исполнена по %s%s.",
+                    ticket.what, "?" if price is None else f"{price:g}",
+                    "" if ticket.first_at is None
+                    else f", исполнение {in_moscow(ticket.first_at):%H:%M:%S} МСК",
+                )
             self._news()
             return
         if ticket.status is OrderStatus.CANCELLED and ticket.cancelling:
             return
         if ticket.spared and ticket.killed:
             return
+        if self._spare_outside(ticket):
+            ticket.outside = True
+            ticket.note = "снята вне программы"
+            self._outside.append(ticket)
+            self._news()
+            return
         self._set_halt(self._end_words(ticket))
+
+    def _spare_outside(self, ticket: _Ticket) -> bool:
+        """Снятие не нами решает позиция, а не остановка (владелец 13.11.2026).
+
+        Только у своей **стоящей** заявки без исполнения: заявки прошлого
+        запуска из журнала (`bound` нет) и тейка у брокера, не исполненного
+        ни на контракт. Заявку немедленного исполнения и выход с пределом
+        ждёт подавший их путь, и снятие у них по-прежнему стоп.
+        """
+        if ticket.status is not OrderStatus.CANCELLED or ticket.done_volume:
+            return False
+        if not ticket.bound:
+            return True
+        take = self._take_of(ticket)
+        return take is not None and take.deal is None
+
+    def _take_of(self, ticket: _Ticket) -> _Take | None:
+        """Сторож, чья заявка у брокера — этот билет; `None` — не тейк."""
+        return next((take for take in self._takes.values() if take.ticket is ticket), None)
+
+    async def _resolve_outside(self, expected: int | None) -> list[str]:
+        """Свои заявки, снятые не нами: позиция сходится — дальше, нет — стоп (0020).
+
+        Владелец счёта 13.11.2026: робот смотрит только на свои заявки, и своя
+        заявка, снятая не его командой, — не остановка, если позиция у брокера
+        та же, что у робота. Сходится — строка «продолжаю» (строку журнала
+        команд уже закрыл `_sync`), а тейк позиции, которую он защищал, встаёт
+        заново по уровню движка тем же путём, что после входа (`_place_take`).
+        Не сходится — `_outside_disagrees`. Позицию не прочитать — остановка.
+
+        Робот уже стоит по другой причине — не трогает ничего: судьбу позиции
+        решает человек (`B-077`).
+
+        :param expected: позиция движка со знаком; `None` — не названа, и тогда
+            позиция робота — та, что защищал тейк.
+        :returns: строки «продолжаю» — человеку; остановки ставятся здесь же.
+        """
+        if not self._outside or self._blocked():
+            return []
+        pending, self._outside = self._outside, []
+        try:
+            actual = await self._position_now()
+        except BrokerError as error:
+            self._add_halt(
+                f"Заявку робота ({pending[0].what}) сняли не командой программы, а позицию "
+                f"у брокера прочитать не удалось ({error.human}): сверить не с чем. "
+                f"{_HALT_TAIL}"
+            )
+            return []
+        lines: list[str] = []
+        for ticket in pending:
+            take = self._take_of(ticket)
+            robot = self._robot_now(take, expected)
+            if robot != actual:
+                await self._outside_disagrees(ticket, take, actual, robot)
+                return lines
+            again = await self._take_again(take, actual)
+            lines.append(
+                f"Заявка робота ({ticket.what}) снята вне программы — не командой робота; "
+                f"позиция у брокера сходится ({position_words(actual)}) — продолжаю.{again}"
+            )
+        return lines
+
+    def _robot_now(self, take: _Take | None, expected: int | None) -> int | None:
+        """Позиция робота со знаком, с исполненным и не отданным движку; `None` — неизвестна."""
+        if expected is not None:
+            return expected + self._undelivered()
+        if take is None:
+            return None
+        return signed_position(take.order.side, int(take.order.volume)) + self._undelivered()
+
+    async def _outside_disagrees(
+        self, ticket: _Ticket, take: _Take | None, actual: int, robot: int | None
+    ) -> None:
+        """Сняли не мы, и позиция не сходится: у тейка — «закрыть всё» (0020), иначе стоп.
+
+        Заявка прошлого запуска — только остановка: позицию, открытую не этим
+        включением, робот не закрывает (`app/live_trading.py`, `_prepare`).
+        """
+        mine = "неизвестна" if robot is None else position_words(robot)
+        why = (
+            f"Заявка робота ({ticket.what}) снята не программой — биржей, брокером или "
+            f"руками в приложении брокера, — а позиция не сходится: у брокера "
+            f"{position_words(actual)}, у робота {mine}."
+        )
+        if take is None or robot is None:
+            self._add_halt(f"{why} {_HALT_TAIL}")
+            return
+        with self._permitted():
+            await self._flatten(why)
+
+    async def _take_again(self, take: _Take | None, actual: int) -> str:
+        """Тейк живой позиции — заново, тем же путём, что после входа. Возврат — хвост строки.
+
+        Только если у брокера та самая позиция, которую тейк защищал: позиции,
+        уже закрытой выходом, ещё не отданным движку, тейк открыл бы шорт
+        без сигнала.
+        """
+        if take is None or take.deal is not None:
+            return ""
+        order = take.order
+        if actual != signed_position(order.side, int(order.volume)):
+            return " Тейк заново не ставится: позиции, которую он защищал, у брокера нет."
+        try:
+            await self._place_take(order, again=True)
+        except (ExecutionRefused, ExecutionHalted) as error:
+            return f" Тейк заново не поставлен: {error} Позиция у брокера без тейка."
+        return f" Тейк поставлен заново по уровню движка {order.price or 0:g}."
 
     def _foreign(self, event: OrderEvent) -> None:
         """Событие не по нашей заявке. Сделка по нашему инструменту — стоп (§8 №9)."""
@@ -2679,9 +3502,31 @@ class LiveExecutor:
         self._set_halt(
             f"По {ticker} прошла сделка, которой программа не подавала: {verb} {volume}{at}. "
             "Похоже, заявка подана руками из приложения брокера — позиция у брокера "
-            f"разошлась с роботом. {_HALT_TAIL}"
+            f"разошлась с роботом. {_HALT_TAIL}{self._left_alive_words()}"
         )
         self._notify()
+
+    def _left_alive_words(self) -> str:
+        """Свои живые заявки у брокера с ключами — хвост строки остановки (D-198 п. 3).
+
+        Робот остановлен и ничего не подаёт и не снимает (`_gate`), а условная
+        заявка у брокера живёт сама: сработав, она откроет позицию и на пустом
+        счёте. Срок её жизни у брокера не известен (`D-197` п. 6). Промолчать
+        о ней — оставить человека с уверенностью, что робот стоит и всё стоит.
+        """
+        alive = [
+            ticket for ticket in self._tickets.values()
+            if not ticket.final and not ticket.missing and ticket.answer is not _Answer.REFUSED
+        ]
+        if not alive:
+            return ""
+        listed = "; ".join(f"{ticket.what} (ключ {ticket.key})" for ticket in alive)
+        return (
+            f" У брокера живы заявки робота: {listed}. Робот их больше не ведёт — "
+            "снимите их кнопкой «Снять заявку» или в приложении брокера: иначе такая "
+            "заявка исполнится сама, а условная сработает и откроет позицию даже "
+            "на пустом счёте."
+        )
 
     # -- журнал и остановка ----------------------------------------------------
 
@@ -2812,8 +3657,10 @@ def _technical(error: BaseException) -> str:
     return error.technical if isinstance(error, BrokerError) else type(error).__name__
 
 
-def _immediate(order: NewOrder) -> bool:
-    """Заявка немедленного исполнения: FOK или рыночная (Р-7)."""
+def _immediate(order: PlacedOrder) -> bool:
+    """Заявка немедленного исполнения: FOK или рыночная (Р-7). Условная — нет."""
+    if not isinstance(order, NewOrder):
+        return False
     return order.time_in_force is TimeInForce.FILL_OR_KILL or order.order_type is OrderType.MARKET
 
 

@@ -15,8 +15,9 @@
 * «Применить» в бою отказывает под **тем** полем, которое сменилось: порог
   проверки по минуткам, размер свечи, объём; вне боя то же принимается (R1);
 * «Позиция без управления» при отложенной пересборке сказана однажды (БЛОК 2);
-* «Закрыть позицию» при позиции «факта» называет её и советует «Выключить
-  бой»; «Старт» без боя говорит, как бой включается (замечания);
+* «Закрыть позицию» при позиции «факта» в бою закрывает её заявкой и
+  останавливает робота (задача владельца 13.11.2026); «Старт» без боя
+  говорит, как бой включается (замечания);
 * сверка после связи — одной операцией под замком: сторож, продавший, пока
   сверка читала портфель, не даёт «закрыть всё» (R2);
 * сверка после связи не идёт, пока поток закрыт (замечание к `relinked`);
@@ -51,6 +52,7 @@ from market import CandleStore, MarketWorker
 from market.commands import BrokerCommand, CommandAction, CommandSide
 from market.journal import RunOrigin, SessionRecord
 from tests.fake_broker import CANCEL, CREATE, STATUS, FakeBroker, _unavailable
+from tests.test_app_hand_actions import _StalePortfolio
 from tests.test_app_live_executor import (
     BAR0,
     TICKER,
@@ -82,6 +84,7 @@ from tests.test_app_live_pair import (
     STEP,
     SYMBOL,
     Bench,
+    Takes,
     _bench,
     _close,
     _connect,
@@ -102,6 +105,15 @@ OLD_TAKE_PRICE = 251_000.0
 OLD_TAKE_NAME = "take:long:прошлый"
 #: Вход прошлого запуска, о котором брокер не отвечает. Ключ выдуманный, в форме UUID.
 MUTE_ENTRY = "00000000-0000-4000-8000-0000000000e1"
+
+#: Причина пропуска сторожей запрета D-141: запрет снят `D-196` (владелец
+#: 13.11.2026) — скользящий тейк в бою ведёт брокер. Механизм удержания
+#: настроек, который они заодно стерегли, перевести на нецелый объём
+#: (`BACKLOG.md`, D-196, вторая очередь).
+D141_LIFTED = (
+    "D-141 снят D-196 (владелец 13.11.2026): скользящий тейк в бою ведёт брокер, "
+    "запрета больше нет. Механизм удержания перевести на нецелый объём — BACKLOG D-196"
+)
 
 
 @pytest.fixture
@@ -416,8 +428,8 @@ class Change:
 
 
 CHANGES = [
-    pytest.param(Change("minute_bar_limit", MinuteBarLimit.FIFTEEN), id="minute-bar-limit"),
-    pytest.param(Change("timeframe", "5 минут"), id="timeframe"),
+    # Смена порога минуток и свечи при скользящем уровне запрещалась D-141 —
+    # запрет снят D-196 (13.11.2026): в бою скользящий тейк ведёт брокер.
     # Окно объём дробным не шлёт; порт — публичная команда, и шаблон или файл
     # могут принести что угодно. Дробная заявка у брокера остановила бы робота.
     pytest.param(Change("volume", 1.5), id="fractional-volume"),
@@ -552,54 +564,186 @@ def test_a_second_change_while_the_rebuild_is_held_is_said_and_shown(
 # --------------------------------------------------------------- замечания: слова кнопок
 
 
-def test_close_position_in_combat_names_the_position_and_says_turn_combat_off_first(
+def test_close_position_in_combat_leaves_the_robot_trading_without_a_position(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """«Закрыть позицию» при лонге «факта»: позиция названа, совет — «Выключить бой».
+    """Стережёт 0069: после «Закрыть позицию» в бою робот не стоит, без позиции, входит по сигналу.
 
-    Закрытия заявкой из программы нет; позиция, закрытая руками при
-    включённом бое, остановила бы робота. Отказ «закрывать нечего» здесь —
-    неправда о деньгах на счёте.
+    Лонг «факта» с тейком у брокера; владелец закрывает позицию кнопкой —
+    тейк снят, позиция ноль, робот не остановлен. Следующий сигнал (10:00,
+    закрытие ниже средней) — вход в шорт настоящей заявкой: движок «факта»
+    принял «позиции нет», иначе он вышел бы из лонга, которого у брокера нет.
     """
     monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
 
-    async def go() -> str:
+    async def go() -> tuple[str, LiveStatus, int, LiveStatus]:
         bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
         try:
             await _connect(bench)
             await _ride(bench, LIVE_FROM + timedelta(minutes=50))
-            sent = len(broker.commands)
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
             bench.port.close_position()
             await bench.port.wait()
-            assert len(broker.commands) == sent, "«Закрыть позицию» подала команду брокеру"
-            return bench.said("Закрытие позиции")
+            said, after = bench.said("Закрытие позиции руками"), bench.port.live_status()
+            flat = broker.position(SYMBOL)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=61),
+                since=LIVE_FROM + timedelta(minutes=51),
+            )
+            return said, after, flat, bench.port.live_status()
         finally:
             await _close(bench, session)
 
-    said = loop.run_until_complete(go())
-    assert "лонг 1" in said, said
-    assert "«Выключить бой»" in said, said
-    assert "Закрывать нечего" not in said, said
+    said, after, flat, later = loop.run_until_complete(go())
+    assert flat == 0, said
+    assert "закрыта" in said, said
+    assert not after.halted and after.on, f"робот после ручного закрытия стоит: {after.halted}"
+    assert broker.position(SYMBOL) == -1, "вход по сигналу после ручного закрытия не подан"
+    assert not later.halted, later.halted
 
 
-def test_start_without_combat_says_how_combat_is_switched_on(
+def test_close_in_combat_does_not_wait_the_whole_settle_pause(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стережёт `/risk` 13.11.2026, п. 2: тейк снят — закрывающая уходит без паузы 30 с.
+
+    Пауза сверки позиции 30 с, как у владельца. Портфель сразу согласен
+    с позицией по сделкам потока: закрытие не ждёт паузу целиком — позиция
+    не стоит без тейка полминуты.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+    values = dataclasses.replace(FIXED_TAKE, live_position_settle_sec=30.0)
+
+    async def go() -> tuple[str, float]:
+        bench, session = await _bench(tmp_path, broker, values)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
+            started = asyncio.get_running_loop().time()
+            bench.port.close_position()
+            await bench.port.wait()
+            spent = asyncio.get_running_loop().time() - started
+            return bench.said("Закрытие позиции руками"), spent
+        finally:
+            await _close(bench, session)
+
+    said, spent = loop.run_until_complete(go())
+    assert broker.position(SYMBOL) == 0, said
+    assert spent < 10.0, f"закрытие ждало {spent:.0f} с при согласном портфеле: {said}"
+
+
+def test_close_in_combat_after_a_take_fill_does_not_sell_by_a_lagging_portfolio(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стережёт `/risk` 13.11.2026, п. 3: тейк исполнился, портфель отстал — второй продажи нет.
+
+    Лонг «факта», тейк у брокера исполнился (поток это знает), портфель ещё
+    показывает лонг 1. «Закрыть позицию» сразу после: позиция по сделкам
+    потока — ноль, и чтение отставшего портфеля её не перетирает. Продажа
+    по лонгу 1 дала бы шорт 1.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def go() -> tuple[str, int]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
+            (take,) = broker.live()
+            _StalePortfolio(broker, after=1)
+            await session.read(PORTFOLIO_PATH)  # портфель застыл на «лонг 1»
+            broker.execute(take.key, 1, take.price or 0.0)
+            await asyncio.sleep(0.2)
+            await bench.port.wait()
+            sent = len([one for one in broker.commands if one[0] == "create"])
+            bench.port.close_position()
+            await bench.port.wait()
+            after = len([one for one in broker.commands if one[0] == "create"])
+            return bench.said("Закрытие позиции руками"), after - sent
+        finally:
+            await _close(bench, session)
+
+    said, sent = loop.run_until_complete(go())
+    assert sent == 0, f"после исполнения тейка подана продажа по отставшему портфелю: {said}"
+    assert broker.position(SYMBOL) == 0, said
+
+
+def test_cancel_take_in_combat_leaves_the_robot_trading_by_signal_without_a_new_take(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Стережёт 0069: после «Снять заявку» (тейк) в бою робот не стоит и выходит по сигналу.
+
+    Лонг «факта» с тейком у брокера; владелец снимает тейк кнопкой — робот
+    не остановлен. Сигнал 10:00 — выход из лонга и вход в шорт настоящими
+    заявками. Тейк шорта снят так же — на закрытиях 10:15 и 10:30 робот его
+    заново не ставит: владелец снял его намеренно.
+    """
+    monkeypatch.delitem(_SPIKES, ENTRY_SPIKE)
+
+    async def cancel_take(bench: Bench) -> LiveStatus:
+        (take,) = [order.key for order in broker.live()]
+        bench.port.cancel_robot_order(take)
+        await bench.port.wait()
+        assert not broker.live(), bench.said("Снятие заявки руками")
+        return bench.port.live_status()
+
+    async def go() -> tuple[LiveStatus, int, LiveStatus, Takes, LiveStatus]:
+        bench, session = await _bench(tmp_path, broker, FIXED_TAKE)
+        try:
+            await _connect(bench)
+            await _ride(bench, LIVE_FROM + timedelta(minutes=50))
+            assert broker.position(SYMBOL) == 1, "бой не вошёл — проверять нечего"
+            first = await cancel_take(bench)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=62),
+                since=LIVE_FROM + timedelta(minutes=51),
+            )
+            turned = broker.position(SYMBOL)
+            second = await cancel_take(bench)
+            await _ride(
+                bench, LIVE_FROM + timedelta(minutes=91),
+                since=LIVE_FROM + timedelta(minutes=63),
+            )
+            return first, turned, second, _takes(broker), bench.port.live_status()
+        finally:
+            await _close(bench, session)
+
+    first, turned, second, takes, later = loop.run_until_complete(go())
+    assert not first.halted and first.on, f"робот после снятия тейка стоит: {first.halted}"
+    assert turned == -1, "выход и вход по сигналу 10:00 после снятия тейка не поданы"
+    assert not second.halted and second.on, second.halted
+    assert takes == [], f"тейк поставлен заново: {takes}"
+    assert not later.halted and later.on, later.halted
+    assert broker.position(SYMBOL) == -1
+
+
+def test_start_without_combat_turns_the_combat_on(
     loop, tmp_path: pathlib.Path, broker: FakeBroker
 ) -> None:
-    """«Старт» без боя: отказ называет кнопку «Включить бой», а не «боевого хода ещё нет»."""
+    """«Старт» без боя включает бой (владелец 16.11.2026), а не отказывает «Запуском робота».
 
-    async def go() -> str:
+    Прежде здесь стерёгся отказ со словами «Включить бой» — «Старт» ничего
+    не включал, и владелец его не увидел («старт жму и нихуя»).
+    """
+
+    async def go() -> tuple[str, str, bool]:
         bench, session = await _bench(tmp_path, broker, OWNER)
         try:
             await _connect(bench, live=False)
             bench.port.start()
             await bench.port.wait()
-            return bench.said("Запуск робота")
+            return (
+                bench.said("Запуск робота"), bench.said("Бой включается"),
+                bench.port.live_status().wanted,
+            )
         finally:
             await _close(bench, session)
 
-    said = loop.run_until_complete(go())
-    assert "«Включить бой»" in said, said
-    assert "ещё нет" not in said, said
+    refused, asked, wanted = loop.run_until_complete(go())
+    assert refused == "", refused
+    assert asked and wanted, (asked, wanted)
 
 
 def test_bad_wait_limits_from_the_file_are_said_in_window_words_in_one_line(
@@ -886,6 +1030,7 @@ def test_a_refusal_without_a_fresh_zero_keeps_the_remembered_position(
         pytest.param(MinuteBarLimit.FIVE, MinuteBarLimit.FIFTEEN, id="new-limit-forbids"),
     ],
 )
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_apply_in_combat_checks_the_held_series_at_both_minute_limits(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
     *, was: MinuteBarLimit, now: MinuteBarLimit,
@@ -946,6 +1091,7 @@ def _no_apply_gate(_self: object, _settings: object) -> None:
     """
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_force(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -984,6 +1130,7 @@ def test_a_rebuild_held_by_an_unclosed_command_keeps_the_engine_settings_in_forc
     assert takes, "у входа нет неподвижного тейка у брокера: «факт» пошёл скользящим на 15 минутах"
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_the_live(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1035,6 +1182,7 @@ def test_a_rebuild_held_by_an_unclosed_command_says_the_new_take_did_not_reach_t
 # --------------------------------------------- четвёртый /risk 2в: мутации Н6–Н8
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_an_engine_change_past_apply_does_not_reach_the_live_and_is_said_once(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1077,6 +1225,7 @@ def test_an_engine_change_past_apply_does_not_reach_the_live_and_is_said_once(
     assert "D-141" in kept[0], kept
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_command_seen_only_on_the_second_read_keeps_the_engine_change_out_of_the_live(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1322,6 +1471,7 @@ def test_turning_on_while_the_live_side_closes_is_a_new_enable_not_a_cancelled_o
     assert status.on and status.wanted, status
 
 
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_apply_while_a_rebuild_is_already_held_checks_the_held_series(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1394,6 +1544,7 @@ def _not_reached(name: str, status: LiveStatus, takes: list[tuple[str, float | N
 
 
 @pytest.mark.parametrize("case", _REACHES, ids=[name for name, *_ in _REACHES])
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_a_forbidden_trailing_holds_back_only_itself_the_rest_reaches_the_fact(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
     case: tuple[str, object, str],
@@ -1483,6 +1634,7 @@ def test_a_fractional_volume_past_apply_stays_out_of_the_live_and_is_said(
         pytest.param(("30 минут", 1), id="held-rebuild"),
     ],
 )
+@pytest.mark.skip(reason=D141_LIFTED)
 def test_the_trailing_forbidden_again_after_it_was_dropped_is_said_again(
     loop, tmp_path: pathlib.Path, broker: FakeBroker, monkeypatch: pytest.MonkeyPatch,
     case: tuple[str, int],

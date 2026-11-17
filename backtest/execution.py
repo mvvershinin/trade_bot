@@ -1086,7 +1086,12 @@ class ExecutionModel:
         fills: list[Fill | LevelUnfilled] = []
         for order_id, guard in list(self.armed.items()):
             order = guard.order
-            if order.submitted_at > ready_at:
+            if order.submitted_at > ready_at or order.trail_offset is not None:
+                # Условная у брокера (`D-196`, `OrderRequest.trail_offset`):
+                # `price` — цена включения, а не уровень выхода, и касанием
+                # её не исполнить. До порога у прогона уровня нет; после
+                # порога движок подаёт обычное вооружение под тем же именем,
+                # и сторожится уже оно — по минуткам, как скользящий уровень.
                 continue
             level = order.price
             assert level is not None, "вооружение без уровня — дефект движка"

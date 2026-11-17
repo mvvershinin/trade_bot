@@ -353,7 +353,9 @@ def test_with_the_real_engine_the_level_moves_inside_the_bar_and_never_back() ->
 
     class Counting(HistoryExecutor):
         async def submit(self, order: OrderRequest) -> None:
-            if order.action is OrderAction.ARM_TAKE_PROFIT:
+            # Условная у брокера (`D-196`) уровнем выхода не является: прогон
+            # её не сторожит, уровни здесь — вооружения движка после порога.
+            if order.action is OrderAction.ARM_TAKE_PROFIT and order.trail_offset is None:
                 arms.append(order)
             await super().submit(order)
 

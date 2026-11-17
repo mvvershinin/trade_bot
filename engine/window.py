@@ -71,6 +71,7 @@ __all__ = [
     "DayRule",
     "DayVerdict",
     "TradingWindow",
+    "WindowDay",
     "minutes_of_day",
     "in_moscow",
     "is_trading_day",
@@ -499,3 +500,41 @@ class TradingWindow:
         if self.whole_day:
             return "весь день"
         return f"{self.start:%H:%M}–{self.end:%H:%M}"
+
+    def running_at(self, at: datetime) -> WindowDay | None:
+        """Какое окно идёт в этот момент: дата открытия и границы. Вне окна — `None`.
+
+        Попадание — тем же `contains`, со строгими неравенствами. Дата —
+        та, в которую окно **открылось**: у окна через полночь свеча 00:30
+        принадлежит окну, открывшемуся накануне. Окно «весь день» — это
+        календарная дата.
+        """
+        if not self.contains(at):
+            return None
+        moment = in_moscow(at)
+        opened = moment.date()
+        if self.over_midnight and minutes_of_day(moment) < minutes_of_day(self.end):
+            opened -= timedelta(days=1)
+        return WindowDay(opened=opened, window=self)
+
+
+@dataclass(frozen=True, slots=True)
+class WindowDay:
+    """Одно торговое окно одного дня: дата открытия и границы, в которых оно шло.
+
+    Метка правила «первый убыток в окне — стоп» (`B-109`, решение 0072):
+    одинаковые метки — то же окно, входы закрыты; разные — счёт заново.
+    Границы входят в метку намеренно: окно, изменённое в настройках посреди
+    дня, — это **новое окно** (слова владельца счёта 16.11.2026), и узнаётся
+    оно без отдельного события «настройки сменились».
+    """
+
+    opened: date
+    window: TradingWindow
+
+    @property
+    def label(self) -> str:
+        """Подпись для журнала: «окна 12:10–12:40» или «дня 16.11.2026» для окна «весь день»."""
+        if self.window.whole_day:
+            return f"дня {self.opened:%d.%m.%Y}"
+        return f"окна {self.window.label}"

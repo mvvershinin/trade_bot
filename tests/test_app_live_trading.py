@@ -156,7 +156,7 @@ class _Preparing:
     async def broker_position(self) -> int:
         return _answer(self.fresh.pop(0))
 
-    async def settle_open_commands(self) -> tuple[str, ...]:
+    async def settle_open_commands(self, expected: int | None = None) -> tuple[str, ...]:
         return self.notes
 
     async def start(self) -> None:
@@ -216,7 +216,7 @@ def test_a_refusal_to_turn_live_on_carries_the_position_only_when_it_was_freshly
     """
     monkeypatch.setattr(live_trading, "LiveExecutor", lambda *_args: executor)
     monkeypatch.setattr(live_trading, "StoreBook", lambda *_args: _Book(rows))
-    monkeypatch.setattr(live_trading, "parse_positions", lambda _payload: ((), "FAKE-ACCOUNT-1"))
+    monkeypatch.setattr(live_trading, "portfolio_account", lambda _payload: "FAKE-ACCOUNT-1")
     desks = LiveDesks(lambda: cast(Any, _Session()), cast(Any, None), class_code="SPBFUT")
     request = FactRequest(
         ticker="MXZ6", bar_minutes=15, ruble_per_point=1.0, limits=FAST, session_id=1,

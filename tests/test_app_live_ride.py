@@ -37,7 +37,7 @@ import websockets
 
 os.environ.setdefault("QT_API", "pyside6")  # до первого импорта qasync
 
-from app.fact import FactDesk, FactRequest
+from app.fact import FactDesk, FactPosition, FactRequest
 from app.live_trading import LiveDesks
 from backtest import HistoryRun
 from broker.session import BrokerSession
@@ -110,6 +110,17 @@ class _Desk:
     @property
     def undelivered(self) -> tuple[str, ...]:
         return self.real.undelivered
+
+    @property
+    def adopted(self) -> FactPosition | None:
+        return self.real.adopted
+
+    @property
+    def flat_by_hand(self) -> bool:
+        return self.real.flat_by_hand
+
+    def flat_taken(self) -> None:
+        self.real.flat_taken()
 
     async def holding(self) -> tuple[int, float | None]:
         return await self.real.holding()
