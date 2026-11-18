@@ -3943,12 +3943,33 @@ def test_the_handed_margin_is_used_only_when_the_broker_said_nothing() -> None:
     assert money.margin_per_contract == 99_999.0
 
 
-def test_the_estimate_is_announced_as_an_estimate_in_the_journal() -> None:
-    """Оценка названа оценкой вслух: движку уходит просто число, отличить нечем.
+def margin_lines(said: list[tuple[str, str, DecisionLevel]]) -> list[str]:
+    """Строки журнала решений про ГО — их в бою быть не должно (заказчик, 18.11.2026)."""
+    return [
+        f"{event}: {reason}"
+        for event, reason, _ in said
+        if "Гарантийное обеспечение" in event or "ГО под контракт" in reason
+    ]
+
+
+def margin_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Записи технического лога про ГО под контракт."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "app.live_feed"
+        and "Гарантийное обеспечение под контракт" in record.getMessage()
+    ]
+
+
+def test_the_estimate_is_announced_as_an_estimate_in_the_technical_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Оценка названа оценкой — в техническом логе, а не в журнале решений.
 
     `AccountFunds.margin_per_contract` — `float`, и ответ брокера от нашей
-    прикидки в нём неразличим. Строка журнала — единственное место, где
-    владелец счёта узнаёт, что объём заявки посчитан по оценке.
+    прикидки в нём неразличим. Строка про ГО в журнал решений боя не идёт
+    (просьба заказчика 18.11.2026), но в техлоге остаётся и названа оценкой.
     """
     account = FakeAccount(account_snapshot(quantity=0.0))
     watch, money, said = watch_of(
@@ -3957,22 +3978,21 @@ def test_the_estimate_is_announced_as_an_estimate_in_the_journal() -> None:
 
     async def scenario() -> None:
         watch.start()
-        await until(
-            lambda: any(
-                row[0] == "Гарантийное обеспечение под контракт" for row in said
-            )
-        )
+        await until(lambda: bool(margin_records(caplog)))
         await watch.aclose()
 
-    asyncio.run(scenario())
-    about = [row for row in said if row[0] == "Гарантийное обеспечение под контракт"]
-    assert about, f"про ГО не сказано ни строки: {said}"
-    event, reason, level = about[0]
-    assert "ОЦЕНКА" in reason, reason
-    assert level is DecisionLevel.WARNING, "оценка подана как обычное событие"
+    with caplog.at_level(logging.INFO, logger="app.live_feed"):
+        asyncio.run(scenario())
+    assert not margin_lines(said), f"ГО попало в журнал решений: {said}"
+    records = margin_records(caplog)
+    assert records, "про ГО в техлоге не сказано ни строки"
+    assert "ОЦЕНКА" in records[0].getMessage(), records[0].getMessage()
+    assert records[0].levelno == logging.WARNING, "оценка подана как обычное событие"
 
 
-def test_an_open_position_is_not_replaced_by_the_estimate() -> None:
+def test_an_open_position_is_not_replaced_by_the_estimate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Есть позиция — берётся ответ брокера, а не оценка: она грубее вдвое."""
     account = FakeAccount(account_snapshot())
     watch, money, said = watch_of(
@@ -3984,10 +4004,14 @@ def test_an_open_position_is_not_replaced_by_the_estimate() -> None:
         await until(lambda: bool(money))
         await watch.aclose()
 
-    asyncio.run(scenario())
+    with caplog.at_level(logging.INFO, logger="app.live_feed"):
+        asyncio.run(scenario())
     assert money[0].margin_per_contract == 13_750.0, "оценка вытеснила ответ брокера"
-    about = [row for row in said if row[0] == "Гарантийное обеспечение под контракт"]
-    assert about and "ОЦЕНКА" not in about[0][1], about
+    assert not margin_lines(said), f"ГО попало в журнал решений: {said}"
+    records = margin_records(caplog)
+    assert records, "про ГО в техлоге не сказано ни строки"
+    assert "ОЦЕНКА" not in records[0].getMessage(), records[0].getMessage()
+    assert records[0].levelno == logging.INFO
 
 
 def test_the_exchange_is_not_asked_on_every_snapshot() -> None:
@@ -4195,10 +4219,8 @@ def test_a_portfolio_that_answers_again_is_announced() -> None:
     assert events == [
         "Состояние счёта не получено",
         "Состояние счёта получено",
-        # Порядок строк — это порядок чтения. Про обеспечение говорится
-        # **после** того, как снимок признан годным: строка про ГО впереди
-        # жалобы объясняла бы владельцу счёта не то, из-за чего робот не входит.
-        "Гарантийное обеспечение под контракт",
+        # Строки про ГО в журнале решений боя нет: просьба заказчика
+        # 18.11.2026, она уходит в технический лог.
     ], events
 
 

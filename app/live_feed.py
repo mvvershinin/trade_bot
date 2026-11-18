@@ -2176,10 +2176,9 @@ class FundsWatch:
             )
             return snapshot
         self._recovered(snapshot)
-        # ⚠️ Про ГО говорится **после** «счёт получен», а не до. Порядок строк
-        # в журнале — это порядок чтения: строка про обеспечение впереди
-        # жалобы на неполный снимок объясняла бы владельцу счёта не то,
-        # из-за чего робот не входит.
+        # Про ГО пишется **после** «счёт получен», а не до, и только в
+        # технический лог: в журнал решений боя строка не идёт по просьбе
+        # заказчика 18.11.2026.
         self._say_margin(margin)
         self._watch.funds(snapshot.account or "", money)
         return snapshot
@@ -2285,13 +2284,14 @@ class FundsWatch:
         self._margin.exchange_said(answer, at)
 
     def _say_margin(self, margin: MarginPerContract | None) -> None:
-        """Сказать в журнал, откуда взято ГО, — на смене источника или числа.
+        """Записать в технический лог, откуда взято ГО, — на смене источника или числа.
 
         ⚠️ Оценка обязана быть **названа оценкой**. Движку уходит просто
         число: `AccountFunds.margin_per_contract` — это `float`, и отличить
-        в нём ответ брокера от нашей прикидки нечем. Значит единственное
-        место, где владелец счёта узнаёт, что объём заявки посчитан по
-        оценке, — эта строка.
+        в нём ответ брокера от нашей прикидки нечем. Единственное место,
+        где видно, что объём заявки посчитан по оценке, — эта строка
+        технического лога: в журнал решений боя она не пишется по просьбе
+        заказчика 18.11.2026.
         """
         if margin is None:
             return
@@ -2299,11 +2299,8 @@ class FundsWatch:
         if key == self._margin_told:
             return
         self._margin_told = key
-        self._watch.say(
-            "Гарантийное обеспечение под контракт",
-            margin.told + ".",
-            DecisionLevel.WARNING if margin.estimated else DecisionLevel.INFO,
-        )
+        level = logging.WARNING if margin.estimated else logging.INFO
+        log.log(level, "Гарантийное обеспечение под контракт: %s.", margin.told)
 
     def _blind(self, why: str) -> None:
         """Счёт неизвестен: сказать один раз и назвать последствие.
