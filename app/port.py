@@ -465,8 +465,9 @@ class _Span:
     """Закреплённый отрезок истории: что показывает окно вместо последних дней.
 
     Появляется от «Прогона на истории» и живёт до «Вернуться к текущим
-    данным». Пока он стоит, порт ведёт себя иначе в трёх местах, и каждое
-    названо, потому что каждое молча ломается:
+    данным» или до включения боя (`_unpin_for_live`). Пока он стоит, порт
+    ведёт себя иначе в трёх местах, и каждое названо, потому что каждое
+    молча ломается:
 
     * `_candles` берёт границы отсюда, а не из глубины показа и не из ключа
       ``--until``;
@@ -500,7 +501,7 @@ class _Backtest:
 
     `span` — закреплённый отрезок истории; `None` означает обычный показ
     последних дней (`HistoryPort._days`). Переживает сколько угодно проходов
-    и снимается только человеком (`show_recent`).
+    и снимается только человеком: `show_recent` или включением боя.
 
     `pending` — просьба, отчёт по которой ещё не отправлен. Живёт ровно один
     проход: ставится в `run_backtest`, снимается в `_pass`. Поле, а не довод
@@ -1465,6 +1466,7 @@ class HistoryPort(TerminalPort):
                 self._refuse("Бой не включён", self._live.refused)
                 self._publish_live()
                 return
+            self._unpin_for_live()
             self._live.wanted, self._live.closing = True, ""
             self.note(
                 "Выключение боя отменено",
@@ -1480,6 +1482,9 @@ class HistoryPort(TerminalPort):
                 self._refuse("Бой не включён", self._live.refused)
                 self._publish_live()
                 return
+            # Отрезок снимается до просьбы боя, а проход, который он ставит,
+            # начнётся только после возврата отсюда — и увидит обе перемены разом.
+            queued = self._unpin_for_live()
             self._live.wanted, self._live.refused, self._live.closing = True, "", ""
             self.note(
                 "Бой включается",
@@ -1490,7 +1495,8 @@ class HistoryPort(TerminalPort):
             )
             self._say_trailing_in_live()
             self._publish_live()
-            self.refresh("включение боя")
+            if not queued:
+                self.refresh("включение боя")
             return
         self._live.wanted = False
         if self._live.desk is not None or self._live.opening:
@@ -1501,6 +1507,49 @@ class HistoryPort(TerminalPort):
             self._say_closed("Бой выключен")
         self._publish_live()
         self.refresh("выключение боя")
+
+    def _unpin_for_live(self) -> bool:
+        """Бой снимает закреплённый отрезок сам (владелец счёта 18.11.2026).
+
+        Прежде отрезок держал бой отказом «нажмите «Вернуться к текущим»», а
+        кнопка возврата на экране шириной 1366 уходила под » панели: бой
+        не включался, и выхода не было видно. Теперь включение снимает отрезок
+        тем же, что `show_recent`, и строкой в журнале. Истина — проход уже
+        поставлен здесь; ложь — отрезка не было, проход ставит вызывающий.
+
+        ⚠️ Бары отрезка в живой ход не попадают (`_Span`, `_advance`). Держат
+        это три вещи:
+
+        * отрезок снят и бой попрошен в одном вызове окна; проход, поставленный
+          здесь, начнётся после возврата из `set_live` и увидит обе перемены;
+        * идущий проход снимается, как «Отменить» (`cancel_backtest`), а новый
+          ждёт его конца (`_after_stop`), а не идёт рядом;
+        * проход, прочитавший бары ещё при отрезке, до живого хода не доходит
+          (`_pass`, сверка отрезка после чтения баров).
+        """
+        if self._back.span is None:
+            return False
+        self._back.span, self._back.pending = None, None
+        running = self._task
+        stopped = running is not None and not running.done()
+        self.note(
+            "Возврат к текущим данным",
+            "Прогон на истории снят: включается бой. Бой идёт по текущим барам — "
+            + ("идущий прогон остановлен, " if stopped else "")
+            + "показаны последние дни вместе с живыми свечами.",
+        )
+        if running is None or not stopped:
+            self.refresh("включение боя")
+            return True
+        self._again = ""
+        running.cancel()
+        self._task = self._begin("run", self._after_stop(running, "включение боя"))
+        return True
+
+    async def _after_stop(self, stopped: asyncio.Task[None], why: str) -> None:
+        """Проход после снятого: сначала дождаться конца прежнего, потом свой."""
+        await _quiet(stopped)
+        await self._refresh(why)
 
     def _say_trailing_in_live(self) -> None:
         """Бой включается со скользящим тейком — строкой, кто его ведёт (`D-196`)."""
@@ -3849,6 +3898,7 @@ class HistoryPort(TerminalPort):
         # Снимок настроек на начало прохода. Дальше в этом проходе `self._values`
         # и `self._engine_settings` не читаются ни разу: см. докстринг `_Frame`.
         frame = _Frame(_in_force(self._values), self._engine_settings)
+        pinned = self._back.span
         self._send(self.busy_changed, True, "Читаю свечи из базы…")
         try:
             frame = await self._held_frame(frame)
@@ -3859,6 +3909,11 @@ class HistoryPort(TerminalPort):
             # `_ask_point_value`.
             self._ask_point_value(symbol)
             candles, stitch = await self._series(frame, symbol, timeframe)
+            if self._back.span is not pinned:
+                # Отрезок сняли, пока читались бары (`show_recent`, включение боя):
+                # бары отрезка, поданные живому ходу, легли бы в его среднюю
+                # (`_Span`). Проход после снятия уже поставлен тем, кто снял.
+                return
             debug_feed.bars_read(symbol, frame.values.timeframe, candles)
             # Чтение базы долей сделанного не отчитывается: это один запрос
             # в поток данных. Отметка здесь делит проход надвое, и молчанием
@@ -4684,6 +4739,9 @@ class HistoryPort(TerminalPort):
         порядок — от «нечего включать» к настройкам. Брокерские причины
         (позиция у брокера, незакрытые команды) знает только сборка
         исполнителя — они приходят отказом `FactRefused`.
+
+        Закреплённого отрезка истории здесь нет (владелец 18.11.2026): включение
+        снимает его само (`_unpin_for_live`), а не отказывает.
         """
         # Первая строка — что нажать (B-101): окно показывает её у кнопки,
         # целиком — в подсказке (`ui.formatting.headline`).
@@ -4692,9 +4750,6 @@ class HistoryPort(TerminalPort):
              "Нет потока котировок: бой идёт поверх живого потока, сначала «Подключиться»."),
             (self._watch.observing and self._live.funds is None,
              f"подождите до 30 с: счёт у брокера ещё не прочитан\n{_NO_FUNDS}"),
-            (self._back.span is not None, "нажмите «Вернуться к текущим»\n"
-             "Показ закреплён на отрезке истории: бой идёт по текущим барам, сначала "
-             "«Вернуться к текущим»."),
             (bool(self._halt.reason), "нажмите «Возобновить работу»\n"
              f"Робот остановлен, сначала «Возобновить работу»: {self._halt.reason}"),
             (self._live.desks is None,

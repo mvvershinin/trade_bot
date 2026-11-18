@@ -4,13 +4,15 @@
 которое здесь стережётся, — то, что владелец счёта видит у кнопки «Бой»:
 
 * бой недоступен, пока ему мешает хоть одна помеха из тех, что порт знает
-  без брокера: нет подачи заявок в сборке, нет потока котировок, показ
-  закреплён на отрезке истории, робот остановлен, скользящий уровень на
-  свече не крупнее порога минуток, шаг цены неизвестен. Каждая — своей
+  без брокера: нет подачи заявок в сборке, нет потока котировок, робот
+  остановлен, скользящий уровень на свече не крупнее порога минуток, шаг
+  цены неизвестен. Каждая — своей
   фразой в снимке боя (`LiveStatus.why_not`) и в строке «Бой не включён»
   на нажатие; ни одной команды брокеру, просьба боя снята;
 * без помех тот же стенд бой включает — иначе зелёные отказы выше
   ничего бы не доказывали;
+* закреплённый отрезок истории — не помеха: включение боя снимает его само
+  и говорит это строкой (владелец счёта 18.11.2026);
 * поток статусов заявок не открылся за срок ожидания — бой не пускает;
 * команда журнала, оставшаяся незакрытой после сверки, бой не пускает;
 * что сверка сделала с командами прошлых запусков, сказано строкой;
@@ -195,7 +197,6 @@ GATES = [
         id="no-order-path",
     ),
     pytest.param(Gate("Нет потока котировок", stream=False), id="no-quote-stream"),
-    pytest.param(Gate("Показ закреплён на отрезке истории", then=_pin), id="pinned-span"),
     pytest.param(
         Gate("Робот остановлен, сначала «Возобновить работу»: Робот остановлен проверкой",
              then=_halt),
@@ -271,6 +272,50 @@ def test_without_a_gate_the_same_bench_turns_live_on(
     assert before.available and before.why_not == (), before.why_not
     assert after.on and after.armed, after
     assert "Бой включается" in events and "Бой включён" in events, events
+
+
+@pytest.mark.parametrize("busy", [False, True], ids=["idle", "pass-running"])
+def test_turning_live_on_unpins_the_history_span_and_says_so(
+    loop, tmp_path: pathlib.Path, broker: FakeBroker, busy: bool
+) -> None:
+    """«Бой сам снимает прогон» (владелец счёта 18.11.2026).
+
+    Стережёт: при закреплённом отрезке бой доступен, нажатие снимает отрезок,
+    бой включается, а в журнале — строка о снятии. Прежде отрезок держал бой
+    отказом «нажмите «Вернуться к текущим»», а кнопка возврата на экране
+    шириной 1366 уходила под » панели — заказчик выхода не нашёл.
+
+    `pass-running` — проход на отрезке поставлен и не кончился к нажатию: он
+    снимается, и бой собирается следующим проходом, а не отказом «занято».
+    """
+
+    async def go() -> tuple[LiveStatus, str, LiveStatus, list[tuple[str, str]]]:
+        bench, session = await _build(tmp_path, broker)
+        # Отрезок — тем, что видит окно: плашкой `history_span` снимка состояния.
+        spans: list[str] = []
+        bench.port.state_changed.connect(lambda state: spans.append(state.history_span))
+        try:
+            await _connect(bench, live=False)
+            await _pin(bench.port)
+            assert spans and spans[-1], "стенд: отрезок не закрепился"
+            before = bench.port.live_status()
+            bench.notes.clear()
+            if busy:
+                bench.port.refresh("проход на отрезке")
+            bench.port.set_live(True)
+            await bench.port.wait()
+            return before, spans[-1], bench.port.live_status(), list(bench.notes)
+        finally:
+            await _close(bench, session)
+
+    before, span, after, notes = loop.run_until_complete(go())
+    assert before.available, before.why_not
+    assert span == "", f"бой включён, а показ так и остался на отрезке истории: {span}"
+    assert "Бой не включён" not in [event for event, _ in notes], notes
+    assert after.on and after.armed, after
+    said = " ".join(reason for event, reason in notes if event == "Возврат к текущим данным")
+    assert "Прогон на истории снят: включается бой" in said, notes
+    assert ("идущий прогон остановлен" in said) == busy, said
 
 
 # --------------------------------------------------------------- журнал команд

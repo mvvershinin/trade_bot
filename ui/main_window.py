@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QPushButton,
     QSplitter,
     QToolBar,
     QToolButton,
@@ -134,6 +135,11 @@ TITLE = "Терминал"
 UNPIN_HINT = (
     "Снять закреплённый отрезок и вернуться к текущим данным. "
     "То же самое делает кнопка «Вернуться к текущим данным»."
+)
+#: Подсказка возврата — у кнопки на плашке и у пункта панели одна.
+RECENT_HINT = (
+    "Снять отрезок прогона на истории и снова показывать последние дни "
+    "вместе с живыми свечами. Включение боя снимает его само."
 )
 TOKEN_WARNING_DAYS = 10
 
@@ -392,8 +398,14 @@ class _Banner(QLabel):
         *,
         on_close: Callable[[], None] | None = None,
         close_hint: str = "",
+        action: tuple[str, Callable[[], None], str] | None = None,
     ) -> None:
         """:param on_close: что делает крестик. `None` — крестика нет вовсе.
+
+        :param action: кнопка на плашке — надпись, действие, подсказка.
+        Кнопка — видимый выход там же, где сказано, из чего выходить. Пункт
+        панели этого не давал: на экране шириной 1366 «Вернуться к текущим
+        данным» уходил под » панели, и заказчик кнопку не нашёл (18.11.2026).
 
         ⚠️ Крестик — **необязательная** часть плашки, и это правило,
         а не удобство. Плашку «робот остановлен дневным лимитом» закрывать
@@ -407,8 +419,7 @@ class _Banner(QLabel):
         super().__init__(parent)
         self.setWordWrap(True)
         self.setVisible(False)
-        # Справа место под крестик, если он есть: иначе текст уезжает под него.
-        self.setContentsMargins(12, 8, 36 if on_close is not None else 12, 8)
+        # Справа место под крестик и кнопку (`_reserve`): иначе текст уезжает под них.
         self.close_button: QToolButton | None = None
         if on_close is not None:
             self.close_button = self._add_close(on_close, close_hint)
@@ -421,9 +432,45 @@ class _Banner(QLabel):
         font.setPointSizeF(max(font.pointSizeF() + 2.0, self.LARGE_POINTS))
         font.setBold(True)
         self.setFont(font)
+        # Кнопка — после шрифта: она берёт его у плашки, и мерить её до этого
+        # значило бы отвести под неё место по мелкому шрифту.
+        self.action_button: QPushButton | None = None
+        if action is not None:
+            self.action_button = self._add_action(*action)
+        self._reserve()
 
     #: Отступ крестика от правого верхнего угла плашки, в точках.
     CLOSE_INSET = 6
+    #: Справа под крестик, в точках; без крестика — обычный отступ.
+    CLOSE_ROOM = 36
+    #: Зазор между текстом плашки и её кнопкой, в точках.
+    ACTION_GAP = 12
+    #: Кегль кнопки на плашке: мельче текста плашки, чтобы на 1366 точках
+    #: она не отнимала у него третью строку, и крупнее панели — чтобы её нашли.
+    ACTION_POINTS = scaled(11.0)
+
+    def _add_action(self, text: str, act: Callable[[], None], hint: str) -> QPushButton:
+        """Кнопка действия у правого края, левее крестика.
+
+        Поверх надписи и двигается в `resizeEvent` — по той же причине, что
+        крестик (`_add_close`): раскладка внутри `QLabel` обрезала бы текст.
+        Место под неё отводит правый отступ надписи (`_reserve`).
+        """
+        button = QPushButton(text, self)
+        button.setToolTip(hint)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        button.clicked.connect(act)
+        button.adjustSize()
+        return button
+
+    def _reserve(self) -> None:
+        """Правый отступ надписи — под крестик и кнопку; высота — не ниже кнопки."""
+        right = self.CLOSE_ROOM if self.close_button is not None else 12
+        if self.action_button is not None:
+            right += self.action_button.width() + self.ACTION_GAP
+            self.setMinimumHeight(self.action_button.height() + 2 * self.CLOSE_INSET)
+        self.setContentsMargins(12, 8, right, 8)
 
     def _add_close(self, on_close: Callable[[], None], hint: str) -> QToolButton:
         """Крестик в правом верхнем углу плашки.
@@ -446,12 +493,22 @@ class _Banner(QLabel):
         return button
 
     def resizeEvent(self, event: QResizeEvent) -> None:  # имя метода задано Qt
-        """Держать крестик в правом верхнем углу при любой ширине окна."""
+        """Держать крестик в правом верхнем углу, а кнопку — левее, при любой ширине."""
         super().resizeEvent(event)
+        self._place()
+
+    def _place(self) -> None:
         if self.close_button is not None:
             width = self.close_button.width()
             self.close_button.move(
                 self.width() - width - self.CLOSE_INSET, self.CLOSE_INSET
+            )
+        button = self.action_button
+        if button is not None:
+            right = self.CLOSE_ROOM if self.close_button is not None else 12
+            button.move(
+                self.width() - right - button.width(),
+                max((self.height() - button.height()) // 2, self.CLOSE_INSET),
             )
 
     def show_text(self, text: str, background: str) -> None:
@@ -471,6 +528,23 @@ class _Banner(QLabel):
                 "font-weight: bold; }"
             )
             self.close_button.adjustSize()
+        if self.action_button is not None:
+            # Обводка цветом надписи: заливку кнопка наследует от плашки,
+            # и без обводки читалась бы как ещё одна строка текста, а не кнопка.
+            ink = text_on(background)
+            self.action_button.setStyleSheet(
+                f"QPushButton {{ color: {ink}; background: transparent; "
+                f"border: 2px solid {ink}; border-radius: 4px; padding: 4px 12px; "
+                f"font-size: {self.ACTION_POINTS:.1f}pt; font-weight: bold; }}"
+                "QPushButton:hover { background: rgba(0, 0, 0, 40); }"
+                f"QPushButton:focus {{ border: 3px solid {ink}; padding: 3px 11px; }}"
+            )
+            # Таблица стилей применяется при полировке: без неё размер мерился
+            # бы по прежнему шрифту, и под кнопку отводилось бы чужое место.
+            self.action_button.ensurePolished()
+            self.action_button.adjustSize()
+            self._reserve()
+            self._place()
         self.setStyleSheet(
             f"background: {background}; color: {text_on(background)}; border-radius: 4px;"
         )
@@ -630,8 +704,10 @@ class MainWindow(QMainWindow):
         #: Плашка «показан прогон на истории». Живые свечи на закреплённый
         #: отрезок не приходят вовсе, и без этой строки застывший график
         #: неотличим от потерянной связи (`app/port.py::_Span`).
-        self.history_banner = _Banner(on_close=self.show_recent_data,
-                                      close_hint=UNPIN_HINT)
+        self.history_banner = _Banner(
+            on_close=self.show_recent_data, close_hint=UNPIN_HINT,
+            action=("Вернуться к текущим данным", self.show_recent_data, RECENT_HINT),
+        )
         #: Действующий контракт по таблице биржи и кнопка перехода (0061, 0016).
         self.contract_bar = ContractBar()
         self.contract_bar.switch_requested.connect(self._switch_contract)
@@ -799,10 +875,7 @@ class MainWindow(QMainWindow):
         #: с многоточием — а это действие без окна (`tests/test_ui_window.py`).
         self.recent_action = QAction("Вернуться к текущим данным", self)
         self.recent_action.setVisible(False)
-        self.recent_action.setToolTip(
-            "Снять отрезок прогона на истории и снова показывать последние дни "
-            "вместе с живыми свечами."
-        )
+        self.recent_action.setToolTip(RECENT_HINT)
         self.recent_action.triggered.connect(self.show_recent_data)
 
         self.mode_box = QComboBox()
