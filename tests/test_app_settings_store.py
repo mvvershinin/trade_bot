@@ -604,6 +604,8 @@ def _migrated(text: str) -> str:
     Поля убранного алгоритма уходят, имя алгоритма и форма выхода — те,
     что выставлены при чтении (решение 0063). Отступ предельной цены —
     процентом по умолчанию вместо шагов (решение 0067, `REPLACED_KEYS`).
+    Пауза сверки позиции — старое умолчание 1,0 поднято до 30 (B-111,
+    `RAISED_DEFAULTS`).
     Строками, а не через `json`: проверка ниже сверяет файл знак в знак.
     """
     gone = ('"confirm_bars"', '"filter_enabled"', '"on_price_equals_average"',
@@ -614,6 +616,7 @@ def _migrated(text: str) -> str:
         .replace('"strategy_id": "ema_reverse"', '"strategy_id": "ma_reverse_always"')
         .replace('"time_exit_order": "market"', '"time_exit_order": "limit"')
         .replace('"time_exit_limit_steps": 10', '"time_exit_limit_pct": 2.0')
+        .replace('"live_position_settle_sec": 1.0', '"live_position_settle_sec": 30.0')
     )
 
 
@@ -965,3 +968,38 @@ def test_a_file_without_the_minute_bar_limit_is_read_and_left_as_it_is(
     assert read.values.minute_bar_limit is MinuteBarLimit.FIVE
     assert any(f"«{FIELD_CAPTIONS['minute_bar_limit']}»" in line for line in read.notes), read.notes
     assert store.path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    ("saved", "read", "said"),
+    [
+        pytest.param(1.0, 30.0, 1, id="old-default-raised"),
+        pytest.param(3.0, 3.0, 0, id="chosen-kept"),
+        pytest.param(0.5, 0.5, 0, id="chosen-below-old-default-kept"),
+        pytest.param(30.0, 30.0, 0, id="new-default-kept"),
+    ],
+)
+def test_the_old_default_settle_pause_is_raised_and_a_chosen_one_is_kept(
+    tmp_path: pathlib.Path, saved: float, read: float, said: int
+) -> None:
+    """Стережёт B-111: сохранённое старое умолчание паузы сверки 1,0 читается как 30.
+
+    У заказчика в файле лежит 1,0 — умолчание прежних сборок, которого он
+    не выбирал; при нём портфель, отставший от потока сделок, останавливал
+    робота на перевороте (решение владельца 20.11.2026: 30 с). Любое другое
+    сохранённое значение — выбор человека, и оно не трогается. Подъём
+    не молчит: строка в заметках чтения. Файл при чтении не переписывается.
+    """
+    path = tmp_path / SETTINGS_FILE_NAME
+    store = SettingsStore(tmp_path)
+    assert store.save(dataclasses.replace(Settings(), live_position_settle_sec=saved)) == ""
+    body = path.read_text(encoding="utf-8")
+    assert f'"live_position_settle_sec": {saved!r}' in body, "в файл записано не то число"
+
+    loaded = SettingsStore(tmp_path).load()
+
+    assert loaded.values.live_position_settle_sec == read
+    assert loaded.troubles == (), loaded.troubles
+    raised = [note for note in loaded.notes if "прежнее умолчание" in note]
+    assert len(raised) == said, loaded.notes
+    assert path.read_text(encoding="utf-8") == body, "файл переписан при чтении"

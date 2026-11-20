@@ -277,7 +277,7 @@ def test_the_seconds_in_the_line_read_as_seconds() -> None:
         ),
     )
     assert _line_of(lines, "live_position_settle_sec").startswith(
-        f"{FIELD_CAPTIONS['live_position_settle_sec']}: 1 с → 0,5 с"
+        f"{FIELD_CAPTIONS['live_position_settle_sec']}: 30 с → 0,5 с"
     ), lines
     assert _line_of(lines, "live_reconnect_pauses_sec").startswith(
         f"{FIELD_CAPTIONS['live_reconnect_pauses_sec']}: 1, 2, 5, 10, 30 с → 3, 7 с"

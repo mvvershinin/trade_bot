@@ -401,6 +401,11 @@ class Wiring:
     #: 10.11.2026). `None` — источника нет: FOK «текущая ± %», выход с пределом —
     #: предел движка, и строка об этом говорит.
     band: BandSource | None = None
+    #: Пауза между перечитываниями портфеля, пока позиция у брокера не сойдётся
+    #: с позицией робота (B-099, B-111): в сумме до `LiveLimits.position_settle`,
+    #: умолчание 30 с. Отдельно от `sleep`: тест подставляет её, не трогая паузы
+    #: переподключения потока.
+    settle_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 
 
 # --------------------------------------------------------------- состояние
@@ -608,6 +613,17 @@ class _Priced(NamedTuple):
     #: строка «исполнена по X, текущая была Y» — у каждой исполненной заявки,
     #: где «текущая» известна. `None` — не судится (тейк, несвежая минутка).
     current: float | None = None
+
+
+class _Reads(NamedTuple):
+    """Объём «закрыть всё», названный надёжно: чтения портфеля согласны со сделками (С2, К2).
+
+    Планка — полученная **до** чтений (`/risk` 10.11.2026, находка 1).
+    """
+
+    first: int
+    position: int
+    band: _BandAnswer
 
 
 @dataclass(eq=False)
@@ -850,6 +866,7 @@ class LiveExecutor:
         )
         self._clock = wiring.clock
         self._sleep = wiring.sleep
+        self._settle_sleep = wiring.settle_sleep
         self._on_news = wiring.on_news
         self._notice = wiring.notice
         self._band = wiring.band
@@ -1102,24 +1119,39 @@ class LiveExecutor:
         не видел (`_undelivered`), и считается она в тот же миг, что читается
         портфель: сторож трейлинга, продавший по догруженной минутке, не
         вклинится между подсчётом и чтением. Совпало — основа позиции по
-        сделкам. Не совпало — «закрыть всё» тут же, под тем же замком.
+        сделкам. Не совпало — портфель перечитывается до схода, не дольше
+        `position_settle`, как перед заявкой (B-099, D-198 п. 4): портфель
+        отстаёт от потока сделок. Не сошлось — `_settle_or_flatten`.
 
         :returns: позиция у брокера, позиция робота, текст остановки или `None`.
         :raises BrokerError: портфель не прочитан.
         """
         async with self._lock:
             # Позицию закрыл владелец, движок ещё не принял: у робота ноль (0069).
-            robot = (0 if self._flat_by_hand else expected) + self._undelivered()
-            actual = await self._position_now()
+            base = 0 if self._flat_by_hand else expected
+            started = self._clock()
+            # Робот — на каждом чтении заново: живая заявка, исполнившаяся
+            # за время перечитывания, сдвигает и портфель, и `_undelivered`.
+            first, actual = await self._read_until(
+                lambda now: now == base + self._undelivered()
+            )
+            robot = base + self._undelivered()
             if actual == robot:
                 self._ledger = actual
+                if first != actual:
+                    self._say(
+                        f"Портфель брокера отстал на {self._since(started)} с: при сверке "
+                        "после связи позиция у брокера сошлась с позицией робота "
+                        f"({position_words(robot)})."
+                    )
                 return actual, robot, None
             why = (
                 f"Сверка с брокером: у брокера {position_words(actual)}, "
-                f"у робота {position_words(robot)}."
+                f"у робота {position_words(robot)}"
             )
             with self._permitted():
-                return actual, robot, await self._flatten(why)
+                halt = await self._settle_or_flatten(why, robot, started)
+            return (robot if halt is None else actual), robot, halt
 
     async def close_everything(self, why: str) -> str:
         """Решение 0020 (0066): снять заявки, закрыть позицию заявкой FOK, остановиться.
@@ -1777,12 +1809,18 @@ class LiveExecutor:
     # -- проверки перед заявкой (план §2.2) ------------------------------------
 
     async def _admit(self, order: OrderRequest, *, expected: int | None) -> None:
-        """Цепочка: свежесть → права → поток → позиция. Порядок — от дешёвого к запросу."""
+        """Цепочка: свежесть → права → поток → позиция. Порядок — от дешёвого к запросу.
+
+        Позиция сошлась не с первого чтения — поток проверяется ещё раз:
+        ожидание схода длится до двух пауз сверки (B-111, умолчание 30 с),
+        и поток, оборвавшийся за это время, иначе не заметили бы до заявки
+        (`/risk` 20.11.2026, находка 2).
+        """
         self._refuse_stale(order)
         self._require_rights()
         await self._require_stream()
-        if expected is not None:
-            await self._require_position(expected, order)
+        if expected is not None and await self._require_position(expected, order):
+            await self._require_stream()
 
     def _freshness(self) -> timedelta:
         """Насколько решение может быть старше «сейчас»: свеча плюс порог (§2.2 п. 1)."""
@@ -1848,43 +1886,59 @@ class LiveExecutor:
             "Заявка не подана, сигнал пропущен."
         )
 
-    async def _require_position(self, expected: int, order: OrderRequest) -> None:
+    async def _require_position(self, expected: int, order: OrderRequest) -> bool:
         """Позиция у брокера свежим запросом; расхождение — перечитать до схода, потом стоп.
 
         Портфель брокера отстаёт от потока исполнений: 13.11.2026 после выхода
         FOK, исполненного по потоку, портфель ещё около 5 с показывал прежний
         лонг, и каждый переворот кончался «закрыть всё» (B-099, выбор
-        владельца — «перечитывать до схода»). Чтения идут шагом `_SETTLE_STEP`,
-        пока позиция не сойдётся, но в сумме пауз не дольше `position_settle`.
-        Сошлось — дальше сразу, без доживания паузы, и строка INFO в журнал
-        решений: на сколько портфель отстал. Не сошлось за паузу — закрыть всё
+        владельца — «перечитывать до схода»; B-111 — 20.11.2026 то же при
+        паузе 1 с). Чтения идут шагом `_SETTLE_STEP`, пока позиция не сойдётся,
+        но в сумме пауз не дольше `position_settle` (умолчание 30 с). Сошлось —
+        дальше сразу, без доживания паузы, и строка INFO в журнал решений:
+        на сколько портфель отстал. Не сошлось за паузу — `_settle_or_flatten`:
+        сошлось при сверке перед закрытием — заявка идёт, иначе закрыть всё
         и остановиться (0020). Пауза 0 — одно перечитывание сразу.
+
+        Позицию по сделкам (`_ledger`) чтение основой не делает, если робот
+        стоит или она уже другая (`/risk` 20.11.2026, находка 4): чужая сделка,
+        принесённая потоком, при отставшем портфеле стёрлась бы чтением.
+
+        :returns: ждали ли схода — первое чтение не сошлось.
         """
-        actual = await self._read_position()
+        started = self._clock()
+        first, actual = await self._read_until(
+            lambda now: now == expected, read=self._read_position
+        )
         if actual == expected:
-            self._ledger = actual
-            return
-        pause = self._limits.position_settle
-        steps = max(1, math.ceil(pause / _SETTLE_STEP))
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        for _ in range(steps):
-            await asyncio.sleep(pause / steps)
-            actual = await self._read_position()
-            if actual == expected:
+            if self._halt is None and self._ledger in (None, expected):
                 self._ledger = actual
-                self._say(
-                    f"Портфель брокера отстал на {loop.time() - started:.0f} с: перед "
-                    f"заявкой ({_order_words(order)}) позиция у брокера сошлась с позицией "
-                    f"робота ({position_words(expected)})."
-                )
-                return
-        waited = f"; портфель перечитывался {pause:g} с и не сошёлся" if pause > 0 else ""
+            if first == expected:
+                return False
+            self._say(
+                f"Портфель брокера отстал на {self._since(started)} с: перед "
+                f"заявкой ({_order_words(order)}) позиция у брокера сошлась с позицией "
+                f"робота ({position_words(expected)})."
+            )
+            return True
         why = (
             f"Перед заявкой ({_order_words(order)}) у брокера {position_words(actual)}, "
-            f"а робот считает {position_words(expected)}{waited}."
+            f"а робот считает {position_words(expected)}"
         )
-        raise ExecutionHalted(await self._flatten(why))
+        halt = await self._settle_or_flatten(why, expected, started)
+        if halt is not None:
+            raise ExecutionHalted(halt)
+        return True
+
+    def _waited_words(self, started: datetime) -> str:
+        """Хвост причины: сколько портфель перечитывался на самом деле, с `started` (находка 5)."""
+        if self._limits.position_settle <= 0:
+            return ""
+        return f"; портфель перечитывался {self._since(started)} с и не сошёлся"
+
+    def _since(self, started: datetime) -> str:
+        """Сколько секунд прошло с `started` по часам исполнителя — для строки журнала."""
+        return f"{(self._clock() - started).total_seconds():.0f}"
 
     async def _read_position(self) -> int:
         try:
@@ -2595,7 +2649,8 @@ class LiveExecutor:
         try:
             band = await self._fetch_band()  # до проверки позиции — как у `_open`
             await self._require_stream()
-            await self._require_position(signed_position(order.side, deal.volume), order)
+            if await self._require_position(signed_position(order.side, deal.volume), order):
+                await self._require_stream()  # ждали схода — как в `_admit` (находка 2)
             priced = self._fok(_CLOSING[order.side], deal.volume, level, "уровень касания", band)
             ticket = await self._send(
                 order.order_id,
@@ -2817,7 +2872,73 @@ class LiveExecutor:
 
     # -- закрыть всё (решение 0020, 0066) --------------------------------------
 
-    async def _flatten(self, why: str) -> str:
+    async def _settle_or_flatten(self, why: str, robot: int, started: datetime) -> str | None:
+        """Расхождение после паузы: отставание портфеля — дальше без остановки, иначе 0020.
+
+        B-111 (20.11.2026): портфель отстал дольше паузы, «закрыть всё»
+        перечитало его и нашло «закрывать нечего», а остановка, поставленная
+        до выяснения, осталась — робот стоял до человека без причины.
+
+        Выяснение без остановки — только когда оно ничего не трогает у брокера
+        (`_only_lag_possible`): снимать нечего, по сделкам потока у робота та же
+        позиция. Тогда чтения «закрыть всё» (`_closing_reads`) делаются **до**
+        остановки: сошлись с позицией робота — строка WARNING в журнал решений
+        и `None`, заявка, ради которой шла сверка, подаётся. Не сошлись — те же
+        чтения идут в `_flatten`, второй паузы нет; остановка там ставится до
+        закрывающей заявки, как прежде.
+
+        Иначе — `_flatten` целиком: остановка до снятия заявок (0020).
+
+        Робот, остановленный за время чтений (сбой потока, отказ биржи), —
+        прежний путь, без строки «работает дальше» (`/risk` 20.11.2026, находка 6).
+
+        :param why: что не сошлось — без точки: хвост о времени ожидания
+            (`_waited_words`) дописывается здесь, по настоящему времени обеих
+            фаз (находка 5).
+        :param robot: позиция робота со знаком, с которой сверялся портфель.
+        :param started: когда сверка прочитала портфель впервые.
+        :returns: текст остановки; `None` — расхождения нет, робот работает.
+        """
+        if not self._only_lag_possible(robot):
+            return await self._flatten(f"{why}{self._waited_words(started)}.")
+        pause = self._limits.position_settle
+        reads = await self._closing_reads(trusted=True)
+        if self._halt is None and isinstance(reads, _Reads) and reads.position == robot:
+            self._ledger = robot
+            self._tell(
+                f"{why}; за паузу {pause:g} с портфель не сошёлся. Расхождение разрешилось "
+                f"само: через {self._since(started)} с у брокера {position_words(robot)} — "
+                "как у робота и по сделкам программы, портфель брокера отставал. Робот "
+                "не остановлен и работает дальше."
+            )
+            return None
+        return await self._flatten(f"{why}{self._waited_words(started)}.", reads=reads)
+
+    def _only_lag_possible(self, robot: int) -> bool:
+        """Расхождение можно выяснить, ничего не трогая у брокера (B-111).
+
+        Робот не стоит; судьба команд известна; у брокера нет ни одной живой
+        заявки робота и у исполнителя ни одного сторожа уровня — снимать
+        нечего; по сделкам потока (`_ledger`) у робота та же позиция, что
+        у движка. Тогда «портфель показывает другое» — это или отставание
+        портфеля, или настоящее расхождение, и решают его чтения, а не
+        остановка. Любое условие не выполнено — прежний путь 0020.
+        """
+        return (
+            self._halt is None
+            and not self._unsettled
+            and self._ledger == robot
+            and not self._outside
+            and not self._takes
+            and not self._alive_tickets()
+        )
+
+    async def _flatten(self, why: str, *, reads: _Reads | str | None = None) -> str:
+        """Решение 0020: остановиться, снять свои заявки, закрыть позицию заявкой FOK.
+
+        :param reads: чтения позиции, уже сделанные `_settle_or_flatten` (снимать
+            было нечего, и перечитывать второй раз незачем); `None` — читать здесь.
+        """
         if self._halt is not None and self._blocked():
             # Робот уже стоит по другой причине, и человек, возможно, уже
             # действует руками: само по себе не закрываем (`B-077`). Закрыть
@@ -2846,7 +2967,10 @@ class LiveExecutor:
             # «Закрыть позицию» (`_hand_close`, `/risk` 14.11.2026 D-198 п. 2):
             # тейк или условная, оставшись у брокера, после закрытия исполнились
             # бы сами и открыли позицию заново — шорт без сигнала.
-            notes.append(_KEPT_OPEN if alive else await self._close_position())
+            # Чтения, сделанные до остановки, годны, только если снимать было
+            # нечего: снятая заявка могла исполниться и сдвинуть позицию.
+            known = reads if not notes else None
+            notes.append(_KEPT_OPEN if alive else await self._close_position(reads=known))
         text = " ".join(
             [why, *notes, "Робот остановлен до вашего решения (решение 0020)."]
         )
@@ -2860,9 +2984,7 @@ class LiveExecutor:
         """Снять все свои живые заявки. Возврат — слова и «хоть одна осталась жива»."""
         notes: list[str] = []
         alive = False
-        for ticket in list(self._tickets.values()):
-            if ticket.final or ticket.answer is _Answer.REFUSED:
-                continue
+        for ticket in self._alive_tickets():
             try:
                 await self._cancel_ticket(ticket)
             except (ExecutionRefused, ExecutionHalted) as error:
@@ -2873,7 +2995,16 @@ class LiveExecutor:
             notes.append(f"Заявка ({ticket.what}) {done}.")
         return notes, alive
 
-    async def _close_position(self, *, trusted: bool | None = None) -> str:
+    def _alive_tickets(self) -> list[_Ticket]:
+        """Свои заявки, которые у брокера, возможно, ещё живы: их снимает «закрыть всё»."""
+        return [
+            ticket for ticket in self._tickets.values()
+            if not ticket.final and ticket.answer is not _Answer.REFUSED
+        ]
+
+    async def _close_position(
+        self, *, trusted: bool | None = None, reads: _Reads | str | None = None
+    ) -> str:
         """Одна заявка FOK на всё, что у брокера, — только по согласным сведениям (С2, К2).
 
         Цена — `_fok_now`: от свежей минутки, иначе по планке биржи, иначе
@@ -2900,28 +3031,15 @@ class LiveExecutor:
 
         :param trusted: позиция по сделкам — из потока, а не из одного чтения;
             `None` — известна ли она сейчас.
+        :param reads: чтения уже сделаны (`_closing_reads`); `None` — читать здесь.
         """
-        if trusted is None:
-            trusted = self._ledger is not None
-        # Планка — до чтений позиции (`/risk` 10.11.2026, находка 1): иначе
-        # объём закрытия — из чтения за `band_wait` до подачи, и сделка,
-        # сделанная руками за это время, превратила бы закрытие в шорт.
-        band = await self._fetch_band()
-        try:
-            if trusted:
-                first, position = await self._read_until(lambda now: now == self._ledger)
-            else:
-                first = await self._position_now()
-                await asyncio.sleep(self._limits.position_settle)
-                position = await self._position_now()
-        except BrokerError as error:
-            return (
-                f"Позицию у брокера прочитать не удалось ({error.human}) — закрывающая "
-                "заявка не подана, закройте позицию сами."
-            )
-        doubt = self._disagreement(first, position, trusted=trusted)
-        if doubt is not None:
-            return doubt
+        if reads is None:
+            if trusted is None:
+                trusted = self._ledger is not None
+            reads = await self._closing_reads(trusted=trusted)
+        if isinstance(reads, str):
+            return reads
+        first, position, band = reads.first, reads.position, reads.band
         if position == 0:
             self._forget_unfilled()
             if first == 0:
@@ -2952,20 +3070,59 @@ class LiveExecutor:
             )
         return await self._closed_words(position, ticket)
 
-    async def _read_until(self, agreed: Callable[[int], bool]) -> tuple[int, int]:
+    async def _closing_reads(self, *, trusted: bool) -> _Reads | str:
+        """Планка и чтения позиции для «закрыть всё»; строка — объём не назван, заявки не будет.
+
+        :param trusted: позиция по сделкам — из потока (`_ledger`): перечитывать
+            до схода с ней; иначе — два чтения через всю паузу (К2).
+        """
+        # Планка — до чтений позиции (`/risk` 10.11.2026, находка 1): иначе
+        # объём закрытия — из чтения за `band_wait` до подачи, и сделка,
+        # сделанная руками за это время, превратила бы закрытие в шорт.
+        band = await self._fetch_band()
+        try:
+            if trusted:
+                first, position = await self._read_until(lambda now: now == self._ledger)
+            else:
+                first = await self._position_now()
+                pause = self._limits.position_settle
+                if pause > 0:
+                    # Пауза 30 с без строки — «Закрыть позицию» молчит полминуты
+                    # (`/risk` 20.11.2026, находка 1а; своё поле — B-114).
+                    self._say(
+                        f"Закрытие через {pause:g} с: портфель брокера может отставать, "
+                        f"жду второе чтение позиции (у брокера сейчас {position_words(first)})."
+                    )
+                await self._settle_sleep(pause)
+                position = await self._position_now()
+        except BrokerError as error:
+            return (
+                f"Позицию у брокера прочитать не удалось ({error.human}) — закрывающая "
+                "заявка не подана, закройте позицию сами."
+            )
+        doubt = self._disagreement(first, position, trusted=trusted)
+        if doubt is not None:
+            return doubt
+        return _Reads(first, position, band)
+
+    async def _read_until(
+        self, agreed: Callable[[int], bool], *, read: Callable[[], Awaitable[int]] | None = None
+    ) -> tuple[int, int]:
         """Перечитывать портфель шагом `_SETTLE_STEP`, пока чтение не `agreed` (B-099).
 
         В сумме пауз не дольше `position_settle`; пауза 0 — одно перечитывание.
-        Возврат — первое и последнее чтение. Отказ чтения — `BrokerError`.
+        Возврат — первое и последнее чтение. Отказ чтения — `BrokerError`,
+        или то, что бросает `read` (у проверки перед заявкой — `_read_position`).
         """
-        first = position = await self._position_now()
+        read = read or self._position_now
+        first = position = await read()
         pause = self._limits.position_settle
         steps = max(1, math.ceil(pause / _SETTLE_STEP))
         for _ in range(steps):
             if agreed(position):
                 break
-            await asyncio.sleep(pause / steps)
-            position = await self._position_now()
+            await self._settle_sleep(pause / steps)
+            position = await read()
         return first, position
 
     def _forget_unfilled(self) -> None:

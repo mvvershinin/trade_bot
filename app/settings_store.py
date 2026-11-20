@@ -75,6 +75,7 @@ from ui.settings_codec import (
     caption_of,
     encode_fields,
     field_codecs,
+    human_value,
     read_fields,
 )
 from ui.userdata_file import write_atomically
@@ -95,6 +96,18 @@ FORMAT_VERSION: Final[int] = 1
 
 _KEY_VERSION: Final[str] = "format_version"
 _KEY_VALUES: Final[str] = "settings"
+
+#: Поднятые умолчания: поле → (прежнее умолчание, новое). Значение в файле,
+#: равное прежнему умолчанию, читается новым — у заказчика в файле лежит
+#: умолчание, которого он не выбирал. Любое другое значение не трогается.
+#:
+#: ⚠️ Отличить «выбрал сам» от «осталось умолчание» по файлу нельзя: прежнее
+#: число, выбранное руками, тоже будет поднято при каждом чтении.
+RAISED_DEFAULTS: Final[Mapping[str, tuple[float, float]]] = {
+    # Старое умолчание 1,0 → 30, 20.11.2026 (B-111, решение владельца счёта):
+    # при 1 с портфель, отставший от потока сделок, останавливал робота.
+    "live_position_settle_sec": (1.0, 30.0),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +470,7 @@ class SettingsStore:
             )
         changes, refused, missing = read_fields(raw, table, start)
         troubles.extend(refused)
+        notes.extend(_raise_defaults(changes))
         if missing:
             notes.append(
                 "Настройки, которых в файле нет, взяты по умолчанию: "
@@ -607,6 +621,20 @@ def _why(error: Exception) -> str:
     if isinstance(error, OSError):
         return f"файл не открылся ({error.strerror or error})"
     return str(error)
+
+
+def _raise_defaults(changes: dict[str, object]) -> list[str]:
+    """Прочитанное прежнее умолчание — новым (`RAISED_DEFAULTS`). Возврат — строки журнала."""
+    lines: list[str] = []
+    for name, (was, now) in RAISED_DEFAULTS.items():
+        if name in changes and changes[name] == was:
+            changes[name] = now
+            lines.append(
+                f"Настройка «{caption_of(name)}» стояла «{human_value(was)}» — прежнее "
+                f"умолчание программы; взято новое «{human_value(now)}». В файл оно "
+                "запишется, когда вы примените настройки."
+            )
+    return lines
 
 
 def _version_notes(version: object, path: Path) -> tuple[str, ...]:

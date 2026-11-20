@@ -751,7 +751,7 @@ def test_bad_wait_limits_from_the_file_are_said_in_window_words_in_one_line(
 ) -> None:
     """Пределы ожидания из файла, которых окно не примет, — одной строкой и словами окна.
 
-    Человек видит «в файле 0,05, а годно … — поставлено умолчание 1», а не
+    Человек видит «в файле 0,05, а годно … — поставлено умолчание 30», а не
     `0.05` и `(1, 2, 5, 10, 30)`: запись Python в журнале — это не текст для
     человека, а запятая вместо точки — его привычная запись чисел.
     """
@@ -777,7 +777,7 @@ def test_bad_wait_limits_from_the_file_are_said_in_window_words_in_one_line(
     rows = [reason for reason in reasons if settle in reason and pauses in reason]
     assert rows, f"о двух негодных пределах не сказано одной строкой: {reasons}"
     row = rows[0]
-    assert "в файле 0,05, а годно" in row and "умолчание 1." in row, row
+    assert "в файле 0,05, а годно" in row and "умолчание 30." in row, row
     assert "в файле 0, 3, а годно" in row and "умолчание 1, 2, 5, 10, 30." in row, row
     for python in ("0.05", "1.0", "(", "[", "'"):
         assert python not in row, f"запись Python «{python}» в строке человеку: {row}"

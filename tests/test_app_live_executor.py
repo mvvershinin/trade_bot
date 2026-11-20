@@ -20,7 +20,7 @@ import logging
 import pathlib
 import sqlite3
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta
 from typing import TypeVar
@@ -276,6 +276,12 @@ class Rig:
     session: BrokerSession | None = None
     #: Те же строки с уровнем, который исполнитель назвал журналу решений.
     levels: list[tuple[str, DecisionLevel]] = field(default_factory=list)
+    #: Паузы перечитывания портфеля (`Wiring.settle_sleep`) — при
+    #: `make_rig(virtual_settle=True)`: каждая двигает часы, а не ждёт.
+    slept: list[float] = field(default_factory=list)
+    #: Что сделать в следующей такой паузе (по одному на паузу) — обрыв
+    #: потока посреди ожидания позиции и т. п.
+    settle_hooks: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
 
     def creates(self) -> list[dict[str, object]]:
         """Тела всех созданий заявок, ушедших к брокеру, по порядку."""
@@ -328,6 +334,7 @@ async def make_rig(
     on_news: Callable[[], None] | None = None,
     limits: LiveLimits = FAST,
     band: BandSource | None = None,
+    virtual_settle: bool = False,
 ) -> AsyncIterator[Rig]:
     worker = MarketWorker(tmp_path / "candles.sqlite3")
     await worker.open()
@@ -365,9 +372,21 @@ async def make_rig(
         notices.append(text)
         levels.append((text, level))
 
+    slept: list[float] = []
+    settle_hooks: list[Callable[[], Awaitable[None]]] = []
+
+    async def settle_sleep(delay: float) -> None:
+        # Боевые 30 с паузы — по часам исполнителя, а не настоящим ожиданием.
+        slept.append(delay)
+        clock.now += timedelta(seconds=delay)
+        if settle_hooks:
+            await settle_hooks.pop(0)()
+        await asyncio.sleep(0)
+
     wiring = Wiring(
         session, book, source, clock=clock, sleep=sleep or asyncio.sleep,
         notice=heard, on_news=on_news, band=band,
+        settle_sleep=settle_sleep if virtual_settle else asyncio.sleep,
     )
     executor = LiveExecutor(wiring, Instrument(TICKER, "SPBFUT", 5, ACCOUNT, STEP), limits)
     exchange = Exchange(broker)
@@ -376,7 +395,7 @@ async def make_rig(
         assert await executor.wait_connected(2.0), "поток статусов не открылся"
         yield Rig(
             broker, exchange, executor, book, clock, minutes, minute_faults, notices, session,
-            levels,
+            levels, slept, settle_hooks,
         )
     finally:
         await executor.close()
@@ -2573,34 +2592,361 @@ def _lag_after_exit(rig: Rig, reads: int) -> None:
     rig.exchange.plans.extend([close_then_lag, filled((1, 104.0))])
 
 
-def test_a_reversal_with_a_portfolio_lagging_past_settle_does_not_open_a_short(
+def _lag_for(rig: Rig, seconds: float) -> None:
+    """Выход исполняется, а портфель ещё `seconds` по часам исполнителя показывает прежний лонг.
+
+    Как `_lag_after_exit`, но отставание — во времени, а не в числе чтений:
+    так оно и устроено у брокера (B-111, 20.11.2026). Часы двигает подставная
+    пауза перечитывания (`make_rig(virtual_settle=True)`). Вход — по 104.
+    """
+    lag: dict[str, datetime] = {}
+
+    def lagging(request: httpx.Request) -> httpx.Response:
+        until = lag.get("until")
+        if until is not None and rig.clock.now < until:
+            rig.broker.outside += 1
+            try:
+                return honest_portfolio(request)
+            finally:
+                rig.broker.outside -= 1
+        return honest_portfolio(request)
+
+    honest_portfolio = rig.broker.replace_route(("GET", PORTFOLIO_PATH), lagging)
+
+    def close_then_lag(fake: FakeBroker, order: BookOrder) -> None:
+        fake.execute(order.key, 1, 104.0)
+        lag["until"] = rig.clock.now + timedelta(seconds=seconds)
+
+    rig.exchange.plans.extend([close_then_lag, filled((1, 104.0))])
+
+
+#: Пауза сверки боя по умолчанию — 30 с, владелец счёта 20.11.2026 (B-111).
+_OWNER_SETTLE = replace(FAST, position_settle=LiveLimits().position_settle)
+
+
+def test_a_reversal_whose_portfolio_lags_three_seconds_opens_the_short_at_the_default_pause(
     tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
 ) -> None:
-    """К2 (S5), B-099: портфель догнал сделки только в «закрыть всё» — ни шорта, ни «закройте».
+    """B-111: портфель отстаёт на 3 с после выхода, пауза по умолчанию — вход подан, стопа нет.
 
-    Пауза 0: перед входом в шорт одно перечитывание, оба чтения — прежний
-    лонг, робот встаёт. В «закрыть всё» раннее чтение ещё лонг 1, последнее —
-    ноль, и по сделкам программы ноль (13.11.2026 14:55).
+    20.11.2026 у заказчика пауза стояла 1 с: одно перечитывание, «закрыть
+    всё», остановка. Стережёт: умолчание паузы — 30 с, и перед входом портфель
+    перечитывается раз в секунду до схода — сошлось на третьей секунде,
+    заявка ушла сразу, в журнал решений одна строка INFO «отстал на 3 с»;
+    до «закрыть всё» дело не дошло (его строки WARNING нет).
+    """
+    assert LiveLimits().position_settle == 30.0, "умолчание паузы сверки — не 30 с"
 
-    Стережёт: при нулевой позиции, на которой сошлись последнее чтение
-    и сделки программы, «закрыть всё» не продаёт и не советует человеку
-    закрыть несуществующую позицию — пишет «закрывать нечего».
+    async def scenario() -> None:
+        async with make_rig(
+            tmp_path, store, broker, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
+            await long_open(rig)
+            _lag_for(rig, seconds=3.0)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+            before = _reads(rig, ("GET", PORTFOLIO_PATH))
+            await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
+            await heard()
+            assert rig.executor.halted is None, rig.executor.halted
+            assert rig.broker.position(TICKER) == -1, "шорт после схода портфеля не открыт"
+            assert len(rig.sells()) == 2
+            # Чтения в 0, 1, 2 и 3 с: дальше схода не читали и не ждали.
+            assert _reads(rig, ("GET", PORTFOLIO_PATH)) - before == 4
+            assert sum(rig.slept) == 3.0, rig.slept
+            lagged = [
+                (text, level) for text, level in rig.levels if "Портфель брокера отстал" in text
+            ]
+            assert [level for _, level in lagged] == [DecisionLevel.INFO], rig.levels
+            assert "отстал на 3 с" in lagged[0][0], lagged
+            assert not [text for text in rig.warnings() if "разрешилось" in text], rig.levels
+
+    run(scenario())
+
+
+def test_a_reversal_whose_portfolio_lags_past_the_pause_opens_the_short_without_a_halt(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-111: портфель отстал дольше паузы, а сверка «закрыть всё» нашла ноль — робот работает.
+
+    Пауза 30 с, портфель догоняет сделки на 40-й секунде. Перед входом —
+    30 с перечитываний, не сошлось; снимать нечего, по сделкам потока
+    у робота ноль — чтения «закрыть всё» идут **до** остановки и сходятся.
+    Стережёт: остановки нет и не было (прежде она ставилась до выяснения
+    и оставалась — «закрывать нечего», робот стоит до человека); вход в шорт
+    подан, а не потерян; в журнал решений — одна строка WARNING
+    «разрешилось само» без совета закрыть позицию; закрывающей заявки нет.
     """
 
     async def scenario() -> None:
-        async with make_rig(tmp_path, store, broker) as rig:
+        async with make_rig(
+            tmp_path, store, broker, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
             await long_open(rig)
-            _lag_after_exit(rig, reads=3)
+            _lag_for(rig, seconds=40.0)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+            await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
+            await heard()
+            assert rig.executor.halted is None, rig.executor.halted
+            assert rig.broker.position(TICKER) == -1, "вход в шорт после схода потерян"
+            # Выход и вход — и ни одной закрывающей «закрыть всё».
+            assert len(rig.sells()) == 2
+            assert not [body for body in rig.creates() if body["side"] == "1"][1:], (
+                "после входа ушла покупка"
+            )
+            assert sum(rig.slept) == 40.0, f"чтения «закрыть всё» не дошли до схода: {rig.slept}"
+            told = [text for text in rig.warnings() if "разрешилось само" in text]
+            assert len(told) == 1, rig.levels
+            assert "через 40 с" in told[0] and "не сошёлся" in told[0], told
+            assert "закройте" not in told[0].lower(), told
+            assert not [text for text in rig.notices if "остановлен до" in text], rig.notices
+
+    run(scenario())
+
+
+def test_a_portfolio_that_never_catches_up_still_closes_all_and_halts(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """Решение 0020 живо: портфель всё время «лонг 1», по сделкам потока ноль — стоп.
+
+    Пауза 30 с перед входом и столько же на чтения «закрыть всё»: портфель
+    так и не сошёлся со сделками. Стережёт: робот остановлен, вход в шорт
+    не подан, закрывающей заявки по несогласному чтению нет (К2) — человек
+    получает обе цифры. Третьей паузы нет: чтения «закрыть всё», сделанные
+    до остановки, не повторяются.
+    """
+
+    async def scenario() -> None:
+        async with make_rig(
+            tmp_path, store, broker, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
+            await long_open(rig)
+            _lag_for(rig, seconds=10_000.0)
             rig.clock.now = BAR1 + timedelta(seconds=5)
             await submit_on_signal(rig, leave())
             with pytest.raises(ExecutionHalted) as halted:
                 await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
-            assert rig.broker.position(TICKER) == 0, "переворот с отставшим портфелем дал шорт"
-            assert len(rig.sells()) == 1
+            await heard()
             text = halted.value.human
-            assert "закрывать нечего" in text and "чтением раньше было лонг 1" in text, text
-            assert "закройте" not in text, f"совет закрыть позицию, которой нет: {text}"
-            assert "не сходится" not in text, text
+            assert rig.executor.halted is not None
+            assert "не сошёлся" in text and "не сходится" in text and "0020" in text, text
+            assert rig.broker.position(TICKER) == 0, "вход по отставшему портфелю дал шорт"
+            assert len(rig.sells()) == 1, "после выхода ушла продажа"
+            assert sum(rig.slept) == 60.0, rig.slept
+            assert not [note for note in rig.notices if "разрешилось" in note], rig.notices
+
+    run(scenario())
+
+
+def test_a_stream_lost_while_the_portfolio_catches_up_stops_the_entry(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """`/risk` 20.11.2026, находка 2: поток оборвался, пока ждали схода портфеля, — входа нет.
+
+    Поток проверяется перед ожиданием позиции, а ожидание теперь до двух
+    пауз по 30 с. Портфель отстаёт 3 с, поток рвётся в первой паузе и не
+    возвращается. Стережёт: после схода поток проверяется ещё раз — вход
+    не подан (отказ «нет связи с потоком статусов», сигнал пропущен), робот
+    не остановлен. Без повторной проверки FOK ушла бы к брокеру вслепую.
+    """
+
+    async def scenario() -> None:
+        gate = asyncio.Event()
+
+        async def gated(seconds: float) -> None:
+            await gate.wait()
+
+        async with make_rig(
+            tmp_path, store, broker, sleep=gated, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
+            await long_open(rig)
+            _lag_for(rig, seconds=3.0)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+
+            async def drop() -> None:
+                rig.broker.drop_stream()
+                for _ in range(100):
+                    if not rig.executor.connected:
+                        return
+                    await asyncio.sleep(0.01)
+
+            rig.settle_hooks.append(drop)
+            with pytest.raises(ExecutionRefused) as refused:
+                await submit_on_signal(rig, entry(side=Side.SHORT, at=BAR1))
+            assert not rig.executor.connected, "поток не оборвался — проверять нечего"
+            assert rig.slept, "ожидания схода не было — проверять нечего"
+            assert "потоком статусов" in str(refused.value), refused.value
+            assert rig.broker.position(TICKER) == 0, "вход подан без потока статусов"
+            assert len(rig.sells()) == 1
+            assert rig.executor.halted is None, rig.executor.halted
+            gate.set()
+
+    run(scenario())
+
+
+def test_a_reconnect_check_rereads_a_lagging_portfolio_until_it_agrees(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """D-198 п. 4: сверка после связи перечитывает отставший портфель до схода, как перед заявкой.
+
+    Выход исполнился, движок его ещё не видел (робот: 1 у движка − 1
+    неотданная сделка = 0), портфель 3 с показывает «лонг 1». Стережёт: сверка
+    не объявляет расхождения по одному чтению — ждёт схода, возвращает «без
+    остановки» и пишет строку INFO «отстал на 3 с», а не WARNING «закрыть всё».
+    """
+
+    async def scenario() -> None:
+        async with make_rig(
+            tmp_path, store, broker, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
+            await long_open(rig)
+            _lag_for(rig, seconds=3.0)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+            actual, robot, halt = await rig.executor.compare_position(1)
+            await heard()
+            assert halt is None and rig.executor.halted is None, halt
+            assert (actual, robot) == (0, 0)
+            assert sum(rig.slept) == 3.0, rig.slept
+            lagged = [
+                (text, level) for text, level in rig.levels if "Портфель брокера отстал" in text
+            ]
+            assert [level for _, level in lagged] == [DecisionLevel.INFO], rig.levels
+            assert "после связи" in lagged[0][0] and "отстал на 3 с" in lagged[0][0], lagged
+            assert not [text for text in rig.warnings() if "разрешилось" in text], rig.levels
+
+    run(scenario())
+
+
+def test_a_reconnect_check_whose_portfolio_lags_past_the_pause_keeps_the_robot_running(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """B-111 на сверке после связи: портфель отстал дольше паузы, чтения «закрыть всё» сошлись.
+
+    Тот же выход, что выше, но портфель догоняет на 40-й секунде при паузе
+    30 с. Стережёт: сверка возвращает «без остановки» и позицию робота
+    (0, 0), а не прочитанный отставший лонг; закрывающей продажи нет;
+    в журнале решений — одна строка WARNING «разрешилось само» (мутация
+    test-expert 20.11.2026: `_flatten` вместо `_settle_or_flatten`).
+    """
+
+    async def scenario() -> None:
+        async with make_rig(
+            tmp_path, store, broker, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
+            await long_open(rig)
+            _lag_for(rig, seconds=40.0)
+            rig.clock.now = BAR1 + timedelta(seconds=5)
+            await submit_on_signal(rig, leave())
+            actual, robot, halt = await rig.executor.compare_position(1)
+            await heard()
+            assert halt is None and rig.executor.halted is None, halt
+            assert (actual, robot) == (0, 0)
+            assert len(rig.sells()) == 1, "после выхода ушла продажа"
+            [told] = [text for text in rig.warnings() if "разрешилось само" in text]
+            assert "через 40 с" in told, told
+
+    run(scenario())
+
+
+def test_a_reconnect_check_counts_a_fill_streamed_between_its_reads(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker
+) -> None:
+    """D-198 п. 4: позиция робота на сверке — заново на каждом чтении, а не одна до них.
+
+    Тейк исполнился в миг сверки: портфель уже показывает ноль, поток сделку
+    ещё не принёс — у робота пока лонг 1. Поток приносит её за первую паузу
+    (настоящую, 1 с). Стережёт: второе чтение сходится с роботом (ноль),
+    и сверка кончается на нём — без дожития паузы и без остановки (мутация
+    test-expert 20.11.2026: робот посчитан до чтений — читали до конца паузы).
+    """
+
+    async def scenario() -> None:
+        limits = replace(FAST, position_settle=2.0)
+        async with make_rig(tmp_path, store, broker, limits=limits) as rig:
+            await long_open(rig)
+            await rig.executor.submit(arm(110.0, LevelTouch.RISE))
+            [take] = rig.broker.live()
+
+            def filled_first(request: httpx.Request) -> httpx.Response:
+                if take.live:
+                    rig.broker.execute(take.key, 1, 110.0)
+                return honest(request)
+
+            honest = rig.broker.replace_route(("GET", PORTFOLIO_PATH), filled_first)
+            before = _reads(rig, ("GET", PORTFOLIO_PATH))
+            actual, robot, halt = await rig.executor.compare_position(1)
+            assert halt is None and (actual, robot) == (0, 0), (actual, robot, halt)
+            assert _reads(rig, ("GET", PORTFOLIO_PATH)) - before == 2
+
+    run(scenario())
+
+
+async def _halted_flat(rig: Rig) -> int:
+    """Робот уже стоит: биржа отклонила вход, позиции нет."""
+    rig.exchange.plans.append(rejected("клиринг"))
+    with pytest.raises(ExecutionHalted):
+        await submit_on_signal(rig, entry())
+    return 0
+
+
+async def _resting_exit(rig: Rig) -> int:
+    """У брокера живая заявка робота и сторожа уровня нет: выход с пределом стоит в книге."""
+    await long_open(rig)
+    rig.clock.now = BAR1 + timedelta(seconds=5)
+    await submit_on_signal(rig, leave(limit=99.0))
+    return 1
+
+
+async def _program_guard(rig: Rig) -> int:
+    """Сторож уровня программы без заявки у брокера (трейлинг, `D-196`)."""
+    await long_open(rig)
+    await rig.executor.submit(arm(95.0, LevelTouch.FALL))
+    return 1
+
+
+@pytest.mark.parametrize(
+    "setup", [_halted_flat, _resting_exit, _program_guard],
+    ids=["robot-halted", "own-order-alive", "level-guard"],
+)
+def test_a_discrepancy_that_resolves_itself_still_halts_when_the_robot_is_not_idle(
+    tmp_path: pathlib.Path, store: TokenStore, broker: FakeBroker,
+    setup: Callable[[Rig], Coroutine[object, object, int]],
+) -> None:
+    """B-111, п. 4: «разрешилось само» — только у робота, которому у брокера трогать нечего.
+
+    Портфель 40 с показывает лишний контракт, потом сходится — снаружи это
+    неотличимо от отставания. Но робот уже стоит, или у брокера живая его
+    заявка, или стоит сторож уровня программы: выяснять чтениями без
+    остановки нельзя. Стережёт: сверка после связи возвращает остановку
+    (0020), строки «разрешилось само… работает дальше» нет. Мутация
+    (test-expert 20.11.2026): убрать из `_only_lag_possible` условие своего
+    случая — сверка вернула «без остановки».
+    """
+
+    async def scenario() -> None:
+        async with make_rig(
+            tmp_path, store, broker, limits=_OWNER_SETTLE, virtual_settle=True
+        ) as rig:
+            expected = await setup(rig)
+            until = rig.clock.now + timedelta(seconds=40)
+
+            def extra(request: httpx.Request) -> httpx.Response:
+                if rig.clock.now >= until:
+                    return honest(request)
+                rig.broker.outside += 1
+                try:
+                    return honest(request)
+                finally:
+                    rig.broker.outside -= 1
+
+            honest = rig.broker.replace_route(("GET", PORTFOLIO_PATH), extra)
+            _, _, halt = await rig.executor.compare_position(expected)
+            await heard()
+            assert halt is not None and rig.executor.halted is not None, "расхождение проглочено"
+            assert not [text for text in rig.warnings() if "разрешилось" in text], rig.levels
 
     run(scenario())
 
@@ -2792,8 +3138,10 @@ def test_close_all_without_known_deals_does_not_sell_on_two_disagreeing_reads(
 
             def growing(request: httpx.Request) -> httpx.Response:
                 reads.append(1)
-                if len(reads) == 3:
-                    rig.broker.outside = 2  # докуплено руками между чтениями
+                # Сверка: чтение и перечитывание (пауза 0, B-111); перед
+                # закрытием — два чтения, между ними докуплено руками.
+                if len(reads) == 4:
+                    rig.broker.outside = 2
                 return honest(request)
 
             honest = rig.broker.replace_route(("GET", PORTFOLIO_PATH), growing)
