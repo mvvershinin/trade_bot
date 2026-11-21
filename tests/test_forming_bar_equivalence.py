@@ -35,6 +35,7 @@ from engine import (
     ExitReason,
     Fill,
     JournalEntry,
+    LevelUnfilled,
     MarketCandle,
     Mode,
     PriceSeen,
@@ -119,7 +120,9 @@ def with_partials(bars: Sequence[Candle]) -> list[Candle]:
 
 #: Ответ исполнителя на незакрытую свечу: свеча, имена заявок, ждавших
 #: до вопроса, и что исполнитель ответил.
-type Answer = tuple[MarketCandle, frozenset[str], tuple[Fill | PriceSeen, ...]]
+type Answer = tuple[
+    MarketCandle, frozenset[str], tuple[Fill | PriceSeen | LevelUnfilled, ...]
+]
 
 
 @dataclass(frozen=True)
@@ -149,7 +152,9 @@ class Answering(HistoryExecutor):
         super().__init__(costs=costs, ruble_per_point=ruble_per_point)
         self.answers: list[Answer] = []
 
-    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen]:
+    async def fills_at(
+        self, candle: MarketCandle
+    ) -> Sequence[Fill | PriceSeen | LevelUnfilled]:
         waiting = frozenset(order.order_id for order in self.pending)
         answer = await super().fills_at(candle)
         if candle.unsettled:

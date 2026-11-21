@@ -36,23 +36,63 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
 import math
 import time
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
 
 from PySide6.QtCore import QObject, QTimer, Signal, SignalInstance
 
-from app import contract_view, convert, debug_feed, paper_report, stitched_view
+from app import contract_view, convert, debug_feed, live_history, paper_report, stitched_view
+from app.fact import (
+    FactDesk,
+    FactDesks,
+    FactPosition,
+    FactRefused,
+    FactRequest,
+    HandDesks,
+    LiveLimits,
+    LiveStatus,
+    position_words,
+)
 from app.minutes import minute_plan, minutes_under
-from app.observe import LiveObserver, RunRecording
-from app.runs import ProgramFields, RunConditions, RunLog, result_note, settings_text
-from backtest import HistoryRun, Summary, pairs, replay, reversal_entries, summarise
-from engine import MSK, EngineSettings, PositionState, close_time, in_moscow
+from app.observe import FactLeg, LiveObserver, RunRecording
+from app.runs import (
+    ProgramFields,
+    RunConditions,
+    RunEntry,
+    RunLog,
+    result_note,
+    settings_text,
+)
+from backtest import (
+    Deal,
+    HistoryRun,
+    Plan,
+    Summary,
+    pairs,
+    replay,
+    reversal_entries,
+    summarise,
+)
+from engine import (
+    MSK,
+    AccountFunds,
+    EngineSettings,
+    ExitReason,
+    OrderAction,
+    PositionState,
+    close_time,
+    in_moscow,
+)
+from engine import Position as EnginePosition
+from engine import Side as EngineSide
 from market import (
     FUTURES,
     WARMUP_LOOK_BACK_DAYS,
@@ -74,6 +114,7 @@ from market import (
     LegDays,
     MarketWorker,
     PointValue,
+    SessionRecord,
     StoredHalt,
     Timeframe,
     WorkerClosed,
@@ -91,11 +132,16 @@ from market import (
 from market import (
     Candle as MarketCandle,
 )
+from market import (
+    DecisionLevel as JournalLevel,
+)
 from market.contracts import monthly_assets
-from ui.formatting import fmt_datetime
+from ui.formatting import fmt_datetime, fmt_level, fmt_money
 from ui.models import (
     FIELD_CAPTIONS,
+    LIVE_LIMITS_BOUNDS,
     STEP_WAIT,
+    AccountLine,
     BacktestOptions,
     BacktestRequest,
     Candle,
@@ -109,16 +155,23 @@ from ui.models import (
     HistoryLoadOutcome,
     HistoryLoadRequest,
     InstrumentInfo,
+    Layer,
     LevelKind,
+    Marker,
     Mode,
     Position,
     PriceLevel,
+    RobotOrder,
+    RobotOrders,
     RobotState,
     RunOrigin,
     Settings,
     TakeGuard,
     TimeExitKind,
+    TradePath,
     TradeRow,
+    TradesSummary,
+    live_limit_rule,
     switch_blocked_reason,
 )
 from ui.ports import Sanitize, TerminalPort
@@ -163,8 +216,8 @@ _ORIGIN = RunOrigin.BACKTEST
 #: Различие уже заведено в самой базе и работает **правилом чистки**:
 #: `market/storage.py` убирает только прогоны по истории, а боевые
 #: и симуляцию на боевом потоке не трогает вовсе — они неповторимы.
-#: `LIVE` здесь по-прежнему не появляется ни при каком условии: заявок
-#: программа не подаёт (Э4).
+#: `LIVE` — только у хода парой с боевым исполнителем (Э4 2в, `_origin`):
+#: строки «факта» — настоящие заявки, и выгрузка обязана это сказать.
 _WATCH_ORIGIN = RunOrigin.PAPER
 
 #: Сколько баров с конца читает дорисовка живой свечи. Двух хватило бы —
@@ -192,12 +245,46 @@ REDRAW_GAP = 0.2
 
 log = logging.getLogger(__name__)
 
-#: Почему «Старт» не запускает робота. Текст один на все места, где это надо
-#: сказать: расхождение формулировок читалось бы как разные причины.
+#: Строка журнала при включении боя со скользящим тейком (`D-196`, владелец
+#: 13.11.2026): в бою уровень ведёт брокер условной заявкой, робот его не двигает.
+#: Прежний запрет D-141 (бой двигал уровень раз в свечу, прогон — по минуткам)
+#: снят: брокер ведёт уровень по сделкам, это ближе к прогону по минуткам,
+#: чем к шагу в свечу.
+_TRAILING_IN_LIVE = (
+    "Скользящий тейк в бою держит брокер: сразу после входа робот ставит у него "
+    "условную заявку с включением на пороге, дальше уровень на отступе от лучшей "
+    "цены ведёт брокер — робот его не двигает."
+)
+
+#: Почему загрузка истории и бой не идут вместе (решение владельца 01.11.2026, 0066).
+_LOAD_IN_LIVE = (
+    "Загрузка истории в бою недоступна: выключите бой. Загрузка занимает поток данных "
+    "и откладывает решения робота — заявка ушла бы к брокеру с опозданием на всю загрузку."
+)
+
+#: Почему бой не включается без шага цены (`D-147`, `D-148`).
+_NO_STEP = (
+    "Шаг цены инструмента не известен: неподвижный тейк у брокера и выход по концу "
+    "окна с предельной ценой — лимитные заявки, цена которых обязана лежать на сетке "
+    "шага, и без шага ни одну не поставить (D-147). Шаг сообщает биржа — дождитесь "
+    "её ответа."
+)
+
+#: Почему бой не включается до первого снимка счёта (`D-044`, Р-9).
+_NO_FUNDS = (
+    "Счёт у брокера ещё не прочитан ни разу с подключения: робот не знает ни размера "
+    "счёта, ни свободных средств, а входить вслепую бой не вправе. Программа читает "
+    "счёт сама — сразу после подключения и затем раз в полминуты; если строка "
+    "не уходит, в журнале выше сказано, почему брокер не ответил про счёт."
+)
+
+#: Почему «Стоп» без боя ничего не делает. «Старт» с 16.11.2026 — то же,
+#: что «Включить бой» (`HistoryPort.start`), и этого отказа больше не говорит.
 NO_LIVE = (
-    "боевого хода в программе ещё нет. Нет потока котировок от брокера "
-    "и не подключена подача заявок — программа показывает прогон робота "
-    "по истории из базы."
+    "боевого хода нет: бой включается кнопкой «Старт» или «Включить бой» — "
+    "после сверки с брокером, поверх живого потока котировок. Без боя робот "
+    "идёт наблюдением или прогоном по истории: решения и расчётные сделки, "
+    "заявок к брокеру нет."
 )
 
 #: Три предохранителя из `CLAUDE.md`, без которых к деньгам подходить нельзя.
@@ -353,6 +440,9 @@ _WORKS: tuple[_Work, ...] = (
     _Work("point", "запрос стоимости пункта у биржи", STUCK_AFTER_ONLINE),
     _Work("retire", "закрытие живого хода робота", STUCK_AFTER),
     _Work("halt", "запись остановки робота в базу", STUCK_AFTER),
+    _Work("watch", "проверка уровня трейлинга по записанной минутке", STUCK_AFTER_ONLINE),
+    _Work("orders", "чтение заявок робота из журнала команд", STUCK_AFTER),
+    _Work("hand", "снятие заявки или закрытие позиции у брокера", STUCK_AFTER_ONLINE),
 )
 
 #: Как часто часы смотрят, не сменились ли сутки с последнего уточнения
@@ -375,8 +465,9 @@ class _Span:
     """Закреплённый отрезок истории: что показывает окно вместо последних дней.
 
     Появляется от «Прогона на истории» и живёт до «Вернуться к текущим
-    данным». Пока он стоит, порт ведёт себя иначе в трёх местах, и каждое
-    названо, потому что каждое молча ломается:
+    данным» или до включения боя (`_unpin_for_live`). Пока он стоит, порт
+    ведёт себя иначе в трёх местах, и каждое названо, потому что каждое
+    молча ломается:
 
     * `_candles` берёт границы отсюда, а не из глубины показа и не из ключа
       ``--until``;
@@ -410,7 +501,7 @@ class _Backtest:
 
     `span` — закреплённый отрезок истории; `None` означает обычный показ
     последних дней (`HistoryPort._days`). Переживает сколько угодно проходов
-    и снимается только человеком (`show_recent`).
+    и снимается только человеком: `show_recent` или включением боя.
 
     `pending` — просьба, отчёт по которой ещё не отправлен. Живёт ровно один
     проход: ставится в `run_backtest`, снимается в `_pass`. Поле, а не довод
@@ -502,6 +593,9 @@ class _History:
 
     facts: asyncio.Task[None] | None = None
     load: asyncio.Task[None] | None = None
+    #: Загрузка истории по просьбе человека (`load_history`) — не уточнение
+    #: контрактов в том же слоте: бой с ней не включается (З7).
+    user: asyncio.Task[None] | None = None
     #: Прогон, отложенный на время загрузки: пойдёт, когда она кончится.
     after_load: str = ""
     #: Идёт загрузка минут в базу (не уточнение контрактов): прогон ждёт.
@@ -601,6 +695,118 @@ class _Watch:
     #: (`_first_minute`). Решение 0065: исполнение по первой минуте бара.
     forming: MarketCandle | None = None
     opened: datetime | None = None
+    #: С какими настройками собран ход. Пока пересборка пары отложена,
+    #: проход идёт по ним — свечами **этого** хода (`_held_frame`, N1).
+    frame: _Frame | None = None
+
+
+class _WatchKey(NamedTuple):
+    """Чем задан живой ход (`HistoryPort._watch_key`). Поля — чтобы отличить движок.
+
+    Кортеж с именами, а не голый: у пары смена **только** настроек движка
+    (режим, объём, тейк, окно) идёт на ходу, без пересборки (`_keep_or_retire`),
+    и отличить её от прочего можно лишь по полю, а не по номеру в кортеже.
+    """
+
+    symbol: str
+    timeframe: str
+    strategy_id: str
+    engine: EngineSettings
+    strategy: object
+    costs: object
+
+    def same_but_engine(self, other: object) -> bool:
+        """Совпадает всё, кроме настроек движка."""
+        return isinstance(other, _WatchKey) and self._replace(engine=other.engine) == other
+
+
+@dataclass(slots=True)
+class _Live:
+    """Бой (Э4 2в): проводка, просьба и собранная боевая сторона.
+
+    Отдельным значением рядом с `_Watch`, а не его полями: боевая сторона
+    живёт вместе с ходом пары, но её проводка (`desks`) и просьба (`wanted`)
+    ход переживают — так же, как остановка (`_Halt`).
+
+    `desks` — чем собирать боевую сторону (`attach_live`); `None` — сборка
+    программы её не дала, бой недоступен. `wanted` — бой просили включить.
+    `desk` — собранная сторона хода пары; гаснет с ходом (`_retire`).
+    `record`/`entry` — прогон «факта» в журнале прогонов (`RunOrigin.LIVE`):
+    под ним пишется каждая команда брокеру. `refused` — почему не включился
+    в прошлый раз, словами. `held` — почему пересборка «факта» отложена (С4),
+    сказанное однажды. `watching` — задача сторожа трейлинга на минутке.
+    `growing` — последняя растущая минутка: по ней проход показывает бар
+    исполнения, пока ни одной его минуты в базе нет (`_growing_forming`).
+    `left` — позиция «факта», с которой боевая сторона закрыта (остановка,
+    выключение, отключение потока): у брокера она осталась, и окно обязано
+    её видеть, а «Выключить бой» — назвать (`/risk` 2в R4). Снимается
+    только свежим чтением позиции у брокера — нулём при сборке.
+    """
+
+    desks: FactDesks | None = None
+    wanted: bool = False
+    desk: FactDesk | None = None
+    record: AbstractAsyncContextManager[RunEntry] | None = None
+    entry: RunEntry | None = None
+    refused: str = ""
+    held: str = ""
+    watching: asyncio.Task[None] | None = None
+    growing: tuple[str, MarketCandle] | None = None
+    left: FactPosition | None = None
+    #: Почему `left` может быть уже не тем, что у брокера, — словами
+    #: (`LiveStatus.position_note`). Пусто — позиция свежая.
+    left_note: str = ""
+    #: Что известно о тейке оставшейся позиции — словами для строки закрытия
+    #: боя (`_take_words`, B-082). Пусто — позиции нет.
+    left_take: str = ""
+    #: Почему новые настройки движка не дошли до боя — сказанное однажды (Н6).
+    kept: str = ""
+    #: Идёт сборка боевой стороны (`desks.open`): «Выключить» в это время
+    #: откладывает строку до её конца (`/risk` 2в З2).
+    opening: bool = False
+    #: Настройки, по которым идёт пара, пока её пересборка отложена (N1):
+    #: по ним и рисуется живая свеча. `None` — не отложена.
+    frozen: Settings | None = None
+    #: Событие строки «бой закрыт», которую скажет `_retire` с позицией
+    #: по брокеру («Бой выключен»). Пусто — говорить нечего.
+    closing: str = ""
+    #: Последний снимок счёта с подключения: номер договора и деньги (`D-044`,
+    #: Р-9). `None` — с подключения брокер о счёте ещё не ответил ни разу,
+    #: и бой не включается: движок не отличил бы «счёт не прочитан» от прогона
+    #: по истории и вошёл бы, ни разу не узнав размера счёта (решение 0037).
+    #: Снимается отключением потока (`_observe`): «с подключения», а не «когда-то».
+    funds: tuple[str, AccountFunds] | None = None
+    #: Чтение заявок робота для «Снять заявку» и само ручное действие
+    #: владельца (снять заявку, закрыть позицию; задача владельца 13.11.2026).
+    #: Пока идёт `hand`, бой не включается: сверка при сборке снимала бы
+    #: те же заявки вторым исполнителем.
+    listing: asyncio.Task[None] | None = None
+    hand: asyncio.Task[None] | None = None
+    #: Строка открытой позиции, показанная последним проходом (`_open_row`):
+    #: «Отдать журналы» без прогона её не теряет (ревью 13.11.2026).
+    open_row: tuple[TradeRow, ...] = ()
+    #: Открытая позиция последнего прохода — чтобы переоценивать строку
+    #: по растущей свече между проходами (B-102). `None` — позиции нет.
+    floating: _Floating | None = None
+    #: Исполнения заявок у брокера по журналу команд: время сделки в «Сделках»
+    #: и выход по условной у брокера (`live_history.Executed`). Читаются
+    #: каждый проход боя: исполнение текущего захода появляется в любой момент.
+    executed: live_history.Executed = dataclasses.field(
+        default_factory=live_history.Executed
+    )
+    #: Когда открыт прогон текущего захода боя — для подписи его итога (B-100).
+    since: datetime | None = None
+    #: Закрытые боевые сделки всех прогонов из базы (`_read_live_history`, B-100)
+    #: и номер прогона «факта», для которого они прочитаны. Прежние прогоны
+    #: закрыты и не меняются: чтение одно на заход.
+    history: live_history.Earlier = live_history.Earlier()
+    history_for: int | None = None
+    #: Сделки боя, показанные последним проходом: «Отдать журналы» берёт их,
+    #: а не собирает заново. `None` — показан не бой.
+    shown: live_history.LiveTrades | None = None
+    #: Причины недоступности «Включить бой», последними записанные
+    #: в технический лог (`_log_blockers`): строка — при смене, не на опрос.
+    blocked: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1000,6 +1206,11 @@ class HistoryPort(TerminalPort):
     #: (`app/main.py::_keep_settings`); окну этот сигнал не нужен.
     settings_to_file = Signal(object, object, object)
 
+    #: Снимок боя (`app.fact.LiveStatus`): доступен ли и почему нет, позиция
+    #: «факта», сделки «факта» и «прогноза». Уходит на каждом снимке состояния
+    #: (`_publish_state`) и на каждой команде боя — тем же рубежом чистки.
+    live_changed = Signal(object)
+
     #: Прежние контракты и стыки для показа (решение 0061), прочитанные
     #: проходом прямо перед `_show`. Объявлено у класса, а не в `__init__`:
     #: сборка порта упирается в предел длины функции, а значение неизменяемое,
@@ -1093,7 +1304,7 @@ class HistoryPort(TerminalPort):
         #: счёта, ни разбору.
         self._runs = RunLog(worker, warn=self._warn, note=self.note)
         self._back = _Backtest()  # прогон на истории; разбор полей — в `_Backtest`
-        self._watch = _Watch()  # живой ход движка; разбор полей — в `_Watch`
+        self._watch, self._live = _Watch(), _Live()  # ход и бой; поля — `_Watch`, `_Live`
         #: Остановка робота. Живёт **вне** `_Watch` намеренно: та гаснет
         #: вместе с ходом, а остановка обязана его пережить (`_Halt`, `D-033`).
         self._halt = _Halt()
@@ -1216,6 +1427,219 @@ class HistoryPort(TerminalPort):
         и ошибка тихая: сделки те же, деньги другие.
         """
         self._point.ask = ask
+
+    def attach_live(self, desks: FactDesks) -> None:
+        """Чем собирать боевую сторону пары (Э4 2в). Зовётся при сборке.
+
+        Та же проводка, что у потока котировок (`attach_stream`): порт решает,
+        **когда** собирать боевой исполнитель — только по явной команде
+        `set_live(True)`, — а сборка решает, **чем**. Брокера порт по-прежнему
+        не знает: исполнитель приходит значением порта движка. Без проводки бой
+        недоступен, и `live_status` говорит это словами.
+        """
+        self._live.desks = desks
+        self._publish_live()
+
+    def set_live(self, on: bool) -> None:
+        """Команда окна: включить или выключить бой. Причина отказа — вслух.
+
+        Включение — просьба, а сборка — на ближайшем проходе (`_advance`):
+        боевой исполнитель собирается там, где уже прочитаны бары, после
+        сверки с брокером (`app/live_trading.py`); пара прогревается
+        в «Выключен» и включается на последней прочитанной свече.
+
+        ⚠️ Выключение **позицию не закрывает** — как режим «Выключен»
+        (`DOMAIN.md` §3): выключение само по себе к сделке не ведёт. Позиция
+        у брокера остаётся без присмотра робота, и об этом строка уровня
+        «предупреждение» с позицией словами — тихого выключения нет.
+        """
+        if on == self._live.wanted:
+            return
+        if on and self._live.desk is not None:
+            # «Выключить» и сразу «Включить» до прохода: боевая сторона ещё
+            # собрана — выключение отменяется, бой идёт тем же ходом (Н4).
+            # Запреты включения — те же, что у нового включения (`/risk` 2в Н6):
+            # между «Выключить» и «Включить» могли применить то, что бою нельзя.
+            reasons = self._live_blockers()
+            if reasons:
+                self._live.refused = " ".join(reasons)
+                self._refuse("Бой не включён", self._live.refused)
+                self._publish_live()
+                return
+            self._unpin_for_live()
+            self._live.wanted, self._live.closing = True, ""
+            self.note(
+                "Выключение боя отменено",
+                "Бой не выключался: боевая сторона ещё собрана, ход идёт дальше тем же — "
+                "без пересборки и без новой сверки.",
+            )
+            self._publish_live()
+            return
+        if on:
+            reasons = self._live_blockers()
+            if reasons:
+                self._live.refused = " ".join(reasons)
+                self._refuse("Бой не включён", self._live.refused)
+                self._publish_live()
+                return
+            # Отрезок снимается до просьбы боя, а проход, который он ставит,
+            # начнётся только после возврата отсюда — и увидит обе перемены разом.
+            queued = self._unpin_for_live()
+            self._live.wanted, self._live.refused, self._live.closing = True, "", ""
+            self.note(
+                "Бой включается",
+                "Собирается боевой исполнитель: сверка с брокером (незакрытые команды, "
+                "позиция), прогрев пары движков в режиме «Выключен», включение на свече. "
+                "Итог — следующей строкой.",
+                DecisionLevel.WARNING,
+            )
+            self._say_trailing_in_live()
+            self._publish_live()
+            if not queued:
+                self.refresh("включение боя")
+            return
+        self._live.wanted = False
+        if self._live.desk is not None or self._live.opening:
+            # Строку скажет закрытие боевой стороны — с позицией, прочитанной
+            # у брокера: движок мог не знать исполненного входа (N2).
+            self._live.closing = "Бой выключен"
+        else:
+            self._say_closed("Бой выключен")
+        self._publish_live()
+        self.refresh("выключение боя")
+
+    def _unpin_for_live(self) -> bool:
+        """Бой снимает закреплённый отрезок сам (владелец счёта 18.11.2026).
+
+        Прежде отрезок держал бой отказом «нажмите «Вернуться к текущим»», а
+        кнопка возврата на экране шириной 1366 уходила под » панели: бой
+        не включался, и выхода не было видно. Теперь включение снимает отрезок
+        тем же, что `show_recent`, и строкой в журнале. Истина — проход уже
+        поставлен здесь; ложь — отрезка не было, проход ставит вызывающий.
+
+        ⚠️ Бары отрезка в живой ход не попадают (`_Span`, `_advance`). Держат
+        это три вещи:
+
+        * отрезок снят и бой попрошен в одном вызове окна; проход, поставленный
+          здесь, начнётся после возврата из `set_live` и увидит обе перемены;
+        * идущий проход снимается, как «Отменить» (`cancel_backtest`), а новый
+          ждёт его конца (`_after_stop`), а не идёт рядом;
+        * проход, прочитавший бары ещё при отрезке, до живого хода не доходит
+          (`_pass`, сверка отрезка после чтения баров).
+        """
+        if self._back.span is None:
+            return False
+        self._back.span, self._back.pending = None, None
+        running = self._task
+        stopped = running is not None and not running.done()
+        self.note(
+            "Возврат к текущим данным",
+            "Прогон на истории снят: включается бой. Бой идёт по текущим барам — "
+            + ("идущий прогон остановлен, " if stopped else "")
+            + "показаны последние дни вместе с живыми свечами.",
+        )
+        if running is None or not stopped:
+            self.refresh("включение боя")
+            return True
+        self._again = ""
+        running.cancel()
+        self._task = self._begin("run", self._after_stop(running, "включение боя"))
+        return True
+
+    async def _after_stop(self, stopped: asyncio.Task[None], why: str) -> None:
+        """Проход после снятого: сначала дождаться конца прежнего, потом свой."""
+        await _quiet(stopped)
+        await self._refresh(why)
+
+    def _say_trailing_in_live(self) -> None:
+        """Бой включается со скользящим тейком — строкой, кто его ведёт (`D-196`)."""
+        values = self._values
+        if not (values.take_profit_enabled and values.trailing_enabled):
+            return
+        self.note("Скользящий тейк в бою", _TRAILING_IN_LIVE)
+
+    def live_status(self) -> LiveStatus:
+        """Снимок боя для окна. Ни одно число здесь не считается заново."""
+        observer = self._watch.observer
+        paired = observer is not None and observer.paired
+        reasons = () if self._live.wanted else self._live_blockers()
+        if not self._live.wanted:
+            self._log_blockers(reasons)
+        return LiveStatus(
+            available=not reasons,
+            why_not=reasons,
+            wanted=self._live.wanted,
+            on=paired and self._live.desk is not None,
+            armed=observer is not None and observer.armed,
+            held=self._live.held,
+            refused=self._live.refused,
+            # Остановленный робот боя не ведёт, даже если его просили (`/risk` 2в R4).
+            halted=self._halt.reason if self._live.wanted else "",
+            position=self._fact_position(),
+            position_note="" if paired else self._live.left_note,
+            take_note="" if paired else self._live.left_take,
+            fact=None if observer is None else observer.fact_run,
+            forecast=observer.run if observer is not None and paired else None,
+            hand_refused=self._hand_refusal(),
+        )
+
+    def _log_blockers(self, reasons: tuple[str, ...]) -> None:
+        """Почему «Включить бой» серая — строкой в технический лог, при смене причины.
+
+        В окне причина видна надписью у кнопки и пропадает, когда кнопка
+        оживает; разбору боя после нужна запись (бой 16.11.2026 08:57: какая
+        причина держала кнопку — не узнать). Снимок боя строится на каждом
+        проходе и опросе — строка только тогда, когда набор причин сменился.
+        """
+        if reasons == self._live.blocked:
+            return
+        self._live.blocked = reasons
+        if reasons:
+            said = "; ".join(" ".join(reason.split()) for reason in reasons)
+            log.info("«Включить бой» недоступна: %s", said)
+        else:
+            log.info("«Включить бой» доступна")
+
+    def _fact_position(self) -> FactPosition | None:
+        """Позиция «факта»: у собранной пары — её, после закрытия — оставшаяся у брокера."""
+        observer = self._watch.observer
+        if observer is not None and observer.paired:
+            return observer.fact_position
+        return self._live.left
+
+    def account_read(self, account: str, funds: AccountFunds) -> None:
+        """Опрос счёта прочитал счёт у брокера (`LiveLink.deliver_funds_to`). Немедленно.
+
+        Две вещи, и обе — здесь, а не в сборке (Р-9, правки 9.2 и 9.3 гейта):
+
+        * **снимок запоминается всегда**, и в наблюдении тоже: без него бой
+          не включается (`_live_blockers`, `D-044`), а номер договора уходит
+          в сборку боевой стороны — та сверяет его с договором исполнителя
+          (`LiveDesks.open`);
+        * **движкам снимок отдаётся только у пары** — «факту» и «прогнозу»
+          одним и тем же (`LiveObserver.funds`). Наблюдение денег счёта
+          не получает (решение 0037, следствие 1): иначе ход без заявок
+          начал бы отличаться от прогона по истории.
+
+        Строки журнала здесь нет: опрос идёт раз в полминуты, строку
+        «Размер счёта принят» пишет движок — один раз на дату.
+        """
+        first = self._live.funds is None
+        self._live.funds = (account, funds)
+        observer = self._watch.observer
+        if observer is not None and observer.paired:
+            observer.funds(funds)
+        if first:
+            # Причина «счёт не прочитан» снялась — окно узнаёт снимком.
+            self._publish_live()
+
+    def account_line(self, line: AccountLine) -> None:
+        """Строка «Счёт у брокера» от опроса счёта — в окно как есть (решение 0070).
+
+        Порт ничего в ней не считает и не сверяет с «фактом»: смысл строки —
+        показать брокера рядом с тем, что думает программа, а не вместо.
+        """
+        self._send(self.account_changed, line)
 
     def stream(self, on: bool) -> None:
         """Команда окна: подключиться к брокеру или отключиться.
@@ -1364,19 +1788,219 @@ class HistoryPort(TerminalPort):
         )
 
     def start(self) -> None:
-        self._refuse("Запуск робота", f"Робот не запущен: {NO_LIVE}")
+        """«Старт» = «Включить бой» (владелец 16.11.2026: «старт жму и нихуя»).
+
+        Тот же путь, что у кнопки боя: `set_live(True)` — те же запреты
+        (`_live_blockers`) и те же строки отказа. Прежде «Старт» отвечал
+        отказом `NO_LIVE` в журнал, и нажатие выглядело ничем. Симметрично
+        «Стопу»: тот в бою выключает бой (решение 0066).
+        """
+        self.set_live(True)
 
     def stop(self) -> None:
+        """«Стоп». В бою — выключить бой (решение владельца 01.11.2026, 0066).
+
+        Те же строки, что у `set_live(False)`: «Бой выключен», при позиции —
+        предупреждение с позицией словами; позиция не закрывается. Без боя
+        останавливать нечего — прежний отказ: ход без заявок идёт сам.
+        """
+        if self._live.wanted:
+            self.set_live(False)
+            return
         self._refuse(
             "Остановка робота",
             f"Останавливать нечего: {NO_LIVE}",
         )
 
+    # -------------------------------------- руками владельца (13.11.2026)
+
     def close_position(self) -> None:
-        self._refuse(
-            "Закрытие позиции",
-            "Закрывать нечего: заявки на биржу не уходят, позиция в окне — "
-            "результат прогона по истории, а не позиция на счёте.",
+        """«Закрыть позицию»: снять заявки робота по инструменту, закрыть заявкой FOK.
+
+        Задача владельца после первого боевого дня: робот встал с позицией
+        и тейком, а закрыть их из программы было нечем. Работает при
+        включённом бое, при остановленном роботе и при выключенном бое —
+        была бы связь и торговый токен. Собран бой — закрывает его
+        исполнитель, и робот останавливается (0020); не собран —
+        исполнитель на одну команду (`LiveDesks.close_by_hand`).
+        """
+        self._by_hand("Закрытие позиции руками", lambda hand, request, desk: (
+            hand.close_by_hand(request, desk)
+        ))
+
+    def cancel_robot_order(self, key: str) -> None:
+        """«Снять заявку»: одна заявка робота по ключу — тем же путём, что закрытие."""
+        self._by_hand("Снятие заявки руками", lambda hand, request, desk: (
+            hand.cancel_by_hand(request, key, desk)
+        ))
+
+    def request_robot_orders(self) -> None:
+        """Заявки робота для «Снять заявку». Ответ — `robot_orders_ready`, **всегда**.
+
+        Только незакрытые команды журнала этого счёта: ручных заявок владельца
+        программа не подавала, и в списке их нет. Счёт — из снимка счёта
+        с подключения (`account_read`), брокер не спрашивается.
+        """
+        hand, refusal = self._hand()
+        seen = self._live.funds
+        if hand is not None and refusal is None and seen is None:
+            refusal = (
+                "Счёт у брокера ещё не прочитан с подключения: без номера счёта "
+                "программа не знает, какие заявки журнала — этого счёта. Счёт "
+                "читается сразу после подключения и затем раз в полминуты — "
+                "повторите чуть позже."
+            )
+        if hand is None or refusal is not None or seen is None:
+            reason = refusal or "Ручные действия в этой сборке программы не подключены."
+            self.note("Снятие заявки руками", reason, DecisionLevel.WARNING)
+            self._send(self.robot_orders_ready, RobotOrders(trouble=reason))
+            return
+        account = seen[0]
+
+        async def read() -> None:
+            try:
+                rows = await hand.robot_orders(account)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # окно ждёт ответа — ответ будет и при беде
+                log.exception("заявки робота из журнала не прочитаны", extra={"panel": False})
+                why = f"Журнал команд не прочитан: {_plain(error)}."
+                self.note("Снятие заявки руками", why, DecisionLevel.WARNING)
+                self._send(self.robot_orders_ready, RobotOrders(trouble=why))
+                return
+            self._send(self.robot_orders_ready, RobotOrders(orders=tuple(
+                RobotOrder(key=key, words=words) for key, words in rows
+            )))
+
+        self._live.listing = self._begin("orders", read())
+
+    def _hand(self) -> tuple[HandDesks | None, str | None]:
+        """Чем действовать руками и почему нельзя; `None` — можно.
+
+        Проверка без вопроса брокеру: проводка есть, связь есть, токен торговый.
+        Остальное (поток статусов, номер счёта) — у самой команды, словами.
+        """
+        # `object`: проводка боя объявлена `FactDesks`, а ручные действия —
+        # отдельный протокол; сужение `isinstance` mypy иначе считает невозможным.
+        desks: object = self._live.desks
+        if not isinstance(desks, HandDesks):
+            return None, "Подача заявок в этой сборке программы не подключена."
+        return desks, desks.refusal()
+
+    def _hand_refusal(self) -> str:
+        """Почему кнопки ручных действий погашены — для снимка боя; пусто — горят.
+
+        Пока ручное действие идёт, кнопки погашены (`/risk` 13.11.2026, Р1):
+        второе нажатие по портфелю, ещё не показавшему первое, — двойная сделка.
+        """
+        hand = self._live.hand
+        if hand is not None and not hand.done():
+            return "Идёт снятие заявки или закрытие позиции: дождитесь его итога в журнале."
+        _, refusal = self._hand()
+        return refusal or ""
+
+    def _by_hand(
+        self, event: str,
+        act: Callable[[HandDesks, FactRequest, FactDesk | None], Awaitable[str]],
+    ) -> None:
+        """Ручное действие владельца: одно за раз, итог — строкой журнала решений."""
+        hand, refusal = self._hand()
+        busy = self._live.hand
+        checks = (
+            (refusal is not None, refusal or ""),
+            (busy is not None and not busy.done(),
+             "Предыдущее ручное действие ещё идёт: дождитесь его итога в журнале решений."),
+            (self._live.opening,
+             "Идёт включение боя (сверка с брокером): дождитесь его итога и повторите."),
+        )
+        reasons = [words for failed, words in checks if failed]
+        if hand is None or reasons:
+            self._refuse(event, " ".join(reasons))
+            return
+        self.note(event, "Команда принята, итог — следующей строкой.")
+        self._live.hand = self._begin("hand", self._hand_work(event, hand, act))
+        self._publish_live()
+
+    async def _hand_work(
+        self, event: str, hand: HandDesks,
+        act: Callable[[HandDesks, FactRequest, FactDesk | None], Awaitable[str]],
+    ) -> None:
+        """Сделать ручное действие и сказать итог. Беда — словами, а не трассировкой."""
+        desk = self._live.desk
+        record: AbstractAsyncContextManager[RunEntry] | None = None
+        try:
+            frame = self._watch.frame or _Frame(_in_force(self._values), self._engine_settings)
+            symbol = convert.instrument_of(frame.values.instrument)
+            session_id: int | None = None if self._live.entry is None else self._live.entry.id
+            if desk is None:
+                record = self._runs.around(SessionRecord(
+                    origin=convert.stored_origin(RunOrigin.LIVE), symbol=symbol,
+                    timeframe=frame.values.timeframe, app_version=version(),
+                    note=f"{event}: команда владельца из окна, не прогон робота.",
+                ))
+                session_id = (await record.__aenter__()).id
+            if session_id is None:
+                raise FactRefused(
+                    "Запись в журнале прогонов не открылась: без неё журнал команд "
+                    "брокеру не пишется, а без журнала заявка не уходит."
+                )
+            text = await act(hand, self._hand_request(frame, symbol, session_id), desk)
+        except FactRefused as refusal:
+            self._refuse(event, f"Не сделано: {refusal.human}")
+        except convert.SettingsRefused as refusal:
+            self._refuse(event, f"Не сделано: {refusal}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # ручное действие — не повод ронять окно
+            log.exception("ручное действие владельца не выполнено", extra={"panel": False})
+            self._refuse(
+                event,
+                f"Не сделано: {_plain(error)}. Проверьте позицию и заявки в приложении "
+                "брокера; подробность — в выводе программы в консоли.",
+            )
+        else:
+            self.note(event, text, DecisionLevel.WARNING)
+            if desk is not None:
+                self._after_hand(desk)
+        finally:
+            if record is not None:
+                with contextlib.suppress(Exception):  # запись важна, итог человеку важнее
+                    await record.__aexit__(None, None, None)
+            # Действие кончилось: кнопки загораются этим же снимком, а задача
+            # ещё не `done()` — она здесь, в своём `finally`.
+            self._live.hand = None
+            self._publish_live()
+
+    def _after_hand(self, desk: FactDesk) -> None:
+        """Бой после ручного действия: стоит — остановка робота; иначе торгует дальше (0069).
+
+        Закрыл позицию — «позиции нет» движку «факта» до его следующей свечи,
+        не посреди неё (`LiveObserver.fact_flat`).
+        """
+        if desk.halted:
+            self._halt_fact(desk.halted)
+            return
+        if not desk.flat_by_hand:
+            return
+        observer = self._watch.observer
+        if observer is None:
+            desk.flat_taken()
+            return
+        observer.fact_flat(desk.flat_taken)
+
+    def _hand_request(self, frame: _Frame, symbol: str, session_id: int) -> FactRequest:
+        """Просьба к исполнителю ручного действия — те же числа, что у боя (`_open_live`)."""
+        seen = self._live.funds
+        return FactRequest(
+            ticker=symbol,
+            bar_minutes=convert.timeframe_of(frame.values.timeframe).minutes,
+            ruble_per_point=frame.engine.ruble_per_point,
+            limits=_fact_limits(frame),
+            session_id=session_id,
+            on_news=_nothing,
+            notice=self._fact_notice,
+            funds_account="" if seen is None else seen[0],
+            price_step=frame.engine.price_step,
         )
 
     def set_mode(self, mode: Mode) -> None:
@@ -1470,9 +2094,14 @@ class HistoryPort(TerminalPort):
             # Настройки алгоритма собираются здесь ради **проверки**: отказ
             # обязан случиться до того, как новые значения станут текущими.
             # Сами они пересобираются там, где нужны, — в живом ходе и в
-            # прогоне (`_watcher`, `_replay`).
-            convert.strategy_settings(settings)
-            convert.expiry_days_of(settings)
+            # прогоне (`_watcher`, `_replay`). Пределы боевого исполнителя —
+            # та же проверка, что при его сборке (`_fact_limits`): граница,
+            # принятая окном, дойдёт до брокера.
+            for check in (
+                convert.strategy_settings, convert.expiry_days_of, convert.live_limits,
+                self._fits_live,
+            ):
+                check(settings)
             self._check_switch(settings)
         except convert.SettingsRefused as refusal:
             self._refuse_settings(str(refusal), refusal.field)
@@ -1595,14 +2224,7 @@ class HistoryPort(TerminalPort):
         """Отдать то, что уже посчитано. Прогон заново не гоняется."""
         self._send(self.decisions_replaced, self._journal)
         if self._run is not None:
-            self._send(
-                self.trades_replaced,
-                tuple(
-                    convert.trade_row(deal, origin=self._origin)
-                    for deal in self._run.deals
-                ),
-                convert.trades_summary(self._run),
-            )
+            self._send(self.trades_replaced, *self._trades_of(self._run, self._live.shown))
 
     # -------------------------------------------- прогон на истории по кнопке
 
@@ -1724,7 +2346,19 @@ class HistoryPort(TerminalPort):
         негодные настройки шаблона иначе оставили бы за собой закреплённый
         отрезок при прежних настройках — то есть график уехал бы в прошлое
         от неудачной попытки.
+
+        ⚠️ **В бою прогон на отрезке недоступен** (решение владельца
+        01.11.2026, 0066, `/risk` 2в R5): закреплённый отрезок закрыл бы
+        живой ход, а с ним боевую сторону — бой прервался бы молча. Отказ
+        словами, ничего не закрывается. Окно гасит кнопки по `LiveStatus.wanted`.
         """
+        if self._live.wanted:
+            self._refuse_backtest(
+                "Прогон на истории в бою недоступен: закреплённый отрезок прервал бы бой. "
+                "Выключите бой — «Выключить бой», — и запустите прогон снова. Бой идёт "
+                "дальше, ничего не изменилось."
+            )
+            return
         if self._task is not None and not self._task.done():
             self._send(self.backtest_refused, self._refuse_busy(
                 "run",
@@ -1965,6 +2599,12 @@ class HistoryPort(TerminalPort):
         except convert.SettingsRefused as error:
             self._refuse_load(request.symbol, str(error))
             return
+        if self._live.wanted or self._live.desk is not None:
+            # Решение владельца 01.11.2026 (0066): загрузка занимает поток
+            # данных и откладывает проходы «факта» — переворот уходил бы к брокеру
+            # с опозданием на всю загрузку. В бою недоступна, ничего не трогается.
+            self._refuse_load(code, _LOAD_IN_LIVE)
+            return
         if is_synthetic(code):
             self._refuse_load(code, _SYNTHETIC_REFUSAL)
             return
@@ -1994,6 +2634,7 @@ class HistoryPort(TerminalPort):
             self._load_contract(request, chain) if chain
             else self._load_history(request),
         )
+        self._history.user = self._history.load
 
     def cancel_history_load(self) -> None:
         """Остановить идущую загрузку. Скачанное остаётся в базе.
@@ -2869,6 +3510,10 @@ class HistoryPort(TerminalPort):
         # С этой минуты отложенный первый взгляд по инструменту закрыт:
         # отделить историю от потока по самой базе больше нельзя (`_first_look`).
         self._trust.streamed.add(symbol)
+        # Сторож трейлинга «факта» — на **каждой** записанной минутке, до
+        # дорисовки и мимо её пропусков: касание судится по минуткам базы,
+        # и проверка на закрытии бара опоздала бы на всю свечу (0066, Р2).
+        self._watch_fact()
         if self._draw is not None and not self._draw.done():
             # Предыдущая дорисовка ещё читает базу. Копить очередь незачем:
             # следующая минута всё равно возьмёт из базы самое свежее.
@@ -2905,6 +3550,10 @@ class HistoryPort(TerminalPort):
         следующий снимок несёт минуту целиком); с прошлой перерисовки прошло
         меньше `_redraw_gap` (обоснование числа — у `REDRAW_GAP`).
         """
+        # Растущая минутка запоминается **до** всех выходов: по ней проход пары
+        # показывает бар исполнения, пока ни одной его минуты нет в базе
+        # (`_growing_forming`), — и пропуск рисунка её терять не вправе.
+        self._live.growing = (symbol, minute)
         if self._draw is not None and not self._draw.done():
             return
         if self._growing is not None and not self._growing.done():
@@ -2945,7 +3594,9 @@ class HistoryPort(TerminalPort):
                 # Загрузка — и та, что заводит уточнение контрактов при
                 # запуске (`sync_contracts`): снимок экрана без неё ловил
                 # окно до перехода на действующий контракт.
-                self._history.load,
+                self._history.load, self._live.watching,
+                # Ручные действия владельца (13.11.2026): список заявок и команда.
+                self._live.listing, self._live.hand,
             ):
                 if task is not None:
                     await _quiet(task)
@@ -2985,11 +3636,13 @@ class HistoryPort(TerminalPort):
         for task in (
             self._point.task, self._growing, self._draw, self._task,
             self._back.options, self._history.facts, self._history.load,
-            self._history.contract, self._history.paper,
+            self._history.contract, self._history.paper, self._live.watching,
+            self._live.listing, self._live.hand,
         ):
             if task is not None and not task.done():
                 task.cancel()
                 await _quiet(task)
+        self._live.watching = self._live.listing = self._live.hand = None
         self._point.task = None
         self._growing = None
         self._draw = None
@@ -3029,6 +3682,9 @@ class HistoryPort(TerminalPort):
         не будет. Посторонний отказ в это время (загрузка «занято»,
         подключение) не запоминается — иначе окно назвало бы чужую причину.
         """
+        # Отказ из двух частей (первая строка — что нажать, B-101) в журнал
+        # и строку состояния идёт одной строкой.
+        reason = reason.replace("\n", " — ")
         self.note(event, reason, DecisionLevel.WARNING)
         if run and self._back.pending is not None:
             self._back.trouble = reason
@@ -3072,6 +3728,9 @@ class HistoryPort(TerminalPort):
             "load": self._history.load,
             "contract": self._history.contract,
             "halt": self._halt.saving,
+            "watch": self._live.watching,
+            "orders": self._live.listing,
+            "hand": self._live.hand,
         }
 
     def _begin(self, key: str, work: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
@@ -3239,8 +3898,10 @@ class HistoryPort(TerminalPort):
         # Снимок настроек на начало прохода. Дальше в этом проходе `self._values`
         # и `self._engine_settings` не читаются ни разу: см. докстринг `_Frame`.
         frame = _Frame(_in_force(self._values), self._engine_settings)
+        pinned = self._back.span
         self._send(self.busy_changed, True, "Читаю свечи из базы…")
         try:
+            frame = await self._held_frame(frame)
             symbol = convert.instrument_of(frame.values.instrument)
             timeframe = convert.timeframe_of(frame.values.timeframe)
             # ⚠️ Не `await`: запрос к бирже ставится задачей и проход не держит.
@@ -3248,6 +3909,11 @@ class HistoryPort(TerminalPort):
             # `_ask_point_value`.
             self._ask_point_value(symbol)
             candles, stitch = await self._series(frame, symbol, timeframe)
+            if self._back.span is not pinned:
+                # Отрезок сняли, пока читались бары (`show_recent`, включение боя):
+                # бары отрезка, поданные живому ходу, легли бы в его среднюю
+                # (`_Span`). Проход после снятия уже поставлен тем, кто снял.
+                return
             debug_feed.bars_read(symbol, frame.values.timeframe, candles)
             # Чтение базы долей сделанного не отчитывается: это один запрос
             # в поток данных. Отметка здесь делит проход надвое, и молчанием
@@ -3272,6 +3938,8 @@ class HistoryPort(TerminalPort):
             else:
                 self._stitched = None
                 run = await self._advance(frame, symbol, candles)
+                await self._read_live_history()
+                await self._read_fill_times()
                 self._context = await self._contract_context(symbol, timeframe, candles)
             self._run = run
             self._show(frame, symbol, timeframe, candles, run)
@@ -3576,8 +4244,11 @@ class HistoryPort(TerminalPort):
         «симуляция на боевом потоке» — то есть окно говорило бы, что робот
         работает, ровно тогда, когда он остановлен.
         """
-        watching = self._watch.observing and self._watch.observer is not None
-        return _WATCH_ORIGIN if watching else _ORIGIN
+        observer = self._watch.observer
+        if not self._watch.observing or observer is None:
+            return _ORIGIN
+        # Ход парой показывает «факт» — настоящие заявки (Э4 2в).
+        return RunOrigin.LIVE if observer.paired else _WATCH_ORIGIN
 
     def _observe(self, on: bool) -> None:
         """Включить или выключить живой ход движка вместе с потоком котировок.
@@ -3627,6 +4298,16 @@ class HistoryPort(TerminalPort):
         # Закрытие хода при этом ставится задачей: она дописывает итог
         # в журнал прогонов, и случиться это обязано независимо от того,
         # будет ли следующий проход вообще.
+        #
+        # Бой без потока идти не может: выключается тем же путём, что кнопкой,
+        # — со строкой про позицию у брокера (`set_live`). Сам по себе он
+        # при следующем подключении не включится: это решение человека.
+        self.set_live(False)
+        # Снимок счёта — «с подключения» (`D-044`): на следующее подключение
+        # прежний не переносится. Снимается при отключении, а не при включении:
+        # включение доходит сюда и после уточнения контрактов, когда первый
+        # снимок нового подключения уже мог прийти.
+        self._live.funds = None
         self.note(
             "Наблюдение выключено",
             "Живой ход движка прекращён вместе с потоком котировок. На графике "
@@ -3663,6 +4344,15 @@ class HistoryPort(TerminalPort):
         и показывается прогон по истории; просьба наблюдать при этом
         не отменяется, и ход соберётся заново, как только отрезок снимут
         (`show_recent`).
+
+        **Бой (Э4 2в)** — тот же ход парой: «факт» с боевым исполнителем
+        и «прогноз» с тенью (`LiveObserver.pair_with`). Что меняется здесь:
+        ход пересобирается и при включении или выключении боя; смена одних
+        настроек движка идёт на ходу; прочая смена при позиции «факта» или
+        незакрытой команде **откладывается** (`_keep_or_retire`, С4). Перед
+        свечами — сверка после обрыва потока статусов (`_fact_relinked`),
+        после них — остановка исполнителя в общий путь (`_after_feed`).
+        Окно получает снимок «факта».
         """
         if not self._watch.observing or self._back.span is not None:
             await self._retire()
@@ -3680,31 +4370,440 @@ class HistoryPort(TerminalPort):
                 await self._retire()
                 return await self._replay(frame, symbol, candles)
         key = self._watch_key(frame, symbol)
-        if self._watch.observer is not None and key != self._watch.key:
-            # Настройки, инструмент или размер свечи сменились. Ход, начатый
-            # со старыми, дальше идти не вправе: средняя, посчитанная
-            # наполовину по прежнему периоду, не соответствует ни старым
-            # настройкам, ни новым, а выглядит как настоящая. Пересборка —
-            # это новый прогрев с той же границы, то есть ровно то, что
-            # владелец счёта и ждёт увидеть, поменяв настройку.
-            #
-            # ⚠️ Глубины показа в ключе нет намеренно — `_watch_key`, `D-033`.
-            await self._retire()
+        await self._keep_or_retire(frame, key)
         if self._watch.observer is None:
             if self._halt.reason:
                 self._say_no_restart()
                 return await self._replay(frame, symbol, candles)
-            self._watch.observer = self._watcher(frame, symbol, candles)
-            self._watch.key = key
+            self._watch.observer = await self._watcher(frame, symbol, candles)
+            self._watch.key, self._watch.frame = key, frame
             await self._watch.observer.start()
+        observer = self._watch.observer
+        if await self._fact_relinked(observer):
+            fact = observer.fact_run
+            return fact if fact is not None else observer.run
         # Незакрытый бар, собранный без дыр, — тем же проходом (решение 0065):
         # заявка, поданная на прошлом закрытии, исполняется по его открытию.
-        run = await self._watch.observer.feed(candles, self._watch.forming)
-        # Остановка снимается с хода **до** того, как ход будет закрыт.
-        # Забрать её позже неоткуда: закрытый наблюдатель уносит `halted`
-        # с собой, и следующий проход увидит чистого движка.
-        self._remember_halt(run.halted)
-        return run
+        forming = self._watch.forming
+        if forming is None and observer.paired:
+            forming = await self._growing_forming(frame, symbol)
+        run = await observer.feed(candles, forming)
+        return self._after_feed(observer, run)
+
+    async def _keep_or_retire(self, frame: _Frame, key: _WatchKey) -> None:
+        """Оставить ход, поправить его на ходу или закрыть — до свечей прохода.
+
+        Таблица из пяти исходов, порядок значим:
+
+        * бой включили или выключили — закрыть: пара и одиночный ход — разные
+          сборки;
+        * ключ тот же — оставить;
+        * одиночный ход, остановка, «Возобновить» (ключ сброшен) — закрыть.
+          Настройки сменились, и ход со старыми дальше идти не вправе:
+          средняя, посчитанная наполовину по прежнему периоду, не
+          соответствует ни старым настройкам, ни новым. Пересборка — новый
+          прогрев с той же границы. Глубины показа в ключе нет — `D-033`;
+        * у пары сменились **только** настройки движка — обоим движкам
+          на ходу (`LiveObserver.retarget`): они действуют со следующей сделки,
+          и ради них терять позицию «факта» нельзя;
+        * прочее у пары — закрыть, если «факт» без позиции, без незакрытых
+          команд и без неотданных сделок; иначе **отложить** и сказать однажды
+          (С4): новый движок родится без позиции, и настоящая позиция у брокера
+          останется без робота. Отложенное — только требующее пересчёта
+          (период средней, алгоритм, инструмент, свеча, издержки тени);
+          настройки движка из того же применения идут к обоим движкам сразу
+          (решение владельца 01.11.2026, 0066).
+        """
+        observer = self._watch.observer
+        if observer is None:
+            return
+        if observer.paired != self._live.wanted:
+            await self._retire()
+            return
+        if key == self._watch.key:
+            return
+        if not observer.paired or self._halt.reason or self._watch.key is None:
+            await self._retire()
+            return
+        if key.same_but_engine(self._watch.key):
+            engine = self._engine_for_fact(frame)
+            observer.retarget(engine)
+            self._watch.key = key._replace(engine=engine)
+            self._say_unmanaged(observer, frame)
+            return
+        busy = await self._fact_busy(observer)
+        if not busy:
+            await self._retire()
+            return
+        # Режим, объём, тейк и окно — к «факту» сразу и при отложенной
+        # пересборке (решение владельца 01.11.2026, `/risk` 2в БЛОК 2):
+        # откладывается только то, что требует пересчёта ряда.
+        current = self._watch.key
+        if isinstance(current, _WatchKey) and current.engine != frame.engine:
+            engine = self._engine_for_fact(frame)
+            observer.retarget(engine)
+            self._watch.key = current._replace(engine=engine)
+            self._say_unmanaged(observer, frame)
+        self._say_held(busy)
+
+    # ------------------------------------------------- бой: пара движков
+
+    async def _held_frame(self, frame: _Frame) -> _Frame:
+        """Пересборка пары отложена — проход идёт по настройкам собранного хода (N1).
+
+        Решение владельца 01.11.2026 («отложить честно», 0066): пока «факт»
+        занят (позиция, незакрытая команда, неотданная сделка), оба движка
+        пары получают свечи **своего** хода — того размера свечи, инструмента
+        и алгоритма, с которыми собраны. Иначе прежний ход ел бы 5-минутки
+        по средней, посчитанной на 15-минутках, и переворачивал бы настоящую
+        позицию по смешанной средней. Настройки движка (режим, объём, тейк,
+        окно) — новые: они идут на ходу (`_keep_or_retire`, БЛОК 2).
+        Свободен «факт» — рамка новая, и `_advance` пересоберёт пару на ней.
+
+        Смена инструмента в бою сюда не доходит: при позиции или запущенном
+        роботе её отвергает `_check_switch` на «Применить».
+        """
+        observer, built = self._watch.observer, self._watch.frame
+        self._live.frozen = None
+        if built is not None and _rest_of(built) == _rest_of(frame):
+            # Ряд тот же — ждать нечего: строка в окне не держит прошлое (З8).
+            self._live.held = ""
+        if built is not None and observer is not None and observer.paired:
+            series = frame.values.replace(
+                timeframe=built.values.timeframe, instrument=built.values.instrument
+            )
+            if not _settings_blocks(series, series):
+                # Нарушения нет — «не дошло» не держится: снова включённый запрет
+                # будет сказан снова, а не замолчит (B-085).
+                self._live.kept = ""
+        if (
+            observer is None or not observer.paired or built is None
+            or not self._live.wanted or self._halt.reason
+            or not self._watch.observing or self._back.span is not None
+            or _rest_of(built) == _rest_of(frame)
+        ):
+            return frame
+        busy = await self._fact_busy(observer)
+        if not busy:
+            self._live.held = ""
+            return frame
+        self._live.frozen = built.values
+        mixed = frame.values.replace(
+            timeframe=built.values.timeframe, instrument=built.values.instrument
+        )
+        if not _settings_blocks(mixed, built.values):
+            self._live.kept = ""
+            self._say_held(busy, _waiting(built.values, frame.values))
+            return _Frame(built.values, frame.engine)
+        # Запрет включения на прежнем ряду (D-141 и др.): запрещённое «факту»
+        # не идёт, пока ряд прежний, — только оно; прочие настройки движка
+        # идут сразу (Н9). Вслух — что не дошло и почему (B-084, правило 13).
+        engine = self._engine_for_fact(frame)
+        self._say_held(busy, _waiting(built.values, frame.values), kept=self._live.kept)
+        return _Frame(built.values, engine)
+
+    def _frame_now(self) -> _Frame:
+        """Настройки живой свечи: те, по которым идёт ход, — отложенные тоже (N1)."""
+        return _Frame(self._live.frozen or _in_force(self._values), self._engine_settings)
+
+    async def _fact_busy(self, observer: LiveObserver) -> str:
+        """Чем «факт» занят сейчас — позиция, незакрытые команды. Пусто — свободен."""
+        busy: list[str] = []
+        position = observer.fact_position
+        if position is not None:
+            busy.append(f"у робота открыта позиция — {position_words(position.signed)}")
+        desk = self._live.desk
+        unclosed = () if desk is None else await desk.unclosed()
+        if unclosed:
+            busy.append(f"в журнале команд незакрытых {len(unclosed)}: {'; '.join(unclosed)}")
+        return "; ".join(busy)
+
+    def _engine_for_fact(self, frame: _Frame) -> EngineSettings:
+        """Настройки движка, которые «факту» можно, — на ряду, по которому он идёт.
+
+        Запреты включения (`/risk` 2в Н6, Н9): «Применить» их проверил
+        (`_fits_live`); здесь последний рубеж для дорог в обход. Нарушающее
+        запрет остаётся прежним — **только оно** (скользящий уровень, нецелый
+        объём, шаг): режим, объём, окно и процент тейка идут «факту» сразу
+        (решение владельца 01.11.2026, 0066). Что не дошло — сказано однажды.
+        """
+        built = self._watch.frame
+        values = frame.values if built is None else frame.values.replace(
+            timeframe=built.values.timeframe, instrument=built.values.instrument
+        )
+        blocks = _settings_blocks(values, values)
+        if not blocks:
+            self._live.kept = ""
+            return frame.engine
+        key = self._watch.key
+        current = key.engine if isinstance(key, _WatchKey) else frame.engine
+        kept = {name for field, _ in blocks for name in _ENGINE_OF_BLOCK.get(field, ())}
+        try:
+            engine = dataclasses.replace(
+                frame.engine, **{name: getattr(current, name) for name in kept}
+            )
+        except (ValueError, TypeError):  # сочетание не собирается — прежние целиком
+            engine = current
+        self._say_kept(frame.engine, engine, blocks[0][1])
+        return engine
+
+    def _say_kept(self, wanted: EngineSettings, current: EngineSettings, why: str) -> str:
+        """Новые настройки движка до боя не дошли — что именно и почему; однажды (B-084).
+
+        Возврат — те же слова короче: их называет и строка отложенной пересборки,
+        чтобы она не обещала того, что не действует.
+        """
+        changes = "; ".join(wanted.changes_from(current)) or "новые настройки движка"
+        kept = f"не дошли до боя: {changes} — {why}"
+        if kept != self._live.kept:
+            self._live.kept = kept
+            self.note(
+                "Настройки не дошли до боя",
+                f"Бой идёт по прежним настройкам движка. Не дошло: {changes}. "
+                f"Почему: {why}",
+                DecisionLevel.WARNING,
+            )
+        return kept
+
+    def _say_unmanaged(self, observer: LiveObserver, frame: _Frame) -> None:
+        """Режим «Выключен» при позиции «факта» — крупно: позиция осталась без робота.
+
+        Выключение позицию не закрывает намеренно (`DOMAIN.md` §3), но тихое
+        выключение с оставленной позицией — дефект.
+        """
+        position = observer.fact_position
+        if position is None or convert.mode_of(frame.engine.mode) is not Mode.OFF:
+            return
+        self.note(
+            "Позиция без управления",
+            f"Режим «Выключен», а у брокера позиция робота — {position_words(position.signed)}. "
+            "Выключение её не закрывает: робот ею больше не управляет — ни выхода "
+            "по сигналу, ни по концу окна. Тейк у брокера (если стоит) жив.",
+            DecisionLevel.WARNING,
+        )
+
+    def _say_held(self, busy: str, waiting: str = "", *, kept: str = "") -> None:
+        """Пересборка «факта» отложена (С4) — однажды на каждую новую причину.
+
+        `kept` — новые настройки движка, до боя не дошедшие (B-084): тогда строка
+        не обещает, что они действуют, а называет, что не дошло.
+        """
+        what = waiting or (
+            "настройки, требующие пересчёта ряда (период средней, алгоритм, "
+            "инструмент, размер свечи, издержки)"
+        )
+        held = f"Ждёт пересборки боя: {what}. Отложена, потому что {busy}."
+        if kept:
+            held += f" Настройки движка {kept}."
+        if held == self._live.held:
+            return
+        self._live.held = held
+        engine = (
+            f"Новые настройки движка {kept}; «факт» и «прогноз» идут по действующим."
+            if kept else
+            "Режим, объём, тейк и торговое окно уже действуют для «факта» и «прогноза» — "
+            "со следующей сделки."
+        )
+        self.note(
+            "Пересборка боя отложена",
+            f"Ждёт пересборки боя: {what}. Отложена, потому что {busy}: пересобрать "
+            "«факт» сейчас значило бы родить движок без позиции — настоящая позиция "
+            "у брокера осталась бы без робота. До пересборки бой идёт прежним ходом — "
+            "его свечами и его средней. Пересборка — сама, на первом проходе после "
+            f"выхода из позиции и закрытия команд. {engine}",
+            DecisionLevel.WARNING,
+        )
+        self._publish_live()
+
+    async def _fact_relinked(self, observer: LiveObserver) -> bool:
+        """Сверка после обрыва потока статусов — до свечей, то есть до первой заявки.
+
+        Расхождение — «закрыть всё и остановиться» (0020), остановка уходит
+        в общий путь (`halt`). `True` — робот остановлен, свечей не подавать.
+        """
+        desk = self._live.desk
+        if desk is None or not observer.armed:
+            return False
+        position = observer.fact_position
+        why = await desk.relinked(0 if position is None else position.signed)
+        if why:
+            self._halt_fact(why)
+            return True
+        return False
+
+    def _after_feed(self, observer: LiveObserver, run: HistoryRun) -> HistoryRun:
+        """Что показать окну после свечей и чья остановка — робота.
+
+        Одиночный ход: остановка движка — `_remember_halt`, как прежде; её
+        снимают с хода **до** закрытия: закрытый наблюдатель уносит `halted`
+        с собой. Пара: робот — это «факт»; его остановка или остановка
+        исполнителя уходит в общий путь (`halt`, таблица `robot_halt`) **словами
+        исполнителя**, а окно получает снимок «факта». Остановка «прогноза»
+        роботом не считается: это модель.
+        """
+        fact = observer.fact_run
+        if fact is None:
+            self._remember_halt(run.halted)
+            return run
+        desk = self._live.desk
+        why = (desk.halted if desk is not None else None) or fact.halted
+        if why:
+            self._halt_fact(why)
+        self._publish_live()
+        return fact
+
+    def _halt_fact(self, why: str) -> None:
+        """Остановка боя — тем же путём, что любая остановка не из движка.
+
+        Вид — «состояние счёта»: исполнитель стоит, когда позиция или судьба
+        заявки у брокера под вопросом, и снимать такую остановку можно только
+        после похода к брокеру. Ход закрывается на ближайшем проходе
+        (`halt` сбрасывает ключ), «Возобновить» пересобирает исполнитель
+        после сверки (С3).
+        """
+        self.halt("Бой остановлен", why, kind=HaltKind.ACCOUNT)
+
+    def _fact_news(self) -> None:
+        """У исполнителя «факта» новость: сделка или остановка (план §3).
+
+        Проход — через **единственный** слот прогона (`refresh`): идёт проход —
+        просьба встаёт в `_again`, и новый пойдёт сразу после, не параллельно.
+        Сделка входа дойдёт до движка этим проходом, а не через минуту,
+        и тейк встанет у брокера на свече входа.
+        """
+        desk = self._live.desk
+        why = None if desk is None else desk.halted
+        if why:
+            self._halt_fact(why)
+            return
+        self.refresh("событие по заявке у брокера")
+
+    def _fact_notice(self, text: str, level: JournalLevel) -> None:
+        """Исполнитель говорит человеку без остановки (С2) — строкой журнала.
+
+        Уровень называет исполнитель: строка о каждой поданной заявке — INFO,
+        иначе журнал мигает предупреждением на каждом перевороте (0067).
+        Перевод по значению: `market.DecisionLevel` и `ui.models.DecisionLevel`
+        пишут уровни дословно одинаково (`market/journal.py`).
+        """
+        self.note("Боевой исполнитель", text, DecisionLevel(level.value))
+
+    async def _growing_forming(self, frame: _Frame, symbol: str) -> MarketCandle | None:
+        """Бар исполнения по растущей минутке, пока ни одной его минуты нет в базе.
+
+        Только пары: «факт» исполнился у брокера через секунды после закрытия
+        свечи, а первая минута бара ляжет в базу через минуту. Показ бара
+        по растущей минутке отдаёт сделку обоим движкам сейчас — тень
+        исполняет по открытию бара, то есть по первой цене минутки. Тем же
+        правилом, что `_forming_of`: бар без дыр, позже закрытых.
+        """
+        growing = self._live.growing
+        if growing is None or growing[0] != symbol:
+            return None
+        minute = growing[1]
+        bar = await self._growing_bar(frame, symbol, minute)
+        if bar is None or self._already_closed(bar):
+            return None
+        passed = (minute.time - bar.time) // timedelta(minutes=1) + 1
+        return bar if bar.filled_minutes == passed else None
+
+    def _watch_fact(self) -> None:
+        """Записана минутка — сторожу «факта» посмотреть её. Одна задача за раз."""
+        desk = self._live.desk
+        task = self._live.watching
+        if desk is None or (task is not None and not task.done()):
+            return
+        self._live.watching = self._begin("watch", self._watch_minute(desk))
+
+    async def _watch_minute(self, desk: FactDesk) -> None:
+        """Сторож трейлинга по записанной минутке. Отказ — вслух, а не молча."""
+        try:
+            await desk.watch()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # исполнитель говорит о своих бедах сам; это — программа
+            log.exception("сторож трейлинга не посмотрел минутку", extra={"panel": False})
+            self.note(
+                "Сторож трейлинга",
+                "Проверка уровня по записанной минутке не удалась (подробность — в выводе "
+                "программы в консоли). Касание найдётся на закрытии свечи, но с опозданием.",
+                DecisionLevel.WARNING,
+            )
+        if desk.halted and desk is self._live.desk:
+            self._halt_fact(desk.halted)
+
+    def _live_blockers(self) -> tuple[str, ...]:
+        """Почему бой нельзя включить, не спрашивая брокера, — каждая причина фразой.
+
+        Цепочка проверок списком (правило 9): условие и его слова рядом,
+        порядок — от «нечего включать» к настройкам. Брокерские причины
+        (позиция у брокера, незакрытые команды) знает только сборка
+        исполнителя — они приходят отказом `FactRefused`.
+
+        Закреплённого отрезка истории здесь нет (владелец 18.11.2026): включение
+        снимает его само (`_unpin_for_live`), а не отказывает.
+        """
+        # Первая строка — что нажать (B-101): окно показывает её у кнопки,
+        # целиком — в подсказке (`ui.formatting.headline`).
+        checks = (
+            (not self._watch.observing, "нажмите «Подключиться»\n"
+             "Нет потока котировок: бой идёт поверх живого потока, сначала «Подключиться»."),
+            (self._watch.observing and self._live.funds is None,
+             f"подождите до 30 с: счёт у брокера ещё не прочитан\n{_NO_FUNDS}"),
+            (bool(self._halt.reason), "нажмите «Возобновить работу»\n"
+             f"Робот остановлен, сначала «Возобновить работу»: {self._halt.reason}"),
+            (self._live.desks is None,
+             "Подача заявок в этой сборке программы не подключена."),
+            (self._loading(), f"дождитесь конца загрузки истории\n{_LOAD_IN_LIVE}"),
+            (self._history.term.holding, "дождитесь уточнения контрактов у биржи\n"
+             "Идёт первое уточнение контрактов у биржи: решения робота ждут его ответа. "
+             "Включите бой после него."),
+            (self._live.hand is not None and not self._live.hand.done(),
+             "дождитесь итога ручного действия\n"
+             "Идёт снятие заявки или закрытие позиции руками: включите бой после его итога."),
+        )
+        reasons = [words for failed, words in checks if failed]
+        try:
+            reasons += [words for _, words in _settings_blocks(self._values, self._values)]
+        except convert.SettingsRefused as refusal:
+            reasons.append(str(refusal))
+        desks = self._live.desks
+        refused = None if desks is None else desks.refusal()
+        if refused:
+            reasons.append(refused)
+        return tuple(reasons)
+
+    def _loading(self) -> bool:
+        """Идёт загрузка истории — бой с ней не уживается (решение владельца, 0066).
+
+        Только загрузка истории (`load_history`) и скачивание минут: слот загрузки
+        занимает и уточнение контрактов, а это другая причина и другие слова (З7).
+        """
+        user = self._history.user
+        return self._history.filling or (user is not None and not user.done())
+
+    def _fits_live(self, settings: Settings) -> None:
+        """В бою «Применить» проверяет те же запреты, что включение (0066, `/risk` 2в R1).
+
+        Шаг цены 0, нецелый объём — отказ под полем, бой идёт по прежним
+        настройкам. Без боя проверять нечего: запреты — у включения.
+
+        Прежний ряд «факта» (свеча и инструмент до пересборки) здесь больше
+        не проверяется: его запрещал только D-141, снятый `D-196`, а шаг цены
+        и объём на прежнем ряду те же, что в новых настройках.
+        """
+        if not self._live.wanted and self._live.desk is None:
+            return
+        blocks = _settings_blocks(settings, self._values)
+        if blocks:
+            field, words = blocks[0]
+            raise convert.SettingsRefused(
+                f"В бою так нельзя: {words} Бой идёт по прежним настройкам.", field=field,
+            )
+
+    def _publish_live(self) -> None:
+        """Снимок боя — в окно, тем же рубежом чистки (`_send`)."""
+        self._send(self.live_changed, self.live_status())
 
     def _remember_halt(self, reason: str) -> None:
         """Запомнить остановку **из движка**. Первая причина главнее прочих.
@@ -4075,7 +5174,7 @@ class HistoryPort(TerminalPort):
         # переход на новый контракт делается до возобновления (решение 0016).
         self.check_contract()
 
-    def _watch_key(self, frame: _Frame, symbol: str) -> tuple[object, ...]:
+    def _watch_key(self, frame: _Frame, symbol: str) -> _WatchKey:
         """Чем задан живой ход. Разошлось хоть одно — ход начинается заново.
 
         ⚠️ **Глубины показа здесь нет, и это правка `D-033`.** До 05.09.2026
@@ -4108,7 +5207,7 @@ class HistoryPort(TerminalPort):
         исполнителя, отказ журнала и обрыв связи не воспроизводились ничем
         и терялись молча.
         """
-        return (
+        return _WatchKey(
             symbol,
             frame.values.timeframe,
             # ⚠️ Имя алгоритма — отдельной частью ключа, а не через настройки
@@ -4122,7 +5221,7 @@ class HistoryPort(TerminalPort):
             convert.run_costs(frame.values),
         )
 
-    def _watcher(
+    async def _watcher(
         self, frame: _Frame, symbol: str, candles: list[MarketCandle]
     ) -> LiveObserver:
         """Собрать живой ход и **одну** запись о нём в журнале прогонов.
@@ -4179,14 +5278,373 @@ class HistoryPort(TerminalPort):
                 symbol=symbol,
             ),
         )
+        if self._live.wanted:
+            # Бой просили — тот же ход парой. Не собралась боевая сторона —
+            # ход остаётся наблюдением, причина уже сказана (`_live_refused`).
+            fact = await self._open_fact(frame, symbol, candles)
+            if fact is not None:
+                observer.pair_with(fact)
+                # Последний снимок — паре сразу, а не через полминуты опроса:
+                # без него движки до следующего снимка не знали бы счёта (`D-044`).
+                if self._live.funds is not None:
+                    observer.funds(self._live.funds[1])
         return observer
 
+    async def _open_fact(
+        self, frame: _Frame, symbol: str, candles: list[MarketCandle]
+    ) -> FactLeg | None:
+        """Боевая сторона пары: прогон «факта», исполнитель после сверки, день.
+
+        Только здесь и только по просьбе (`set_live`): исполнитель не
+        собирается ни при запуске, ни при связи, ни при смене настроек сам.
+        Отказ — бой не включён, строка журнала с причиной, ход — наблюдение.
+
+        Прогон «факта» (`RunOrigin.LIVE`) открывается **до** исполнителя:
+        каждая команда брокеру пишется под его номером (`StoreBook`), а без
+        журнала команд заявка не уходит (С5).
+        """
+        desks = self._live.desks
+        reasons = self._live_blockers()
+        if desks is None or reasons:
+            self._live_refused(" ".join(reasons))
+            return None
+        try:
+            limits = _fact_limits(frame)
+        except convert.SettingsRefused as refusal:
+            self._live_refused(str(refusal))
+            return None
+        session_id = await self._open_live_run(frame, symbol, candles)
+        if session_id is None:
+            await self._close_live_run("")
+            self._live_refused(
+                "Прогон боя не открылся в журнале прогонов: без него журнал команд "
+                "брокеру не пишется, а без журнала заявка не уходит."
+            )
+            return None
+        seen = self._live.funds
+        request = FactRequest(
+            ticker=symbol,
+            bar_minutes=convert.timeframe_of(frame.values.timeframe).minutes,
+            ruble_per_point=frame.engine.ruble_per_point,
+            limits=limits,
+            session_id=session_id,
+            on_news=self._fact_news,
+            notice=self._fact_notice,
+            # `_live_blockers` выше уже отказал бы без снимка; пустой номер
+            # здесь — защита от гонки со сменой связи, и сборка откажет словами.
+            funds_account="" if seen is None else seen[0],
+            # Шаг цены — тем же путём, что свечи выхода (`_fact_limits`): из
+            # движка. Ноль сюда не доходит — `_live_blockers` отказал бы (`_NO_STEP`).
+            price_step=frame.engine.price_step,
+        )
+        desk = await self._open_desk(desks, request)
+        if desk is None:
+            return None
+        self._live.desk = desk
+        algorithm = convert.chosen_algorithm(frame.values)
+        return FactLeg(
+            # Свой экземпляр модуля: ряд модуля — состояние движка.
+            strategy=algorithm.build(convert.strategy_settings(frame.values)),
+            executor=desk.executor,
+            day=desk.day,
+            session_id=session_id,
+            position=desk.adopted,
+        )
+
+    async def _open_desk(self, desks: FactDesks, request: FactRequest) -> FactDesk | None:
+        """Собрать боевую сторону. `None` — бой не включён, причина уже сказана.
+
+        Отказ сборки — строками сверки и причиной; беда программы — словами;
+        «Выключить», пришедшее, пока шла сверка, — пара не включается (З2).
+        """
+        self._live.opening = True
+        try:
+            desk = await desks.open(request)
+        except FactRefused as refusal:
+            # Что сверка успела сделать с заявками — вслух и при отказе: снятая
+            # молча заявка хуже отказа (`/risk` 2в БЛОК 1).
+            for note in refusal.notes:
+                self.note("Сверка с брокером", note, DecisionLevel.WARNING)
+            self._refused_position(refusal.position)
+            await self._close_live_run(f"Бой не включён: {refusal.human}")
+            self._live_refused(refusal.human)
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # сборка боя — не повод ронять ход и окно
+            log.exception("боевой исполнитель не собран", extra={"panel": False})
+            why = (
+                f"Боевой исполнитель не собран: {_plain(error)}. Подробность — в выводе "
+                "программы в консоли."
+            )
+            await self._close_live_run(f"Бой не включён: {why}")
+            self._live_refused(why)
+            return None
+        finally:
+            self._live.opening = False
+        # Позиция у брокера теперь у «факта» (ноль или подхвачена, 0070): запомненной нет.
+        self._live.left, self._live.left_note, self._live.left_take = None, "", ""
+        for note in desk.notes:
+            self.note("Сверка с брокером", note, DecisionLevel.WARNING)
+        if not self._live.wanted:
+            # «Выключить» пришло, пока шла сверка (`/risk` 2в З2): пара не
+            # включается, исполнитель закрывается, строка — после строк сверки.
+            with contextlib.suppress(Exception):  # закрыть не удалось — строка всё равно
+                await desk.aclose()
+            await self._close_live_run("Бой не включён: выключен во время сверки")
+            closing, self._live.closing = self._live.closing or "Бой выключен", ""
+            self._say_closed(closing)
+            self._publish_live()
+            return None
+        return desk
+
+    def position_read(self, ticker: str, signed: int) -> None:
+        """Опрос счёта прочитал позицию у брокера — запомненная позиция боя по ней (`B-097`).
+
+        Запомненная позиция («на момент остановки») прежде снималась только
+        сборкой боя: после остановки окно часами показывало лонг, которого
+        у брокера давно не было, и владелец не понимал, почему бой не включается.
+        Теперь её сверяет каждый снимок счёта — сразу при подключении и раз
+        в полминуты: у брокера ноль — позиции нет; та же — остаётся с уровнем
+        тейка и словами о нём; другая — на её место встаёт брокерская
+        (`_refused_position`). Остановку робота не снимает: это кнопка владельца.
+        У собранной пары позиция своя, опрос её не трогает.
+        """
+        left = self._live.left
+        if left is None or self._live.desk is not None or self._live.opening:
+            return
+        if ticker != self._values.instrument.strip() or signed == left.signed:
+            return
+        self._refused_position(signed, how="")
+        self._publish_live()
+
+    def _refused_position(
+        self, position: int | None, *, how: str = ", при попытке включить бой,"
+    ) -> None:
+        """Отказ включения прочитал позицию у брокера — запомненная позиция по ней (З5).
+
+        Ноль — оставшейся позиции нет. Не ноль — она свежая: совпала с запомненной
+        по знаку и объёму — та остаётся с новой отметкой времени, иначе на её место
+        встаёт позиция брокера (цены и тейка он при отказе не называет).
+
+        :param how: при каком чтении — для слов «по брокеру на HH:MM МСК…».
+        """
+        if position is None:
+            return
+        if position == 0:
+            self._live.left, self._live.left_note, self._live.left_take = None, "", ""
+            return
+        at = f"{in_moscow(self._clock()):%H:%M}"
+        note = f"по брокеру на {at} МСК{how} — могла измениться"
+        left = self._live.left
+        if left is None or left.signed != position:
+            left = FactPosition(
+                side=EngineSide.LONG if position > 0 else EngineSide.SHORT,
+                volume=float(abs(position)), entry_price=math.nan,
+            )
+            note += "; цену входа брокер не назвал"
+        else:
+            # Позиция свежая, а тейк — нет: отказ заявок у брокера не читал,
+            # и уровень с момента выключения обещал бы то, чего могло не стать (Н10).
+            left = dataclasses.replace(left, take_level=None)
+        self._live.left_take = _take_words(None, None, sure=False)
+        self._live.left, self._live.left_note = left, note
+
+    async def _open_live_run(
+        self, frame: _Frame, symbol: str, candles: list[MarketCandle]
+    ) -> int | None:
+        """Запись «факта» в журнале прогонов. `None` — не открылась."""
+        record = RunConditions(
+            origin=convert.stored_origin(RunOrigin.LIVE),
+            symbol=symbol,
+            timeframe=frame.values.timeframe,
+            engine=frame.engine,
+            strategy=convert.strategy_settings(frame.values),
+            algorithm=convert.chosen_algorithm(frame.values),
+            app_version=version(),
+            days=self._days,
+            until=self._until,
+            program=ProgramFields.of(frame.values),
+        ).record(candles)
+        manager = self._runs.around(record)
+        entry = await manager.__aenter__()
+        self._live.record, self._live.entry = manager, entry
+        self._live.since = self._clock()
+        return entry.id
+
+    async def _close_live_run(self, note: str) -> None:
+        """Закрыть запись «факта» итогом. Отказ записи — в технический лог."""
+        manager, entry = self._live.record, self._live.entry
+        self._live.record = self._live.entry = None
+        if manager is None:
+            return
+        if entry is not None:
+            entry.note = note
+        try:
+            await manager.__aexit__(None, None, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # запись важна, но ход и окно важнее (`RunLog`)
+            log.exception("запись боевого хода не закрыта")
+
+    def _live_refused(self, why: str) -> None:
+        """Бой не включился: просьба снята, причина — в журнал и в снимок боя."""
+        self._live.wanted = False
+        self._live.refused = why
+        self.note("Бой не включён", why, DecisionLevel.WARNING)
+        self._publish_live()
+
     async def _retire(self) -> None:
-        """Закрыть живой ход: снять задачу и дописать итог в журнал прогонов."""
+        """Закрыть живой ход: снять задачу и дописать итог в журнал прогонов.
+
+        У пары — ещё и боевую сторону: исполнитель закрывается (поток
+        статусов, запись журнала команд), позиция у брокера **остаётся**,
+        запись «факта» закрывается итогом «факта».
+        """
         observer, self._watch.observer = self._watch.observer, None
-        self._watch.key = None
+        self._watch.key, self._watch.frame = None, None
+        self._live.held, self._live.frozen, self._live.kept = "", None, ""
+        # Боевая сторона снимается сразу, до ожиданий ниже: «Включить» посреди
+        # закрытия не должен принять её за живую (`/risk` 2в З3).
+        desk, self._live.desk = self._live.desk, None
         if observer is not None:
             await observer.aclose()
+        hand = self._live.hand
+        if desk is not None and hand is not None and not hand.done():
+            # Ручное действие идёт исполнителем боя («Выключить бой», остановка
+            # посреди него): закрыть исполнитель сейчас — оборвать поток статусов,
+            # которым придёт подтверждение снятия и закрытия (ревью 13.11.2026, 5).
+            # `close()` замка не берёт, поэтому ждёт порт.
+            await _quiet(hand)
+        if desk is not None:
+            try:
+                await desk.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # позиция и строки — в любом случае (`/risk` 2в Н3)
+                log.exception("боевая сторона не закрылась", extra={"panel": False})
+                self.note(
+                    "Боевой исполнитель",
+                    f"Боевая сторона закрылась с ошибкой: {_plain(error)}. Поток статусов "
+                    "и запись журнала команд могли не закрыться; новых заявок робот "
+                    "не подаёт, позиция у брокера не тронута. Подробность — в выводе "
+                    "программы в консоли.",
+                    DecisionLevel.WARNING,
+                )
+            if observer is not None and observer.paired:
+                await self._remember_left(desk, observer)
+        fact = None if observer is None else observer.fact_run
+        if self._live.record is not None:
+            note = "" if fact is None else result_note(fact)
+            lost = "" if observer is None else observer.fact_lost
+            await self._close_live_run(f"{note}\n{lost}" if lost else note)
+        closing, self._live.closing = self._live.closing, ""
+        if closing:
+            self._say_closed(closing)
+        if desk is not None:
+            self._publish_live()
+
+    async def _resting(self, desk: FactDesk) -> tuple[float, ...] | None:
+        """Живые лимитные заявки счёта по журналу; `None` — журнал не прочитан."""
+        try:
+            return await desk.resting_levels()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # без журнала — «неизвестно», а не «тейка нет»
+            log.exception("журнал команд при закрытии боя не прочитан", extra={"panel": False})
+            return None
+
+    async def _remember_left(self, desk: FactDesk, observer: LiveObserver) -> None:
+        """Какая позиция осталась у брокера, когда боевая сторона закрылась (N2, N3).
+
+        Не позиция движка: вход, исполненный у брокера и ещё не отданный
+        движку, у движка не виден, а у брокера есть — и окно сказало бы
+        «позиции нет» при лонге без тейка (N2). Поэтому — свежее чтение
+        портфеля. Уровень остаётся, только если тейк жив у брокера: заявка
+        тейка не закрыта в журнале (N3). Скользящий уровень после закрытия
+        стороны не сторожит никто — его нет. Не прочиталось — позиция робота
+        **с неотданным исполнителем** (вход у брокера, движку не отданный) —
+        и слова, что брокер не спрошен; слова — и при пустой позиции (Н2).
+        """
+        at = f"{in_moscow(self._clock()):%H:%M}"
+        engine = observer.fact_position
+        guessed = observer.fact_position_after(desk.undelivered)
+        resting = await self._resting(desk)
+        try:
+            signed, price = await desk.holding()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # окну нужна позиция, а не трассировка
+            log.exception(
+                "позиция у брокера при закрытии боя не прочитана", extra={"panel": False}
+            )
+            # Уровня у позиции нет — брокер не спрошен, ручаться за тейк нельзя;
+            # живая лимитная из журнала названа словами (`take_note`, Н7).
+            self._live.left = (
+                None if guessed is None else dataclasses.replace(guessed, take_level=None)
+            )
+            self._live.left_take = _take_words(None, resting, sure=False)
+            self._live.left_note = (
+                f"у брокера не прочитана на момент остановки {at} МСК: показана позиция "
+                "по роботу — с исполненным у брокера, но ещё не отданным движку, — у брокера "
+                "могла быть другой; жив ли тейк у брокера, неизвестно"
+            )
+            return
+        if signed == 0:
+            self._live.left, self._live.left_note, self._live.left_take = None, "", ""
+            return
+        note = f"на момент остановки {at} МСК — у брокера могло измениться"
+        sure = engine is not None and engine.signed == signed and resting is not None
+        if engine is not None and engine.signed == signed:
+            level = engine.take_level if engine.take_level in (resting or ()) else None
+            self._live.left = dataclasses.replace(engine, take_level=level)
+            self._live.left_take = _take_words(level, resting, sure=sure)
+        else:
+            self._live.left_take = _take_words(None, resting, sure=False)
+            same_side = engine is not None and engine.signed * signed > 0
+            near = guessed if guessed is not None and guessed.signed * signed > 0 else None
+            known = engine.entry_price if engine is not None and same_side else None
+            known = known if known is not None else (None if near is None else near.entry_price)
+            entry = price if price is not None else (math.nan if known is None else known)
+            self._live.left = FactPosition(
+                side=EngineSide.LONG if signed > 0 else EngineSide.SHORT,
+                volume=float(abs(signed)), entry_price=entry,
+            )
+            note += (
+                "; по брокеру, а не по роботу: робот считал "
+                f"{position_words(0 if engine is None else engine.signed)}"
+                + ("" if price is not None else ", цену входа брокер не назвал")
+            )
+        self._live.left_note = note
+
+    def _say_closed(self, event: str) -> None:
+        """Бой выключен — строкой с позицией, которая осталась у брокера (`set_live`)."""
+        position = self._fact_position()
+        note = self._live.left_note
+        if position is None and note:
+            # Брокер не прочитан, а по роботу позиции нет: молчать «позиции нет»
+            # нельзя — у брокера она могла быть (`/risk` 2в Н2).
+            self.note(
+                event,
+                f"Заявки к брокеру больше не подаются, ход идёт наблюдением. ⚠️ Позиция {note}. "
+                "По роботу позиции нет. Проверьте позицию и заявки в приложении брокера.",
+                DecisionLevel.WARNING,
+            )
+            return
+        self.note(
+            event,
+            "Заявки к брокеру больше не подаются, ход идёт наблюдением. "
+            + (
+                f"⚠️ У брокера осталась позиция робота — {position_words(position.signed)}"
+                + (f" ({note})" if note else "")
+                + ": выключение её не закрывает, робот ею больше не управляет; "
+                + (self._live.left_take or _take_words(position.take_level, None, sure=False))
+                + ". Закройте её кнопкой «Закрыть позицию» или включите бой снова — "
+                "робот подхватит её."
+                if position is not None else "Позиции у робота нет."
+            ),
+            DecisionLevel.WARNING if position is not None else DecisionLevel.INFO,
+        )
 
     def _say_result(
         self, frame: _Frame, symbol: str, candles: list[MarketCandle], run: HistoryRun
@@ -4452,7 +5910,7 @@ class HistoryPort(TerminalPort):
         )
 
     async def _draw_live(self, symbol: str) -> None:
-        frame = _Frame(_in_force(self._values), self._engine_settings)
+        frame = self._frame_now()
         bars = await self._live_bars(frame, symbol)
         if not bars:
             return
@@ -4517,7 +5975,7 @@ class HistoryPort(TerminalPort):
         а закрытие бара прогоном, и их отказ порт говорит вслух.
         """
         try:
-            frame = _Frame(_in_force(self._values), self._engine_settings)
+            frame = self._frame_now()
             bar = await self._growing_bar(frame, symbol, minute)
             if bar is None or self._already_closed(bar):
                 return
@@ -4621,6 +6079,42 @@ class HistoryPort(TerminalPort):
         elif candle.opens_at > edge.last and bar.unsettled:
             self._edge = now
             self._send(self.candle_appended, candle)
+        else:
+            return
+        self._reprice_open_row()
+
+    def _price_open_row(self) -> tuple[TradeRow, ...]:
+        """Строка открытой позиции по последней цене, что есть у порта (B-102).
+
+        Растущая свеча на краю графика того же инструмента — её закрытие,
+        то есть цена потока сейчас; нет её — закрытие последней закрытой свечи.
+        """
+        floating = self._live.floating
+        if floating is None:
+            return ()
+        edge = self._edge
+        forming = None
+        if (
+            edge is not None and edge.forming is not None
+            and (edge.instrument, edge.timeframe) == (floating.symbol, floating.timeframe)
+            and edge.forming.opens_at >= floating.last_open
+        ):
+            forming = edge.forming
+        return _open_row(floating, forming)
+
+    def _reprice_open_row(self) -> None:
+        """Растущая свеча сдвинула цену — переоценить строку открытой позиции.
+
+        Таблица уходит заново только при изменившейся строке: цена у фьючерса
+        меняется шагами, и одинаковую строку отдавать незачем.
+        """
+        if self._live.floating is None or self._run is None:
+            return
+        row = self._price_open_row()
+        if row == self._live.open_row:
+            return
+        self._live.open_row = row
+        self._send(self.trades_replaced, *self._trades_of(self._run, self._live.shown))
         # Прочее не рисуется, и оба случая намеренные. Свеча **левее** края
         # устарела: пока дорисовка читала базу, прогон успел показать её место
         # сам, и уточнение задним числом переставило бы последнюю свечу
@@ -4936,13 +6430,31 @@ class HistoryPort(TerminalPort):
         идут **только свечами**: прогон шёл по одному контракту, и его метки
         до рубежа этого контракта не рисуются — там показан другой.
         """
-        markers, paths = convert.markers_and_paths(
-            run,
-            pairs(run, ruble_per_point=frame.engine.ruble_per_point),
-            reversal_entries(run.deals),
-            timeframe,
-            pending=_pending_of(pinned=self._back.span is not None, halted=self.halted),
+        pending = _pending_of(pinned=self._back.span is not None, halted=self.halted)
+        forecast = self._forecast_shown()
+        rubles = frame.engine.ruble_per_point
+        markers, paths = (
+            convert.markers_and_paths(
+                run, pairs(run, ruble_per_point=rubles), reversal_entries(run.deals), timeframe,
+                pending=pending,
+            )
+            if forecast is None
+            else _live_overlay(
+                run, forecast, timeframe, ruble_per_point=rubles, pending=pending,
+                broker=live_history.at_broker(run, self._executed()),
+            )
         )
+        # Бой просили, а «факт» не собран (остановка, сборка): показан прогон-
+        # симуляция, и его сделки в бою — не сделки (решение 0070, владелец
+        # 13.11: «бой включён и заявки из симуляции отображены»). Ни меток,
+        # ни уровней, ни позиции прогона — только настоящие сделки из базы.
+        own = None if self._sim_in_combat() else run
+        if own is None:
+            markers, paths = (), ()
+        # Бой: сделки прежних заходов — тем же списком, что у таблицы (B-100).
+        live = self._live.shown = self._live_trades(run, symbol, timeframe)
+        if live is not None:
+            markers, paths = markers + live.markers, paths + live.paths
         before = self._edge
         context = self._context
         drawn, seams = contract_view.split_shown(context, candles)
@@ -4955,7 +6467,9 @@ class HistoryPort(TerminalPort):
             average_label=convert.average_label(frame.values),
             markers=markers,
             paths=paths,
-            levels=_levels(run),
+            levels=() if own is None else _levels(
+                run.position, live=self._origin is RunOrigin.LIVE
+            ),
             shades=convert.shades_of(candles, frame.engine),
             seams=seams,
             basis=self._basis,
@@ -4963,13 +6477,11 @@ class HistoryPort(TerminalPort):
         self._keep_forming(
             before, _Edge(symbol, frame.values.timeframe, shown[-1].opens_at, None)
         )
-        self._send(
-            self.trades_replaced,
-            self._seam_rows(
-                tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals)
-            ),
-            convert.trades_summary(run),
+        self._live.floating = (
+            None if own is None else _Floating.of(run, candles, frame, symbol, self._origin)
         )
+        self._live.open_row = self._price_open_row()
+        self._send(self.trades_replaced, *self._trades_of(run, live))
         # Прогон по склейке называет все контракты периода, а не код из настроек.
         named = (
             " → ".join(one.piece.symbol for one in self._stitched.pieces)
@@ -4977,7 +6489,11 @@ class HistoryPort(TerminalPort):
         )
         self._say_result(frame, named, candles, run)
         self._publish_journal(run)
-        self._publish_state(self._state(frame, symbol, candles, run))
+        self._publish_state(self._state(frame, symbol, candles, own))
+
+    def _sim_in_combat(self) -> bool:
+        """Бой просили, а показан не «факт»: прогон по истории или наблюдение (0070)."""
+        return self._live.wanted and self._origin is not RunOrigin.LIVE
 
     def _forget_report(self) -> None:
         """Обещанный отчёт не состоялся — сказать это вслух, а не промолчать.
@@ -5043,6 +6559,114 @@ class HistoryPort(TerminalPort):
             )
         self._send(self.backtest_finished, report)
 
+    def _live_trades(
+        self, run: HistoryRun, symbol: str, timeframe: Timeframe
+    ) -> live_history.LiveTrades | None:
+        """Бой: сделки прежних заходов из базы плюс текущего (B-100). `None` — не бой.
+
+        Бой просили, а «факт» не собран (`_sim_in_combat`) — текущего захода нет:
+        только сделки из базы, прогон-симуляция в таблицу не идёт (0070).
+        """
+        if self._sim_in_combat():
+            run = HistoryRun()
+        elif self._origin is not RunOrigin.LIVE:
+            return None
+        return live_history.compose(
+            run, self._live.history, symbol=symbol, timeframe=timeframe, since=self._live.since,
+            executed=self._executed(),
+        )
+
+    def _executed(self) -> live_history.Executed:
+        """Исполнения у брокера с номером прогона текущего захода боя — его сделкам."""
+        entry = self._live.entry
+        return dataclasses.replace(
+            self._live.executed, current=None if entry is None else entry.id
+        )
+
+    def _trades_of(
+        self, run: HistoryRun, live: live_history.LiveTrades | None
+    ) -> tuple[tuple[TradeRow, ...], TradesSummary]:
+        """Строки «Сделок» и итог: в бою — все заходы, иначе — прогон. Плюс открытая позиция."""
+        if live is not None:
+            return live.rows + self._live.open_row, live.summary
+        rows = self._seam_rows(
+            tuple(convert.trade_row(deal, origin=self._origin) for deal in run.deals)
+        )
+        return rows + self._live.open_row, convert.trades_summary(run)
+
+    async def _read_live_history(self) -> None:
+        """Закрытые боевые сделки всех прогонов — из базы, один раз на заход (B-100).
+
+        Движок «факта» каждого захода прогрет с нуля и прежних сделок не знает;
+        без этого чтения «Сделки» пустели после любой остановки. Прежние прогоны
+        закрыты и не меняются, поэтому чтение повторяется только со сменой
+        прогона «факта» или после отказа. Сделки текущего захода в выдаче тоже
+        есть — их пишет `PaperLog`, — и дубль снимает `live_history.compose`.
+
+        Отказ — не пустая таблица (правило 13): строка журнала один раз
+        на причину, причина в подписи итога, текущий заход показан.
+        """
+        if self._origin is not RunOrigin.LIVE and not self._live.wanted:
+            return
+        entry = self._live.entry
+        current = None if entry is None else entry.id
+        live = self._live
+        if current is not None and current == live.history_for and not live.history.trouble:
+            return
+        try:
+            page = await self._worker.trades(
+                origin=convert.stored_origin(RunOrigin.LIVE), all_runs=True,
+                limit=_PAPER_LIMIT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.exception("боевые сделки прежних заходов не прочитаны", extra={"panel": False})
+            why = f"база {self._worker.path} не ответила: {_plain(error)}."
+            if why != live.history.trouble:
+                self.note(
+                    "Сделки прежних заходов боя не прочитаны",
+                    f"Причина: {why} «Сделки» и график показывают только текущий "
+                    "заход; чтение повторится на следующем проходе.",
+                    DecisionLevel.WARNING,
+                )
+            live.history, live.history_for = live_history.Earlier(trouble=why), None
+            return
+        if live.history.trouble:
+            self.note(
+                "Сделки прежних заходов боя прочитаны",
+                "База ответила: «Сделки» и график снова показывают все заходы боя.",
+            )
+        live.history, live.history_for = live_history.Earlier(page.rows), current
+        if page.truncated:
+            self.note(
+                "Сделки прежних заходов боя прочитаны не все",
+                f"В базе больше {_PAPER_LIMIT} боевых сделок — показаны последние "
+                f"{_PAPER_LIMIT}, итог за всю историю неполон.",
+                DecisionLevel.WARNING,
+            )
+
+    async def _read_fill_times(self) -> None:
+        """Исполнения заявок у брокера — для времени сделки и подписи условной (B-104).
+
+        Отказ базы — не остановка и не пустая таблица: строки остаются со временем
+        свечи, как до этого чтения, а причина — в технический лог. Торговых
+        решений по этим строкам нет.
+        """
+        if self._origin is not RunOrigin.LIVE and not self._live.wanted:
+            return
+        try:
+            rows = await self._worker.order_fill_times()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "исполнения заявок у брокера не прочитаны: в «Сделках» время свечи",
+                extra={"panel": False},
+            )
+            return
+        self._live.executed = live_history.Executed.of(rows)
+
     def _seam_rows(self, rows: tuple[TradeRow, ...]) -> tuple[TradeRow, ...]:
         """Строки сделок; у сделки на стыке — «смена контракта», а не «конец отрезка»."""
         if self._stitched is None:
@@ -5078,15 +6702,39 @@ class HistoryPort(TerminalPort):
         """Снимок состояния — в окно, и запомнить его для `restate`."""
         self._last_state = state
         self._send(self.state_changed, state)
+        self._publish_live()
 
     def _publish_journal(self, run: HistoryRun | None = None) -> None:
-        """Журнал решений целиком: строки движка плюс строки программы."""
+        """Журнал решений целиком: строки движка плюс строки программы.
+
+        В бою строк движка две ленты, у каждой своя метка данными: «факт» —
+        боевой режим, теневой «прогноз» — симуляция (`D-172`). Слиты
+        по времени; при равном — сначала «факт»: это то, что сделано.
+        """
         engine_rows = tuple(
             convert.decision_row(entry, origin=self._origin)
             for entry in (run.journal if run else ())
         )
+        forecast = None if run is None else self._forecast_shown()
+        if forecast is not None:
+            shadow = tuple(
+                convert.decision_row(entry, origin=_WATCH_ORIGIN) for entry in forecast.journal
+            )
+            engine_rows = tuple(sorted(engine_rows + shadow, key=lambda row: row.time))
         self._journal = engine_rows + tuple(self._notes)
         self._send(self.decisions_replaced, self._journal)
+
+    def _forecast_shown(self) -> HistoryRun | None:
+        """Ход теневого «прогноза», если окну показан бой; иначе `None`.
+
+        В бою показан ход «факта» (`_after_feed`), и метка происхождения
+        у него — боевой режим (`_origin`). Тень — тот же ход пары: её метки
+        и строки уходят окну рядом, слоем «Прогноз» и меткой симуляции.
+        """
+        observer = self._watch.observer
+        if observer is None or self._origin is not RunOrigin.LIVE:
+            return None
+        return observer.run
 
     def _state(
         self,
@@ -5111,8 +6759,10 @@ class HistoryPort(TerminalPort):
             # показывало красную плашку «робот выключен, позиция открыта»
             # про позицию, которой в новом прогоне не будет вовсе.
             mode=convert.mode_of(frame.engine.mode),
-            running=False,
-            simulation=True,
+            # Метка из данных, а не из режима окна (`D-172`): идёт ли бой,
+            # говорит собранный ход — пара с боевой стороной.
+            running=self._live.desk is not None,
+            simulation=self._live.desk is None,
             position=_position(run),
             # ⚠️ Прогон, остановленный движком, обязан выглядеть остановленным.
             # Без этой строки `halted` оставался пустым всегда: окно рисовало
@@ -5153,6 +6803,265 @@ class HistoryPort(TerminalPort):
             # каждом старте (`announce`) и строкой на каждое изменение
             # их полей (`apply_settings`).
         )
+
+
+def _live_overlay(
+    fact: HistoryRun,
+    forecast: HistoryRun,
+    timeframe: Timeframe,
+    *,
+    ruble_per_point: float,
+    pending: convert.Unfilled,
+    broker: convert.AtBroker | None = None,
+) -> tuple[tuple[Marker, ...], tuple[TradePath, ...]]:
+    """Метки боя: «Прогноз» — исполнения тени, «Факт» — исполнения брокера (`DOMAIN.md` §8).
+
+    Наложение двух слоёв — это и есть вопрос «расчёт или исполнение»: тень
+    исполнила там, где обещает модель, брокер — там, где исполнил. Пара — по
+    имени заявки: у движков пары имена одни (ход один). Расчётом слоя
+    «Прогноз» становится **сделка тени** на её свече (`decided_at` — закрытие
+    этой свечи, то есть метка ложится на тот же бар, что и сделка брокера),
+    плюс заявки тени, ждущие исполнения. Дальше — тот же перевод, что
+    у прогона (`convert.markers_and_paths`): подсказка с расхождением
+    в пунктах и рублях, «сигнал пропущен» и «сделка вне расчёта» — по данным.
+
+    Линии сделок: «Факт» — сделки брокера, «Прогноз» — сделки тени.
+
+    `broker` — время исполнения у брокера и выходы по условной (`D-196`): после
+    выхода брокера тень ведёт скользящий сама и расходится с боем штатно —
+    метки об этом говорят, а не называют сделки боя дефектом (B-104).
+    """
+    decided = {plan.order_id: plan for plan in forecast.plans}
+    reasons = {name: plan.exit_reason for name, plan in decided.items()}
+    expected = tuple(
+        Plan(
+            order_id=fill.order_id,
+            decided_at=bar_start(fill.at, timeframe) + timeframe.delta,
+            price=fill.price,
+            side=fill.side,
+            action=fill.action,
+            exit_reason=reasons.get(fill.order_id),
+        )
+        for fill in forecast.fills
+    ) + tuple(decided[name] for name in forecast.waiting if name in decided)
+    overlay = dataclasses.replace(fact, plans=expected, waiting=forecast.waiting)
+    reversals = reversal_entries(fact.deals) | reversal_entries(forecast.deals)
+    markers, paths = convert.markers_and_paths(
+        overlay, pairs(overlay, ruble_per_point=ruble_per_point), reversals, timeframe,
+        pending=pending, broker=broker,
+    )
+    _, shadow = convert.markers_and_paths(
+        forecast, pairs(forecast, ruble_per_point=ruble_per_point), reversals, timeframe,
+        pending=pending,
+    )
+    planned = tuple(
+        dataclasses.replace(path, layer=Layer.PLAN, profitable=None)
+        for path in shadow if path.layer is Layer.FACT
+    )
+    return markers, tuple(path for path in paths if path.layer is Layer.FACT) + planned
+
+
+#: Поле окна, нарушившее запрет боя (`_settings_blocks`) → поля движка, которые
+#: остаются у «факта» прежними (Н9). Прочие настройки движка идут сразу.
+_ENGINE_OF_BLOCK: Final[dict[str, tuple[str, ...]]] = {
+    "volume": ("volume",),
+    "instrument": ("price_step",),
+}
+
+
+def _settings_blocks(values: Settings, _was: Settings) -> tuple[tuple[str, str], ...]:
+    """Запреты боя, которые решают настройки: (поле окна, причина словами).
+
+    Одна таблица на два места — включение боя (`_live_blockers`) и «Применить»
+    в бою (`_fits_live`): разойдись они, «Применить» пропускало бы то, на чём
+    включение отказывает (`/risk` 2в R1). `_was` — настройки в силе; нужны
+    были запрету D-141, снятому `D-196`, и оставлены вызывающим ради формы.
+
+    Скользящего уровня здесь нет: в бою его ведёт брокер условной заявкой
+    (`D-196`), прогон — по минуткам, и запрет D-141 «бой — раз в свечу,
+    прогон — каждую минуту» больше не о чем.
+    """
+    volume = float(values.volume)
+    # Первая строка — что поменять (B-101), дальше — почему.
+    checks = (
+        (values.price_step <= 0, "instrument", f"дождитесь шага цены от биржи\n{_NO_STEP}"),
+        (not volume.is_integer() or volume < 1, "volume",
+         "объём — целое число контрактов, не меньше 1\n"
+         f"Объём {volume:g} — не целое число контрактов: боевой заявки такой не бывает."),
+    )
+    return tuple((field, words) for failed, field, words in checks if failed)
+
+
+def _take_words(
+    level: float | None, resting: tuple[float, ...] | None, *, sure: bool
+) -> str:
+    """Что сказать о тейке позиции, оставшейся у брокера (B-082).
+
+    «Тейка нет» — только когда за это можно поручиться: брокер прочитан,
+    позиция совпала с роботом и по журналу нет живой лимитной (`sure` и пустой
+    журнал). Иначе — «неизвестно, проверьте», с ценами живых лимитных из
+    журнала, если они есть: человек, поверивший «тейка нет», закроет позицию
+    руками и оставит у брокера заявку, которая откроет её снова без робота.
+    """
+    if level is not None:
+        return f"тейк у брокера по {level:g} жив — снимите его, если закрываете позицию руками"
+    if sure and not resting:
+        return "тейка у неё нет"
+    if resting:
+        prices = ", ".join(f"{price:g}" for price in resting)
+        return (
+            f"по журналу команд у брокера жива лимитная заявка по {prices} — возможно, это "
+            "тейк; проверьте заявки в приложении брокера"
+        )
+    return "жив ли тейк у брокера, неизвестно — проверьте заявки в приложении брокера"
+
+
+def _rest_of(frame: _Frame) -> tuple[object, ...]:
+    """Чем задан ряд хода, кроме настроек движка: то, что требует пересборки."""
+    values = frame.values
+    return (
+        convert.instrument_of(values.instrument), values.timeframe, values.strategy_id,
+        convert.strategy_settings(values), convert.run_costs(values),
+    )
+
+
+def _waiting(was: Settings, now: Settings) -> str:
+    """Что ждёт пересборки — «было → стало» по полям ряда; пусто — не назвать."""
+    lines = [
+        f"{FIELD_CAPTIONS.get(name, name)}: {getattr(was, name)} → {getattr(now, name)}"
+        for name in ("instrument", "timeframe")
+        if getattr(was, name) != getattr(now, name)
+    ]
+    lines += convert.rule_changes(was, now)
+    if convert.run_costs(was) != convert.run_costs(now):
+        lines.append("издержки «прогноза»")
+    return "; ".join(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class _Floating:
+    """Открытая позиция прохода и всё, чем её переоценивать между проходами (B-102).
+
+    Комиссия — как у закрытых сделок: обе стороны. Вход — по сделке входа,
+    если исполнитель её назвал (у боя — комиссия брокера), иначе по тарифу;
+    выход ещё не случился — по тарифу из настроек. Тарифа нет — комиссия
+    неизвестна, и строка говорит это, а не подставляет ноль.
+    """
+
+    position: EnginePosition
+    ruble_per_point: float
+    origin: RunOrigin | None
+    entry_commission: float | None
+    per_side: float | None
+    symbol: str
+    timeframe: str
+    #: Последняя закрытая свеча прохода: цена по ней, если растущей нет.
+    last_open: datetime
+    last_close: float
+    last_closes_at: datetime
+
+    @classmethod
+    def of(
+        cls, run: HistoryRun, candles: Sequence[MarketCandle], frame: _Frame, symbol: str,
+        origin: RunOrigin | None,
+    ) -> _Floating | None:
+        """Позиция прохода `run` по свечам `candles`; `None` — позиции нет."""
+        position = run.position
+        if position is None or not candles:
+            return None
+        entry = next(
+            (
+                fill for fill in reversed(run.fills)
+                if fill.action is OrderAction.OPEN and fill.side is position.side
+                and fill.at == position.entry_time and fill.price == position.entry_price
+            ),
+            None,
+        )
+        last = candles[-1]
+        return cls(
+            position=position, ruble_per_point=frame.engine.ruble_per_point, origin=origin,
+            entry_commission=None if entry is None else entry.commission,
+            per_side=frame.values.commission_per_side_rub, symbol=symbol,
+            timeframe=frame.values.timeframe,
+            last_open=last.time, last_close=last.close, last_closes_at=close_time(last),
+        )
+
+    def commission(self) -> tuple[float, str] | None:
+        """Комиссия обеих сторон и откуда она: вход — брокер или тариф, выход — тариф."""
+        if self.per_side is None:
+            return None
+        exit_side = self.per_side * self.position.volume
+        if self.entry_commission is not None:
+            return self.entry_commission + exit_side, (
+                f"вход {fmt_money(self.entry_commission)} по сделке, "
+                f"выход {fmt_money(exit_side)} по тарифу"
+            )
+        return exit_side * 2, f"обе стороны по тарифу {fmt_money(self.per_side)} за контракт"
+
+
+def _open_row(floating: _Floating, forming: Candle | None) -> tuple[TradeRow, ...]:
+    """Строка открытой позиции для таблицы «Сделки» — только окну (задача владельца 13.11.2026).
+
+    Позиция — та же, что у ячеек «Позиция» и «Позиция у брокера» на панели:
+    позиция движка прогона, чьи сделки в таблице (у пары — «факт»). Выхода
+    нет, результат плавающий — по **текущей** цене потока (растущая свеча,
+    `forming`), а без неё по закрытию последней закрытой свечи, и **с комиссией**,
+    как у закрытых строк рядом (B-102: 16.11.2026 шорт от 248 500 стоял «+75 ₽»
+    по закрытию 09:05 при текущей ~248 575). Считает его та же сделка
+    `backtest.Deal`, что закрытые, — формула одна. В журнал сделок базы, итог
+    под таблицей и выгрузку строка не идёт: итог считается из `run.deals`,
+    выгрузка отбрасывает строки без выхода (`ui/main_window.py`).
+
+    Подпись — главное первым (ячейка режется по ширине): «открыта, по текущей X,
+    с комиссией»; разбор целиком — в подсказке ячейки.
+    """
+    position = floating.position
+    if forming is not None:
+        price, at = forming.close, forming.opens_at
+        where = f"по текущей {fmt_level(price)}"
+        when = f"растущая свеча с {in_moscow(at):%H:%M} МСК"
+    else:
+        price, at = floating.last_close, floating.last_closes_at
+        where = f"по закрытию {fmt_level(price)}"
+        when = f"закрытие свечи {in_moscow(at):%H:%M} МСК"
+    costs = floating.commission()
+    deal = Deal(
+        side=position.side, volume=position.volume, entry_time=position.entry_time,
+        entry_price=position.entry_price, entry_order_id="", exit_time=at,
+        exit_price=price, exit_order_id="", exit_reason=ExitReason.SIGNAL,
+        commission=None if costs is None else costs[0],
+        ruble_per_point=floating.ruble_per_point,
+    )
+    if costs is None:
+        words = (
+            f"Позиция открыта, {where}, без комиссии: тариф не задан. "
+            f"Результат плавающий; цена — {when}."
+        )
+    else:
+        words = (
+            f"Позиция открыта, {where}, с комиссией. Результат плавающий; "
+            f"цена — {when}; комиссия {fmt_money(costs[0])}: {costs[1]}."
+        )
+    return (dataclasses.replace(
+        convert.trade_row(deal, origin=floating.origin),
+        exit_time=None, exit_price=None, exit_reason=words,
+    ),)
+
+
+def _nothing() -> None:
+    """Новость исполнителя ручного действия: прохода по ней не нужно — хода нет."""
+
+
+def _fact_limits(frame: _Frame) -> LiveLimits:
+    """Пределы боевого исполнителя: из окна плюс свечи выхода — из движка.
+
+    Одно число — одно место: сколько свечей ждать выхода с пределом,
+    говорит движок (`time_exit_wait_bars`), и исполнитель ждёт столько же —
+    тогда остановку по живой заявке у брокера называет он, а не движок (С9).
+    """
+    return dataclasses.replace(
+        convert.live_limits(frame.values), limit_exit_bars=frame.engine.time_exit_wait_bars
+    )
 
 
 def _restored_halt_event(standing: Sequence[StoredHalt]) -> str:
@@ -5239,16 +7148,38 @@ def _pending_of(*, pinned: bool, halted: str) -> convert.Unfilled:
     return next((fate for hit, fate in chain if hit), convert.Unfilled.WAITING)
 
 
-def _levels(run: HistoryRun) -> tuple[PriceLevel, ...]:
-    """Горизонтальные линии открытой позиции — цена входа и уровень выхода."""
-    position = run.position
+#: Подпись линии включения скользящего тейка в бою (`B-103`): до порога
+#: уровня выхода нет, у брокера стоит условная заявка с этой ценой включения.
+ACTIVATION_LABEL = "Включение скользящего тейка — условная заявка у брокера"
+#: Подпись уровня программы после порога, пока условная у брокера жива
+#: (`D-196`): брокер ведёт свой уровень по сделкам, без шага, и он может
+#: отличаться от расчёта программы по минуткам.
+PROGRAM_LEVEL_LABEL = "Скользящий тейк по расчёту программы — у брокера уровень свой"
+
+
+def _levels(position: EnginePosition | None, *, live: bool) -> tuple[PriceLevel, ...]:
+    """Горизонтальные линии открытой позиции — цена входа и уровень выхода.
+
+    Скользящий тейк до порога уровня выхода не имеет, но цена включения
+    у него есть (`TakeProfit.activation`, `D-196`), и её видно линией
+    (`B-103`): иначе владелец не знает, где тейк включится. После порога —
+    уровень программы; `live` и живая условная — с оговоркой, что у брокера
+    уровень свой. Позиции нет — линий нет: после выхода они исчезают.
+    """
     if position is None:
         return ()
     levels = [PriceLevel(position.entry_price, LevelKind.ENTRY, "Цена входа")]
+    take = position.take
     level = position.take_profit
     if level is not None:
-        kind = LevelKind.TRAILING if position.take.trailing else LevelKind.TAKE
-        levels.append(PriceLevel(level, kind, kind.label))
+        kind = LevelKind.TRAILING if take.trailing else LevelKind.TAKE
+        aside = live and take.trailing and take.activation is not None
+        levels.append(PriceLevel(level, kind, PROGRAM_LEVEL_LABEL if aside else kind.label))
+    elif take.activation is not None:
+        kind = LevelKind.ACTIVATION
+        levels.append(
+            PriceLevel(take.activation, kind, ACTIVATION_LABEL if live else kind.label)
+        )
     return tuple(levels)
 
 
@@ -5526,7 +7457,64 @@ def _startup_settings(
     ⚠️ Отказ, который подменой не лечится (программа собрана несогласованно,
     `convert._ENGINE_GAP`), не глотается: чинить его значениями настроек
     нечем, и работать с ним нельзя.
+
+    Пределы ожидания боя (`B-078`) — тем же приёмом, но после движка:
+    движку они не нужны, а негодный предел, оставленный в силе, ронял бы
+    каждое следующее применение настроек — первым карточку биржи с шагом цены.
     """
+    values, engine, said = _engine_startup(given, mode)
+    values, limits = _limits_repaired(values)
+    return values, engine, " ".join(part for part in (said, limits) if part)
+
+
+def _limits_repaired(values: Settings) -> tuple[Settings, str]:
+    """Пределы ожидания боя из файла, которых окно не примет, — в умолчание, вслух.
+
+    Какой предел негоден, решает та же проверка, что на «Применить»
+    (`convert.live_limits`), а не список здесь. Отказ называет поле; оно
+    ставится в умолчание программы, и проверка идёт снова — до чистого
+    набора. Отказ без поля подменой не лечится и не глотается.
+    """
+    defaults = Settings()
+    said: list[str] = []
+    for _ in dataclasses.fields(values):
+        try:
+            convert.live_limits(values)
+        except convert.SettingsRefused as refusal:
+            name = refusal.field
+            if name not in LIVE_LIMITS_BOUNDS or getattr(values, name) == getattr(defaults, name):
+                raise
+            was, put = getattr(values, name), getattr(defaults, name)
+            values = dataclasses.replace(values, **{name: put})
+            said.append(
+                f"«{FIELD_CAPTIONS.get(name, name)}»: в файле {_plain_value(was)}, а годно "
+                f"{live_limit_rule(name)} — поставлено умолчание {_plain_value(put)}."
+            )
+        else:
+            break
+    if not said:
+        return values, ""
+    return values, (
+        "Пределы ожидания боя из файла настроек, которых окно не принимает: "
+        + " ".join(said)
+        + " Остальные настройки из файла в силе. Файл не изменён: умолчание "
+        "запишется в него, когда вы сами примените настройки."
+    )
+
+
+def _plain_value(value: object) -> str:
+    """Значение поля человеку: «0», «1,5», «1, 2, 5» — без записи Python."""
+    if isinstance(value, tuple):
+        return ", ".join(_plain_value(one) for one in value)
+    if isinstance(value, float):
+        return f"{value:g}".replace(".", ",")
+    return str(value)
+
+
+def _engine_startup(
+    given: Settings | None, mode: Mode
+) -> tuple[Settings, EngineSettings, str]:
+    """Движок обязан принять настройки файла — подмена невыполнимого (`B-050`)."""
     values = (given or Settings()).replace(price_step=0.0)
     try:
         return values, _engine_of(values, mode), ""

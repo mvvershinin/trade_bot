@@ -777,9 +777,13 @@ def test_an_unknown_status_in_the_status_answer_is_refused(store: TokenStore) ->
     [
         {"clientOrderId": "x", "data": []},
         {"clientOrderId": "x"},
+        {"clientOrderId": "x", "data": None},
+        {"clientOrderId": "x", "data": "0"},
+        # Объект — живой вид (13.11.2026) и читается, но без `executionType`
+        # сообщение не понять: отказ идёт из `parse_report`.
         {"clientOrderId": "x", "data": {"orderStatus": "0"}},
     ],
-    ids=["пустой-data", "без-data", "data-не-массив"],
+    ids=["пустой-data", "без-data", "data-null", "data-строка", "data-объект-без-вида"],
 )
 def test_a_status_answer_without_messages_is_refused_not_read_as_no_order(
     store: TokenStore, payload: dict[str, object]
@@ -977,8 +981,9 @@ def test_an_order_that_cannot_be_sent_is_refused_before_the_wire(
 def test_the_orders_search_sends_its_filter_and_reads_the_rows(store: TokenStore) -> None:
     """Список заявок: `POST` с фильтром в теле, страница — в строке запроса (15).
 
-    Сторона и состояние в теле — числа, время — UTC с `Z`. Мутация:
-    состояние строкой; страница в теле.
+    Сторона и состояние в теле — числа, время — UTC с миллисекундами и `Z`
+    (живой ответ 13.11.2026: без миллисекунд 422). Мутация: состояние
+    строкой; страница в теле.
     """
     rows = [
         {"orderNum": 7, "orderId": "261027-SPBFUT-7", "orderStatus": 3, "side": 2,
@@ -1004,7 +1009,7 @@ def test_the_orders_search_sends_its_filter_and_reads_the_rows(store: TokenStore
     assert len(asked) == 1
     assert dict(asked[0].url.params) == {"page": "0", "size": "100"}
     assert json.loads(asked[0].content) == {
-        "startDateTime": "2026-10-27T07:00:00Z",
+        "startDateTime": "2026-10-27T07:00:00.000Z",
         "side": 2,
         "orderStatus": [3],
         "tickers": ["MXZ6"],
@@ -1161,3 +1166,44 @@ def test_reading_around_orders_is_allowed_and_repeated(page: str) -> None:
     assert endpoint in READ_ENDPOINTS
     assert endpoint in REPEATABLE
     assert not set(WRITE_ENDPOINTS) & set(READ_ENDPOINTS)
+
+
+#: Кадры пробы Б 13.11.2026 18:35:12 (`D-196`, `broker-api/13`, «Пробы»):
+#: срабатывание условной — без `executionType`, затем исполнение по её ключу.
+#: `clientCode` заменён: в тестовые данные код клиента не кладём.
+_TRIGGER = {
+    "messageType": "8", "orderStatus": "0", "orderQuantity": 1, "executedQuantity": 0,
+    "lastQuantity": 0, "remainedQuantity": 1, "ticker": "MXZ6", "classCode": "SPBFUT",
+    "side": "2", "orderType": "5", "averagePrice": 0,
+    "orderId": "261113-SPBFUT-1984994564063182335",
+    "executionId": "261113-SPBFUT-fED8o-L-CQ057", "price": 249825, "currency": "RUB",
+    "clientCode": "TEST", "transactionTime": "2026-11-13T15:35:12.877Z",
+    "orderNumber": "609216886", "rejectReason": "", "stopPrice": 0, "takePrice": 250100,
+    "timeInForce": "1", "spread": 0.1, "spreadType": 1, "offset": 0.03, "offsetType": 1,
+}
+_TRIGGER_FILL = {
+    **_TRIGGER, "orderStatus": "2", "executionType": "11", "executedQuantity": 1,
+    "lastQuantity": 1, "remainedQuantity": 0, "averagePrice": 250075,
+    "executionId": "SPBFUT-2MdIMRrCZ9u-S-1-1-N", "commission": 16.58,
+}
+
+
+def test_the_trigger_frame_of_a_conditional_is_read_and_the_fill_after_it_counts() -> None:
+    """Стережёт: кадр срабатывания условной без `executionType` не рвёт поток.
+
+    Живой брокер 13.11.2026 прислал его перед исполнением; отказ разбора
+    закрывал поток, исполнение терялось, а сверка с отстающим портфелем
+    останавливала робота после штатного скользящего тейка (/risk 14.11).
+    Послабление узкое: у обычной заявки кадр без вида — отказ, как прежде.
+    """
+    key = "b7bbad81-ed5a-410b-a046-aa5ee5792142"
+    trigger = parse_order_event({"clientOrderId": key, "data": _TRIGGER})
+    assert trigger.key == key
+    assert trigger.report.status is OrderStatus.NEW
+    assert not trigger.report.is_execution
+    fill = parse_order_event({"clientOrderId": key, "data": _TRIGGER_FILL})
+    assert fill.report.is_execution and fill.report.last_quantity == 1
+    with pytest.raises(UnexpectedAnswer):
+        parse_order_event({"clientOrderId": key, "data": {**_TRIGGER, "orderType": "2"}})
+    with pytest.raises(UnexpectedAnswer):
+        parse_order_event({"clientOrderId": key, "data": {**_TRIGGER, "lastQuantity": 1}})

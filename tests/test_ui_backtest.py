@@ -751,6 +751,36 @@ def test_returning_to_current_data_reaches_the_port(window) -> None:
     assert window.port.calls == ["recent"]
 
 
+def test_the_banner_itself_carries_a_visible_return_button(window, qapp) -> None:
+    """Стережёт: на ширине 1366 кнопка возврата видна на самой плашке.
+
+    Заказчик 18.11.2026 (Windows, 1366 точек): пункт «Вернуться к текущим
+    данным» в конце панели ушёл под », и выхода из прогона он не нашёл.
+    Кнопка на плашке — внутри неё, не поверх текста, и зовёт порт.
+    """
+    from ui.models import RobotState
+
+    window.resize(1366, 728)
+    window.apply_state(RobotState(history_span=(
+        "Показан прогон на истории: 01.11.2026 10:05 — 14.11.2026 18:45 МСК, "
+        "торговых дней: 10. Живые свечи на этот отрезок не приходят."
+    )))
+    qapp.processEvents()
+    banner = window.history_banner
+    button = banner.action_button
+    assert button is not None, "на плашке нет кнопки возврата — только крестик"
+    assert button.isVisible(), "плашка показана, а кнопки на ней не видно"
+    assert "Вернуться к текущим данным" in button.text()
+    assert banner.rect().contains(button.geometry()), (
+        f"кнопка {button.geometry()} вылезла за плашку {banner.rect()}"
+    )
+    assert button.x() >= banner.width() - banner.contentsMargins().right(), (
+        "кнопка легла поверх текста плашки"
+    )
+    button.click()
+    assert window.port.calls == ["recent"], "кнопка на плашке не сняла отрезок"
+
+
 def test_the_cross_on_the_banner_unpins_the_span_instead_of_hiding_it(
     window, qapp
 ) -> None:

@@ -41,12 +41,15 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+import math
 import typing
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from itertools import chain
 from typing import Any, Final
 
+from app.fact import LiveLimits
 from backtest import Costs, Deal, HistoryRun, MinuteOrder, Pair, Plan, headline
 from engine import (
     DayMarks,
@@ -95,6 +98,10 @@ from ui.formatting import (
 )
 from ui.models import (
     EXPIRY_HALT_DAYS_LIMITS,
+    FIELD_CAPTIONS,
+    LIVE_LATER,
+    LIVE_LIMITS_BOUNDS,
+    TIME_EXIT_LIMIT_PCT_LIMITS,
     AfterTakeProfit,
     AlgorithmDemand,
     AlgorithmOption,
@@ -105,6 +112,7 @@ from ui.models import (
     DecisionRow,
     Layer,
     LinePoint,
+    LiveUnit,
     Marker,
     MarkerKind,
     MinutePriceOrder,
@@ -120,10 +128,14 @@ from ui.models import (
     TradePath,
     TradeRow,
     TradesSummary,
+    live_limit_fits,
+    live_limit_rule,
 )
 from ui.trade_story import OrderStep, Phase, TradeStory
 
 __all__ = [
+    "BROKER_TRAILING",
+    "AtBroker",
     "MONEY_FIELDS",
     "SettingsRefused",
     "TIMEFRAMES",
@@ -146,6 +158,7 @@ __all__ = [
     "run_costs",
     "minute_order_of",
     "minute_bar_limit_of",
+    "live_limits",
     "window_changes",
     "guard_changes",
     "all_changes",
@@ -364,6 +377,35 @@ def _time_exit_in_force(values: Settings) -> TimeExitOrder:
     return _TIME_EXIT_ORDERS[values.time_exit_order]
 
 
+def _time_exit_percent(values: Settings) -> float:
+    """Отступ предела выхода по концу окна, % — или отказ вслух (решение 0067).
+
+    Границы — те же, что у поля окна (`TIME_EXIT_LIMIT_PCT_LIMITS`): файл
+    настроек правится и руками, а движок проверяет только арифметику (больше
+    нуля и меньше ста). Без этой проверки 50 % из файла ушли бы в предел
+    молча — продажа по половине цены.
+
+    Отказ — `ValueError`, как у границ самого движка, а не `SettingsRefused`:
+    на нём стоят оба пути, которые обязаны его поймать, — «Применить»
+    («Значение не годится…», `HistoryPort.apply_settings`) и запуск с файлом,
+    где негодное число ставится в умолчание вслух (`_numbers_repaired`).
+    `SettingsRefused` при запуске программу не открыл бы вовсе (`B-050`).
+
+    :raises ValueError: число вне границ или не число.
+    """
+    low, high = TIME_EXIT_LIMIT_PCT_LIMITS
+    share = values.time_exit_limit_pct
+    if (
+        isinstance(share, bool) or not isinstance(share, (int, float))
+        or not math.isfinite(share) or not low <= share <= high
+    ):
+        raise ValueError(
+            f"отступ предельной цены — от {_plain(low)} до {_plain(high)} % "
+            f"от закрытия свечи, а стоит {share!r}"
+        )
+    return float(share)
+
+
 #: Откуда движок берёт каждое своё поле, если оно **приходит из окна**.
 #:
 #: Таблица, а не перечисление в конструкторе, и по той же причине, что
@@ -398,6 +440,11 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     "stop_after_take_profit": lambda values, _mode: (
         values.after_take_profit is AfterTakeProfit.STOP_FOR_THE_DAY
     ),
+    # Третий вариант списка «После сработавшего тейка» (`B-106`, `B-109`):
+    # «ждать нового сигнала», плюс первый убыток в окне закрывает окно для входов.
+    "stop_after_loss": lambda values, _mode: (
+        values.after_take_profit is AfterTakeProfit.WAIT_THEN_STOP_ON_LOSS
+    ),
     "commission_per_side": lambda values, _mode: values.commission_per_side_rub,
     # ⚠️ Стоимость пункта переехала сюда из «полей, которых в окне нет»
     # 05.09.2026 (`B-021`). Прежде она бралась у прежних настроек движка
@@ -416,8 +463,11 @@ _ENGINE_FROM_WINDOW: dict[str, Callable[[Settings, Mode], object]] = {
     # Выход по концу окна с предельной ценой (Э5, задача З8, Ф3): три поля
     # окна на вкладке «Торговое окно». Форма — таблицей `_TIME_EXIT_ORDERS`.
     "time_exit_order": lambda values, _mode: _time_exit_in_force(values),
-    "time_exit_limit_steps": lambda values, _mode: values.time_exit_limit_steps,
+    "time_exit_limit_percent": lambda values, _mode: _time_exit_percent(values),
     "time_exit_wait_bars": lambda values, _mode: values.time_exit_wait_bars,
+    # «Заходить заново при обрыве связи» (решение 0067, Р-10 п. 9): что делать
+    # с позицией в убытке, когда уровень задет, а выход по нему не исполнился.
+    "hold_after_unfilled_level": lambda values, _mode: values.reenter_after_disconnect,
     # Календарь владельца счёта: отметки окна → набор дат движка. Перевод,
     # а не правило: что значит отметка, решает `engine/window.py`.
     "calendar": lambda values, _mode: DayMarks.of(
@@ -1198,6 +1248,93 @@ def minute_bar_limit_of(values: Settings) -> int:
     return values.minute_bar_limit.minutes
 
 
+#: Поле `LiveLimits` → поле окна, из которого оно берётся. Таблица плюс один
+#: цикл, а не шесть строк конструктора: поле, заведённое исполнителю завтра
+#: и здесь не названное, ловит тест полноты
+#: (`tests/test_live_limits_settings.py`), а не память.
+#:
+#: ⚠️ `limit_exit_bars` здесь нет намеренно: сколько свечей ждать выхода
+#: с пределом — это `time_exit_wait_bars` движка, одно число на движок
+#: и исполнитель (находка проверки 2а/2б). Своего поля в окне у него нет
+#: и не будет; связывает его тот, кто собирает исполнитель.
+_LIVE_FROM_WINDOW: Final[dict[str, str]] = {
+    "stale_after": "live_stale_after_sec",
+    "event_wait": "live_event_wait_sec",
+    "fill_wait": "live_fill_wait_sec",
+    "cancel_wait": "live_cancel_wait_sec",
+    "position_settle": "live_position_settle_sec",
+    "reconnect_pauses": "live_reconnect_pauses_sec",
+    # Решение 0067, Р-5: отступ цены FOK (проценты) и ожидание планки (секунды).
+    "fok_percent": "live_fok_pct",
+    "band_wait": "live_band_wait_sec",
+    # D-196: защитный спред условной заявки скользящего тейка (проценты).
+    "trailing_spread_percent": "live_trailing_spread_pct",
+}
+
+
+def _plain(value: float) -> str:
+    """Число по-русски, без хвостовых нулей: `60`, `0,5`."""
+    return f"{value:g}".replace(".", ",")
+
+
+def _live_refused(field: str, said: str) -> SettingsRefused:
+    """Отказ поля «Бой»: подпись окна, граница словами, что стоит сейчас."""
+    return SettingsRefused(
+        f"«{FIELD_CAPTIONS[field]}» — {live_limit_rule(field)}, а стоит «{said}». "
+        "Прежние настройки остались в силе.",
+        field=field,
+    )
+
+
+def _live_pauses(values: Settings, field: str) -> tuple[float, ...]:
+    """Паузы переподключения в секундах — или отказ с подписью поля."""
+    value = getattr(values, field)
+    if live_limit_fits(field, value):
+        return tuple(float(item) for item in value)
+    raise _live_refused(field, _as_pauses(value))
+
+
+def _live_number(values: Settings, field: str) -> float:
+    """Одно число «Боя» в своей единице — или отказ с подписью поля."""
+    value = getattr(values, field)
+    if live_limit_fits(field, value):
+        return float(value)
+    raise _live_refused(field, _as_live(LIVE_LIMITS_BOUNDS[field].unit)(value))
+
+
+def live_limits(values: Settings) -> LiveLimits:
+    """Настройки окна → пределы ожидания боевого исполнителя. Или отказ вслух.
+
+    Одна функция перевода на все пути: проверка при «Применить» и сборка
+    исполнителя зовут её же, поэтому граница, проверенная в окне, — ровно
+    та, что дойдёт до брокера (решение 0066, правило 16).
+
+    ⚠️ Проверка здесь, а не только в `LiveLimits.__post_init__`: там
+    граница «больше нуля», а окно держит разумные пределы
+    (`LIVE_LIMITS_BOUNDS`), и отказ обязан назвать поле подписью окна —
+    `SettingsRefused.field` открывает вкладку с ним.
+
+    ⚠️ `limit_exit_bars` остаётся умолчанием `LiveLimits` — см.
+    `_LIVE_FROM_WINDOW`. Его кладёт тот, кто собирает исполнитель, из
+    `time_exit_wait_bars` движка.
+
+    Класс — из `app/fact.py`, шва без `broker/`: этот модуль импортирует
+    наблюдение (`app/observe.py`), которому брокер не положен по устройству.
+
+    :raises SettingsRefused: число вне границ, NaN, пустой или длинный список
+        пауз; `field` — имя поля окна.
+    """
+    pauses = _LIVE_FROM_WINDOW["reconnect_pauses"]
+    # `Any`: имена полей приходят из таблицы, и тип каждого сверяет не mypy,
+    # а `LiveLimits.__post_init__` и тест полноты таблицы.
+    numbers: dict[str, Any] = {
+        inner: _live_number(values, outer)
+        for inner, outer in _LIVE_FROM_WINDOW.items()
+        if outer != pauses
+    }
+    return LiveLimits(reconnect_pauses=_live_pauses(values, pauses), **numbers)
+
+
 # ---------------------------------------------------------------------------
 # Строки журнала об изменении настроек, о которых не расскажет никто другой
 # ---------------------------------------------------------------------------
@@ -1215,6 +1352,11 @@ class _Told:
     #: что предохранитель ещё не включён. Тихое «принято» читалось бы как
     #: «ограничение поставлено», а цена ошибки здесь — деньги на счёте.
     guard: bool = False
+    #: Хвост строки после «было → стало» — когда изменение начнёт
+    #: действовать, если не сразу. У полей «Бой» — `LIVE_LATER`
+    #: (правка 5.2 гейта 04.11.2026): исполнитель читает их при сборке
+    #: «факта» — включение боя, «Возобновить работу», перезапуск хода.
+    tail: str = ""
 
 
 def _as_text(value: object) -> str:
@@ -1247,6 +1389,32 @@ def _as_load_days(value: object) -> str:
     «скачаем всё», которого никто не давал.
     """
     return f"{value} дн."
+
+
+def _as_live(unit: LiveUnit) -> Callable[[object], str]:
+    """Число «Боя» в своей единице (`LIVE_LIMITS_BOUNDS`): «0,5 с», «2 %».
+
+    Оформитель по единице из таблицы границ, а не «секунды» на всех (правка
+    5.1 гейта 04.11.2026): отступ цены — проценты, и «2 с → 3 с» в журнале
+    назвало бы его не тем.
+
+    NaN и бесконечность — словами: JSON-разбор Питона пропускает `NaN`
+    из файла настроек, и «nan с» в отказе человеку ничего не скажет.
+    """
+
+    def show(value: object) -> str:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return unit.show(value) if math.isfinite(value) else "не число"
+        return str(value)
+
+    return show
+
+
+def _as_pauses(value: object) -> str:
+    """Паузы переподключения: «1, 2, 5, 10, 30 с». Пустой список — словами."""
+    if not isinstance(value, tuple) or not value:
+        return "не заданы"
+    return ", ".join(str(item) for item in value) + " с"
 
 
 def _as_source(value: object) -> str:
@@ -1320,6 +1488,19 @@ _WINDOW_TOLD: dict[str, _Told] = {
     # в прогоне двигается только на закрытии свечи (`B-058`).
     "minute_bar_limit": _Told("Наибольшая свеча для проверки по минуткам", _as_label),
     "log_directory": _Told("Каталог технического журнала", _as_text),
+    # Числа боевого исполнителя (вкладка «Бой», правило 16) — обходом
+    # таблицы границ: поле «Боя», заведённое завтра, получит строку само,
+    # и в своей единице. Подпись — та же, что у строки окна: человек ищет
+    # поле по ней. Движок и алгоритм их не знают — рассказать больше некому.
+    # Хвост — с какого момента действует (правка 5.2 гейта 04.11.2026).
+    **{
+        name: _Told(
+            FIELD_CAPTIONS[name],
+            _as_pauses if name == "live_reconnect_pauses_sec" else _as_live(bound.unit),
+            tail=LIVE_LATER,
+        )
+        for name, bound in LIVE_LIMITS_BOUNDS.items()
+    },
     # Три предохранителя: у каждого галочка и число, и в журнал идут оба.
     # Одна галочка без числа читалась бы как «включил и всё» — а включение
     # без числа не значит ничего; одно число без галочки читалось бы как
@@ -1351,8 +1532,10 @@ _TOLD_BY_ENGINE: frozenset[str] = frozenset({
     "trailing_step_pct", "after_take_profit", "commission_per_side_rub",
     "ruble_per_point",
     # Выход по концу окна и шаг цены (Ф3 задачи З8): поля движка.
-    "time_exit_order", "time_exit_limit_steps", "time_exit_wait_bars",
+    "time_exit_order", "time_exit_limit_pct", "time_exit_wait_bars",
     "price_step",
+    # Р-10: строку «Заходить заново при обрыве связи: нет → да» пишет движок.
+    "reenter_after_disconnect",
     # Календарь нерабочих дней: отметки уезжают в `EngineSettings.calendar`,
     # и строку «Календарь нерабочих дней: нет → 12.06.2026 не торгуем» пишет
     # движок. Своей строки в окне у него нет намеренно — двух строк об одном
@@ -1429,7 +1612,7 @@ def _changes_by_field(
         (
             name,
             f"{told.label}: {told.show(getattr(previous, name))} → "
-            f"{told.show(getattr(now, name))}",
+            f"{told.show(getattr(now, name))}" + (f" — {told.tail}" if told.tail else ""),
         )
         for name, told in _WINDOW_TOLD.items()
         if told.guard is guard and getattr(previous, name) != getattr(now, name)
@@ -2036,6 +2219,27 @@ def trades_summary(run: HistoryRun) -> TradesSummary:
     )
 
 
+#: Насколько вперёд от последней свечи ряда продолжается разбор затенения.
+#: Константа показа, а не торговое число: на решения робота она не влияет,
+#: только на то, докуда вправо нарисована полоса. Суток хватает с запасом:
+#: в будний день полоса успевает дойти до ближайшего открытия окна, а дальше
+#: правого края экрана её всё равно не видно.
+_SHADE_AHEAD: Final = timedelta(days=1)
+
+
+def _bars_ahead(last: MarketCandle) -> Iterator[MarketCandle]:
+    """Воображаемые бары того же таймфрейма после `last` — на `_SHADE_AHEAD` вперёд.
+
+    Первый из них стоит на месте растущей свечи, которую порт дорисовывает
+    после прогона (`_keep_forming`), остальные — будущее справа. Цены у них
+    чужие и не читаются: нужно только время, и закрытие считается тем же
+    `close_time`, что у настоящих свечей.
+    """
+    step = last.timeframe.delta
+    for count in range(1, _SHADE_AHEAD // step + 1):
+        yield last.replace(time=last.time + count * step)
+
+
 def shades_of(
     candles: Sequence[MarketCandle], settings: EngineSettings
 ) -> tuple[Shade, ...]:
@@ -2066,6 +2270,14 @@ def shades_of(
     закрытая биржа, — и полоса называет ту, которая была. Различает их движок
     (`day_verdict`), не мы: вторая реализация правила разошлась бы с первой
     молча, и на графике была бы затенена не та половина.
+
+    ⚠️ Разбор не кончается на последней свече ряда. Справа от неё — растущая
+    свеча и будущее, и прежде полоса обрывалась на последней закрытой: в 07:22
+    при окне 09:10–11:00 правый край графика выглядел как идущее окно
+    (17.11.2026). Поэтому за рядом тот же разбор идёт по воображаемым барам
+    того же таймфрейма (`_bars_ahead`) — тем же закрытием и теми же
+    предикатами движка, — и полоса продолжается без шва. Продолжение живёт
+    здесь, а не у вызывающего: забыть его в проводке нельзя.
     """
     if not candles:
         return ()
@@ -2074,7 +2286,7 @@ def shades_of(
     end: datetime | None = None
     outside = False
     rules: set[DayRule] = set()
-    for candle in candles:
+    for candle in chain(candles, _bars_ahead(candles[-1])):
         closes_at = close_time(candle)
         # ⚠️ Окно «весь день» (начало равно концу) отдельной проверки не имеет
         # намеренно: `contains` для него возвращает True всегда, и единственной
@@ -2180,6 +2392,25 @@ def chart_time(closes_at: datetime, timeframe: Timeframe) -> datetime:
     return bar_open(closes_at - timeframe.delta, timeframe)
 
 
+#: Подпись причины выхода, когда скользящий тейк вёл брокер условной заявкой
+#: (`D-196`, B-104). Движок подписывает такой выход «скользящий уровень» —
+#: он не знает, кто вёл уровень; знает журнал команд (`app/live_history.py`).
+BROKER_TRAILING = "скользящий тейк у брокера"
+
+
+@dataclass(frozen=True, slots=True)
+class AtBroker:
+    """Что брокер сообщил о сделках боя сверх движка — для меток «Факта» (B-104).
+
+    `executed` — имя заявки → момент исполнения у брокера (секунда, а не свеча);
+    `trailing` — имена выходов, уровень которых вёл брокер условной заявкой.
+    Собирает `app/live_history.py::at_broker` из журнала команд.
+    """
+
+    executed: Mapping[str, datetime] = dataclasses.field(default_factory=dict)
+    trailing: frozenset[str] = frozenset()
+
+
 def markers_and_paths(
     run: HistoryRun,
     pairs: Sequence[Pair],
@@ -2187,6 +2418,7 @@ def markers_and_paths(
     timeframe: Timeframe,
     *,
     pending: Unfilled,
+    broker: AtBroker | None = None,
 ) -> tuple[tuple[Marker, ...], tuple[TradePath, ...]]:
     """Метки и линии обоих слоёв: «прогноз» и «факт» (DOMAIN.md §8).
 
@@ -2205,7 +2437,15 @@ def markers_and_paths(
       тоже ⊗, но со своей подсказкой: прогон кончился до исполнения
       (`Unfilled.CUT`);
     * **прогноза нет** — метка «сделка вне расчёта» на слое факта. Разбирается
-      как дефект, поэтому у неё своя форма и свой цвет, а не общая.
+      как дефект, поэтому у неё своя форма и свой цвет, а не общая;
+    * **бой: после выхода по условной у брокера** (`broker`, `D-196`, B-104)
+      сделки без пары — не дефект и не «сигнал пропущен»: брокер ведёт уровень
+      по сделкам и без шага, «прогноз» — сам, по минуткам с шагом, и дальше
+      слои идут разными сделками. Метка — обычная своего слоя, подсказка
+      объясняет расхождение словами.
+
+    :param broker: что брокер сообщил о сделках боя — время исполнения
+        и выходы по условной. `None` — не бой: метки как прежде.
 
     :param pending: что будет с заявками из `run.waiting` по сведениям
         **порта** — того, чего движок этого прогона не знает. Считает порт
@@ -2226,14 +2466,16 @@ def markers_and_paths(
     """
     fate = Unfilled.MISSED if run.halted else pending
     unfilled = {order_id: fate for order_id in run.waiting}
+    since = _broker_apart_since(run, broker)
     markers: list[Marker] = []
     for pair in pairs:
-        note = _divergence(pair, unfilled)
+        apart = _apart(pair, since, unfilled)
+        note = _divergence(pair, unfilled, broker=broker, since=since if apart else None)
         if pair.plan is not None:
             markers.append(Marker(
                 time=chart_time(pair.plan.decided_at, timeframe),
                 price=pair.plan.price,
-                kind=_plan_kind(pair, reversals, unfilled),
+                kind=_plan_kind(pair, reversals, unfilled, apart=apart),
                 layer=Layer.PLAN,
                 tooltip=note,
                 pair_id=pair.order_id,
@@ -2243,7 +2485,7 @@ def markers_and_paths(
                 time=bar_open(pair.fill.at, timeframe),
                 price=pair.fill.price,
                 kind=(
-                    MarkerKind.UNPLANNED if pair.plan is None
+                    MarkerKind.UNPLANNED if pair.plan is None and not apart
                     else _fill_kind(pair, reversals)
                 ),
                 layer=Layer.FACT,
@@ -2324,14 +2566,17 @@ _UNFILLED: Final[dict[Unfilled, tuple[MarkerKind, str]]] = {
 
 
 def _plan_kind(
-    pair: Pair, reversals: frozenset[str], unfilled: Mapping[str, Unfilled]
+    pair: Pair, reversals: frozenset[str], unfilled: Mapping[str, Unfilled],
+    *, apart: bool = False,
 ) -> MarkerKind:
     """Метка слоя «прогноз». Расчёт без сделки — по причине (`_UNFILLED`).
 
-    Ждущая заявка — «заявка подана»; прочее без сделки — ⊗.
+    Ждущая заявка — «заявка подана»; прочее без сделки — ⊗. Кроме сделки
+    «прогноза» после выхода по условной у брокера (`apart`, B-104): у боя
+    её нет штатно, и метка — обычная, а не «сигнал пропущен».
     """
     assert pair.plan is not None
-    if pair.fill is None:
+    if pair.fill is None and not apart:
         kind, _ = _UNFILLED[unfilled.get(pair.order_id, Unfilled.MISSED)]
         return kind
     if pair.plan.action is OrderAction.OPEN:
@@ -2347,7 +2592,59 @@ def _fill_kind(pair: Pair, reversals: frozenset[str]) -> MarkerKind:
     return MarkerKind.EXIT
 
 
-def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
+def _broker_apart_since(run: HistoryRun, broker: AtBroker | None) -> datetime | None:
+    """С какой свечи «факт» мог уйти от «прогноза» из-за уровня у брокера (B-104).
+
+    Первый выход по условной у брокера: до него у пары один ход и одни
+    имена заявок, после — у брокера и у тени разные выходы, а значит,
+    и разные следующие входы. `None` — таких выходов не было.
+    """
+    if broker is None or not broker.trailing:
+        return None
+    moments = [fill.at for fill in run.fills if fill.order_id in broker.trailing]
+    return min(moments) if moments else None
+
+
+def _apart(pair: Pair, since: datetime | None, unfilled: Mapping[str, Unfilled]) -> bool:
+    """Сделка без пары после выхода по условной у брокера — расхождение штатное.
+
+    Сделка «факта» без расчёта — на свече выхода брокера или позже. Расчёт
+    «прогноза» без сделки — решённый после неё и не ждущий исполнения:
+    поданная заявка по-прежнему «заявка подана» (`_UNFILLED`).
+    """
+    if since is None:
+        return False
+    if pair.plan is None:
+        return pair.fill is not None and pair.fill.at >= since
+    return pair.fill is None and pair.order_id not in unfilled and pair.plan.decided_at > since
+
+
+def _fill_moment(pair: Pair, broker: AtBroker | None) -> str:
+    """Когда исполнена сделка: секунда у брокера, если известна, иначе свеча движка."""
+    assert pair.fill is not None
+    executed = None if broker is None else broker.executed.get(pair.order_id)
+    if executed is not None:
+        return f"исполнена {fmt_datetime(executed, seconds=True)} МСК"
+    return f"свеча {fmt_datetime(pair.fill.at)} МСК"
+
+
+def _broker_apart_words(since: datetime) -> str:
+    """Почему у сделки нет пары — словами (B-104)."""
+    return (
+        f"Пары в другом слое нет — это штатно. Со свечи {fmt_datetime(since)} МСК "
+        "скользящий тейк боя вела условная заявка у брокера: брокер ведёт уровень "
+        "по сделкам и без шага, а «прогноз» — сам, по минуткам и с шагом подтяжки. "
+        "После выхода брокера слои идут разными сделками до конца дня."
+    )
+
+
+def _divergence(
+    pair: Pair,
+    unfilled: Mapping[str, Unfilled],
+    *,
+    broker: AtBroker | None = None,
+    since: datetime | None = None,
+) -> str:
     """Подсказка при наведении: расчёт, факт и расхождение (ТЗ §4.5).
 
     Оформление берётся у окна (`ui.formatting`), а не пишется здесь заново:
@@ -2356,13 +2653,32 @@ def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
     У поданной заявки без исполнения (`unfilled`, таблица `_UNFILLED`)
     подсказка говорит, что она подана, — а не «не состоялся»: ровно эти
     слова владелец счёта 12.10.2026 прочёл как «заявки не было».
+
+    `since` — пара разошлась штатно после выхода по условной у брокера
+    (`_apart`): подсказка объясняет это, а не называет дефектом (B-104).
+    Время сделки «факта» в бою — секунда исполнения у брокера (`broker`).
     """
     if pair.plan is None:
+        if since is not None and pair.fill is not None:
+            what = "Вход" if pair.fill.action is OrderAction.OPEN else "Выход"
+            return (
+                f"{what} боя: {fmt_price(pair.fill.price)}, {_fill_moment(pair, broker)}.\n"
+                f"{_broker_apart_words(since)}"
+            )
         return (
             "Сделка, которой расчёт не предполагал. Разбирается как дефект: "
             "в журнале решений должна быть строка о ней."
         )
     what = "Вход" if pair.plan.action is OrderAction.OPEN else "Выход"
+    if pair.fill is None and since is not None:
+        reason = (
+            f" ({pair.plan.exit_reason.label})"
+            if pair.plan.exit_reason is not None else ""
+        )
+        return (
+            f"{what} «прогноза»{reason}: {fmt_price(pair.plan.price)}. У боя такой "
+            f"сделки нет.\n{_broker_apart_words(since)}"
+        )
     if pair.fill is None:
         reason = (
             f" ({pair.plan.exit_reason.label})"
@@ -2370,15 +2686,25 @@ def _divergence(pair: Pair, unfilled: Mapping[str, Unfilled]) -> str:
         )
         _, tail = _UNFILLED[unfilled.get(pair.order_id, Unfilled.MISSED)]
         return f"{what} по расчёту{reason}: {fmt_price(pair.plan.price)}{tail}"
+    moment = (
+        _fill_moment(pair, broker) if broker is not None
+        else f"{fmt_datetime(pair.fill.at)} МСК"
+    )
     lines = [
         f"{what}. Расчётная цена: {fmt_price(pair.plan.price)}",
-        f"Фактическая: {fmt_price(pair.fill.price)}, {fmt_datetime(pair.fill.at)} МСК",
+        f"Фактическая: {fmt_price(pair.fill.price)}, {moment}",
     ]
     if pair.favour_points is not None and pair.favour_rubles is not None:
         better = "в пользу позиции" if pair.favour_points >= 0 else "против позиции"
         lines.append(
             f"Расхождение: {fmt_price(abs(pair.favour_points), 0)} пунктов, "
             f"{fmt_money(abs(pair.favour_rubles))} {better}"
+        )
+    if broker is not None and pair.order_id in broker.trailing:
+        lines.append(
+            "Выход — скользящий тейк у брокера: уровень вела условная заявка "
+            "по сделкам и без шага, «прогноз» ведёт его сам, по минуткам "
+            "с шагом. Расхождение выходов штатное."
         )
     return "\n".join(lines)
 

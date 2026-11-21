@@ -11,10 +11,12 @@
 модуль умеет спрашивать у брокера **состояние счёта** и класть деньги в движок
 (`FundsWatch`, решения 0035, 0037 и 0040): без этого два предохранителя из трёх
 не работают в принципе — они считаются от размера счёта, а размер счёта знает
-брокер. Получателя денег называет **боевая** сборка вызовом
-`LiveLink.deliver_funds_to`, и по умолчанию его нет: прогон по истории
-и наблюдение на живом потоке размера счёта не имеют и иметь не должны, иначе
-движок начнёт различать, откуда пришла свеча (`ARCHITECTURE.md` §1).
+брокер. Получателя денег называет сборка программы вызовом
+`LiveLink.deliver_funds_to`, и по умолчанию его нет. Получатель — порт: он
+запоминает снимок (бой без него не включается, `D-044`) и отдаёт его движкам
+**только пары боя**. Прогон по истории и наблюдение на живом потоке размера
+счёта не имеют и иметь не должны, иначе движок начнёт различать, откуда пришла
+свеча (`ARCHITECTURE.md` §1, решение 0037).
 
 ⚠️ **Два пути к графику, и пересечься им нечем.** Всё, что **хранится**, идёт
 одной дорогой: поток пишет в `minute_candle`, окно перечитывает базу. Мимо базы
@@ -123,6 +125,23 @@
 Код класса при этом не меняется: он задаётся ключом `--stream-class` и в окне
 не редактируется.
 
+⚠️ Отстающий поток переподключается сам
+---------------------------------------
+Боевой прогон 13.11.2026: машину заняли тесты, программа не успевала читать
+сокет, и **после ухода нагрузки** соединение осталось отстающим — минута
+приходила через 2–4 минуты, часть не пришла вовсе, а второй поток, открытый
+рядом, получал каждую минуту сразу. Брокер был исправен, испорчено было
+соединение. Пятиминутки из неполных минут выбрасывались, робот вошёл в 11:52
+и до ручного переподключения не получил ни одной целой свечи.
+
+Отсюда сторож (`LiveFeed._guard`, срок — `lag_due`): **таймер, а не проверка
+на приходе снимка** — главный случай как раз «снимков нет». Порог — поле
+«Допустимое опоздание» вкладки «Бой» (`live_stale_after_sec`), свежим чтением.
+Сработал — строка в журнал и переподключение тем же путём, что при обрыве,
+с догрузкой пропущенного (`StreamLagging`). Запись законченной минуты в базу
+вынесена из чтения сокета в отдельную задачу (`LiveFeed._race`): база одна
+на прогон, рисунок и таблицу, и ожидание её очереди останавливало приём снимков.
+
 Чего здесь намеренно нет — и почему
 -----------------------------------
 Правил закрытия бара по часам, подачи свечей в движок, догрузки после обрыва,
@@ -163,10 +182,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import enum
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -174,8 +194,10 @@ from time import monotonic
 from typing import TYPE_CHECKING, Final, Protocol
 
 from app import debug_feed
+from app.account_panel import AccountPanel, AccountSeen, robot_live_orders
 from app.backfill import Backfiller
 from app.halt import halt_on_unknown_outcome
+from app.live_trading import LiveDesks
 from broker.account import SNAPSHOT_INTERVAL, Account, AccountSnapshot
 from broker.candles import History
 from broker.clock import Verdict
@@ -185,11 +207,13 @@ from broker.schedule import DailySchedule, Schedule, TradingStatus
 from broker.session import BrokerSession
 from broker.stream import CandleSnapshot, candle_stream, snapshot_of
 from broker.token_store import TokenStore
+from broker.tokens import now_utc
 from engine import AccountFunds
 from market import MSK, MarketWorker, floor_to_minute
 from market import Candle as MarketCandle
+from market.commands import StoredCommand
 from market.storage import Source
-from ui.models import Connection, DecisionLevel
+from ui.models import Connection, DecisionLevel, Settings
 
 if TYPE_CHECKING:  # только для подписи: порт живёт в `app/port.py`
     from app.port import HistoryPort
@@ -228,6 +252,77 @@ class SnapshotsLate(BrokerError):
             "Программа переподключится сама.",
             f"first snapshot not received in {waited:.0f} s",
         )
+
+
+class StreamLagging(BrokerError):
+    """Поток открыт, а снимков нет или они старые дольше порога (`lag_due`).
+
+    Повтор помогает — это и есть лечение: на 13.11.2026 отстающее соединение
+    выправилось только переподключением, а брокер всё это время был исправен.
+
+    `aloud` — говорить ли в журнал решений. Молчат два случая: биржа закрыта
+    по расписанию (поток затих по делу, «Биржа закрыта» скажет `_wait_out`)
+    и повтор на той же минуте после переподключения — о ней уже сказано,
+    а брокер подтвердил, что новее у него ничего нет (затишье). Технический
+    лог получает каждое срабатывание.
+    """
+
+    retryable = True
+
+    def __init__(self, human: str, technical: str, *, aloud: bool) -> None:
+        super().__init__(human, technical)
+        self.aloud = aloud
+
+
+def lag_due(*, heard_at: datetime, minute: datetime, since: datetime, after: float) -> datetime:
+    """Когда поток объявляется отстающим, если до тех пор ничего не придёт.
+
+    Два признака, срабатывает ранний:
+
+    * **снимков нет** дольше порога: `heard_at + after`;
+    * **снимки старые**: минута последнего снимка закончилась дольше порога
+      назад, а снимков следующей нет — `конец минуты + after`. Ровно случай
+      13.11.2026: снимки шли, но по минуте, закончившейся минуты назад.
+
+    Второй отсчёт идёт не раньше начала захода (`since`): сразу после
+    подписки брокер присылает свечу прошлой минуты (замер в
+    `.docs/broker-api/20-ws-last-candle.md`), и без этого заход, открытый
+    после затишья, рвался бы немедленно.
+    """
+    return min(heard_at, max(minute + timedelta(minutes=1), since)) + timedelta(seconds=after)
+
+
+def lag_words(minute: datetime, now: datetime) -> str:
+    """Строка журнала: какая минута последняя, который час, что делаем."""
+    return (
+        f"Поток брокера отстаёт: последняя минута {minute.astimezone(MSK):%H:%M}, "
+        f"сейчас {now.astimezone(MSK):%H:%M:%S} — переподключаюсь. Пропущенные "
+        "минуты догрузятся у брокера. Если по инструменту просто нет сделок, "
+        "это затишье, а не сбой."
+    )
+
+
+def _settings_lag_after() -> float:
+    """Порог сторожа, пока сборка не дала свой: умолчание поля окна."""
+    return float(Settings().live_stale_after_sec)
+
+
+def _msk_now() -> datetime:
+    return datetime.now(MSK)
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedMinute:
+    """Законченная минута в очереди записи: инструмент, последний снимок, итог.
+
+    Инструмент — свой у каждой минуты, а не текущий у потока: смена
+    инструмента не должна положить минуту прежнего под новый символ.
+    """
+
+    ticker: str
+    last: CandleSnapshot
+    tally: MinuteTally
+
 
 #: Сколько ждать закрытия сокета при завершении программы. Мёртвый сокет
 #: не должен держать завершение (миниплан Э1-5, §4.6): по истечении задача
@@ -859,6 +954,51 @@ class LiveFeed:
         #: за выходные их 192. Журнал из 192 одинаковых строк — то же
         #: молчание, только громкое.
         self._doubted: set[ScheduleDoubt] = set()
+        #: Сторож отставания (`_guard`): порог в секундах, часы и сон.
+        #: Порог даёт сборка (`pace`); часы и сон подставляет проверка.
+        self._lag_after: Callable[[], float] = _settings_lag_after
+        self._now: Callable[[], datetime] = _msk_now
+        self._nap: Callable[[float], Awaitable[None]] = asyncio.sleep
+        #: По часам `_now`: начало захода, приход последнего своего снимка
+        #: и самая поздняя его минута. Сбрасываются на каждом заходе.
+        self._since: datetime | None = None
+        self._heard_at: datetime | None = None
+        self._heard_minute: datetime | None = None
+        #: Минута, об отставании на которой уже сказано в журнал. Снимается
+        #: первым снимком более поздней минуты: поток догнал часы.
+        self._lag_minute: datetime | None = None
+        #: Очередь записи законченных минут захода (`_race`), сколько в ней
+        #: ещё не записано и растущая минута, придержанная до записи.
+        self._queue: asyncio.Queue[ClosedMinute | None] | None = None
+        self._unwritten = 0
+        self._held: tuple[str, MarketCandle] | None = None
+        #: Первый принятый снимок минуты, ещё не сказанный в ленту (`_show`).
+        self._started: MarketCandle | None = None
+
+    @property
+    def lag_after(self) -> float:
+        """Порог сторожа отставания, секунды — читается на каждой проверке."""
+        return self._lag_after()
+
+    def pace(
+        self,
+        after: Callable[[], float],
+        *,
+        now: Callable[[], datetime] | None = None,
+        nap: Callable[[float], Awaitable[None]] | None = None,
+    ) -> None:
+        """Дать сторожу отставания порог: `live_stale_after_sec`, свежим чтением.
+
+        Вызов, а не довод конструктора, — по той же причине, что `follow`
+        (`PLR0913`). Без вызова сторож работает с умолчанием поля окна.
+        `now` и `nap` — часы и сон; их подставляет проверка, чтобы минуты
+        шли без настоящего ожидания.
+        """
+        self._lag_after = after
+        if now is not None:
+            self._now = now
+        if nap is not None:
+            self._nap = nap
 
     def follow(self, hours: TradingHours) -> None:
         """Дать потоку расписание торгов: закрытую биржу он тогда не долбит.
@@ -930,6 +1070,7 @@ class LiveFeed:
         self._tally = None
         self._last = None
         self._complaint = None
+        self._lag_minute = None
         self._foreign.clear()
         self._watch.say(
             "Инструмент подписки изменён",
@@ -1036,7 +1177,8 @@ class LiveFeed:
                 self._complain(str(unknown), unknown.technical)
             except BrokerError as error:
                 final = not error.retryable
-                self._complain(str(error), error.technical)
+                aloud = not isinstance(error, StreamLagging) or error.aloud
+                self._complain(str(error), error.technical, aloud=aloud)
             except Exception as error:  # трассировка уходит в log.exception ниже
                 final = True
                 # Мимо ленты: в ней эта беда — строкой журнала из `_complain`.
@@ -1219,8 +1361,11 @@ class LiveFeed:
         self._complaint = text
         self._watch.say(event, text, level)
 
-    def _complain(self, text: str, technical: str = "") -> None:
+    def _complain(self, text: str, technical: str = "", *, aloud: bool = True) -> None:
         """Причина обрыва: в лог — всегда, в журнал окна — один раз.
+
+        `aloud=False` — только в лог: так молчат повторы сторожа отставания
+        (`StreamLagging.aloud`).
 
         Технический лог получает **обе** половины отказа: человеческую фразу
         и `BrokerError.technical`. До 05.09.2026 причина уходила только
@@ -1239,7 +1384,8 @@ class LiveFeed:
             # а каждый заход виден строкой фазы (`_phase`).
             extra={"panel": False},
         )
-        self._say_once("Связь с брокером", text, DecisionLevel.WARNING)
+        if aloud:
+            self._say_once("Связь с брокером", text, DecisionLevel.WARNING)
 
     async def _drain(self) -> None:
         """Дождаться задач, снятых кнопкой: прежний сокет закрывается до нового.
@@ -1276,6 +1422,8 @@ class LiveFeed:
             await self._worker.open()
         self._tally = None
         self._last = None
+        self._heard_at = self._heard_minute = None
+        self._unwritten, self._held, self._started = 0, None, None
         async with candle_stream(
             self._session,
             ticker=self._ticker,
@@ -1285,8 +1433,55 @@ class LiveFeed:
             # Сокет открыт, снимков ещё нет. У брокера это 3–17 секунд
             # (замер `B-007`), и до `B-022` окно всё это время говорило
             # то же самое, что при неудачной попытке.
+            self._since = self._now()
             self._phase(LinkPhase.AWAITING_FIRST)
-            await self._read(socket)
+            await self._race(socket)
+
+    async def _race(self, socket: object) -> None:
+        """Чтение, запись минут и сторож — три задачи захода; исход решает первая.
+
+        Паттерн — надзор над группой задач, а не `asyncio.TaskGroup`: тот
+        заворачивает отказ в `ExceptionGroup`, и `_ride` перестал бы отличать
+        обрыв, который лечится повтором, от беды программы. Здесь отказ
+        первой закончившейся задачи поднимается **как был**, и поднимается
+        внутри `candle_stream` — отказ сокета переводится в отказ слоя там же,
+        где переводился до 13.11.2026.
+
+        ⚠️ Запись — отдельной задачей, а не ожиданием в чтении. База одна
+        на прогон, рисунок и таблицу контрактов (`MarketWorker`, один поток),
+        и `put_minutes` в чтении ждал всю её очередь: приём снимков вставал,
+        `websockets` переставал читать из сети, брокер копил отставание.
+        Порядок минут держит одна задача записи над очередью.
+
+        Чтение или сторож закончились — очередь **дописывается** до конца:
+        минута, уже прочитанная, не теряется на переподключении. Отказ записи
+        важнее обрыва: это беда программы, и повтор её не лечит.
+        """
+        queue: asyncio.Queue[ClosedMinute | None] = asyncio.Queue()
+        self._queue = queue
+        reader = asyncio.ensure_future(self._read(socket))
+        guard = asyncio.ensure_future(self._guard())
+        writer = asyncio.ensure_future(self._write(queue))
+        try:
+            done, _ = await asyncio.wait(
+                (reader, guard, writer), return_when=asyncio.FIRST_COMPLETED
+            )
+            first = writer if writer in done else reader if reader in done else guard
+            for task in (reader, guard):
+                if task is not first:
+                    task.cancel()
+            await asyncio.wait((reader, guard))
+            for task in (reader, guard):
+                if task is not first and not task.cancelled():
+                    task.exception()  # второй отказ того же захода прочитан и отброшен
+            if first is not writer:
+                queue.put_nowait(None)
+                await writer
+            first.result()
+        finally:
+            self._queue = None
+            for task in (reader, guard, writer):
+                task.cancel()
 
     async def _read(self, socket: object) -> None:
         """Чтение сообщений открытого сокета до обрыва.
@@ -1327,7 +1522,10 @@ class LiveFeed:
                     DecisionLevel.INFO,
                 )
                 first = False
-            if not announced and self._foreign_of(snapshot) is None:
+            own = self._foreign_of(snapshot) is None
+            if own:
+                self._heard(snapshot)
+            if not announced and own:
                 # ⚠️ Минута захода объявляется **один раз** и только по
                 # **своему** снимку (`D-023`): M5 в канале M1 или чужой
                 # инструмент задали бы догрузке границу по своему времени,
@@ -1338,7 +1536,68 @@ class LiveFeed:
                 # закрываться, и лечение дыры само сделало бы новую.
                 announced = True
                 self._watch.connected(floor_to_minute(snapshot.opened_at))
-            await self._accept(snapshot)
+            self._accept(snapshot)
+
+    def _heard(self, snapshot: CandleSnapshot) -> None:
+        """Свой снимок пришёл: отметить для сторожа время прихода и минуту.
+
+        Отвергнутый снимок (`tally_after`) тоже считается: он доказывает,
+        что поток живой и какая у брокера минута, — это и меряет сторож.
+        Минута позже той, об отставании на которой сказано, снимает
+        отметку: поток догнал часы, и следующее отставание — снова вслух.
+        """
+        minute = floor_to_minute(snapshot.opened_at)
+        self._heard_at = self._now()
+        if self._heard_minute is None or minute > self._heard_minute:
+            self._heard_minute = minute
+        if self._lag_minute is not None and minute > self._lag_minute:
+            self._lag_minute = None
+
+    async def _guard(self) -> None:
+        """Сторож отставания потока: таймер, а не проверка на приходе снимка.
+
+        Проверка на приходе не видит главного случая — снимков нет вовсе.
+        Сторож спит до срока (`lag_due`), просыпается и считает заново:
+        пришли снимки — срок отодвинулся, нет — поток отстаёт. До первого
+        своего снимка срока нет: там стережёт `FIRST_SNAPSHOT_WAIT`.
+        Порог читается на каждом круге — правка в окне действует сразу.
+        """
+        while True:
+            after, now = self.lag_after, self._now()
+            due = self._lag_due(after)
+            if due is not None and now >= due:
+                raise await self._lagging(now, after)
+            await self._nap(after if due is None else (due - now).total_seconds())
+
+    def _lag_due(self, after: float) -> datetime | None:
+        heard_at, minute, since = self._heard_at, self._heard_minute, self._since
+        if heard_at is None or minute is None or since is None:
+            return None
+        return lag_due(heard_at=heard_at, minute=minute, since=since, after=after)
+
+    async def _lagging(self, now: datetime, after: float) -> StreamLagging:
+        """Отказ «поток отстаёт»: вслух — один раз на минуту и только при торгах.
+
+        Расписание спрашивается здесь, а не перед каждой проверкой: оно
+        нужно только тогда, когда поток затих, — на клиринге и вечером
+        поток молчит по делу, и строка «отстаёт» была бы ложной тревогой.
+        Повтор переподключения при этом остаётся: дальше `_ride` спросит
+        расписание и будет ждать открытия, не долбя брокера.
+        """
+        minute = self._heard_minute or now
+        heard_at = self._heard_at or now
+        shut = await self._shut()
+        aloud = shut is None and self._lag_minute is None
+        if aloud:
+            self._lag_minute = minute
+        technical = (
+            f"поток {self._ticker} отстаёт: последний снимок "
+            f"{(now - heard_at).total_seconds():.0f} с назад, минута "
+            f"{minute.astimezone(MSK):%H:%M} МСК, порог {after:.0f} с"
+            f"{'; биржа закрыта по расписанию' if shut is not None else ''}"
+            f"{'' if aloud or shut is not None else '; об этой минуте уже сказано'}"
+        )
+        return StreamLagging(lag_words(minute, now), technical, aloud=aloud)
 
     def _foreign_of(self, snapshot: CandleSnapshot) -> str | None:
         """Чем снимок не из нашей подписки — либо `None`, если свой.
@@ -1356,8 +1615,12 @@ class LiveFeed:
             f"а подписка — {expected[0]} ({expected[1]}, {expected[2]})"
         )
 
-    async def _accept(self, snapshot: CandleSnapshot) -> None:
+    def _accept(self, snapshot: CandleSnapshot) -> None:
         """Один снимок: сверка с подпиской, счёт, рисунок; на смене минуты — запись.
+
+        Ничего не ждёт: законченная минута уходит в очередь записи
+        (`_hand_over`), а пишет её отдельная задача (`_write`). Ожидание
+        здесь останавливало чтение сокета — 13.11.2026 это стоило потока.
 
         ⚠️ Отвергнутый снимок (`after.refusal`) не рисуется — выход стоит
         **до** вызова рисующего, и это его единственная защита. Сомнительная
@@ -1376,7 +1639,7 @@ class LiveFeed:
             return
         before, after = self._tally, tally_after(self._tally, snapshot)
         if before is not None and before.minute != after.minute and self._last is not None:
-            await self._close_minute(self._last, before)
+            self._hand_over(self._last, before)
         self._tally = after
         if after.refusal is not None:
             # Вслух — на первом отвергнутом снимке минуты; дальше та же минута
@@ -1392,17 +1655,55 @@ class LiveFeed:
                 )
             return
         first, self._last = self._last is None, snapshot
-        # Снимок принят — растущая минута идёт в окно. **После** записи
-        # закрытой минуты выше: тот, кто рисует, читает из базы минутки этого
-        # же бара, и порядок «сначала записали, потом рисуем» не даёт бару
-        # мигнуть без только что закончившейся минуты.
         growing = to_minute(snapshot, after.contracts, unsettled=True)
         if first:
             # В ленту — первый принятый снимок минуты, а не каждый из девяти.
-            debug_feed.minute_started(self._ticker, growing)
-        self._watch.growing_minute(self._ticker, growing)
+            self._started = growing
+        # Снимок принят — растущая минута идёт в окно. **После** записи
+        # закончившейся минуты: тот, кто рисует, читает из базы минутки этого
+        # же бара, и порядок «сначала записали, потом рисуем» не даёт бару
+        # мигнуть без только что закончившейся минуты. Пока запись в очереди,
+        # минута придерживается, и показывает её задача записи (`_write`).
+        if self._unwritten:
+            self._held = (self._ticker, growing)
+            return
+        self._show(self._ticker, growing)
 
-    async def _close_minute(self, last: CandleSnapshot, tally: MinuteTally) -> None:
+    def _show(self, ticker: str, growing: MarketCandle) -> None:
+        """Растущую минуту — в окно, а начало минуты, если не сказано, — в ленту.
+
+        Лента идёт за записью, как рисунок: «минута пошла» не встаёт раньше
+        «предыдущая закрыта и записана».
+        """
+        started, self._started = self._started, None
+        if started is not None:
+            debug_feed.minute_started(ticker, started)
+        self._watch.growing_minute(ticker, growing)
+
+    def _hand_over(self, last: CandleSnapshot, tally: MinuteTally) -> None:
+        """Законченную минуту — в очередь записи, без ожидания."""
+        queue = self._queue
+        if queue is None:
+            raise RuntimeError("очередь записи минут не заведена: снимок принят вне захода")
+        self._last = None
+        self._unwritten += 1
+        queue.put_nowait(ClosedMinute(self._ticker, last, tally))
+
+    async def _write(self, queue: asyncio.Queue[ClosedMinute | None]) -> None:
+        """Задача записи захода: минуты по одной, в порядке прихода, до `None`.
+
+        После каждой записи — придержанная растущая минута, если очередь
+        опустела: так рисунок идёт за записью, как шёл до 13.11.2026.
+        """
+        while (closed := await queue.get()) is not None:
+            await self._close_minute(closed)
+            self._unwritten -= 1
+            held = self._held
+            if not self._unwritten and held is not None:
+                self._held = None
+                self._show(*held)
+
+    async def _close_minute(self, closed: ClosedMinute) -> None:
         """Минута закончилась — теперь, и только теперь, она пишется в базу.
 
         Пишется её последний принятый снимок с контрактами по приращениям.
@@ -1414,9 +1715,9 @@ class LiveFeed:
         сам, что с этим делать — дорисовать закрытую свечу или гнать прогон
         (`HistoryPort.live_candle`). Поток знает только, что минута записана.
         """
-        written = to_minute(last, tally.contracts)
-        await self._worker.put_minutes(self._ticker, [written], Source.BROKER)
-        self._last = None
+        tally = closed.tally
+        written = to_minute(closed.last, tally.contracts)
+        await self._worker.put_minutes(closed.ticker, [written], Source.BROKER)
         log.info(
             "минута %s: оборот %.0f → %d контрактов%s",
             tally.minute.isoformat(),
@@ -1426,8 +1727,8 @@ class LiveFeed:
             # Мимо ленты: её числа уже есть в строке ленты ниже, с ценами.
             extra={"panel": False},
         )
-        debug_feed.minute_closed(self._ticker, written, tally.refused)
-        self._watch.closed_minute(self._ticker)
+        debug_feed.minute_closed(closed.ticker, written, tally.refused)
+        self._watch.closed_minute(closed.ticker)
         self._tell_clock()
 
     def _tell_clock(self) -> None:
@@ -1548,11 +1849,11 @@ POSITION_NOT_MANAGED: Final[str] = (
 class FundsWatchers:
     """Куда опрос счёта сообщает о себе. Два разных получателя, не один."""
 
-    #: Деньги счёта, готовые к укладке в движок. Получатель обязан вернуться
-    #: **немедленно**: вызов идёт из задачи опроса, и ожидание здесь задержало
-    #: бы следующий снимок. `Engine.on_funds` возвращается сразу — он кладёт
-    #: значение и пишет строку журнала.
-    funds: Callable[[AccountFunds], None]
+    #: Номер договора из снимка и деньги счёта, готовые к укладке в движок.
+    #: Получатель обязан вернуться **немедленно**: вызов идёт из задачи опроса,
+    #: и ожидание здесь задержало бы следующий снимок. Номер — пустая строка,
+    #: если брокер его не назвал.
+    funds: Callable[[str, AccountFunds], None]
     #: Событие, причина и важность — человеческим языком, в журнал решений.
     say: Callable[[str, str, DecisionLevel], None]
     #: Остановить робота: событие и причина. Тот же смысл, что у `Watchers.halt`,
@@ -1565,6 +1866,19 @@ class FundsWatchers:
     #: ничего не делать (`D-086`, находка Н-2). Спрашивается, а не хранится
     #: флагом: остановить робота может кто угодно ещё, в том числе движок.
     halted: Callable[[], bool]
+    #: Позиция по инструменту у брокера из того же снимка: тикер и количество
+    #: со знаком (`B-097`). Получатель — порт: запомненная позиция боя
+    #: «на момент остановки» сменяется свежей. Возврат немедленный. `None` —
+    #: позицию никому не отдавать.
+    position: Callable[[str, int], None] | None = None
+    #: Что брокер ответил заходом — для строки «Счёт у брокера» (решение 0070):
+    #: снимок и живые заявки по инструменту, или почему не прочитано. `None` —
+    #: строки нет, и список заявок не спрашивается вовсе. Возврат немедленный.
+    account: Callable[[AccountSeen], None] | None = None
+    #: Незакрытые команды журнала — ключи заявок робота, о которых строка
+    #: спрашивает брокера по ключу (`B-105`: условную робота список заявок
+    #: может не показать). `None` — по ключу не спрашивать.
+    journal: Callable[[], Awaitable[Sequence[StoredCommand]]] | None = None
 
 
 class FundsWatch:
@@ -1648,12 +1962,23 @@ class FundsWatch:
         #: как отказ, и молчать о нём нельзя: владелец счёта иначе не знает,
         #: можно ли уже торговать.
         self._answering = False
+        #: Внеочередной заход (`poke`): будит паузу цикла, а не ставит второй цикл.
+        self._wake = asyncio.Event()
 
     def start(self) -> None:
         """Начать опрос. На работающем опросе ничего не делает."""
         if self._task is not None and not self._task.done():
             return
         self._task = asyncio.ensure_future(self._ride())
+
+    def poke(self) -> None:
+        """Зайти сразу, не дожидаясь паузы, — после команды брокеру (решение 0070).
+
+        Работающего опроса нет — ничего: связь не открыта, спрашивать некого.
+        Несколько толчков подряд дают один заход.
+        """
+        if self._task is not None and not self._task.done():
+            self._wake.set()
 
     def request_stop(self) -> None:
         """Остановить опрос. Возврат немедленный: зовётся из слота окна."""
@@ -1714,11 +2039,71 @@ class FundsWatch:
         часовой давности.
         """
         while True:
+            self._wake.clear()
             await self._once()
-            await asyncio.sleep(self._every)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._wake.wait(), self._every)
 
     async def _once(self) -> None:
-        """Один заход: спросить, перевести, положить. Наружу не бросает ничего.
+        """Один заход: деньги в движок, затем — что видно в строке «Счёт у брокера»."""
+        got = await self._funds_once()
+        if self._watch.account is not None:
+            await self._account_once(got)
+
+    async def _account_once(self, got: AccountSnapshot | str) -> None:
+        """Живые заявки по инструменту и всё прочитанное — получателю строки (0070).
+
+        Снимок не прочитан — получатель узнаёт почему, а список заявок
+        не спрашивается: строка без позиции и денег всё равно скажет «не прочитан».
+        Ничего наружу не бросает: строка окна не вправе уронить опрос денег.
+        """
+        receiver = self._watch.account
+        assert receiver is not None, "зовётся только при получателе"
+        ticker = self._ticker
+        if isinstance(got, str):
+            seen = AccountSeen(ticker, None, trouble=got)
+        else:
+            seen = AccountSeen(ticker, got)
+            try:
+                seen = dataclasses.replace(seen, orders=await self._account.live_orders(ticker))
+            except asyncio.CancelledError:
+                raise
+            except BrokerError as failure:
+                seen = dataclasses.replace(seen, orders_trouble=failure.human)
+            except Exception as error:  # трассировка уходит в log.exception
+                log.exception("список заявок для строки счёта упал", extra={"panel": False})
+                seen = dataclasses.replace(
+                    seen, orders_trouble=f"ошибка программы: {type(error).__name__}"
+                )
+            seen = await self._robot_seen(seen, got.account)
+        try:
+            receiver(seen)
+        except Exception:  # строка окна не роняет опрос денег
+            log.exception("строка «Счёт у брокера» не собрана", extra={"panel": False})
+
+    async def _robot_seen(self, seen: AccountSeen, account: str | None) -> AccountSeen:
+        """Живые заявки робота по ключам журнала — в заход (`B-105`). Наружу не бросает."""
+        journal = self._watch.journal
+        if journal is None:
+            return seen
+        try:
+            robot, trouble = await robot_live_orders(
+                journal, self._account.order_state, ticker=seen.ticker, account=account
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # трассировка уходит в log.exception
+            log.exception("заявки робота для строки счёта не прочитаны", extra={"panel": False})
+            robot, trouble = (), (
+                f"заявки робота по журналу не прочитаны — ошибка программы: "
+                f"{type(error).__name__}"
+            )
+        return dataclasses.replace(seen, robot=robot, robot_trouble=trouble)
+
+    async def _funds_once(self) -> AccountSnapshot | str:
+        """Спросить, перевести, положить. Снимок — или почему его нет, словами.
+
+        Наружу не бросает ничего.
 
         Три исхода, и все три говорятся человеческим языком:
 
@@ -1753,7 +2138,7 @@ class FundsWatch:
             # эти две строки, и человек прочтёт успокоительную неправду.
             halt_on_unknown_outcome(unknown, self._watch.halt)
             self._blind(str(unknown))
-            return
+            return str(unknown)
         except BrokerError as failure:
             log.warning(
                 "состояние счёта не получено: %s%s",
@@ -1762,33 +2147,60 @@ class FundsWatch:
                 extra={"panel": False},  # в ленте — строка журнала из `_blind`
             )
             self._blind(str(failure))
-            return
+            return failure.human
         except Exception as error:  # трассировка уходит в log.exception
             log.exception(  # мимо ленты: в ней — строка журнала из `_blind`
                 "опрос состояния счёта упал ошибкой программы", extra={"panel": False}
             )
-            self._blind(
+            trouble = (
                 f"Ошибка программы, а не связи: {type(error).__name__}: {error}. "
                 "Подробность — в выводе программы в консоли."
             )
-            return
+            self._blind(trouble)
+            return trouble
+        self._tell_position(snapshot)
         self._refresh_exchange_margin(snapshot.taken_at)
         margin = self._margin_now(snapshot)
         money = funds_of(snapshot, self._ticker, margin=margin)
         if money is None:
+            # Поля названы, но причина пустоты бывает и не в них: опрос идёт
+            # без кода биржи (`D-047`, `/risk` 04.11.2026 22:35, находка 3),
+            # и при рублях на двух рынках брокер отвечает двумя блоками, из
+            # которых программа не выбирает. Без этой фразы разбор ушёл бы
+            # искать опечатку в имени поля (правило 13).
             self._blind(
                 "Брокер ответил про счёт не полностью: не хватает "
                 + ", ".join(snapshot.funds_missing())
-                + "."
+                + ". Возможно, на счёте несколько рынков; код биржи для БКС "
+                "неизвестен (D-047)."
             )
-            return
+            return snapshot
         self._recovered(snapshot)
-        # ⚠️ Про ГО говорится **после** «счёт получен», а не до. Порядок строк
-        # в журнале — это порядок чтения: строка про обеспечение впереди
-        # жалобы на неполный снимок объясняла бы владельцу счёта не то,
-        # из-за чего робот не входит.
+        # Про ГО пишется **после** «счёт получен», а не до, и только в
+        # технический лог: в журнал решений боя строка не идёт по просьбе
+        # заказчика 18.11.2026.
         self._say_margin(margin)
-        self._watch.funds(money)
+        self._watch.funds(snapshot.account or "", money)
+        return snapshot
+
+    def _tell_position(self, snapshot: AccountSnapshot) -> None:
+        """Позиция по инструменту из снимка — порту (`B-097`), хоть деньги и неполны.
+
+        Непрочитанная позиция своего тикера (`UnexpectedAnswer`) и дробное
+        количество — не отдаются: запомненная позиция остаётся со своей
+        пометкой «на момент остановки», а не подменяется догадкой.
+        """
+        receiver = self._watch.position
+        if receiver is None:
+            return
+        ticker = self._ticker
+        try:
+            mine = snapshot.position(ticker)
+        except BrokerError:
+            return
+        quantity = 0.0 if mine is None else float(mine.quantity)
+        if quantity.is_integer():
+            receiver(ticker, int(quantity))
 
     def _margin_now(self, snapshot: AccountSnapshot) -> MarginPerContract | None:
         """ГО под контракт: у брокера, в памяти или оценкой по бирже. `None` — никак.
@@ -1872,13 +2284,14 @@ class FundsWatch:
         self._margin.exchange_said(answer, at)
 
     def _say_margin(self, margin: MarginPerContract | None) -> None:
-        """Сказать в журнал, откуда взято ГО, — на смене источника или числа.
+        """Записать в технический лог, откуда взято ГО, — на смене источника или числа.
 
         ⚠️ Оценка обязана быть **названа оценкой**. Движку уходит просто
         число: `AccountFunds.margin_per_contract` — это `float`, и отличить
-        в нём ответ брокера от нашей прикидки нечем. Значит единственное
-        место, где владелец счёта узнаёт, что объём заявки посчитан по
-        оценке, — эта строка.
+        в нём ответ брокера от нашей прикидки нечем. Единственное место,
+        где видно, что объём заявки посчитан по оценке, — эта строка
+        технического лога: в журнал решений боя она не пишется по просьбе
+        заказчика 18.11.2026.
         """
         if margin is None:
             return
@@ -1886,11 +2299,8 @@ class FundsWatch:
         if key == self._margin_told:
             return
         self._margin_told = key
-        self._watch.say(
-            "Гарантийное обеспечение под контракт",
-            margin.told + ".",
-            DecisionLevel.WARNING if margin.estimated else DecisionLevel.INFO,
-        )
+        level = logging.WARNING if margin.estimated else logging.INFO
+        log.log(level, "Гарантийное обеспечение под контракт: %s.", margin.told)
 
     def _blind(self, why: str) -> None:
         """Счёт неизвестен: сказать один раз и назвать последствие.
@@ -1983,16 +2393,18 @@ class LiveLink:
         self._userdata = userdata
         self._ticker = ticker.strip()
         self._class_code = class_code
-        #: Кому класть деньги счёта. `None` — **никому**, и это умолчание.
+        #: Кому класть деньги счёта: номер договора и деньги. `None` —
+        #: **никому**, и это умолчание.
         #:
         #: ⚠️ Умолчание здесь не осторожность, а граница главного правила.
         #: Прогон по истории и наблюдение на живом потоке денег счёта
         #: не получают и получать не должны: движок, которому в одном режиме
         #: сообщают счёт, а в другом нет, начинает вести себя по-разному
         #: на одной и той же свече (`ARCHITECTURE.md` §1, решение 0037,
-        #: следствие 1). Получатель появляется **только** в боевой сборке,
-        #: и появляется отдельной строкой, которую видно (`deliver_funds_to`).
-        self._funds_to: Callable[[AccountFunds], None] | None = None
+        #: следствие 1). Получатель появляется отдельной строкой сборки,
+        #: которую видно (`deliver_funds_to`), и это порт: движкам он отдаёт
+        #: снимок только у пары боя (`HistoryPort.account_read`).
+        self._funds_to: Callable[[str, AccountFunds], None] | None = None
         #: Код биржи для выбора рублёвого блока «Лимитов»: их приходит
         #: несколько (фондовый рынок и срочный), и какой наш — знает сборка,
         #: а не слой брокера (`broker/account.py`, `_ruble_block`).
@@ -2009,14 +2421,22 @@ class LiveLink:
         #: Расписание торгов. Одно на весь запуск: у него своя память ответов,
         #: и пересборка на каждом подключении сделала бы её бесполезной.
         self._hours: Schedule | None = None
+        #: Слова строки «Счёт у брокера» и последнее удачное чтение (0070).
+        self._account_panel = AccountPanel()
 
     def deliver_funds_to(
         self,
-        receiver: Callable[[AccountFunds], None],
+        receiver: Callable[[str, AccountFunds], None],
         *,
         exchange: str | None = None,
     ) -> None:
-        """Сказать звену, кому класть деньги счёта. **Только боевая сборка.**
+        """Сказать звену, кому класть деньги счёта. Зовёт сборка (`app/main.py`).
+
+        Получатель берёт номер договора **отдельным доводом**, а не полем денег:
+        `engine.AccountFunds` номера счёта не несёт и нести не должен — движку
+        он ни к чему, а сборке боя нужен для сверки «снимок от того же счёта,
+        по которому пойдут заявки» (Р-9, правка 9.3). Брокер номера не назвал —
+        приходит пустая строка, и сборка боя откажет словами.
 
         Отдельным вызовом, а не параметром конструктора, по двум причинам,
         и обе по делу. Первая механическая: седьмой довод ловит `PLR0913`,
@@ -2027,15 +2447,40 @@ class LiveLink:
         различать, откуда пришла свеча (`ARCHITECTURE.md` §1, решение 0037).
         Параметр со значением по умолчанию проще не заметить, чем вызов.
 
+        ⚠️ С проводкой опрос идёт при **любом** включённом потоке, и в наблюдении
+        тоже: раз в полминуты портфель и строки про ГО. Иначе нельзя — снимок
+        нужен до включения боя, а бой включают поверх уже идущего потока.
+        Движкам наблюдения снимок не попадает: это решает порт, а не звено.
+
         `exchange` — код биржи, чьи рубли наши: «Лимиты» приходят массивом
         по валюте и бирже, и на счёте с фондовым и срочным рынком рублёвых
         блоков два (`broker/account.py`).
 
-        Звать до первого включения потока: после сборки опроса счёта
-        получателя не подменить.
+        Звать до первого включения потока: опрос счёта собирается при первом
+        включении (`_build`), и после этого получателя не подменить. Вызов
+        после включения не сделал бы ничего — снимка не было бы никогда,
+        и бой не включился бы никогда (правка 9.1 гейта).
         """
         self._funds_to = receiver
         self._exchange = exchange
+
+    @property
+    def session(self) -> BrokerSession | None:
+        """Сессия брокера, если поток хоть раз включали; `None` — ещё нет.
+
+        Нужна боевой стороне пары (`app/live_trading.py`): сессия одна
+        на запуск, и вторая, своя, меняла бы токен отдельно — обмен одной
+        сделал бы негодным токен другой.
+        """
+        return self._session
+
+    def desks(self) -> LiveDesks:
+        """Чем порт собирает боевую сторону пары — на сессии этого звена (Э4 2в).
+
+        Сборка исполнителя — только по команде «Включить бой»
+        (`HistoryPort.set_live`); здесь ничего не строится и токен не читается.
+        """
+        return LiveDesks(lambda: self._session, self._worker, class_code=self._class_code)
 
     def switch(self, on: bool) -> str | None:
         """Команда окна: включить или выключить поток. Причина — если нельзя.
@@ -2176,9 +2621,12 @@ class LiveLink:
             self._funds = FundsWatch(
                 Account(self._session, exchange=self._exchange),
                 ticker=self._ticker,
-                watchers=self._funds_watchers(self._funds_to),
+                watchers=self.funds_watchers(self._funds_to),
                 exchange_margin=self._exchange_margin,
             )
+            # После каждой команды брокеру — внеочередной заход: строка
+            # «Счёт у брокера» не ждёт полминуты опроса (решение 0070).
+            self._session.after_commands(self._account_now)
         feed = LiveFeed(
             self._session,
             self._worker,
@@ -2194,12 +2642,22 @@ class LiveLink:
             ),
         )
         feed.follow(self._hours)
+        feed.pace(self._lag_after)
         return feed
 
-    def _funds_watchers(
-        self, funds: Callable[[AccountFunds], None]
+    def _lag_after(self) -> float:
+        """Порог сторожа отставания — поле «Допустимое опоздание» вкладки «Бой».
+
+        Число то же, что у исполнителя (`LiveLimits.stale_after`): насколько
+        данные вправе опоздать. Читается из порта на каждой проверке, а не
+        при сборке: правка в окне действует сразу, без переподключения.
+        """
+        return float(self._port.values.live_stale_after_sec)
+
+    def funds_watchers(
+        self, funds: Callable[[str, AccountFunds], None]
     ) -> FundsWatchers:
-        """Куда опрос счёта сообщает о себе. Отдельным методом — ради проверки.
+        """Куда опрос счёта сообщает о себе. Отдельным открытым методом — ради проверки.
 
         Выделено не ради красоты `_build`, а потому что иначе эту проводку
         не проверить ничем: `_build` строит сессию брокера и читает файл
@@ -2218,6 +2676,30 @@ class LiveLink:
             say=self._port.note,
             halt=self._port.halt,
             halted=lambda: bool(self._port.halted),
+            position=self._port.position_read,
+            account=self._account_seen,
+            journal=self._open_commands,
+        )
+
+    async def _open_commands(self) -> tuple[StoredCommand, ...]:
+        """Незакрытые команды журнала — ключи заявок робота для строки счёта (`B-105`)."""
+        return await self._worker.call(lambda store: store.open_broker_commands())
+
+    def _account_now(self) -> None:
+        """Команда брокеру ушла — опрос счёта заходит сразу (решение 0070)."""
+        if self._funds is not None:
+            self._funds.poke()
+
+    def _account_seen(self, seen: AccountSeen) -> None:
+        """Заход опроса — строкой «Счёт у брокера» в окно (решение 0070).
+
+        Стоимость пункта — из настроек окна и только своего инструмента:
+        у чужого она другая, и тогда результат остаётся в пунктах.
+        """
+        values = self._port.values
+        rubles = values.ruble_per_point if values.instrument.strip() == seen.ticker else None
+        self._port.account_line(
+            self._account_panel.line(seen, at=now_utc(), ruble_per_point=rubles)
         )
 
     async def _exchange_margin(self, ticker: str) -> float | None:

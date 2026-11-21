@@ -61,6 +61,7 @@ from broker.session import (
     BrokerSession,
 )
 from broker.stream import CandleSnapshot, StreamRejected
+from engine import AccountFunds
 from market import (
     MSK,
     Candle,
@@ -415,6 +416,17 @@ class FakeWorker:
     async def close(self) -> None:
         self._closed = True
         self._open = False
+
+    async def call[T](self, work: Callable[[Any], T]) -> T:
+        """Работа над базой — над пустым журналом команд (`B-105`: строка счёта).
+
+        Оригинал открывает базу по требованию; у дублёра базы нет, и поток
+        просит через `call` только незакрытые команды журнала — их здесь нет.
+        После `close()` — тот же отказ, что у оригинала.
+        """
+        if self._closed:
+            raise RuntimeError("поток данных остановлен, база закрыта")
+        return work(SimpleNamespace(open_broker_commands=tuple))
 
     async def put_minutes(
         self, symbol: str, candles: Iterable[Candle], source: Source
@@ -1352,6 +1364,15 @@ class FakePort:
         self.halts: list[tuple[str, str]] = []
         #: Границы полноты, подтверждённые догрузкой (`HistoryPort.history_confirmed`).
         self.confirmed: list[tuple[str, datetime]] = []
+        #: Чем собирать боевую сторону (`HistoryPort.attach_live`, Э4 2в).
+        self.desks: object | None = None
+        #: Снимки счёта, пришедшие от опроса (`HistoryPort.account_read`, Э4 2г).
+        self.accounts: list[tuple[str, object]] = []
+        #: Позиции по инструменту из тех же снимков (`HistoryPort.position_read`, B-097).
+        self.positions: list[tuple[str, int]] = []
+        #: Настройки порта (`HistoryPort.values`): звено читает отсюда порог
+        #: сторожа отставания потока (`LiveLink._lag_after`).
+        self.values = Settings()
 
     def note(self, event: str, reason: str, level: DecisionLevel = DecisionLevel.INFO) -> None:
         self.notes.append((event, reason, level))
@@ -1387,6 +1408,15 @@ class FakePort:
 
     def stream_leads(self, symbol: str, minute: datetime) -> None:
         self.leads.append((symbol, minute))
+
+    def attach_live(self, desks: object) -> None:
+        self.desks = desks
+
+    def account_read(self, account: str, funds: object) -> None:
+        self.accounts.append((account, funds))
+
+    def position_read(self, ticker: str, signed: int) -> None:
+        self.positions.append((ticker, signed))
 
     def stream(self, on: bool) -> None:
         """Как настоящий порт: команду передал, причину отказа наружу **не** вернул.
@@ -2334,6 +2364,9 @@ def quiet_session(monkeypatch) -> None:
 
         def allow_token_retry(self) -> None:
             """Кнопка снимает запомненный отказ токена (`B-062`); дублёру снимать нечего."""
+
+        def after_commands(self, listener: object) -> None:
+            """Опрос счёта после команд (0070); дублёр команд не подаёт."""
 
     monkeypatch.setattr(live_feed, "BrokerSession", Session)
 
@@ -3590,6 +3623,27 @@ def test_the_assembly_wires_both_the_switch_and_the_retarget(
     )
 
 
+def test_the_assembly_wires_the_live_desks_without_building_anything(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Бой (Э4 2в): сборка даёт порту, чем собирать исполнитель, — и только это.
+
+    Исполнитель собирается по команде «Включить бой», а не при запуске:
+    при сборке сессии нет, токен не прочитан, и бой честно недоступен
+    словами «подключения нет» — не заявкой и не трассировкой.
+    """
+    from app.live_trading import LiveDesks
+
+    spy = token_store_spy(monkeypatch)
+    port: Any = FakePort()
+    worker: Any = FakeWorker()
+    _live_feed(port, worker, tmp_path / "userdata", Settings(), _arguments([]))
+    assert isinstance(port.desks, LiveDesks), "боевая сторона порту не проведена"
+    refusal = port.desks.refusal()
+    assert refusal is not None and "Подключения к брокеру нет" in refusal, refusal
+    assert not spy, "сборка тронула токен до команды"
+
+
 def _connection_callers() -> set[str]:
     """Методы `LiveFeed`, которые сами дёргают `self._watch.connection(...)`.
 
@@ -3694,12 +3748,14 @@ def watch_of(
     every: float = 0.001,
     exchange_margin: Callable[[], Any] | None = None,
     halts: list[tuple[str, str]] | None = None,
+    positions: list[tuple[str, int]] | None = None,
 ):
     """Опрос счёта с мгновенным темпом и двумя списками: деньги и строки журнала.
 
     `halts` — куда складывать остановки робота. Довод, а не четвёртое
     возвращаемое значение: остановка нужна одной проверке из тридцати,
-    а распаковку по три поменяли бы все.
+    а распаковку по три поменяли бы все. `positions` — то же для позиции
+    по инструменту, которую опрос отдаёт порту (`B-097`).
     """
     money: list[Any] = []
     said: list[tuple[str, str, DecisionLevel]] = []
@@ -3708,7 +3764,7 @@ def watch_of(
         cast(Any, account),
         ticker=ticker,
         watchers=live_feed.FundsWatchers(
-            funds=money.append,
+            funds=lambda _account, value: money.append(value),
             say=lambda event, reason, level: said.append((event, reason, level)),
             halt=lambda event, reason: halts.append((event, reason)),
             # Подставной порт: остановлен ровно тогда, когда `halt` уже
@@ -3716,6 +3772,9 @@ def watch_of(
             # читает то, что положил `halt`), и без этого проверки жалобы
             # про счёт зеленели бы на постоянном «робот работает».
             halted=lambda: bool(halts),
+            position=None if positions is None else (
+                lambda ticker, signed: positions.append((ticker, signed))
+            ),
         ),
         every=timedelta(seconds=every),
         exchange_margin=cast(Any, exchange_margin),
@@ -3788,6 +3847,27 @@ def test_a_gap_in_the_snapshot_yields_no_money_at_all(kwargs: dict, what: str) -
     snapshot = account_snapshot(**kwargs)
     assert live_feed.funds_of(snapshot, "MXU6") is None
     assert what in snapshot.funds_missing()
+
+
+def test_each_snapshot_tells_the_port_the_position_of_the_instrument() -> None:
+    """B-097: позиция по инструменту из снимка уходит порту — и при неполных деньгах.
+
+    Запомненную позицию боя порт сверяет по ней (`HistoryPort.position_read`);
+    снимок без рублей деньгам не годится, а позиция в нём та же правда.
+    """
+    positions: list[tuple[str, int]] = []
+    account = FakeAccount(
+        account_snapshot(quantity=0.0, free=None), account_snapshot(quantity=-2.0)
+    )
+    watch, _money, _said = watch_of(account, positions=positions)
+
+    async def scenario() -> None:
+        watch.start()
+        await until(lambda: ("MXU6", -2) in positions)
+        await watch.aclose()
+
+    asyncio.run(scenario())
+    assert positions[0] == ("MXU6", 0), "позиция неполного снимка порту не отдана"
 
 
 # --- ГО под контракт до первого входа (`D-046`, 05.09.2026) ---
@@ -3863,12 +3943,33 @@ def test_the_handed_margin_is_used_only_when_the_broker_said_nothing() -> None:
     assert money.margin_per_contract == 99_999.0
 
 
-def test_the_estimate_is_announced_as_an_estimate_in_the_journal() -> None:
-    """Оценка названа оценкой вслух: движку уходит просто число, отличить нечем.
+def margin_lines(said: list[tuple[str, str, DecisionLevel]]) -> list[str]:
+    """Строки журнала решений про ГО — их в бою быть не должно (заказчик, 18.11.2026)."""
+    return [
+        f"{event}: {reason}"
+        for event, reason, _ in said
+        if "Гарантийное обеспечение" in event or "ГО под контракт" in reason
+    ]
+
+
+def margin_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Записи технического лога про ГО под контракт."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "app.live_feed"
+        and "Гарантийное обеспечение под контракт" in record.getMessage()
+    ]
+
+
+def test_the_estimate_is_announced_as_an_estimate_in_the_technical_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Оценка названа оценкой — в техническом логе, а не в журнале решений.
 
     `AccountFunds.margin_per_contract` — `float`, и ответ брокера от нашей
-    прикидки в нём неразличим. Строка журнала — единственное место, где
-    владелец счёта узнаёт, что объём заявки посчитан по оценке.
+    прикидки в нём неразличим. Строка про ГО в журнал решений боя не идёт
+    (просьба заказчика 18.11.2026), но в техлоге остаётся и названа оценкой.
     """
     account = FakeAccount(account_snapshot(quantity=0.0))
     watch, money, said = watch_of(
@@ -3877,22 +3978,21 @@ def test_the_estimate_is_announced_as_an_estimate_in_the_journal() -> None:
 
     async def scenario() -> None:
         watch.start()
-        await until(
-            lambda: any(
-                row[0] == "Гарантийное обеспечение под контракт" for row in said
-            )
-        )
+        await until(lambda: bool(margin_records(caplog)))
         await watch.aclose()
 
-    asyncio.run(scenario())
-    about = [row for row in said if row[0] == "Гарантийное обеспечение под контракт"]
-    assert about, f"про ГО не сказано ни строки: {said}"
-    event, reason, level = about[0]
-    assert "ОЦЕНКА" in reason, reason
-    assert level is DecisionLevel.WARNING, "оценка подана как обычное событие"
+    with caplog.at_level(logging.INFO, logger="app.live_feed"):
+        asyncio.run(scenario())
+    assert not margin_lines(said), f"ГО попало в журнал решений: {said}"
+    records = margin_records(caplog)
+    assert records, "про ГО в техлоге не сказано ни строки"
+    assert "ОЦЕНКА" in records[0].getMessage(), records[0].getMessage()
+    assert records[0].levelno == logging.WARNING, "оценка подана как обычное событие"
 
 
-def test_an_open_position_is_not_replaced_by_the_estimate() -> None:
+def test_an_open_position_is_not_replaced_by_the_estimate(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Есть позиция — берётся ответ брокера, а не оценка: она грубее вдвое."""
     account = FakeAccount(account_snapshot())
     watch, money, said = watch_of(
@@ -3904,10 +4004,14 @@ def test_an_open_position_is_not_replaced_by_the_estimate() -> None:
         await until(lambda: bool(money))
         await watch.aclose()
 
-    asyncio.run(scenario())
+    with caplog.at_level(logging.INFO, logger="app.live_feed"):
+        asyncio.run(scenario())
     assert money[0].margin_per_contract == 13_750.0, "оценка вытеснила ответ брокера"
-    about = [row for row in said if row[0] == "Гарантийное обеспечение под контракт"]
-    assert about and "ОЦЕНКА" not in about[0][1], about
+    assert not margin_lines(said), f"ГО попало в журнал решений: {said}"
+    records = margin_records(caplog)
+    assert records, "про ГО в техлоге не сказано ни строки"
+    assert "ОЦЕНКА" not in records[0].getMessage(), records[0].getMessage()
+    assert records[0].levelno == logging.INFO
 
 
 def test_the_exchange_is_not_asked_on_every_snapshot() -> None:
@@ -4115,15 +4219,19 @@ def test_a_portfolio_that_answers_again_is_announced() -> None:
     assert events == [
         "Состояние счёта не получено",
         "Состояние счёта получено",
-        # Порядок строк — это порядок чтения. Про обеспечение говорится
-        # **после** того, как снимок признан годным: строка про ГО впереди
-        # жалобы объясняла бы владельцу счёта не то, из-за чего робот не входит.
-        "Гарантийное обеспечение под контракт",
+        # Строки про ГО в журнале решений боя нет: просьба заказчика
+        # 18.11.2026, она уходит в технический лог.
     ], events
 
 
 def test_an_incomplete_snapshot_is_not_half_a_snapshot() -> None:
-    """Половина ответа в движок не уходит: она читается как целое."""
+    """Половина ответа в движок не уходит: она читается как целое.
+
+    Строка называет недостающие поля **и** вероятную причину: опрос идёт без
+    кода биржи (`D-047`, `/risk` 04.11.2026 22:35, находка 3), и при рублях
+    на двух рынках снимок неполон, хотя имена полей верны. Мутация молчания:
+    убрать фразу о нескольких рынках и `D-047`.
+    """
     account = FakeAccount(account_snapshot(equity=None))
     watch, money, said = watch_of(account)
 
@@ -4134,7 +4242,10 @@ def test_an_incomplete_snapshot_is_not_half_a_snapshot() -> None:
 
     asyncio.run(scenario())
     assert money == []
-    assert "размер счёта" in said[0][1], said[0][1]
+    # Недостающее названо именно в «не хватает …», а не где-то в последствии
+    # (мутация: список полей выпал, «размер счёта» осталось в хвосте строки).
+    assert "не хватает размер счёта." in said[0][1], said[0][1]
+    assert "несколько рынков" in said[0][1] and "(D-047)" in said[0][1], said[0][1]
 
 
 def test_a_broken_parser_is_logged_as_ours_not_blamed_on_the_broker(caplog) -> None:
@@ -4217,7 +4328,7 @@ def link_with_funds(monkeypatch, port, stream: FakeStream, tmp_path: pathlib.Pat
     monkeypatch.setattr(live_feed, "RETRY_FIRST", 0.0)
     monkeypatch.setattr(live_feed, "RETRY_CAP", 0.0)
     link = link_of(port, FakeWorker(), tmp_path / "userdata")
-    link.deliver_funds_to(lambda funds: None)
+    link.deliver_funds_to(lambda _account, _funds: None)
     return link, watches
 
 
@@ -4327,7 +4438,7 @@ def test_the_account_poll_is_queued_before_the_backfill(
     monkeypatch.setattr(live_feed, "FundsWatch", OrderedWatch)
     monkeypatch.setattr(live_feed, "candle_stream", stream)
     link = link_of(port, FakeWorker(), tmp_path / "userdata")
-    link.deliver_funds_to(lambda funds: None)
+    link.deliver_funds_to(lambda _account, _funds: None)
 
     async def scenario() -> None:
         assert link.switch(True) is None
@@ -4399,6 +4510,51 @@ def test_without_a_receiver_the_link_never_asks_about_the_account(
     asyncio.run(scenario())
     assert "счёт" not in built, "портфель спросили без боевой сборки"
     schedule_was_asked()
+
+
+def test_the_program_assembly_hands_the_account_snapshot_to_the_port(
+    tmp_path: pathlib.Path, monkeypatch
+) -> None:
+    """Э4 2г (`D-044`, правка 9.1 гейта): сборка программы проводит опрос счёта в порт.
+
+    Стережёт **проводку**, а не порт: собирает звено настоящая сборка
+    `app/main.py::_live_feed`, опрос счёта — настоящий `FundsWatch`, подставлены
+    только сеть и брокер. Порт получает номер договора из снимка отдельным
+    доводом и деньги счёта. Без этого снимка бой не включается никогда.
+
+    Мутации, обязанные ронять проверку: убрать `link.deliver_funds_to(...)`
+    из `_live_feed` — опрос не собирается, порт снимка не получает; перенести
+    вызов после `port.stream(True)` — то же при ключе `--stream`; потерять
+    номер договора по дороге (`FundsWatch` отдаёт пустую строку) — сверка
+    «тот же счёт» в сборке боя откажет на каждом включении.
+    """
+    socket = FakeSocket([wire(snapshot(MINUTE_A, close=100.0, turnover=1000.0))])
+    quiet_session(monkeypatch)
+    monkeypatch.setattr(live_feed, "TokenStore", lambda directory: directory)
+    monkeypatch.setattr(live_feed, "Backfiller", lambda *a, **k: SimpleNamespace(
+        start=lambda boundary: None, request_stop=lambda: None, aclose=_noop_aclose,
+    ))
+    monkeypatch.setattr(live_feed, "History", lambda session: session)
+    monkeypatch.setattr(
+        live_feed, "Account", lambda session, exchange=None: FakeAccount(account_snapshot())
+    )
+    monkeypatch.setattr(live_feed, "candle_stream", FakeStream(socket))
+    port: Any = FakePort()
+    worker: Any = FakeWorker()
+    link = _live_feed(port, worker, tmp_path / "userdata", Settings(), _arguments([]))
+
+    async def scenario() -> None:
+        assert link.switch(True) is None
+        await settle(lambda: bool(port.accounts), "снимок счёта дошёл до порта")
+        await link.aclose()
+
+    asyncio.run(scenario())
+    account, money = port.accounts[0]
+    assert account == "9876543", f"номер договора не дошёл до порта: {account!r}"
+    assert isinstance(money, AccountFunds), money
+    assert (money.equity, money.free) == (210_850.0, 248_500.0), money
+    # B-097: позиция по инструменту тем же снимком — запомненная позиция боя по ней.
+    assert port.positions, "позиция из снимка счёта не дошла до порта"
 
 
 async def _noop_aclose() -> None:

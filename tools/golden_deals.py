@@ -134,6 +134,7 @@ FIXED_VALUES: dict[str, Any] = {
     "trailing_offset_percent": 0.10,
     "trailing_step_percent": 0.05,
     "stop_after_take_profit": True,
+    "stop_after_loss": False,
     "min_exit_profit_sides": 0.0,
     "partial_candles": PartialCandles.ACCEPT,
     "commission_per_side": COMMISSION,
@@ -142,9 +143,13 @@ FIXED_VALUES: dict[str, Any] = {
     "calendar": NO_MARKS,
     "exchange_days": NO_MARKS,
     "time_exit_order": TimeExitOrder.LIMIT,
-    "time_exit_limit_steps": 10,
+    # Решение 0067: предел выхода по концу окна — процент, умолчание владельца.
+    "time_exit_limit_percent": 2.0,
     "time_exit_wait_bars": 1,
     "price_step": PRICE_STEP,
+    # Р-10: модель прогона событие «уровень не исполнился» не выдаёт —
+    # настройка на образец не влияет, стоит умолчанием.
+    "hold_after_unfilled_level": False,
 }
 
 #: Вариант (б): то же со скользящим уровнем 0,20 / 0,10 / 0,05 и минутками.
@@ -265,7 +270,11 @@ def counted_arms() -> Iterator[list[HistoryExecutor]]:
             made.append(self)
 
         async def submit(self, order: OrderRequest) -> None:
-            if order.action is OrderAction.ARM_TAKE_PROFIT:
+            # Условная у брокера (`D-196`, `trail_offset`) не считается: прогон
+            # её не сторожит, а подаётся она каждую свечу до порога. Счёт —
+            # вооружения, которые прогон исполняет; с ним образцы скользящего
+            # уровня сверяют ещё и то, что условная не сдвинула ни одного.
+            if order.action is OrderAction.ARM_TAKE_PROFIT and order.trail_offset is None:
                 self.arms += 1
             await super().submit(order)
 

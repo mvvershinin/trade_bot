@@ -16,7 +16,9 @@
    легенда, спрятанная за кнопкой, — это легенда, которую он не найдёт.
    Она сворачивается кнопкой и место графику возвращает, но первым делом
    человек видит объяснение, а не догадывается.
-2. **Оба слоя меток включены, ни одна метка с графика не убрана.** Было
+2. **Вне боя оба слоя меток включены, ни одна метка с графика не убрана.**
+   В бою «Прогноз» снят по умолчанию (решение 0070, `set_combat`): там на
+   графике — сделки брокера, и полые метки модели читались как заявки. Было
    предложено гасить «Прогноз» по умолчанию — шесть видов меток сразу и есть
    причина жалобы, — и владелец счёта это отклонил прямо: «точки, где сделки,
    с графика не убирай, оставь, но сделай понятней» (05.09.2026). Значит
@@ -78,6 +80,7 @@ from ui.formatting import (
     to_msk,
 )
 from ui.legend import (
+    FACT_MEANING,
     LegendItem,
     LineSample,
     MarkerSample,
@@ -94,12 +97,19 @@ from ui.models import (
     LinePoint,
     Marker,
     PriceLevel,
+    RunOrigin,
     Shade,
     TradePath,
     TradeRow,
 )
 from ui.theme import Theme
 from ui.theme import current as current_theme
+
+#: Подсказка галочки «Факт». Откуда исполнения — дописывает `set_fact_origin`.
+FACT_HINT = (
+    "Где сделка произошла на самом деле: цена исполнения\n"
+    "и фактическое время."
+)
 
 BAR_HINT = (
     "Сведения о свече: цена открытия, наибольшая и наименьшая цены за свечу,\n"
@@ -401,6 +411,8 @@ class LegendPanel(QWidget):
         self._surface = surface
         self._theme = theme
         self._plan = False
+        #: Откуда данные залитых меток (`D-172`). `None` — не названо.
+        self._fact_origin: RunOrigin | None = None
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(10, 2, 10, 4)
         self._grid.setHorizontalSpacing(14)
@@ -421,6 +433,13 @@ class LegendPanel(QWidget):
         self._plan = visible
         self.rebuild()
 
+    def set_fact_origin(self, origin: RunOrigin | None) -> None:
+        """Откуда данные «факта» — из снимка боя. Легенда идёт следом."""
+        if origin == self._fact_origin:
+            return
+        self._fact_origin = origin
+        self.rebuild()
+
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
         paint_background(self, theme)
@@ -438,7 +457,8 @@ class LegendPanel(QWidget):
             if widget is not None:
                 widget.deleteLater()
         self.rows = []
-        for number, item in enumerate(legend_items(plan=self._plan)):
+        shown = legend_items(plan=self._plan, fact_origin=self._fact_origin)
+        for number, item in enumerate(shown):
             row, column = divmod(number, LEGEND_COLUMNS)
             icon = QLabel()
             icon.setPixmap(swatch(item, self._theme, self._surface, self))
@@ -593,7 +613,12 @@ def span_totals(rows: Sequence[TradeRow]) -> SpanTotals:
 
 def span_summary(facts: SpanFacts) -> SpanTotals | None:
     """Итог участка или `None`, если складывать нечего: сделок здесь нет."""
-    picked = trades_in_span(facts.span, facts.trades)
+    # Строка открытой позиции из журнала окна (выхода нет, результат плавающий,
+    # `app/port.py::_open_row`) — не сделка: в деньги участка она не идёт
+    # (ревью 13.11.2026). У «Отчётов» её нет вовсе (`JournalTabs.closed_trades`).
+    picked = [
+        row for row in trades_in_span(facts.span, facts.trades) if row.exit_time is not None
+    ]
     return span_totals(picked) if picked else None
 
 
@@ -1008,6 +1033,9 @@ class ChartPanel(QWidget):
         #: Курсор стоит на свече. Пока стоит — обновления ряда строку не трогают,
         #: иначе живая свеча перебивала бы то, что человек разглядывает.
         self._hovered = False
+        #: Бой просили (`set_combat`): «Прогноз» снимается при входе в бой
+        #: и возвращается при выходе. Между ними галочка — за человеком.
+        self._combat = False
 
         self.info_bar = CandleInfoBar(theme=self._theme)
         self.legend = LegendPanel(self._surface, self._theme)
@@ -1036,14 +1064,12 @@ class ChartPanel(QWidget):
             "Где робот должен был войти и выйти по расчёту.\n"
             "Полые метки и пунктир поверх обычных: видно, насколько исполнение\n"
             "разошлось с расчётом.\n"
-            "Снимите галочку, если хотите видеть только то, что произошло."
+            "Снимите галочку, если хотите видеть только то, что произошло.\n"
+            "В бою снята сама: на графике — только сделки у брокера."
         )
-        self.fact_box = QCheckBox("Факт")
+        self.fact_box = QCheckBox(Layer.FACT.label)
         self.fact_box.setChecked(True)
-        self.fact_box.setToolTip(
-            "Где сделка произошла на самом деле: цена исполнения у брокера\n"
-            "и фактическое время."
-        )
+        self.fact_box.setToolTip(FACT_HINT)
         self.plan_box.toggled.connect(self._toggle_plan)
         self.fact_box.toggled.connect(lambda on: self._surface.set_layer_visible(Layer.FACT, on))
 
@@ -1227,6 +1253,34 @@ class ChartPanel(QWidget):
             label.setStyleSheet(f"color: {self._theme.text_dim};")
         for box in (self.plan_box, self.fact_box):
             box.setStyleSheet(f"color: {self._theme.text};")
+
+    def set_fact_origin(self, origin: RunOrigin | None) -> None:
+        """Откуда данные залитых меток — подпись галочки «Факт» и легенда.
+
+        Из данных снимка боя (`LiveView.fact_origin`), а не из режима окна
+        (`D-172`): окно не решает, чьи исполнения на графике, — ему сказали.
+        `None` — не сказали, и подпись прежняя, без утверждения о деньгах.
+        """
+        if origin is None:
+            self.fact_box.setText(Layer.FACT.label)
+            self.fact_box.setToolTip(FACT_HINT)
+        else:
+            self.fact_box.setText(f"{Layer.FACT.label} · {origin.label}")
+            self.fact_box.setToolTip(f"{FACT_HINT}\nСейчас это {FACT_MEANING[origin]}.")
+        self.legend.set_fact_origin(origin)
+
+    def set_combat(self, on: bool) -> None:
+        """Бой просили — «Прогноз» снят; бой выключили — снова включён (решение 0070).
+
+        Владелец счёта 13.11.2026: «бой включён и заявки из симуляции
+        отображены» — полые метки модели он не отличал от сделок брокера.
+        Снимается только на **смене** состояния боя: включил человек «Прогноз»
+        в бою сам — следующий снимок боя его не погасит.
+        """
+        if on == self._combat:
+            return
+        self._combat = on
+        self.plan_box.setChecked(not on)
 
     def _toggle_plan(self, on: bool) -> None:
         """Слой «Прогноз» включили или выключили: график и легенда идут вместе."""

@@ -47,11 +47,20 @@ from dataclasses import dataclass
 from datetime import date, time
 from typing import Final
 
-from ui.models import FIELD_CAPTIONS, CalendarDay, Settings
+from ui.models import (
+    FIELD_CAPTIONS,
+    LIVE_LIMITS_BOUNDS,
+    CalendarDay,
+    Settings,
+    live_limit_fits,
+    live_limit_rule,
+)
 
 __all__ = [
+    "REPLACED_KEYS",
     "BadValue",
     "Codec",
+    "Replaced",
     "codec_of",
     "encode_fields",
     "field_codecs",
@@ -177,6 +186,29 @@ def _dump_calendar(value: object) -> object:
     }
 
 
+def _as_whole_list(raw: object) -> tuple[int, ...]:
+    """Список целых чисел из файла: `[1, 2, 5]` → `(1, 2, 5)`.
+
+    Паузы переподключения (`Settings.live_reconnect_pauses_sec`). Годны ли
+    сами числа, решает проверка при «Применить» (`app/convert.py::live_limits`);
+    здесь — только то, что в файле действительно список целых. Один негодный
+    элемент отвергает весь список: пропуск элемента молча поменял бы порядок
+    пауз.
+    """
+    if not isinstance(raw, list):
+        raise BadValue(f"ожидался список целых чисел, а записано {shown(raw)}")
+    return tuple(_as_int(item) for item in raw)
+
+
+def _dump_whole_list(value: object) -> object:
+    """Список целых наружу — списком JSON. Не кортеж целых — поломка таблицы."""
+    if not isinstance(value, tuple) or not all(
+        isinstance(item, int) and not isinstance(item, bool) for item in value
+    ):
+        raise TypeError(f"поле объявлено списком целых, а хранит {value!r}")
+    return list(value)
+
+
 def _dump_time(value: object) -> object:
     """Время наружу строкой `10:05`. Не время — поломка таблицы, а не данных."""
     if not isinstance(value, time):
@@ -206,6 +238,7 @@ _CODECS: Final[dict[object, Codec]] = {
     time: Codec(dump=_dump_time, load=_as_time),
     float | None: Codec(dump=_as_is, load=_as_money),
     tuple[CalendarDay, ...]: Codec(dump=_dump_calendar, load=_as_calendar),
+    tuple[int, ...]: Codec(dump=_dump_whole_list, load=_as_whole_list),
 }
 
 
@@ -261,6 +294,59 @@ def field_codecs() -> dict[str, Codec]:
     }
 
 
+@dataclass(frozen=True, slots=True)
+class Replaced:
+    """Поле `Settings`, сменившее старый ключ файла, и что поменялось словами.
+
+    :param field: имя нового поля
+    :param change: продолжение фразы «Настройка «…» …» — что стало иначе
+    :param was_unit: в чём было старое значение, для «(в шагах цены: 10)»
+    :param unit: единица нового значения, для «взято «2 %»»
+    """
+
+    field: str
+    change: str
+    was_unit: str
+    unit: str
+
+
+#: Ключи файла, которые сменило другое поле с другой единицей: старый ключ →
+#: новое поле. Прежнее значение **не переводится**: десять шагов цены
+#: в процентах — это разное число при каждой цене, и перевод выдал бы
+#: за выбор владельца счёта число, которого он не выбирал.
+#:
+#: ⚠️ Молча такой ключ не пропускается (правило 13): без этой таблицы новое
+#: поле попало бы в общую строку «появилось в новой сборке», а старый ключ —
+#: в «незнакомые», со словами «файл сделан более новой сборкой», то есть
+#: неправдой, и возвращался бы в файл при каждой записи. Строка идёт
+#: в отвергнутые: значение, которое стояло в файле, потеряно.
+REPLACED_KEYS: Final[Mapping[str, Replaced]] = {
+    # Решение 0067: предел выхода по концу окна — процент, а не шаги цены.
+    "time_exit_limit_steps": Replaced(
+        field="time_exit_limit_pct",
+        change="теперь задаётся в процентах от закрытия свечи, а не в шагах цены",
+        was_unit="в шагах цены",
+        unit=" %",
+    ),
+}
+
+
+def _replaced_line(name: str, raw: Mapping[str, object], start: Settings) -> str:
+    """Строка о поле, сменившем старый ключ файла. Пусто — ключа в файле нет."""
+    for old, replaced in REPLACED_KEYS.items():
+        if replaced.field == name and old in raw:
+            return (
+                f"Настройка «{caption_of(name)}» {replaced.change}. Прежнее "
+                f"значение из файла ({replaced.was_unit}: {shown(raw[old])}) "
+                "в новые единицы не переводится и не применено. Взято "
+                f"«{human_value(getattr(start, name))}{replaced.unit}» — "
+                "проверьте его в окне "
+                "«Настройки»; в файл оно запишется, когда вы примените "
+                "настройки. Остальные настройки прочитаны."
+            )
+    return ""
+
+
 def read_fields(
     raw: Mapping[str, object], table: Mapping[str, Codec], start: Settings
 ) -> tuple[dict[str, object], list[str], list[str]]:
@@ -269,16 +355,24 @@ def read_fields(
     Негодное поле теряет **себя**, а не весь файл: остальные настройки
     остаются прочитанными, а про это говорится отдельной строкой с именем
     поля и с тем, что подставлено вместо него.
+
+    Поле, сменившее старый ключ, который в файле есть (`REPLACED_KEYS`), —
+    не «пропущенное», а отвергнутое: значение в файле было, и оно потеряно.
+    Строка одна, своими словами, а не общая «появилось в новой сборке».
     """
     changes: dict[str, object] = {}
     refused: list[str] = []
     missing: list[str] = []
     for name, codec in table.items():
         if name not in raw:
-            missing.append(name)
+            replaced = _replaced_line(name, raw, start)
+            if replaced:
+                refused.append(replaced)
+            else:
+                missing.append(name)
             continue
         try:
-            changes[name] = codec.load(raw[name])
+            changes[name] = _within_bounds(name, codec.load(raw[name]), raw[name])
         except BadValue as error:
             refused.append(
                 f"Настройка «{caption_of(name)}» в файле негодная: {error}. "
@@ -288,6 +382,19 @@ def read_fields(
     return changes, refused, missing
 
 
+def _within_bounds(name: str, value: object, raw: object) -> object:
+    """Пределы боя — ещё и по границам, а не только по типу (`B-078`).
+
+    Тип годный, а число вне границ (`live_fill_wait_sec: 0`) — отказ поля
+    тем же путём, что у негодного типа: поле берётся прежним значением,
+    и это сказано строкой с подписью окна. Пропущенный молча, такой предел
+    ронял бы каждое следующее «Применить» с чужой причиной.
+    """
+    if name in LIVE_LIMITS_BOUNDS and not live_limit_fits(name, value):
+        raise BadValue(f"нужно {live_limit_rule(name)}, а записано {shown(raw)}")
+    return value
+
+
 def caption_of(name: str) -> str:
     """Подпись поля из окна настроек; имя поля — только если подписи нет.
 
@@ -295,6 +402,17 @@ def caption_of(name: str) -> str:
     которого нет в `FIELD_CAPTIONS`, а полноту таблицы стережёт тест.
     """
     return FIELD_CAPTIONS.get(name, name)
+
+
+def _tuple_shown(value: tuple[object, ...]) -> str:
+    """Список словами: целые — как есть через запятую, прочее — числом штук.
+
+    Паузы переподключения читаются числами («1, 2, 5»), календарь — счётом
+    отметок: дат в одной строке отказа может быть сотня.
+    """
+    if value and all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        return ", ".join(str(item) for item in value)
+    return f"{len(value)} шт."
 
 
 def human_value(value: object) -> str:
@@ -307,7 +425,7 @@ def human_value(value: object) -> str:
     if isinstance(value, time):
         return value.strftime("%H:%M")
     if isinstance(value, tuple):
-        return f"{len(value)} шт."
+        return _tuple_shown(value)
     if isinstance(value, float):
         return f"{value:g}".replace(".", ",")
     return str(value) if value != "" else "пусто"

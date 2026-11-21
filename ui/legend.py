@@ -23,9 +23,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from ui.models import Layer, MarkerKind
+from ui.models import Layer, MarkerKind, RunOrigin
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +80,13 @@ class LegendItem:
     meaning: str
     detail: str = ""
     needs_plan: bool = False
+    #: Строка про то, чего на настоящих деньгах не бывает, — по данным
+    #: «факта», а не по режиму окна (`D-172`). Прячется, когда залитые метки —
+    #: сделки у брокера (`RunOrigin.real_money`).
+    simulated_only: bool = False
+    #: Строка слоя «Факт»: её смысл — откуда данные залитых меток
+    #: (`FACT_MEANING`), а не постоянный текст.
+    fact_layer: bool = False
 
     @property
     def hint(self) -> str:
@@ -127,6 +134,15 @@ LEGEND: tuple[LegendItem, ...] = (
         "смотрите журнал решений за это время.",
     ),
     LegendItem(
+        MarkerSample(MarkerKind.ENTRY_LONG, Layer.FACT),
+        "Факт",
+        "что произошло на самом деле",
+        "Залитая метка — исполнение, а не расчёт. Откуда оно — сказано здесь "
+        "же: в боевом режиме это сделки у брокера на вашем счёте, в симуляции "
+        "и на истории — исполнения модели, заявок брокеру нет.",
+        fact_layer=True,
+    ),
+    LegendItem(
         MarkerSample(MarkerKind.ENTRY_LONG, Layer.PLAN),
         "Прогноз",
         "расчётные вход и выход",
@@ -152,8 +168,10 @@ LEGEND: tuple[LegendItem, ...] = (
         "заявку; биржа исполнит её по цене открытия следующей свечи. Это не "
         "пропуск: когда сделка случится, часы сменятся обычной полой меткой "
         "прогноза, а рядом встанет залитая метка факта. Видна, пока включена "
-        "галочка «Прогноз».",
+        "галочка «Прогноз». В боевом режиме этой метки нет: когда исполнится "
+        "заявка у брокера, знает брокер, а не модель.",
         needs_plan=True,
+        simulated_only=True,
     ),
     LegendItem(
         LineSample("success"),
@@ -215,12 +233,34 @@ LEGEND: tuple[LegendItem, ...] = (
 )
 
 
-def visible(*, plan: bool) -> tuple[LegendItem, ...]:
+#: Что значат залитые метки — по происхождению данных «факта» (`D-172`).
+#: `None` — происхождение не названо: окно не знает, чьи исполнения
+#: на графике, и не придумывает.
+FACT_MEANING: dict[RunOrigin | None, str] = {
+    None: "что произошло на самом деле",
+    RunOrigin.LIVE: "сделки у брокера на вашем счёте — настоящие деньги",
+    RunOrigin.PAPER: "исполнения симуляции на живом потоке — заявок брокеру нет",
+    RunOrigin.BACKTEST: "исполнения прогона по истории — заявок брокеру нет",
+}
+
+
+def visible(
+    *, plan: bool, fact_origin: RunOrigin | None = None
+) -> tuple[LegendItem, ...]:
     """Строки легенды для текущего состояния слоёв.
 
     Со снятой галочкой «Прогноз» полая метка и пунктир расчёта появиться
     не могут, и объяснять их — значит показывать человеку то, чего на экране
     нет. Легенда обязана совпадать с картинкой, иначе она добавляет путаницы
     вместо того, чтобы её снимать.
+
+    Происхождение «факта» (`fact_origin`) — из данных снимка боя, не из
+    режима окна: оно подписывает строку «Факт» и прячет строки, которых
+    на настоящих деньгах не бывает (`simulated_only`, `D-172`).
     """
-    return tuple(item for item in LEGEND if plan or not item.needs_plan)
+    real = fact_origin is not None and fact_origin.real_money
+    return tuple(
+        replace(item, meaning=FACT_MEANING[fact_origin]) if item.fact_layer else item
+        for item in LEGEND
+        if (plan or not item.needs_plan) and not (real and item.simulated_only)
+    )

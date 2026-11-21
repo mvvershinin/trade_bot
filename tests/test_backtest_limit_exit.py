@@ -23,6 +23,7 @@ from engine import (
     EngineSettings,
     ExitReason,
     Fill,
+    LevelUnfilled,
     Mode,
     OrderAction,
     OrderRequest,
@@ -41,7 +42,8 @@ MARKET = EngineSettings(
     mode=Mode.REVERSE, window=WINDOW, take_profit=False, commission_per_side=1.0,
     price_step=1.0,
 )
-LIMIT = MARKET.replace(time_exit_order=TimeExitOrder.LIMIT)
+#: Предел 990 = 1 000 − 1 % (решение 0067: отступ — процент; прежде 10 шагов по 1).
+LIMIT = MARKET.replace(time_exit_order=TimeExitOrder.LIMIT, time_exit_limit_percent=1.0)
 
 Prices = tuple[float, float, float, float]
 
@@ -211,7 +213,7 @@ def test_the_limit_touch_comes_after_the_prices_before_it_not_in_the_open_round(
         _one(11, 2, (985.0, 995.0, 984.0, 993.0)),
         _one(11, 3, (993.0, 994.0, 992.0, 993.0)),
     ]))
-    answers: list[list[Fill | PriceSeen]] = []
+    answers: list[list[Fill | PriceSeen | LevelUnfilled]] = []
 
     async def go() -> None:
         await model.submit(OrderRequest(

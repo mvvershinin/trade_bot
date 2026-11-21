@@ -1516,7 +1516,7 @@ def test_all_four_forks_are_settings_not_constants() -> None:
     assert [kind.name for kind in AverageKind] == ["EMA", "SMA"]
     assert [moment.name for moment in ReversalMoment] == ["NEXT_BAR", "SAME_BAR"]
     assert [after.name for after in AfterTakeProfit] == [
-        "STOP_FOR_THE_DAY", "WAIT_FOR_SIGNAL", "RESTORE_AT_ONCE"
+        "STOP_FOR_THE_DAY", "WAIT_FOR_SIGNAL", "WAIT_THEN_STOP_ON_LOSS", "RESTORE_AT_ONCE"
     ]
 
     defaults = Settings()
@@ -2217,8 +2217,21 @@ SAMPLE = Settings(
     # Выход по концу окна (Ф3 задачи З8). Предельная форма — не умолчание
     # и годится второму алгоритму, которого требует (`_ALWAYS_DEMANDS`).
     time_exit_order=TimeExitKind.MARKET,
-    time_exit_limit_steps=7,
+    time_exit_limit_pct=3.5,
     time_exit_wait_bars=3,
+    # Р-10: «Заходить заново при обрыве связи», не умолчание.
+    reenter_after_disconnect=True,
+    # Ожидания боевого исполнителя (вкладка «Бой»).
+    live_stale_after_sec=90,
+    live_event_wait_sec=5,
+    live_fill_wait_sec=45,
+    live_cancel_wait_sec=20,
+    live_position_settle_sec=2.5,
+    live_reconnect_pauses_sec=(2, 4, 8),
+    # Решение 0067: отступ цены боевой заявки и ожидание планки биржи.
+    live_fok_pct=3.5,
+    live_band_wait_sec=12,
+    live_trailing_spread_pct=0.25,
     log_directory="/tmp/терминал-логи",
     # ⚠️ Поля календаря в этом окне нет: его правят в своём окне, из меню
     # «Настройки». Но пронести его через обмен окно обязано — иначе «Применить»
@@ -2289,6 +2302,7 @@ def test_the_unfinished_variant_is_shown_but_not_offered(dialog) -> None:
     assert offered == {
         AfterTakeProfit.STOP_FOR_THE_DAY: True,
         AfterTakeProfit.WAIT_FOR_SIGNAL: True,
+        AfterTakeProfit.WAIT_THEN_STOP_ON_LOSS: True,
         AfterTakeProfit.RESTORE_AT_ONCE: False,
     }, f"выбирается не то, что умеет робот: {offered}"
     index = box.findData(AfterTakeProfit.RESTORE_AT_ONCE)

@@ -76,13 +76,14 @@ import concurrent.futures
 import pathlib
 import queue
 import threading
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from types import TracebackType
 from typing import Any, TypeVar, cast
 
 from market.candles import Candle, Timeframe
 from market.chain import Leg
+from market.commands import OrderFillTimes
 from market.contracts import (
     ContractLoad,
     ContractRequest,
@@ -92,10 +93,19 @@ from market.contracts import (
     load_contract_minutes,
     refresh_contracts,
 )
+from market.day import OpeningFunds, TradingDay
 from market.gaps import Gap
 from market.history import HistoryOutcome, HistoryRequest, load_history
 from market.inventory import Inventory, take_inventory
-from market.iss import FetchResult, InstrumentSpec, IssClient, Market
+from market.iss import (
+    FUTURES,
+    FetchResult,
+    InstrumentSpec,
+    IssClient,
+    Market,
+    PriceBand,
+    ask_price_band,
+)
 from market.journal import (
     BACKTEST_SESSIONS_KEPT,
     DecisionRecord,
@@ -717,6 +727,49 @@ class MarketWorker:
             lambda: ask_point_value(loader, symbol, markets=tuple(markets))
         )
 
+    async def price_band(
+        self,
+        symbol: str,
+        *,
+        timeout: float,
+        market: Market = FUTURES,
+        client: IssClient | None = None,
+    ) -> PriceBand:
+        """Планка биржи по контракту: `HIGHLIMIT`/`LOWLIMIT` — или причина словами.
+
+        Для выхода по концу окна (решение 0067). Ждёт **не дольше `timeout`**
+        секунд, и это обещание метода, а не транспорта: таймаут `httpx`
+        отмеряет каждую фазу запроса порознь, а поток сети может быть занят
+        чужим походом (уточнение стоимости пункта) — тогда этот запрос стоит
+        в очереди. Не дождались — ответ «биржа не ответила за N с», а запрос,
+        так и не начатый, снимается с очереди и к бирже не уходит.
+
+        Поток сети, а не `asyncio.to_thread`: потоки стандартного исполнителя
+        питон ждёт при выходе, и повисший запрос держал бы закрытую программу
+        (`_NetThread`). Клиент — `single_try` фасадного: **одна попытка**,
+        таймаут сети тот же `timeout`, сеть та же, что у фасада.
+
+        ⚠️ Подгонки к шагу цены и проверки стороны от закрытия здесь нет:
+        значения сырые, время — момент ответа (`PriceBand`).
+
+        :param timeout: сколько ждать ответа, секунд; задаёт вызывающий.
+        :raises WorkerClosed: поток данных закрыт.
+        :raises ValueError: таймаут не положительный или не конечный.
+        """
+        if self._closed:
+            raise WorkerClosed(_CLOSED)
+        once = self._loader(client).single_try(timeout=timeout)
+        try:
+            return await asyncio.wait_for(
+                self._submit_net(lambda: ask_price_band(once, symbol, market=market)),
+                timeout,
+            )
+        except TimeoutError:
+            waited = f"{timeout:g}".replace(".", ",")
+            return PriceBand(
+                symbol, None, None, f"биржа не ответила про планку {symbol} за {waited} с"
+            )
+
     def _loader(self, client: IssClient | None) -> IssClient:
         """Чем идти на биржу: названный вызовом, затем фасадный, затем новый.
 
@@ -1031,6 +1084,56 @@ class MarketWorker:
         """
         return await self.call(lambda store: store.lift_halt(reason))
 
+    # -- день счёта (`market.day`, решение 0066 Р7) -------------------------
+
+    async def record_opening_funds(self, funds: OpeningFunds) -> OpeningFunds:
+        """Снимок счёта; ложится первый в дате. Возврат — счёт на утро.
+
+        Разбор — `CandleStore.record_opening_funds`.
+        """
+        return await self.call(lambda store: store.record_opening_funds(funds))
+
+    async def executions_day(
+        self,
+        account: str,
+        day: date,
+        *,
+        ruble_per_point: Mapping[str, float],
+        is_take: Callable[[str], bool],
+        closes_day: Callable[[str], bool],
+    ) -> TradingDay:
+        """День счёта по исполнениям — боевому движку при старте.
+
+        ⚠️ `is_take` и `closes_day` исполняются **в потоке базы**: они обязаны
+        быть чистыми функциями имени, без обращений к окну и к циклу событий.
+        Умолчаний у них нет нарочно: забытый предикат — отказ вызова, а не
+        тихо снятый запрет после перезапуска. Разбор — `CandleStore.executions_day`.
+        """
+        return await self.call(
+            lambda store: store.executions_day(
+                account, day, ruble_per_point=ruble_per_point,
+                is_take=is_take, closes_day=closes_day,
+            )
+        )
+
+    async def journal_day(
+        self,
+        session_id: int,
+        day: date,
+        *,
+        account: str | None,
+        is_take: Callable[[str], bool],
+    ) -> TradingDay:
+        """День по журналу сделок прогона — симуляции при старте.
+
+        Разбор — `CandleStore.journal_day`; про `is_take` — `executions_day`.
+        """
+        return await self.call(
+            lambda store: store.journal_day(
+                session_id, day, account=account, is_take=is_take
+            )
+        )
+
     async def journal_sessions(
         self, *, origin: RunOrigin | None = None, limit: int = 50
     ) -> JournalPage[JournalSession]:
@@ -1090,6 +1193,10 @@ class MarketWorker:
                 all_runs=all_runs,
             )
         )
+
+    async def order_fill_times(self) -> tuple[OrderFillTimes, ...]:
+        """Подача и исполнения заявок движка у брокера — `CandleStore.order_fill_times`."""
+        return await self.call(lambda store: store.order_fill_times())
 
     async def orders(
         self, *, session_id: int, limit: int = 5000

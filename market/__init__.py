@@ -62,6 +62,7 @@ from market.commands import (
     CommandAction,
     CommandSide,
     CommandStatus,
+    OrderFillTimes,
     StoredCommand,
 )
 from market.contracts import (
@@ -88,6 +89,7 @@ from market.contracts import (
     refresh_contracts,
     rows_of_asset,
 )
+from market.day import OpeningFunds, TradingDay
 from market.depth import Depth, declared_depth, measured_depth
 from market.fee import Commission, read_commission
 from market.gaps import Gap, count_missing_minutes, find_gaps
@@ -128,10 +130,13 @@ from market.iss import (
     IssTransportError,
     IssUnknownInstrument,
     Market,
+    PriceBand,
+    ask_price_band,
     candles_url,
     check_interval,
     parse_borders,
     parse_candles,
+    parse_price_band,
     parse_security,
     securities_url,
 )
@@ -283,6 +288,9 @@ __all__ = [
     "IssUnknownInstrument",
     "InstrumentSpec",
     "parse_security",
+    "PriceBand",
+    "parse_price_band",
+    "ask_price_band",
     "MARKETS_PROBED",
     "PointValue",
     "ask_point_value",
@@ -327,7 +335,10 @@ __all__ = [
     "CommandAction",
     "CommandSide",
     "CommandStatus",
+    "OrderFillTimes",
     "StoredCommand",
+    "OpeningFunds",
+    "TradingDay",
     "BACKTEST_SESSIONS_KEPT",
     "SECRET_MASK",
     "redact",

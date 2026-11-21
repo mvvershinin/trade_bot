@@ -341,6 +341,7 @@ _ANOTHER_ENGINE: dict[str, object] = {
     "trailing_offset_percent": 0.3,
     "trailing_step_percent": 0.07,
     "stop_after_take_profit": False,
+    "stop_after_loss": True,
     "min_exit_profit_sides": 2.0,
     "partial_candles": PartialCandles.SKIP,
     "commission_per_side": 7.0,
@@ -355,9 +356,10 @@ _ANOTHER_ENGINE: dict[str, object] = {
     # Предельная форма законна только при известном шаге — шаг стоит
     # в основе (см. следующий тест), как тариф для порога выхода.
     "time_exit_order": TimeExitOrder.LIMIT,
-    "time_exit_limit_steps": 3,
+    "time_exit_limit_percent": 3.0,
     "time_exit_wait_bars": 2,
     "price_step": 10.0,
+    "hold_after_unfilled_level": True,
 }
 
 _ANOTHER_STRATEGY: dict[str, object] = {
@@ -1039,8 +1041,8 @@ _TIME_EXIT_PAIRS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
     "time_exit_order": (
         {"time_exit_order": TimeExitKind.LIMIT}, {"time_exit_order": TimeExitKind.MARKET},
     ),
-    "time_exit_limit_steps": (
-        {"time_exit_limit_steps": 10}, {"time_exit_limit_steps": 3},
+    "time_exit_limit_pct": (
+        {"time_exit_limit_pct": 2.0}, {"time_exit_limit_pct": 3.0},
     ),
     "time_exit_wait_bars": ({"time_exit_wait_bars": 1}, {"time_exit_wait_bars": 2}),
     "price_step": ({"price_step": 25.0}, {"price_step": 10.0}),

@@ -88,9 +88,10 @@
 
 from __future__ import annotations
 
+import enum
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from datetime import date, datetime, timedelta
 
 from strategies import Decision, Intent, check_bar
 
@@ -105,6 +106,7 @@ from engine.contracts import (
     JournalEntry,
     JournalLevel,
     LevelTouch,
+    LevelUnfilled,
     OrderAction,
     OrderRequest,
     Position,
@@ -119,26 +121,34 @@ from engine.contracts import (
 # раскомментировать строку ниже и удалить живую замену под ней.
 # from engine.guards import DayResult, Sizing, Unchecked, day_result, entry_size, unchecked_guards
 from engine.guards import entry_size
-from engine.ports import Refusal
+from engine.bars import close_time
+from engine.ports import MarketCandle, Refusal
 from engine.settings import EngineSettings, Mode, Reversal, TimeExitOrder
-from engine.take_profit import covers_commission, target_profit
-from engine.window import DayVerdict, day_verdict, in_moscow, minutes_of_day, verdict_of_day
+from engine.take_profit import covers_commission, limit_beyond, target_profit
+from engine.window import (
+    DayVerdict, WindowDay, day_verdict, in_moscow, minutes_of_day, verdict_of_day,
+)
 
 __all__ = [
     "Outcome",
     "FillOutcome",
     "process_closed_candle",
+    "adopted_state",
+    "dropped_state",
     "after_submit",
     "after_refused_cancel",
     "after_refused_exit",
     "apply_fill",
     "apply_price",
+    "apply_unfilled",
+    "closes_entries_day",
     "exit_signal",
     "money",
     "order_words",
     "percent",
     "plural",
     "take_order_id",
+    "is_take_order",
 ]
 
 
@@ -301,9 +311,15 @@ class FillOutcome:
     не знает никто.
 
     `halt` не пуст — движок обязан **остановиться до подачи любой следующей
-    заявки**. Сегодня причина одна: сделка, не сопоставившаяся ни с одной
-    заявкой в полёте. Пока она не разобрана человеком, движок не знает, что
-    на счёте, — и любая следующая заявка может удвоить объём.
+    заявки**. Причин две: сделка, не сопоставившаяся ни с одной заявкой
+    в полёте (пока она не разобрана человеком, движок не знает, что на счёте,
+    и любая следующая заявка может удвоить объём), и событие «уровень
+    не исполнился», которое разобрать нельзя (`apply_unfilled`).
+
+    `refused` не пуст — **определённый отказ** в рождённой заявке означает
+    остановку с этими словами, а не общую строку «повторит следующая свеча».
+    Так у выхода после неисполненного уровня (Р-10, Н2): сторожа у позиции
+    уже нет, повторять выход некому, и позиция осталась бы в рынке молча.
 
     ⚠️ Заявка вооружения обязана дойти до исполнителя **до того**, как он закончит
     разбирать тот же бар: `high`/`low` той же свечи уже сторожат уровень,
@@ -316,6 +332,7 @@ class FillOutcome:
     written: tuple[tuple[str, JournalEntry], ...] = ()
     orders: tuple[OrderRequest, ...] = ()
     halt: str = ""
+    refused: str = ""
 
     @property
     def journal(self) -> tuple[JournalEntry, ...]:
@@ -402,6 +419,14 @@ def _after_arm(state: EngineState, order: OrderRequest) -> EngineState:
     position = state.position
     if position is None or take_order_id(position) != order.order_id:
         return state
+    if order.trail_offset is not None:
+        # Условная у брокера (`D-196`): цена включения, а не уровень выхода.
+        # Уровня у позиции по-прежнему нет — его ведёт брокер, а движок
+        # заведёт свой на пороге (`TakeProfit.advance`).
+        return replace(
+            state,
+            position=replace(position, take=replace(position.take, activation=order.price)),
+        )
     return replace(
         state, position=replace(position, take=replace(position.take, level=order.price))
     )
@@ -494,7 +519,9 @@ def _after_cancel(state: EngineState, order: OrderRequest) -> EngineState:
     pending = _without_order(state.pending, order.target_id or "")
     position = state.position
     if position is not None and take_order_id(position) == order.target_id:
-        position = replace(position, take=replace(position.take, level=None))
+        position = replace(
+            position, take=replace(position.take, level=None, activation=None)
+        )
         return replace(state, pending=pending, position=position)
     return replace(state, pending=pending)
 
@@ -714,8 +741,9 @@ def process_closed_candle(
     if snapshot is not None:
         working, held = _step_close_by_signal(
             working, decision, closes_at, orders, writer,
-            settings=settings, armed_before=armed_before,
+            settings=settings, armed_before=armed_before, close=close,
         )
+        refused = replace(refused, losing_window=working.losing_window)  # B-108: решение свечи
 
     # ---- шаг 8: режим «только закрытие» ------------------------------------
     steps.append(Step.CLOSE_ONLY)
@@ -731,8 +759,7 @@ def process_closed_candle(
             writer, refused, steps, orders, closes_at, snapshot, inside, trading
         )
 
-    # ---- шаг 9: «стоп после тейка» и тейк уже был сегодня ------------------
-    # (и режим «один вход в день»: выход сегодня уже был — `_day_is_closed`)
+    # ---- шаг 9: «стоп после тейка» и другие закрытые дни — `_day_is_closed` --
     # Здесь только СРАВНЕНИЕ: дата тейка против даты времени ЗАКРЫТИЯ текущей
     # свечи, «начало + таймфрейм». Место шага в порядке значимо — он стоит
     # после закрытия по сигналу и до открытия, то есть выйти из позиции в день
@@ -750,7 +777,7 @@ def process_closed_candle(
     # оба» снято 31.08.2026 разбором журнала прототипа: пути расходятся
     # не на полуночи, а после разрыва в ряде, и путь А даёт там СТАРШУЮ дату.
     steps.append(Step.STOP_AFTER_TAKE)
-    closed, note = _day_is_closed(state, working, orders, closes_at, settings)
+    closed, note = _day_is_closed(working, orders, closes_at, settings)
     if closed:
         if note is not None:
             writer.quiet(*note)
@@ -835,12 +862,96 @@ def apply_fill(
         ), halt=True)
     wrong = _fill_against_order(order, fill)
     if wrong is not None:
-        return _refuse(state, fill, "Сделка противоречит своей заявке", wrong)
+        # ⚠️ Остановка, а не строка и дальше (решение 0066, Р6). Сделка
+        # не на объём своей заявки — это частичное исполнение: на счёте
+        # объём, которого движок не видит, а заявка в полёте ждёт сделку,
+        # которой в таком виде не будет. Следующая заявка ушла бы
+        # на неизвестную позицию.
+        return _refuse(
+            state, fill, "Сделка противоречит своей заявке", wrong + _PARTIAL_HALT,
+            halt=True,
+        )
 
     pending = _without_order(state.pending, order.order_id)
     if order.action is OrderAction.OPEN:
         return _opened(state, fill, order, pending, settings)
     return _closed(state, fill, order, pending, settings)
+
+
+def adopted_state(
+    state: EngineState,
+    held: tuple[Side, float, float],
+    at: datetime,
+    settings: EngineSettings,
+) -> tuple[EngineState, JournalEntry]:
+    """Позиция, взятая у брокера при включении боя (решение 0070). **Не сделка.**
+
+    Сторона и объём — из портфеля, цена входа — средняя брокера. План тейка —
+    тот же, что у сделки открытия (`_opened`), от этой цены, на сетке шага.
+    Уровень у брокера ставит шаг 5 ближайшей закрытой свечи — как у любой
+    позиции без принятого вооружения: заявки здесь не рождаются, и подавать
+    их некому (метод синхронный, вызывается между свечами). Комиссии и денег
+    дня нет: сделку делал не этот запуск.
+
+    :param held: сторона, объём, средняя цена брокера.
+    """
+    side, volume, price = held
+    position = Position(side=side, volume=volume, entry_price=price, entry_time=at)
+    plan = settings.plan().initial(price, position.side_sign)
+    position = replace(position, take=replace(plan, level=None))
+    words = _no_take_reason(plan)
+    activation = plan.activation_level(price, position.side_sign)
+    if plan.level is not None:
+        take = f"тейк {_price(plan.level)} встанет у брокера на закрытии ближайшей свечи"
+    elif activation is not None:
+        take = (
+            "скользящий тейк встанет у брокера условной заявкой (включение на "
+            f"{_price(activation)}) на закрытии ближайшей свечи"
+        )
+    else:
+        take = words[:1].lower() + words[1:]
+    entry = JournalEntry(
+        at=at,
+        event="Подхвачена позиция у брокера",
+        reason=(
+            f"{side.label} {_volume(volume)} по средней цене брокера {_price(price)}; "
+            f"{take}. Дальше робот ведёт её по сигналам, как свою"
+        ),
+        level=JournalLevel.WARNING,
+    )
+    return replace(
+        state, position=position, pending=(), closing_bars=0, exit_blocked_bars=0,
+        quiet_note="",
+    ), entry
+
+
+def dropped_state(state: EngineState, at: datetime) -> tuple[EngineState, JournalEntry]:
+    """Позицию закрыл владелец кнопкой «Закрыть позицию» (решение 0069). **Не сделка.**
+
+    Заявки робота по инструменту сняты тем же действием, поэтому забываются
+    и заявки в полёте. Дат тейка и выхода нет: выходил не робот, и «стоп после
+    тейка» ручное закрытие не включает. Деньги дня не трогаются — результат
+    закрытия движок не видел; он есть в таблице исполнений счёта.
+    """
+    position = state.position
+    what = (
+        "позиции у робота не было"
+        if position is None
+        else f"{position.side.label.lower()} {_volume(position.volume)} закрыт"
+    )
+    entry = JournalEntry(
+        at=at,
+        event="Позиция закрыта владельцем",
+        reason=(
+            f"Кнопкой «Закрыть позицию»: {what}. Робот без позиции и войдёт снова "
+            "по сигналу ближайшей свечи; чтобы остаться без позиции — сначала выключите бой"
+        ),
+        level=JournalLevel.WARNING,
+    )
+    return replace(
+        state, position=None, pending=(), closing_bars=0, exit_blocked_bars=0,
+        quiet_note="",
+    ), entry
 
 
 def take_managed(state: EngineState, settings: EngineSettings) -> bool:
@@ -942,6 +1053,336 @@ def apply_price(
     return FillOutcome(state, ((order.order_id, entry),), (order,))
 
 
+class _AfterUnfilled(enum.Enum):
+    """Что движок делает после неисполненного уровня. Значение — приставка имени.
+
+    Таблица 0067 «Выход по касанию трейлинга, поданный после обрыва связи»
+    даёт три исхода, и у двух из них рождается заявка на выход. Их **имена
+    различаются приставкой** (Р-10, Н3): по имени тейк узнаётся для «стопа
+    после тейка» (`is_take_order`), а закрытый день — по команде брокеру
+    после перезапуска (`closes_entries_day`). Сборка имени
+    (`_unfilled_close_order`) и узнавание — здесь, в одном месте, как
+    у `_TAKE_PREFIX`: две копии формата разошлись бы молча.
+
+    ⚠️ Приставки не начинаются с `take:` и с `close:` нарочно: первое сделало
+    бы заявку на выход неотличимой от вооружения (`_after_arm`), второе —
+    от выхода по сигналу.
+    """
+
+    #: В убытке, настройка включена: позиция остаётся, заявки нет.
+    HOLD = ""
+    #: В убытке, настройка выключена: закрыть и до конца дня не входить.
+    CLOSE_DAY = "unfilled-day:"
+    #: Не в убытке: закрыть и работать дальше; выход засчитывается тейком (В4).
+    CLOSE_TAKE = "unfilled-take:"
+
+
+@dataclass(frozen=True, slots=True)
+class _Touch:
+    """Событие «уровень не исполнился» и то, что движок знает о его уровне."""
+
+    event: LevelUnfilled
+    settled: bool
+    position: Position | None
+    arm: OrderRequest | None
+
+    @property
+    def guarded(self) -> tuple[Position, float] | None:
+        """Открытая позиция, чей уровень задет, и сам уровень — или `None`.
+
+        Уровень принадлежит **своей** позиции: заявка вооружения с этим
+        именем в полёте, позиция открыта, и имя выведено из неё
+        (`take_order_id`). Иначе событие не про эту позицию.
+        """
+        position, arm = self.position, self.arm
+        if (
+            arm is None
+            or arm.action is not OrderAction.ARM_TAKE_PROFIT
+            or arm.price is None
+            or position is None
+            or not position.is_open
+            or take_order_id(position) != arm.order_id
+        ):
+            return None
+        return position, arm.price
+
+
+def _stop_unsettled(touch: _Touch) -> str | None:
+    """Звено 1: событие по незакрытой свече (Р-10, Н4)."""
+    if touch.settled:
+        return None
+    return (
+        "событие пришло по незакрытой свече. Решение по нему — в убытке ли "
+        "позиция и какой предел у выхода — принимается по закрытию свечи, "
+        "а закрытия ещё нет (решение 0065); контракт порта такое событие "
+        "запрещает"
+    )
+
+
+def _stop_no_guard(touch: _Touch) -> str | None:
+    """Звено 2: заявки вооружения с этим именем у открытой позиции нет."""
+    if touch.guarded is not None:
+        return None
+    return (
+        f"заявки вооружения {_named(touch.event.order_id)} у открытой позиции "
+        "движка в полёте нет — чей уровень задет, движку неизвестно"
+    )
+
+
+def _stop_fixed_take(touch: _Touch) -> str | None:
+    """Звено 3: событие для неподвижного тейка (Р-10, П3)."""
+    guarded = touch.guarded
+    if guarded is None or guarded[0].take.trailing:
+        return None
+    return (
+        "событие пришло для неподвижного тейка. Неподвижный уровень стоит "
+        "у брокера заявкой, и выхода «после обрыва связи» у него нет; начать "
+        "его заново значило бы поставить тот же уровень и получить тот же "
+        "круг: касание, снятый выход, снова касание"
+    )
+
+
+#: Когда событие «уровень не исполнился» разобрать нельзя — цепочка звеньев,
+#: порядок проверки — порядок кортежа (правило 9). Первое сработавшее звено
+#: называет причину остановки.
+_UNFILLED_STOPS: tuple[Callable[[_Touch], str | None], ...] = (
+    _stop_unsettled,
+    _stop_no_guard,
+    _stop_fixed_take,
+)
+
+#: Таблица решения 0067 «позиция от цены входа × настройка → что делает
+#: робот». Ключ: (в убытке ли позиция, `hold_after_unfilled_level`).
+_AFTER_UNFILLED_TABLE: dict[tuple[bool, bool], _AfterUnfilled] = {
+    (True, True): _AfterUnfilled.HOLD,
+    (True, False): _AfterUnfilled.CLOSE_DAY,
+    (False, True): _AfterUnfilled.CLOSE_TAKE,
+    (False, False): _AfterUnfilled.CLOSE_TAKE,
+}
+
+
+def apply_unfilled(
+    state: EngineState,
+    event: LevelUnfilled,
+    settings: EngineSettings,
+    candle: MarketCandle,
+) -> FillOutcome:
+    """Уровень задет, выход по нему не исполнился. Чистая функция, как `apply_fill`.
+
+    Решение 0067, абзац «Выход по касанию трейлинга, поданный после обрыва
+    связи», и Р-10 плана координатора 04.11.2026. Разбирается в обмене
+    свечи (`engine.runner.Engine._exchange`), до десяти шагов: порядок
+    шагов не меняется, снимок шага 3 берётся уже после события.
+
+    :param candle: свеча, в обмене которой пришло событие. Её время
+        закрытия помечает рождённую заявку на выход (Н1), а не время
+        события: модель прогона исполнила бы её по `open` той же свечи —
+        по цене до касания, — а боевой исполнитель не нашёл бы цены свечи
+        сигнала. По её закрытию — «в убытке ли позиция» (хуже цены входа
+        по стороне позиции, без комиссии; равенство — «не в убытке»)
+        и предел рождённого выхода. Незакрытая — остановка (Н4).
+
+    Остановка со словами — цепочкой `_UNFILLED_STOPS`: незакрытая свеча,
+    заявки нет в полёте, неподвижный тейк.
+
+    **Во всех трёх ветках** (Н2): заявка вооружения уходит из полёта,
+    `exit_blocked_bars` обнуляется, а план тейка позиции начинается заново —
+    `position.take.initial(...)`: план самой позиции с её замороженными
+    параметрами, а не `settings.plan()` (ТЗ §4.4 А). Это и есть «трейлинг
+    заново, как у новой позиции» (В3); заодно шаг 5 не вооружит старую
+    вершину, если рождённый выход отклонят.
+
+    Ветки — таблица `_AFTER_UNFILLED_TABLE`:
+
+    * **в убытке, настройка включена** — позиция остаётся, заявки нет.
+      Дальше обычные шаги той же свечи: уровня нет, пока трейлинг
+      не включится; обратный сигнал средней закроет позицию без снятия
+      тейка; переворот — по моменту переворота;
+    * **в убытке, настройка выключена** — рождённый выход и закрытый день
+      (`EngineState.entries_closed_date`, в момент решения);
+    * **не в убытке** — рождённый выход; сделка по нему засчитывается тейком
+      по имени заявки (`is_take_order`, В4).
+
+    Рождённый выход: `submitted_at` — закрытие свечи, предел — закрытие ∓
+    процент выхода по концу окна при любой его форме (`_exit_limit`). Отказ
+    в нём — остановка со словами (`FillOutcome.refused`). В «Выключен»
+    он тоже подаётся: позиция осталась без сторожа, а исполнитель выходит
+    по касанию и в «Выключен» (0066). Признака источника у события нет,
+    и ветки по нему здесь нет (железное правило 1).
+    """
+    closes_at, close = close_time(candle), float(candle.close)
+    touch = _Touch(
+        event=event,
+        settled=not getattr(candle, "unsettled", False),
+        position=state.position,
+        arm=state.order_in_flight(event.order_id),
+    )
+    why = next((words for stop in _UNFILLED_STOPS if (words := stop(touch))), None)
+    guarded = touch.guarded
+    if why is not None or guarded is None:
+        return _unfilled_halt(state, event, why or "")
+    position, level = guarded
+    plan = position.take.initial(position.entry_price, position.side_sign)
+    position = replace(position, take=replace(plan, level=None))
+    state = replace(
+        state,
+        position=position,
+        pending=_without_order(state.pending, event.order_id),
+        exit_blocked_bars=0,
+        quiet_note="",
+    )
+    points = (close - position.entry_price) * position.side_sign
+    verdict = _AFTER_UNFILLED_TABLE[(points < 0, settings.hold_after_unfilled_level)]
+    touched = (
+        f"Уровень {_price(level)} {position.side.label.lower()}а задет в "
+        f"{in_moscow(event.at):%H:%M}; выход по нему подан исполнителем "
+        f"и не исполнился: {_event_words(event)}. Сторожа у позиции больше нет. "
+        f"Закрытие свечи {in_moscow(closes_at):%H:%M} — {_price(close)}, "
+        f"вход {_price(position.entry_price)}: позиция "
+        + (f"в убытке на {_price(-points)} пунктов" if points < 0 else "не в убытке")
+    )
+    if verdict is _AfterUnfilled.HOLD:
+        return FillOutcome(state, (("", JournalEntry(
+            at=event.at,
+            event="Уровень не исполнился — позиция остаётся",
+            reason=touched + ". " + _hold_words(position, settings),
+            level=JournalLevel.WARNING,
+        )),))
+    if verdict is _AfterUnfilled.CLOSE_DAY:
+        state = replace(state, entries_closed_date=in_moscow(closes_at).date())
+    order = _unfilled_close_order(position, closes_at, close, verdict, settings)
+    return FillOutcome(
+        state,
+        (
+            ("", JournalEntry(
+                at=event.at,
+                event="Уровень не исполнился — выходим",
+                reason=touched,
+                level=JournalLevel.WARNING,
+            )),
+            (order.order_id, JournalEntry(
+                at=closes_at,
+                event=f"Выход из {position.side.label.lower()}а после неисполненного уровня",
+                reason=order.reason,
+                level=JournalLevel.TRADE,
+            )),
+        ),
+        (order,),
+        refused=(
+            "Выход после неисполненного уровня не принят, позиция открыта "
+            f"без сторожа ({position.side.label.lower()}, "
+            f"{_volume(position.volume)}). Повторить выход некому: уровень уже "
+            "задет, а следующая свеча этот выход не подаст. Робот остановлен — "
+            "закройте позицию или поставьте защиту в приложении брокера"
+            + (_closed_day_lost(closes_at) if verdict is _AfterUnfilled.CLOSE_DAY else "")
+        ),
+    )
+
+
+def _closed_day_lost(closes_at: datetime) -> str:
+    """Хвост остановки на отказе выхода «закрыть и до конца дня не входить».
+
+    Известная дыра Р-10 (`/risk` 04.11.2026, п. 4): заявку могли отклонить
+    ещё до записи в журнал команд, а после «Возобновить» движок собирается
+    заново и дату закрытого дня берёт только оттуда (`closes_entries_day`).
+    Строки нет — запрета нет, и робот войдёт в тот же день по сигналу.
+    Назвать это обязана строка остановки: здесь человек решает, возобновлять
+    ли работу (правило 13).
+    """
+    return (
+        ". ⚠️ По настройке «Заходить заново при обрыве связи» до конца дня "
+        f"({in_moscow(closes_at):%d.%m.%Y}) входов нет — сегодня не возобновляйте: "
+        "запрет на вход до конца дня после перезапуска не восстановится, и робот "
+        "войдёт по первому сигналу"
+    )
+
+
+def _event_words(event: LevelUnfilled) -> str:
+    """Причина события словами исполнителя — без точки в конце, не пустая.
+
+    Как `ExecutionHalted.human`: строка уже очищена исполнителем (правило 7),
+    здесь только оформление. Пустая причина названа пустой, а не подменена.
+    """
+    words = event.reason.strip().rstrip(".").strip()
+    return words or "исполнитель причину не назвал"
+
+
+def _hold_words(position: Position, settings: EngineSettings) -> str:
+    """Что дальше с позицией, которую держат после неисполненного уровня (В3, П1)."""
+    if settings.mode is Mode.OFF:
+        return (
+            "Настройка «Заходить заново при обрыве связи» включена — позиция "
+            "остаётся. ⚠️ Но режим «Выключен»: робот позицией не управляет — "
+            "ни сторожимого уровня, ни переворота по средней у неё нет. "
+            "Закрыть её можно в приложении брокера или включив робота"
+        )
+    return (
+        "Настройка «Заходить заново при обрыве связи» включена — позиция "
+        "остаётся, решает средняя на этой же свече, как будто касания не было: "
+        "обратный сигнал закроет позицию (и перевернёт, если режим разрешает), "
+        "сигнал по стороне позиции — держать. Скользящий уровень начинается "
+        "заново, как у только что открытой позиции: пока прибыль не дойдёт "
+        f"до порога {percent(position.take.start_percent)}%, уровня нет, "
+        "и позицию держат только переворот по средней и выход по концу окна"
+    )
+
+
+def _unfilled_close_order(
+    position: Position,
+    closes_at: datetime,
+    close: float,
+    verdict: _AfterUnfilled,
+    settings: EngineSettings,
+) -> OrderRequest:
+    """Рождённый выход после неисполненного уровня. Имя — по виду выхода (Н3)."""
+    bound = _exit_limit(position.side, close, settings)
+    if verdict is _AfterUnfilled.CLOSE_DAY:
+        why = (
+            "Уровень задет, выход по нему не исполнился, позиция в убытке, "
+            "настройка «Заходить заново при обрыве связи» выключена: закрываем "
+            "сразу, и до конца дня "
+            f"({in_moscow(closes_at):%d.%m.%Y}) новых входов нет"
+        )
+    else:
+        why = (
+            "Уровень задет, выход по нему не исполнился, позиция не в убытке: "
+            "закрываем и работаем дальше. Выход засчитывается тейком"
+            + (
+                " — по правилу «стоп после тейка» новых входов в эту дату "
+                "больше не будет"
+                if settings.stop_after_take_profit else ""
+            )
+        )
+    tail = bound[1] if bound is not None else (
+        ". Шаг цены неизвестен — предел не посчитать, заявка без предела"
+    )
+    return OrderRequest(
+        action=OrderAction.CLOSE,
+        side=position.side,
+        volume=position.volume,
+        submitted_at=closes_at,
+        reason=why + tail,
+        order_id=f"{verdict.value}{position.side.value}:{closes_at.isoformat()}",
+        exit_reason=ExitReason.LEVEL_UNFILLED,
+        limit_price=bound[0] if bound is not None else None,
+    )
+
+
+def _unfilled_halt(state: EngineState, event: LevelUnfilled, why: str) -> FillOutcome:
+    """Событие разобрать нельзя: строка ERROR и остановка, состояние то же."""
+    reason = (
+        f"Исполнитель сообщил, что уровень заявки {_named(event.order_id)} задет "
+        f"в {in_moscow(event.at):%d.%m %H:%M} и выход по нему не исполнился "
+        f"({_event_words(event)}), но разобрать это нельзя: {why}. Состояние "
+        "движка не изменено. Робот остановлен: позиция у брокера может стоять "
+        "без сторожа — проверьте позицию и список заявок в приложении брокера"
+    )
+    event_title = "Событие исполнителя не разобрано"
+    return FillOutcome(state, (("", JournalEntry(
+        at=event.at, event=event_title, reason=reason, level=JournalLevel.ERROR,
+    )),), halt=f"{event_title}. {reason}")
+
+
 def _opened(
     state: EngineState,
     fill: Fill,
@@ -970,6 +1411,7 @@ def _opened(
         volume=fill.volume,
         entry_price=fill.price,
         entry_time=fill.at,
+        entry_commission=fill.commission,
     )
     plan = settings.plan().initial(fill.price, position.side_sign)
     level = plan.level
@@ -993,7 +1435,15 @@ def _opened(
         # кандидат съесть весь результат (DOMAIN.md §5).
         day=_day_after(state, fill.at, -(fill.commission or 0.0)),
     )
-    if level is not None:
+    activation = plan.activation_level(fill.price, position.side_sign)
+    if activation is not None:
+        # Скользящий тейк (`D-196`): с первой минуты позиции — условная заявка
+        # у брокера с включением на пороге. Подаётся и в прогоне, и в бою
+        # (правило 1); прогон её не исполняет, бой ставит у брокера.
+        order = _conditional_order(position, fill.at, activation)
+        orders = (order,)
+        entries.append((order.order_id, _conditional_line(position, activation, fill.at)))
+    elif level is not None:
         # ⚠️ `after_submit` здесь НЕ зовётся. Заявка подаётся раньше, чем движок
         # себе что-то запишет: применит её тот, кто её подал и получил ответ.
         # Иначе отказ в вооружении оставил бы движок с уровнем, которого
@@ -1046,13 +1496,17 @@ def _closed(
             f"а в позиции {_volume(position.volume)}. Частичное исполнение "
             "движок не разбирает: закрыть позицию целиком по неполной сделке "
             "значит потерять из виду остаток на счёте. Состояние не изменено, "
-            "расхождение разбирается сверкой позиции"
-        ))
+            "расхождение разбирается сверкой позиции" + _PARTIAL_HALT
+        ), halt=True)
 
-    # Признак «вышли по уровню» — по действию заявки, а не по причине: на нём
-    # путь Б «стопа после тейка». Причина — из заявки, вид уровня назван
-    # в ней движком при вооружении (`_LEVEL_REASON`).
-    by_take = order.action is OrderAction.ARM_TAKE_PROFIT
+    # Признак «вышли по тейку» — по ИМЕНИ заявки, а не по действию и не по
+    # причине: на нём путь Б «стопа после тейка». Тейком считаются две
+    # заявки — вооружение и выход после неисполненного уровня «не в убытке»
+    # (решение 0067, В4; Р-10 Н3). По действию вторая не узналась бы: это
+    # заявка на закрытие, и второй вход в тот же день прошёл бы прямо
+    # в сессии. Тем же предикатом тейк узнаёт слой данных после перезапуска.
+    # Причина — из заявки, вид уровня назван в ней движком (`_LEVEL_REASON`).
+    by_take = is_take_order(order.order_id)
     reason = order.exit_reason
     points = (fill.price - position.entry_price) * position.side_sign * position.volume
     # ⚠️ Оба счётчика ожидания обнуляются вместе с позицией. Счётчик,
@@ -1077,7 +1531,7 @@ def _closed(
         # как есть, а не чинится (PROTOTYPE.md §5): приведение их к одному виду
         # даёт другой список сделок на окне через полночь.
         state = replace(state, take_profit_date=in_moscow(fill.at).date())
-    return FillOutcome(state, (("", JournalEntry(
+    entries: list[tuple[str, JournalEntry]] = [("", JournalEntry(
         at=fill.at,
         event=f"{position.side.label} закрыт",
         reason=(
@@ -1085,10 +1539,163 @@ def _closed(
             f"Вход {_price(position.entry_price)}, "
             f"выход {_price(fill.price)}, объём {_volume(position.volume)}. "
             f"Результат {_points(points)} пунктов{_commission(fill)}"
-            + (_stop_after_take_note(state) if by_take else "")
+            + (_stop_after_take_note(state) if by_take and settings.stop_after_take_profit else "")
         ),
         level=JournalLevel.TRADE,
-    )),))
+    ))]
+    state, said = _loss_marked(state, position, order, fill, settings)
+    return FillOutcome(state, (*entries, *said))
+
+
+#: Причины выхода, по которым сделка **засчитывается** правилу «первый убыток
+#: в окне — стоп» (`B-106`, `B-109`, решение 0072). Торговые: робот решил выйти
+#: по сигналу или сработал его уровень — в том числе уровень, выход по которому
+#: не исполнился и закрыт рождённой заявкой (`LEVEL_UNFILLED`). Остальные —
+#: уход с рынка по расписанию или по чужой команде: конец окна и нерабочий
+#: день впереди (ответ владельца счёта 16.11.2026 — «выход по концу окна
+#: стопом не считается»), конец поданного ряда, команда человека, дневной
+#: лимит. Таблица, а не перечень
+#: `if`: новая причина выхода по умолчанию стопа **не даёт**, пока её сюда
+#: не внесли осознанно.
+_LOSS_COUNTS: frozenset[ExitReason] = frozenset({
+    ExitReason.SIGNAL, ExitReason.TAKE_PROFIT, ExitReason.TRAILING_TAKE,
+    ExitReason.LEVEL_UNFILLED,
+})
+
+
+#: Имя правила в строках журнала — одно на все строки, чтобы их можно было
+#: найти поиском и чтобы правило не путалось со «стопом после тейка».
+_LOSS_RULE = "«первый убыток в окне — стоп»"
+
+
+def _loss_marked(
+    state: EngineState,
+    position: Position,
+    order: OrderRequest,
+    fill: Fill,
+    settings: EngineSettings,
+) -> tuple[EngineState, tuple[tuple[str, JournalEntry], ...]]:
+    """Сделка выхода засчитана убытком в окне — метка окна и строка журнала.
+
+    Метка пишется при любой настройке (как `last_exit_date`): переключение
+    в вариант посреди окна обязано знать, что убыток в нём уже был. Строка —
+    только при включённом правиле.
+    """
+    counted = _counted_loss(position, order, fill, settings)
+    if counted is None:
+        return state, ()
+    mark, net, commission = counted
+    state = replace(state, losing_window=mark)
+    if not settings.stop_after_loss:
+        return state, ()
+    return state, (("", _stop_after_loss_line(position, fill, net, commission, mark)),)
+
+
+def _counted_loss(
+    position: Position, order: OrderRequest, fill: Fill, settings: EngineSettings
+) -> tuple[WindowDay, float, float] | None:
+    """Сделка закрыта в убыток чистыми внутри окна — `(окно, чистыми, комиссия)`, иначе `None`.
+
+    Одно место правила `B-106` на прогон и на бой: сюда приходит сделка
+    исполнителя, а кто он — модель на истории или брокер, — движку неизвестно.
+
+    * **Чистыми** — пункты в рублях минус комиссия входа (`Position.entry_commission`)
+      и выхода (`Fill.commission`). Сделка «+пункты, но минус после комиссии»
+      засчитывается. Не сообщённая исполнителем комиссия считается нулём:
+      другой цифры у движка нет, и строка журнала называет её как есть.
+    * **Внутри окна** — причина из `_LOSS_COUNTS` и окно, которое шло
+      в момент решения: у рыночного выхода это свеча решения (`submitted_at` —
+      время её закрытия), у выхода по уровню свечи решения нет, уровень
+      срабатывает у брокера — берётся время сделки. Вне окна — `None`:
+      выход по сигналу **вне** окна при снятом «закрывать в конце окна»
+      (шаг 6) и уровень, сработавший после конца окна, стопа не дают —
+      окно, в котором их засчитывать, уже кончилось (`B-109`).
+    """
+    if order.exit_reason not in _LOSS_COUNTS:
+        return None
+    decided = order.submitted_at if order.action is OrderAction.CLOSE else fill.at
+    mark = settings.window.running_at(decided)
+    if mark is None:
+        return None
+    points = (fill.price - position.entry_price) * position.side_sign * position.volume
+    commission = (position.entry_commission or 0.0) + (fill.commission or 0.0)
+    net = points * settings.ruble_per_point - commission
+    return (mark, net, commission) if net < 0 else None
+
+
+def _loss_ahead(
+    position: Position, close: float, settings: EngineSettings
+) -> tuple[float, float] | None:
+    """Выход по сигналу при перевороте «в той же свече» по оценке в убытке — `(чистыми, комиссия)`.
+
+    `B-108`, слова владельца счёта 16.11.2026: «стоп должен был быть сразу
+    после закрытия лонга». В режиме «в одной свече» вход в обратную сторону
+    подаётся вместе с выходом, до сделки, и результата выхода на закрытии
+    свечи ещё нет. Поэтому решение — по **оценке**: закрытие свечи против
+    цены входа, в рублях, минус комиссия входа (известна, едет с позицией;
+    не сообщена — по ставке настроек) и комиссия выхода по ставке настроек.
+    Окно проверять не нужно: шаг 7 идёт только внутри окна.
+
+    `None` — правило выключено, переворот «через свечу» (вход там подаётся
+    только на следующей свече, после сделки, и решает фактический результат)
+    либо оценка не в минусе.
+
+    ⚠️ Ограничение, названное в решении 0072: оценка не в минусе, а сделка
+    выхода прошла хуже (проскальзывание) — переворот уже подан, стоп ставит
+    фактический результат, и открытая позиция доводится до выхода. Обратное:
+    оценка в минусе, а сделка прошла в плюс — окно всё равно закрыто,
+    решение по оценке сделкой не пересматривается.
+    """
+    if not settings.stop_after_loss or settings.reversal is not Reversal.SAME_BAR:
+        return None
+    rate = (settings.commission_per_side or 0.0) * position.volume
+    entry = position.entry_commission if position.entry_commission is not None else rate
+    points = (close - position.entry_price) * position.side_sign * position.volume
+    net = points * settings.ruble_per_point - entry - rate
+    return (net, entry + rate) if net < 0 else None
+
+
+def _loss_ahead_words(
+    position: Position, close: float, net: float, commission: float, mark: WindowDay
+) -> tuple[str, str, str, JournalLevel]:
+    """Строка журнала `B-108`: выход по оценке в убыток — переворота нет."""
+    return (
+        "stop-after-loss-ahead",
+        "Переворота не будет: выход по оценке в убыток",
+        f"Правило {_LOSS_RULE}, переворот «в той же свече»: результат выхода "
+        "станет известен только по сделке, поэтому решение — по оценке "
+        f"на закрытии свечи. {position.side.label} от {_price(position.entry_price)}, "
+        f"закрытие {_price(close)}: {money(net)} чистыми, комиссия обеих сторон "
+        f"{money(commission)} учтена. Подан только выход, вход в обратную "
+        f"сторону не подаётся; новых входов до конца {mark.label} нет. "
+        "Решение принято по оценке и сделкой выхода не пересматривается",
+        JournalLevel.WARNING,
+    )
+
+
+def _stop_after_loss_line(
+    position: Position, fill: Fill, net: float, commission: float, mark: WindowDay
+) -> JournalEntry:
+    """Строка журнала: сработал «первый убыток в окне — стоп», с суммой и причиной."""
+    told = (
+        f"комиссия обеих сторон {money(commission)} учтена"
+        if position.entry_commission is not None and fill.commission is not None
+        else f"комиссия исполнителем сообщена не по обеим сторонам, учтено {money(commission)}"
+    )
+    return JournalEntry(
+        at=fill.at,
+        event="Новых входов в этом окне больше не будет",
+        reason=(
+            f"Сработало правило {_LOSS_RULE}: "
+            f"{position.side.label.lower()} закрыт с результатом {money(net)} "
+            f"чистыми, {told}. До конца {mark.label} робот новых позиций "
+            "не открывает; следующее окно, в том числе изменённое в настройках, — "
+            "счёт заново. Позиция, если она уже открыта (переворот «в той же "
+            "свече» по оценке был не в убытке, а сделка выхода прошла хуже), "
+            "доводится до выхода по обычным правилам"
+        ),
+        level=JournalLevel.WARNING,
+    )
 
 
 def _day_after(state: EngineState, at: datetime, delta: float) -> DayMoney:
@@ -1113,12 +1720,24 @@ def _day_after(state: EngineState, at: datetime, delta: float) -> DayMoney:
 
 
 def _stop_after_take_note(state: EngineState) -> str:
-    """Хвост строки про сработавший тейк: день закрыт для новых входов."""
+    """Хвост строки про сработавший тейк: день закрыт для новых входов.
+
+    Пишется только при включённом «стопе после тейка» (`B-109`, попутно):
+    при «ждать нового сигнала» и «первый убыток в окне — стоп» строка про
+    чужое правило сбивала — владелец счёта читал её как запрет входов.
+    """
     return (
         f". Сегодня ({state.take_profit_date:%d.%m.%Y}) тейк уже был — "
-        "если включено правило «стоп после тейка», новых входов в эту дату "
-        "больше не будет"
+        "по правилу «стоп после тейка» новых входов в эту дату больше не будет"
     )
+
+
+#: Хвост строки о сделке, не совпавшей со своей заявкой: почему робот стоит.
+_PARTIAL_HALT = (
+    ". Робот остановлен: на счёте объём, которого движок не видит, и любая "
+    "следующая заявка ушла бы на неизвестную позицию. Проверьте позицию "
+    "и список заявок в приложении брокера"
+)
 
 
 def _fill_against_order(order: OrderRequest, fill: Fill) -> str | None:
@@ -1152,7 +1771,8 @@ def _refuse(
 
     `halt` — движок обязан остановиться **до подачи любой следующей заявки**.
     Ставится там, где движок перестал понимать, что на счёте: сделка
-    не сопоставилась ни с одной заявкой в полёте.
+    не сопоставилась ни с одной заявкой в полёте или пришла не на объём
+    своей заявки (частичное исполнение, решение 0066).
 
     ⚠️ Самый дорогой случай выглядит невинно. Снятие тейка подано, брокер его
     принял (снимать нечего — уровень уже задет), движок уровень погасил;
@@ -1203,7 +1823,49 @@ def take_order_id(position: Position) -> str:
 
     Имя ещё и воспроизводимо: прогон по истории обязан повторяться до строки.
     """
-    return f"take:{position.side.value}:{position.entry_time.isoformat()}"
+    return f"{_TAKE_PREFIX}{position.side.value}:{position.entry_time.isoformat()}"
+
+
+#: Начало имени заявки вооружения. Одно место на сборку имени
+#: (`take_order_id`) и его узнавание (`is_take_order`): две копии формата
+#: разошлись бы молча, и выход по тейку в базе стал бы «выходом по сигналу».
+_TAKE_PREFIX = "take:"
+
+
+def is_take_order(order_id: str) -> bool:
+    """Сделка по заявке с этим именем — выход по тейку.
+
+    Таких заявок две: вооружение тейка (`take_order_id`) и выход после
+    неисполненного уровня «не в убытке» (решение 0067, В4: это закрытие —
+    тейк для «стопа после тейка»). Нужна дважды и обязана быть одной:
+    разбор сделки в сессии (`_closed`) ставит по ней дату тейка, а тот, кто
+    восстанавливает день по журналу исполнений (решение 0066, Р7), узнаёт
+    тейк после перезапуска. Формат имени знает только движок; `market/`
+    получает предикат от сборки и формат не повторяет.
+
+    ⚠️ Снятие тейка (`cancel:take:…`) — не тейк: сделок по снятию не бывает,
+    и имя начинается не с приставки тейка. Выход «в убытке» после
+    неисполненного уровня тейком **не** назван (В4) — день он закрывает
+    своим правилом (`closes_entries_day`).
+    """
+    return isinstance(order_id, str) and order_id.startswith(
+        (_TAKE_PREFIX, _AfterUnfilled.CLOSE_TAKE.value)
+    )
+
+
+def closes_entries_day(order_id: str) -> bool:
+    """Заявка с этим именем закрывает день для входов — **с момента подачи**.
+
+    Это выход после неисполненного уровня «в убытке» при выключенной
+    настройке «Заходить заново при обрыве связи» (решение 0067). В сессии
+    дату ставит само решение (`EngineState.entries_closed_date`); после
+    перезапуска её восстанавливает слой данных по **команде брокеру** —
+    имени заявки и времени подачи, а не по исполнению (Р-10, Н5): заявка
+    могла не исполниться, а позицию владелец счёта закрыл руками.
+    """
+    return isinstance(order_id, str) and order_id.startswith(
+        _AfterUnfilled.CLOSE_DAY.value
+    )
 
 
 #: С какой стороны цена доходит до сторожимого уровня — **таблица**, а не
@@ -1267,6 +1929,51 @@ def _arm_order(position: Position, at: datetime, level: float) -> OrderRequest:
     )
 
 
+def _conditional_order(position: Position, at: datetime, activation: float) -> OrderRequest:
+    """Заявка «скользящий тейк ведёт брокер»: включение на `activation` (`D-196`).
+
+    Сторона касания — та, с которой цена дойдёт до цены включения, то есть
+    сторона неподвижного тейка (`_TOUCH_SIDE`, первый столбец): до порога
+    цена идёт в прибыль. Причина выхода — скользящий уровень.
+    """
+    take = position.take
+    return OrderRequest(
+        action=OrderAction.ARM_TAKE_PROFIT,
+        side=position.side,
+        volume=position.volume,
+        submitted_at=at,
+        reason=(
+            f"Скользящий тейк {position.side.label.lower()}а объёмом "
+            f"{_volume(position.volume)} — условной заявкой у брокера: включение "
+            f"на {_price(activation)}, отступ {percent(take.offset_percent)}% "
+            "от лучшей цены"
+        ),
+        order_id=take_order_id(position),
+        price=activation,
+        touch=_TOUCH_SIDE[(False, position.side)],
+        exit_reason=_LEVEL_REASON[True],
+        trail_offset=take.offset_percent,
+    )
+
+
+def _conditional_line(position: Position, activation: float, at: datetime) -> JournalEntry:
+    """Строка журнала: скользящий тейк поставлен у брокера условной заявкой."""
+    take = position.take
+    sign = "+" if position.side is Side.LONG else "−"
+    return JournalEntry(
+        at=at,
+        event="Скользящий тейк выставлен у брокера",
+        reason=(
+            f"Условная заявка: включение на {_price(activation)} = цена входа "
+            f"{_price(position.entry_price)} {sign} {percent(take.start_percent)}%"
+            f"{_grid_words(position)}. После сделки по этой цене уровень едет "
+            f"за лучшей ценой на отступе {percent(take.offset_percent)}% и закрывает "
+            "позицию на откате. В бою его ведёт брокер, робот его не двигает; "
+            "уровень на графике — расчёт программы, у брокера он может отличаться"
+        ),
+    )
+
+
 def _cancel_order(position: Position, at: datetime, why: str) -> OrderRequest:
     """Заявка «перестань сторожить». Подаётся ДО заявки на закрытие, всегда."""
     return OrderRequest(
@@ -1315,7 +2022,9 @@ def _rearm_take_profit(
         return empty, empty, ""
 
     if not position.is_open:
-        state = replace(state, closing_bars=state.closing_bars + 1)
+        state = replace(
+            state, closing_bars=state.closing_bars + _waited_bar(state, closes_at)
+        )
         return state, state, _closing_wait(state, position, writer, settings)
 
     state = replace(state, closing_bars=0)
@@ -1346,6 +2055,18 @@ def _rearm_take_profit(
         position = replace(position, take=replace(position.take, peak=plan.peak))
         state = replace(state, position=position)
     refused = state
+    activation = plan.activation_level(position.entry_price, position.side_sign)
+    if managed and plan.level is None and plan.peak is None and activation is not None:
+        # До порога скользящий тейк стоит у брокера условной заявкой (`D-196`):
+        # перестановка — то же «состояние, а не событие», что у неподвижного
+        # тейка. Строка журнала — только если условной у позиции не было
+        # (снята не нами или отклонена): иначе свеча за свечой одно и то же.
+        order = _conditional_order(position, closes_at, activation)
+        state = _submitted(orders, state, order)
+        if position.take.activation != activation:
+            line = _conditional_line(position, activation, closes_at)
+            writer.note(line.event, line.reason, line.level, key=order.order_id)
+        return state, refused, ""
     if not managed or plan.level is None:
         return state, refused, ""
     order = _arm_order(position, closes_at, plan.level)
@@ -1360,6 +2081,22 @@ def _rearm_take_profit(
         )
         writer.note(event, reason, importance, key=order.order_id)
     return state, refused, ""
+
+
+def _waited_bar(state: EngineState, closes_at: datetime) -> int:
+    """Считать ли эту свечу свечой ожидания выхода: 1 — да, 0 — нет.
+
+    Свеча ожидания — закрытая **после** подачи выхода. Выход после
+    неисполненного уровня подаётся в обмене свечи T и помечен её закрытием
+    (Р-10, Н1), а шаг 5 той же T идёт следом: без этого правила такой выход
+    получил бы на свечу ожидания меньше, чем выход по концу окна, решённый
+    на шаге 6 той же свечи (П2). Выходы разбора свечи этого не замечают:
+    к шагу 5 следующей свечи их время всегда раньше её закрытия.
+    """
+    exit_order = _exit_in_flight(state)
+    if exit_order is not None and exit_order.submitted_at >= closes_at:
+        return 0
+    return 1
 
 
 def _closing_wait(
@@ -1404,11 +2141,19 @@ def _off_with_closing_words(state: EngineState, position: Position) -> str:
 
     ⚠️ Заявка с предельной ценой называется **вместе с пределом**: она может
     исполниться и через час, когда цена вернётся, — человек обязан знать,
-    по какой цене её ждать или снимать.
+    по какой цене её ждать или снимать. Предел — тот, что посчитал движок;
+    исполнитель вправе подать вместо него границу ценового коридора биржи,
+    по любую сторону от предела (решение 0067), поэтому
+    слова отсылают к его строке о поданной заявке, а не обещают цену у брокера.
+    Ветки по исполнителю нет: слова верны при любом.
     """
     exit_order = _exit_in_flight(state)
     limit = exit_order.limit_price if exit_order is not None else None
-    form = f" с предельной ценой {_price(limit)}" if limit is not None else ""
+    form = (
+        f" с пределом движка {_price(limit)} (если исполнитель подал её по границе "
+        "ценового коридора биржи, эту цену называет его строка о поданной заявке)"
+        if limit is not None else ""
+    )
     return (
         f"Режим «Выключен»: свеча не разбирается. По позиции "
         f"({position.side.label.lower()}, объём {_volume(position.volume)}) "
@@ -1452,33 +2197,53 @@ def _time_exit_limit(
 ) -> tuple[float, str] | None:
     """Предел заявки на выход по времени и его объяснение — или `None` (по рынку).
 
-    `предел = close ∓ N × шаг`, округление к сетке шага **от рынка**: продажа
-    (выход из лонга) — вниз, покупка (выход из шорта) — вверх. Так предел
-    не оказывается ближе к рынку, чем названо в настройке.
+    `предел = close ∓ процент`, округление к сетке шага **от рынка**: продажа
+    (выход из лонга) — вниз, покупка (выход из шорта) — вверх, продажа
+    не ниже одного шага. Правило одно на движок и исполнителя
+    (`engine.take_profit.limit_beyond`), копии у него нет.
 
-    Счёт в `Decimal` от строкового вида чисел: `Decimal(0.1)` тащит двоичный
-    хвост, и цена, лежащая ровно на сетке, уехала бы на шаг.
-
-    ⚠️ Предел продажи не опускается ниже одного шага: нулевая или
-    отрицательная цена — не предел. Достижимо только на заведомо негодном
-    отступе, но заявку без цены подавать нельзя.
+    ⚠️ Слова верны при любом исполнителе за портом, и ветки по исполнителю
+    здесь нет: модель прогона подаёт ровно этот предел, а боевой исполнитель
+    вправе подать вместо него границу ценового коридора биржи — по любую
+    сторону от предела (решение 0067; `/risk` 04.11.2026, п. 5;
+    `engine/ports.py`, `OrderExecutor.submit`). Поэтому обещание «не хуже
+    предела» дано только для поданного предела, а что ушло к брокеру
+    на самом деле, называет исполнитель своей строкой.
     """
     if settings.time_exit_order is not TimeExitOrder.LIMIT:
         return None
-    step = Decimal(str(settings.price_step))
-    steps = settings.time_exit_limit_steps
+    return _exit_limit(side, close, settings)
+
+
+def _exit_limit(
+    side: Side, close: float, settings: EngineSettings
+) -> tuple[float, str] | None:
+    """Предел заявки на выход `close ∓ процент выхода` при любой форме выхода.
+
+    Общий для выхода по времени (`_time_exit_limit`, только при
+    `TimeExitOrder.LIMIT`) и выхода после неисполненного уровня
+    (`apply_unfilled`, всегда — Р-10 п. 4). Процент один — процент выхода
+    по концу окна; правило округления одно — `limit_beyond`.
+
+    `None` — шаг цены неизвестен (ноль): без сетки предела нет. У выхода
+    по времени этого не бывает — такие настройки отвергает `EngineSettings`;
+    выход после неисполненного уровня в этом случае подаётся без предела,
+    и бой при шаге ноль запрещён и так (`app/port.py`, `_NO_STEP`).
+    """
+    if not settings.price_step > 0:
+        return None
+    share = settings.time_exit_limit_percent
     selling = side is Side.LONG
-    raw = Decimal(str(close)) + (-1 if selling else 1) * steps * step
-    grid = (raw / step).to_integral_value(
-        rounding=ROUND_FLOOR if selling else ROUND_CEILING
-    )
-    limit = float(max(grid * step, step))
+    limit = limit_beyond(close, share, settings.price_step, buying=not selling)
+    deal = "продажа" if selling else "покупка"
     words = (
-        f". Заявка с предельной ценой {_price(limit)}: закрытие "
-        f"{_price(close)} {'−' if selling else '+'} {steps} × шаг "
-        f"{_price(settings.price_step)}, к сетке шага "
-        f"{'вниз' if selling else 'вверх'} — "
-        f"{'продажа' if selling else 'покупка'} не хуже предела"
+        f". Предел заявки {_price(limit)}: закрытие {_price(close)} "
+        f"{'−' if selling else '+'} {percent(share)} %, к сетке шага "
+        f"{_price(settings.price_step)} {'вниз' if selling else 'вверх'}. "
+        f"Поданный предел — {deal} не {'дешевле' if selling else 'дороже'} "
+        f"{_price(limit)}; исполнитель заявок вправе подать вместо него границу "
+        "ценового коридора биржи — она может лежать по любую сторону от предела, "
+        "и тогда поданную цену называет его собственная строка"
     )
     return limit, words
 
@@ -1501,7 +2266,7 @@ def _take_event(
                 if position.take.moving
                 else f" = цена входа {_price(position.entry_price)} "
                 f"{'+' if position.side is Side.LONG else '−'} "
-                f"{percent(position.take.percent)}%"
+                f"{percent(position.take.percent)}%{_grid_words(position)}"
             )
         )
     else:
@@ -1559,6 +2324,30 @@ def _take_event(
         "чем маленькая цель, — но процент тейка стоит поднять (ТЗ §4.4 В)",
         JournalLevel.WARNING,
     )
+
+
+def _grid_words(position: Position) -> str:
+    """Хвост строки про неподвижный уровень: как он лёг на сетку шага.
+
+    Без него строка «уровень 217 200 = цена входа 216 100 + 0,5%» была бы
+    неправдой на 20 пунктов: 0,5% от 216 100 — это 217 180,5, а на сетку
+    шага 25 уровень поднят от рынка (решение 0066, Р1).
+    """
+    step = position.take.price_step
+    if not step > 0:
+        return ""
+    way = "вверх" if position.side is Side.LONG else "вниз"
+    return f", к сетке шага {_price(step)} {way} — от рынка"
+
+
+def _take_words(position: Position) -> str:
+    """Что стоит у брокера, словами: «тейк 250 100» или условная до порога (`D-196`)."""
+    take = position.take
+    if take.activation is not None:
+        # И после порога: уровень программы у позиции есть, но у брокера стоит
+        # условная, а не лимитная по этому уровню (/risk 14.11).
+        return f"скользящий тейк (условная заявка, включение на {_price(take.activation)})"
+    return f"тейк {_price(take.level or 0.0)}"
 
 
 def _take_line(
@@ -1620,7 +2409,7 @@ def _exit(
     if armed_before:
         state = _submitted(orders, state, _cancel_order(position, at, why))
         text = (
-            f"{why}. Сначала снимаем тейк {_price(position.take.level or 0.0)}, "
+            f"{why}. Сначала снимаем {_take_words(position)}, "
             "и только потом подаём заявку на выход"
         )
         position = state.position if state.position is not None else position
@@ -1640,10 +2429,16 @@ def _step_close_by_signal(
     *,
     settings: EngineSettings,
     armed_before: bool,
+    close: float,
 ) -> tuple[EngineState, str]:
     """Шаг 7 целиком: выход из позиции по обратному сигналу средней.
 
-    ⚠️ Два последних довода — **только по имени**, и это не стиль. `settings`
+    `close` — закрытие свечи, для оценки результата выхода при перевороте
+    «в той же свече» и правиле «первый убыток в окне — стоп» (`B-108`):
+    оценка в минусе — метка окна ставится здесь же, в момент решения,
+    и шаг 9 закрывает окно раньше, чем шаг 10 подал бы вход.
+
+    ⚠️ Доводы после `*` — **только по имени**, и это не стиль. `settings`
     и `armed_before` стоят седьмым и шестым в ряду однотипных объектов, а
     `armed_before` — голое булево: перепутанный слот здесь означает снятие
     тейка, которого не было, либо его несняние перед выходом (решение 0008,
@@ -1686,6 +2481,11 @@ def _step_close_by_signal(
         f"Выход из {current.side.label.lower()}а по обратному сигналу",
         orders[-1].reason, key=orders[-1].order_id, intent=intent,
     )
+    ahead = _loss_ahead(current, close, settings)
+    mark = settings.window.running_at(closes_at)
+    if ahead is not None and mark is not None:
+        state = replace(state, losing_window=mark)
+        writer.quiet(*_loss_ahead_words(current, close, *ahead, mark))
     return state, ""
 
 
@@ -2522,44 +3322,159 @@ def _armed_note(position: Position) -> str:
             "к ней больше не применяются"
         )
     return (
-        f". ⚠️ Но выставленный тейк {_price(position.take.level or 0.0)} "
+        f". ⚠️ Но выставленный {_take_words(position)} "
         "остаётся у брокера и может сработать: это заявка на его стороне, "
         "а не расчёт внутри программы. Снять её можно в приложении брокера"
     )
 
 
 def _day_is_closed(
-    state: EngineState,
     working: EngineState,
     orders: list[OrderRequest],
     closes_at: datetime,
     settings: EngineSettings,
 ) -> tuple[bool, tuple[str, str, str] | None]:
-    """Шаг 9: день закрыт для новых входов. Две причины, проверяются по порядку.
+    """Шаг 9: день (или окно) закрыт для новых входов. Причины — таблицей, по порядку.
 
-    «Стоп после тейка» — сегодня был тейк. Режим «один вход в день» —
-    сегодня был выход (сделкой) или выход подан на ЭТОЙ свече. Вторая
-    половина нужна перевороту «в одной свече»: сделки выхода ещё нет, дата
-    не записана, а шаг 10 подал бы вход в обратную сторону сразу за выходом.
-    Строка режима пишется и при поданном выходе: строка выхода объясняет
-    выход, а не то, почему за ним не последовал вход.
+    Цепочка обязанностей (правило 9): звенья — строки `_DAY_CLOSERS`,
+    порядок проверки — порядок строк, первая сработавшая решает и даёт
+    строку журнала. Третья причина (Р-10, П4) и четвёртая — «первый убыток
+    в окне» (`B-106`, `B-109`) — встали строками таблицы, а не очередным `if`.
 
     Возвращает «закрыт ли день» и строку журнала. Строки может не быть при
-    закрытом дне: «стоп после тейка» молчит, если заявка на свече уже
-    объяснена своей строкой.
+    закрытом дне: оба стопа молчат, если заявка на свече уже объяснена
+    своей строкой.
+
+    Звенья читают состояние **после** шагов 5–7: даты тейка, выхода и
+    закрытого дня движутся только сделками и событиями уровня, поэтому
+    до и после этих шагов совпадают, а метку окна оценка `B-108` пишет
+    на этой же свече, на шаге 7 (`_loss_ahead`).
 
     Дата сравнивается с датой ЗАКРЫТИЯ текущей свечи, а пишется из времени
     сделки — асимметрия прототипа (PROTOTYPE.md §5), см. комментарий шага 9.
+    У закрытого после неисполненного уровня дня асимметрии нет: дату ставит
+    само решение, и это дата закрытия свечи обмена.
     """
-    today = in_moscow(closes_at).date()
-    if settings.stop_after_take_profit and state.take_profit_date == today:
-        return True, (None if orders else _stop_after_take(working))
-    if settings.mode is Mode.ONE_ENTRY_A_DAY and (
-        state.last_exit_date == today
-        or any(order.action is OrderAction.CLOSE for order in orders)
-    ):
-        return True, _one_entry_day_closed(working)
+    for closed, note in _DAY_CLOSERS:
+        if closed(working, orders, closes_at, settings):
+            return True, note(working, orders)
     return False, None
+
+
+def _closed_by_take(
+    state: EngineState, _orders: list[OrderRequest], closes_at: datetime, settings: EngineSettings
+) -> bool:
+    """«Стоп после тейка» — сегодня был тейк."""
+    return settings.stop_after_take_profit and state.take_profit_date == _date_of(closes_at)
+
+
+def _closed_by_one_entry(
+    state: EngineState, orders: list[OrderRequest], closes_at: datetime, settings: EngineSettings
+) -> bool:
+    """Режим «один вход в день» — сегодня был выход сделкой или подан на ЭТОЙ свече.
+
+    Вторая половина нужна перевороту «в одной свече»: сделки выхода ещё нет,
+    дата не записана, а шаг 10 подал бы вход в обратную сторону сразу
+    за выходом. Строка режима пишется и при поданном выходе: строка выхода
+    объясняет выход, а не то, почему за ним не последовал вход.
+    """
+    return settings.mode is Mode.ONE_ENTRY_A_DAY and (
+        state.last_exit_date == _date_of(closes_at)
+        or any(order.action is OrderAction.CLOSE for order in orders)
+    )
+
+
+def _closed_by_loss(
+    state: EngineState, _orders: list[OrderRequest], closes_at: datetime, settings: EngineSettings
+) -> bool:
+    """«Первый убыток в окне — стоп» (`B-106`, `B-109`): в этом же окне уже был убыток.
+
+    «Это же окно» — та же дата открытия и те же границы (`WindowDay`).
+    Окно сдвинули в настройках — метка другая, счёт заново.
+    """
+    return settings.stop_after_loss and (
+        state.losing_window is not None
+        and state.losing_window == settings.window.running_at(closes_at)
+    )
+
+
+def _closed_after_unfilled(
+    state: EngineState, _orders: list[OrderRequest], closes_at: datetime, _settings: EngineSettings
+) -> bool:
+    """После неисполненного уровня в убытке робот решил до конца дня не входить.
+
+    ⚠️ Независимо от «стопа после тейка»: это другое правило (решение 0067),
+    и выключенный «стоп после тейка» его не снимает.
+    """
+    return state.entries_closed_date == _date_of(closes_at)
+
+
+def _date_of(closes_at: datetime) -> date:
+    """Московская дата закрытия свечи — то, с чем сравнивают даты звенья шага 9."""
+    return in_moscow(closes_at).date()
+
+
+#: Шаг 9: причины закрытого для входов дня — звено и его строка журнала.
+#: Порядок строк — порядок проверки: при двух причинах сразу пишется первая.
+_DAY_CLOSERS: tuple[
+    tuple[
+        Callable[[EngineState, list[OrderRequest], datetime, EngineSettings], bool],
+        Callable[[EngineState, list[OrderRequest]], tuple[str, str, str] | None],
+    ],
+    ...,
+] = (
+    (_closed_by_take, lambda working, orders: None if orders else _stop_after_take(working)),
+    (_closed_by_loss, lambda working, orders: None if orders else _stop_after_loss(working)),
+    (_closed_by_one_entry, lambda working, _orders: _one_entry_day_closed(working)),
+    (_closed_after_unfilled, lambda working, _orders: _unfilled_day_closed(working)),
+)
+
+
+def _stop_after_loss(state: EngineState) -> tuple[str, str, str]:
+    """Шаг 9: в этом окне уже был убыток — два текста, как у `_stop_after_take`."""
+    span = state.losing_window.label if state.losing_window is not None else "окна"
+    if state.position is not None:
+        return (
+            "stop-after-loss-holding",
+            "Новых входов в этом окне больше не будет",
+            f"Сработало правило {_LOSS_RULE}: в этом окне уже был убыток "
+            "с учётом комиссии. Открытая позиция "
+            f"({state.position.side.label.lower()}, объём "
+            f"{_volume(state.position.volume)}) при этом закрывается "
+            f"по обычным правилам — до конца {span} сделка ещё возможна",
+        )
+    return (
+        "stop-after-loss",
+        "Сделок в этом окне больше не будет",
+        f"Сработало правило {_LOSS_RULE}: в этом окне уже был убыток "
+        f"с учётом комиссии, новых входов до конца {span} нет. Следующее "
+        "окно, в том числе изменённое в настройках, начинает счёт заново",
+    )
+
+
+def _unfilled_day_closed(state: EngineState) -> tuple[str, str, str]:
+    """Шаг 9: день закрыт решением после неисполненного уровня (решение 0067).
+
+    Два текста, как у `_stop_after_take`: пока выход ещё не стал сделкой,
+    обещать «сделок не будет» нельзя.
+    """
+    if state.position is not None:
+        return (
+            "unfilled-day-closing",
+            "Новых входов сегодня больше не будет",
+            "После неисполненного уровня позиция в убытке закрывается, "
+            "и до конца дня робот не входит: настройка «Заходить заново "
+            "при обрыве связи» выключена. Выход по позиции "
+            f"({state.position.side.label.lower()}) ещё не стал сделкой — "
+            "сделка сегодня ещё будет",
+        )
+    return (
+        "unfilled-day-closed",
+        "Сделок сегодня больше не будет",
+        "После неисполненного уровня позиция в убытке закрыта, и до конца "
+        "календарной даты робот не входит: настройка «Заходить заново "
+        "при обрыве связи» выключена",
+    )
 
 
 def _one_entry_day_closed(state: EngineState) -> tuple[str, str, str]:
