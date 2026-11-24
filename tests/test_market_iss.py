@@ -753,3 +753,68 @@ def test_the_client_asks_the_card_at_the_right_address() -> None:
     )
     assert transport.urls == [securities_url("MXU6", market=FUTURES)]
     assert spec.secid == "MXU6"
+
+
+# -- кому верит транспорт (24.11.2026: биржа перешла на УЦ Минцифры) ---------
+
+#: Отпечаток SHA-256 корня Минцифры, сверенный по двум независимым источникам —
+#: файл с Госуслуг и цепочка, которую отдаёт `iss.moex.com`. Вход извне: сторож
+#: не берёт его из проверяемого модуля.
+MINISTRY_ROOT_SHA256 = "d26d2d0231b7c39f92cc738512ba54103519e4405d68b5bd703e9788ca8ecf31"
+
+
+def test_the_exchange_context_trusts_the_ministry_root_on_top_of_certifi() -> None:
+    """Сертификат биржи проверяется корнем Минцифры, и обычные корни не пропали.
+
+    Без этого корня 24.11.2026 не грузилась история и не приходил шаг цены —
+    бой был недоступен. Набор `certifi` остаётся: подмена вместо дополнения
+    сломала бы любой другой адрес.
+
+    Обычный набор сверяется с самим файлом `certifi` поштучно, а не счётом корней:
+    подмена `certifi` системным хранилищем даёт те же «больше сотни» и проходила бы
+    (мутация 24.11.2026), а на Windows хранилище своё, и без автообновления корней
+    оно беднее `certifi`.
+    """
+    import hashlib
+    import re
+    import ssl
+    from pathlib import Path
+
+    import certifi
+
+    from market.tls import exchange_ssl_context
+
+    trusted = {
+        hashlib.sha256(der).hexdigest()
+        for der in exchange_ssl_context().get_ca_certs(binary_form=True)
+    }
+    bundle = Path(certifi.where()).read_text(encoding="ascii")
+    certifi_roots = {
+        hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+        for pem in re.findall(
+            r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", bundle, re.DOTALL
+        )
+    }
+    assert MINISTRY_ROOT_SHA256 in trusted, "корня Минцифры нет — биржа не проверится"
+    assert len(certifi_roots) > 100, "файл certifi не разобран — сверять не с чем"
+    missing = certifi_roots - trusted
+    assert not missing, f"обычный набор certifi пропал: нет {len(missing)} корней"
+
+
+def test_the_real_transport_checks_the_exchange_with_that_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Настоящий транспорт идёт к бирже именно с этим набором, а не с умолчанием httpx."""
+    import httpx
+
+    from market.tls import exchange_ssl_context
+
+    seen: dict[str, object] = {}
+
+    def fake_get(url: str, **kwargs: object) -> httpx.Response:
+        seen.update(kwargs)
+        return httpx.Response(200, content=b"{}", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    HttpxTransport().get("https://iss.moex.com/iss/x.json", timeout=1.0)
+    assert seen.get("verify") is exchange_ssl_context()

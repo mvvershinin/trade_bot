@@ -70,6 +70,7 @@ from datetime import date, datetime
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from market.candles import MINUTE, MSK, Candle, ensure_msk, floor_to_minute
+from market.tls import exchange_ssl_context
 
 __all__ = [
     "ISS_BASE",
@@ -221,7 +222,10 @@ class HttpxTransport:
 
         try:
             if self._client is None:
-                response = httpx.get(url, timeout=timeout, follow_redirects=True)
+                # Сертификат биржи выдан УЦ Минцифры — без своего набора не проверится.
+                response = httpx.get(
+                    url, timeout=timeout, follow_redirects=True, verify=exchange_ssl_context()
+                )
             else:
                 response = self._client.get(url, timeout=timeout)  # type: ignore[attr-defined]
             response.raise_for_status()
