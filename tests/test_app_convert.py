@@ -412,7 +412,7 @@ def test_every_engine_field_has_a_source() -> None:
         "mode", "window", "volume", "reversal", "take_profit",
         "take_profit_percent", "trailing_take_profit", "trailing_start_percent",
         "trailing_offset_percent", "trailing_step_percent",
-        "stop_after_take_profit", "commission_per_side",
+        "stop_after_take_profit", "stop_after_loss", "commission_per_side",
         # ⚠️ Переехало из `from_the_previous` 05.09.2026 (`B-021`): величину
         # спрашивают у биржи и кладут в поле окна, а не тащат у прежних
         # настроек, где она навсегда оставалась умолчанием 1,0.
@@ -423,6 +423,8 @@ def test_every_engine_field_has_a_source() -> None:
         # Шаг цены — одно поле окна на всю программу, общее с издержками
         # тестера (решение владельца счёта 04.10.2026, задача З8).
         "price_step",
+        # «Заходить заново при обрыве связи» (решение 0067, Р-10 п. 9).
+        "hold_after_unfilled_level",
     }
     from_the_previous = {
         "close_on_time_end", "trade_in_weekend", "partial_candles",
@@ -433,7 +435,7 @@ def test_every_engine_field_has_a_source() -> None:
         "exchange_days",
         # Выход по концу окна с предельной ценой: полей в окне пока нет
         # (Ф3 задачи З8), «Применить» не должно их стирать.
-        "time_exit_order", "time_exit_limit_steps", "time_exit_wait_bars",
+        "time_exit_order", "time_exit_limit_percent", "time_exit_wait_bars",
     }
     # ПРЕДОХРАНИТЕЛЬ ВЫКЛЮЧЕН НА ЭТАПЕ (D-113): предохранителей в настройках движка больше нет.
     # # Три предохранителя по деньгам. Проведены 05.09.2026 (`D-030`), но
@@ -761,10 +763,15 @@ def test_the_shading_decides_by_closes_but_is_laid_out_by_starts() -> None:
         "робот торговал, либо оставила незатенённой свечу, на которой он молчал"
     )
 
+    # Полоса после окна уходит за последнюю свечу — в воображаемые бары того
+    # же таймфрейма, — поэтому её конец сверяется с сеткой оси, а не со
+    # свечами ряда. Ряд непрерывен: внутри него сетка и есть его свечи.
     starts = {each_candle.time for each_candle in candles}
+    step = candles[0].timeframe.delta
     for band in bands:
-        assert band.start in starts and band.end in starts, (
-            "граница полосы не совпадает ни с одной отметкой свечи на оси: "
+        assert band.start in starts, band.start
+        assert (band.end - candles[0].time) % step == timedelta(0), (
+            "граница полосы не совпадает ни с одной отметкой оси: "
             "полоса стоит между свечами"
         )
 
@@ -788,7 +795,10 @@ def test_a_non_trading_day_is_shaded_even_without_a_trading_window() -> None:
     assert bands, "выходной день не затенён — не видно, где робот молчал"
     assert "Нерабочий день" in bands[0].note, bands[0].note
     assert bands[0].start == datetime(2026, 6, 20, 10, 0, tzinfo=MSK)
-    assert bands[0].end == datetime(2026, 6, 20, 10, 55, tzinfo=MSK)
+    assert bands[0].end > saturday[-1].time, (
+        "полоса оборвалась на последней свече: суббота справа от неё "
+        "выглядит торговой"
+    )
 
 
 def test_trading_on_weekends_removes_the_weekend_shading() -> None:
@@ -799,6 +809,48 @@ def test_trading_on_weekends_removes_the_weekend_shading() -> None:
         trade_in_weekend=True,
     )
     assert convert.shades_of(saturday, configuration) == ()
+
+
+#: Окно владельца счёта 17.11.2026 и два положения последней закрытой свечи.
+#: 17.06.2026 — среда, следующий день тоже будний.
+_AHEAD_CASES = {
+    # 07:22: последняя закрытая 07:15, растёт 07:20. Полоса одна — от первой
+    # свечи ряда до 09:05 включительно: закрытие 09:05 в 09:10 в окно
+    # 09:10–11:00 не входит, закрытие 09:10 в 09:15 входит.
+    "до окна": (
+        _series(7, 0, 4, day=17),
+        datetime(2026, 6, 17, 7, 0, tzinfo=MSK),
+        datetime(2026, 6, 17, 9, 5, tzinfo=MSK),
+    ),
+    # В окне, последняя закрытая 10:30: будущее до 10:50 торговое, полоса
+    # начинается со свечи 10:55 — её закрытие 11:00 в окно не входит — и идёт
+    # до 09:05 следующего утра.
+    "в окне": (
+        _series(9, 10, 17, day=17),
+        datetime(2026, 6, 17, 10, 55, tzinfo=MSK),
+        datetime(2026, 6, 18, 9, 5, tzinfo=MSK),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(_AHEAD_CASES))
+def test_the_shading_continues_past_the_last_closed_candle(case: str) -> None:
+    """Растущая свеча и будущее справа затенены по тому же правилу окна.
+
+    Жалоба владельца счёта 17.11.2026: бой включён в 07:22, окно 09:10–11:00
+    ещё не открылось, а график светлый справа от последней закрытой свечи —
+    читается как «окно идёт». Полоса обязана продолжаться за ряд без шва
+    и обрываться ровно там, где по закрытию бара открывается окно.
+    """
+    candles, start, end = _AHEAD_CASES[case]
+    configuration = EngineSettings(window=TradingWindow(start=time(9, 10), end=time(11, 0)))
+    bands = convert.shades_of(candles, configuration)
+    assert bands, "за последней свечой не затенено ничего"
+    assert (bands[0].start, bands[0].end) == (start, end), (
+        f"{case}: первая полоса {bands[0].start:%d.%m %H:%M}–{bands[0].end:%d.%m %H:%M}, "
+        f"ожидалась {start:%d.%m %H:%M}–{end:%d.%m %H:%M}: либо полоса оборвалась "
+        "на последней свече, либо граница окна взята не по закрытию бара"
+    )
 
 
 def test_the_band_label_never_promises_an_exit_that_will_not_happen() -> None:
@@ -879,24 +931,26 @@ def test_the_band_names_the_owner_mark_and_not_the_weekend() -> None:
     другим значит объяснять владельцу счёта его собственное решение чужой
     причиной (решение 0038).
     """
-    friday = _series(10, 0, 12, day=19)  # 19.06.2026 — пятница, обычный будний
+    # 17.06.2026 — среда: полоса уходит за последнюю свечу в следующий день,
+    # и после пятницы она захватила бы субботу, а с ней и «выходные» в подписи.
+    wednesday = _series(10, 0, 12, day=17)
     marked = EngineSettings(
         window=TradingWindow(start=time(10, 0), end=time(10, 0)),  # весь день
-        calendar=DayMarks.of({date(2026, 6, 19): False}),
+        calendar=DayMarks.of({date(2026, 6, 17): False}),
     )
-    bands = convert.shades_of(friday, marked)
+    bands = convert.shades_of(wednesday, marked)
     assert bands, "помеченный день не затенён — не видно, где робот молчал"
     assert "вы пометили эти дни нерабочими" in bands[0].note, bands[0].note
 
 
 def test_the_band_names_a_closed_exchange_in_its_own_words() -> None:
     """День, закрытый биржей, подписан биржей, а не выходными и не отметкой."""
-    friday = _series(10, 0, 12, day=19)
+    wednesday = _series(10, 0, 12, day=17)  # среда — разбор в тесте выше
     closed = EngineSettings(
         window=TradingWindow(start=time(10, 0), end=time(10, 0)),
-        exchange_days=DayMarks.of({date(2026, 6, 19): False}),
+        exchange_days=DayMarks.of({date(2026, 6, 17): False}),
     )
-    bands = convert.shades_of(friday, closed)
+    bands = convert.shades_of(wednesday, closed)
     assert bands
     assert "биржа в эти дни не работает" in bands[0].note, bands[0].note
 
@@ -1189,3 +1243,53 @@ def test_changing_the_minute_bar_limit_is_a_journal_line() -> None:
     assert lines == [
         "Наибольшая свеча для проверки по минуткам: 5 минут → 15 минут"
     ], lines
+
+
+def test_fact_trades_apart_from_the_forecast_after_a_broker_trailing_exit_are_not_defects() -> None:
+    """Стережёт: после выхода по условной у брокера сделка без пары — не «дефект» (B-104).
+
+    Бой 16.11.2026: условная брокера закрыла шорт в 09:33:49, «прогноз»
+    (тень, скользящий по минуткам с шагом) не вышел, и метки выхода и следующего
+    входа стояли «!» с подсказкой «Разбирается как дефект». Здесь: выход брокера
+    и вход после него — обычные метки с объяснением словами и секундой
+    исполнения; сделка «прогноза» без пары после выхода — не «сигнал пропущен».
+    Сделка без расчёта **до** выхода брокера по-прежнему дефект.
+    """
+    frame = Timeframe(5)
+    at = datetime(2026, 11, 16, 9, 0, tzinfo=MSK)
+
+    def fill(name: str, action: OrderAction, minute: int) -> Fill:
+        return Fill(
+            action=action, side=EngineSide.SHORT, volume=1.0, price=248_325.0,
+            at=at + timedelta(minutes=minute), order_id=name,
+        )
+
+    stray = fill("open:stray", OrderAction.OPEN, 0)
+    broker_exit = fill("take:1", OrderAction.CLOSE, 30)
+    after = fill("open:2", OrderAction.OPEN, 40)
+    shadow_only = Plan(
+        order_id="take:shadow", decided_at=at + timedelta(minutes=55), price=248_450.0,
+        side=EngineSide.SHORT, action=OrderAction.CLOSE, exit_reason=ExitReason.TRAILING_TAKE,
+    )
+    pairs_ = (
+        Pair(stray.order_id, None, stray), Pair(broker_exit.order_id, None, broker_exit),
+        Pair(after.order_id, None, after), Pair(shadow_only.order_id, shadow_only, None),
+    )
+    broker = convert.AtBroker(
+        executed={"take:1": at.replace(minute=33, second=49)}, trailing=frozenset({"take:1"})
+    )
+
+    markers, _ = convert.markers_and_paths(
+        HistoryRun(fills=(stray, broker_exit, after)), pairs_, frozenset(), frame,
+        pending=convert.Unfilled.WAITING, broker=broker,
+    )
+
+    shown = {marker.pair_id: marker for marker in markers}
+    assert shown["open:stray"].kind is MarkerKind.UNPLANNED, shown["open:stray"]
+    assert shown["take:1"].kind is MarkerKind.EXIT, shown["take:1"]
+    assert shown["open:2"].kind is MarkerKind.ENTRY_SHORT, shown["open:2"]
+    assert shown["take:shadow"].kind is MarkerKind.EXIT, shown["take:shadow"]
+    for name in ("take:1", "open:2", "take:shadow"):
+        tip = shown[name].tooltip
+        assert "дефект" not in tip and "условная заявка у брокера" in tip, (name, tip)
+    assert "09:33:49" in shown["take:1"].tooltip, shown["take:1"].tooltip

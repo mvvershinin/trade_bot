@@ -41,7 +41,7 @@ from __future__ import annotations
 import math
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -51,6 +51,7 @@ __all__ = [
     "CommandAction",
     "CommandSide",
     "CommandStatus",
+    "OrderFillTimes",
     "StoredCommand",
 ]
 
@@ -223,6 +224,11 @@ class BrokerCommand:
     :param price: цена лимитной заявки. Пусто — заявка по рынку; у отмены
         пусто всегда.
     :param target_client_order_id: ключ отменяемой заявки — только у отмены.
+    :param account: счёт, которому команда подана (`agreementId`). Обязателен
+        и только по имени: в `userdata/` бывает два токена на два счёта
+        (находка `/risk`, Э4 шаг 1), и сверка, спросившая не тот счёт, нашла бы
+        «чужую» позицию или не нашла бы своей заявки. По нему же день счёта
+        отбирает свои исполнения (`market.day`).
     """
 
     client_order_id: str
@@ -233,6 +239,7 @@ class BrokerCommand:
     volume: int | None = None
     price: float | None = None
     target_client_order_id: str | None = None
+    account: str = field(kw_only=True)
 
     def __post_init__(self) -> None:
         _canonical_uuid(self.client_order_id, "ключ команды")
@@ -243,6 +250,11 @@ class BrokerCommand:
             raise ValueError("у команды нет имени заявки движка: связать её будет не с чем")
         if not self.symbol.strip():
             raise ValueError("у команды нет тикера")
+        if not self.account.strip():
+            raise ValueError(
+                f"команда {self.client_order_id}: не назван счёт — сверка спросила бы "
+                "брокера о другом счёте"
+            )
         if not _finite_or_none(self.price):
             raise ValueError(f"цена {self.price!r} — не конечное число")
         problem = _SHAPE_PROBLEM[action](self)
@@ -271,6 +283,28 @@ class StoredCommand:
     status: CommandStatus
     status_at: datetime
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class OrderFillTimes:
+    """Когда заявка движка ушла брокеру и когда исполнилась — по журналу команд.
+
+    Движок знает о сделке только свечу (`engine.Fill.at` — начало бара),
+    брокер — секунду. Окну нужна вторая: исполнение условной в 10:38:03
+    под свечой 10:35 читалось строкой «10:35 → 10:35» (бой 16.11.2026).
+
+    :param session_id: прогон, подавший команду.
+    :param order_id: имя заявки движка (`broker_command.order_id`).
+    :param placed_at: когда записана первая исполнившаяся команда этого имени.
+    :param first_at: первое исполнение по брокеру.
+    :param last_at: последнее исполнение по брокеру.
+    """
+
+    session_id: int
+    order_id: str
+    placed_at: datetime
+    first_at: datetime
+    last_at: datetime
 
 
 @dataclass(frozen=True, slots=True)

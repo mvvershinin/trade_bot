@@ -392,11 +392,17 @@ def test_a_missing_instrument_names_what_is_there(loop, database) -> None:
 
 
 def test_start_refuses_with_an_explanation(loop, database) -> None:
-    """Кнопка «Старт» не делает вид, что робот пошёл."""
+    """Кнопка «Старт» не делает вид, что робот пошёл.
+
+    «Старт» = «Включить бой» (владелец 16.11.2026): без потока бой нельзя,
+    и отказ называет причину запрета боя — что нажать, — а не прежнее
+    «боевого хода по этой кнопке нет».
+    """
     port, recorded = replay_history(loop, database, values=Settings(), days=0)
     port.start()
     assert recorded.failures, "«Старт» промолчал"
-    assert "боевого хода" in recorded.failures[-1]
+    assert "«Подключиться»" in recorded.failures[-1], recorded.failures[-1]
+    assert "боевого хода" not in recorded.failures[-1]
 
 
 def test_bad_settings_are_not_applied(loop, database) -> None:
@@ -689,6 +695,12 @@ _ANOTHER_VALUE = {
     "instrument": "RIU6",
     "timeframe": "15 минут",
     "after_take_profit": AfterTakeProfit.WAIT_FOR_SIGNAL,
+    # Список целых, а не календарь: «другой кортеж» по типу дал бы паузам
+    # переподключения отметки календаря, и строка журнала вышла бы о мусоре.
+    "live_reconnect_pauses_sec": (3, 7),
+    # Умолчание 30 с стоит на потолке поля (B-111): «другое» по типу — 30,25 —
+    # вне границ и отвергается, а не пишется строкой «было → стало».
+    "live_position_settle_sec": 2.5,
 }
 
 

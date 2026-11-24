@@ -118,9 +118,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 
 from engine import (
+    ExecutionHalted,
     ExecutionRefused,
     Fill,
     LevelTouch,
+    LevelUnfilled,
     MarketCandle,
     OrderAction,
     OrderRequest,
@@ -648,6 +650,22 @@ class ExecutionModel:
     и первый раз выполняется на реальных деньгах. Сверкой с прототипом эти
     ветки не проходятся никогда — отказов в снятии в эталонном прогоне ноль
     из 85.
+
+    Остановка по слову исполнителя (`ExecutionHalted`, решение 0066) —
+    тем же порядком и по той же причине. `halt_on` — имена заявок (или тех,
+    кого они снимают) и причина словами: подача такой заявки кончается
+    остановкой. `halt_at` — начала свечей и причина: вопрос о сделках
+    по закрытой свече кончается остановкой, и сделки, которые модель
+    по этой свече нашла, уходят **вместе с исключением**, а не пропадают.
+    Обе остановки срабатывают один раз.
+
+    Событие «уровень не исполнился» (`LevelUnfilled`, решение 0067, Р-10) —
+    тем же порядком и по той же причине. `unfilled_on` — имена заявок
+    вооружения и причина словами: касание такого уровня отдаётся движку
+    событием, а не сделкой, сторож снимается, нога остаётся открытой —
+    как у брокера, снявшего выход «исполнить целиком или снять». Срабатывает
+    один раз. Признака источника у события нет; в прогоне по истории
+    крючок не включается никогда, и сделки прогона он не меняет.
     """
 
     def __init__(
@@ -656,10 +674,19 @@ class ExecutionModel:
         costs: Costs | None = None,
         refuse: dict[str, Refusal] | None = None,
         hollow_cancel: bool = False,
+        halt_on: dict[str, str] | None = None,
+        halt_at: dict[datetime, str] | None = None,
     ) -> None:
         self.costs = costs if costs is not None else Costs()
         self.refuse = dict(refuse or {})
         self.hollow_cancel = hollow_cancel
+        self.halt_on = dict(halt_on or {})
+        self.halt_at = dict(halt_at or {})
+        #: Имена заявок вооружения → причина: касание такого уровня отдаётся
+        #: событием «уровень не исполнился» (шапка класса, «Отказы»).
+        #: Атрибут, а не довод конструктора: имя вооружения выводится
+        #: из времени входа, и тест узнаёт его только после сделки открытия.
+        self.unfilled_on: dict[str, str] = {}
         #: Рыночные заявки, ждущие открытия следующей свечи.
         self.pending: list[OrderRequest] = []
         #: Сторожимые уровни по имени заявки. Словарь — самое короткое
@@ -746,6 +773,9 @@ class ExecutionModel:
 
     async def submit(self, order: OrderRequest) -> None:
         """Принять заявку. Возврат означает «принято к исполнению»."""
+        for name in (order.order_id, order.target_id or ""):
+            if name in self.halt_on:
+                raise ExecutionHalted(self.halt_on.pop(name))
         reason = refusal_for(order, self.refuse)
         if reason is not None:
             raise ExecutionRefused(
@@ -774,7 +804,9 @@ class ExecutionModel:
         self.submitted_market.append(order)
         self.pending.append(order)
 
-    async def fills_at(self, candle: MarketCandle) -> Sequence[Fill | PriceSeen]:
+    async def fills_at(
+        self, candle: MarketCandle
+    ) -> Sequence[Fill | PriceSeen | LevelUnfilled]:
         """Сделки, случившиеся к моменту закрытия этой свечи и ещё не отданные.
 
         Порядок внутри круга однозначен: сначала исполнения по **открытию**
@@ -804,14 +836,31 @@ class ExecutionModel:
             self.fills.extend(opened)
             return opened
         self._remember(candle)
-        fills = self._market_fills(candle)
-        if not fills:
+        found: Sequence[Fill | PriceSeen | LevelUnfilled]
+        opened = self._market_fills(candle)
+        if opened:
+            self.fills.extend(opened)
+            found = opened
+        else:
             walk = self._walk_of(candle)
             if walk is not None:
-                return self._walked(walk, candle)
-            fills = self._level_fills(candle)
-        self.fills.extend(fills)
-        return fills
+                found = self._walked(walk, candle)
+            else:
+                levels = self._level_fills(candle)
+                self.fills.extend(_deals(levels))
+                found = levels
+        why = self.halt_at.pop(candle.time, None)
+        if why is not None:
+            # Сделки и события этого ответа уходят вместе с остановкой: сделка
+            # на счёте уже есть, а событие «уровень не исполнился» движок
+            # обязан назвать строкой (Р-10, Н6). Наблюдение цены — не то и
+            # не другое, и контракт `ExecutionHalted` его не несёт.
+            raise ExecutionHalted(
+                why,
+                _deals(found),
+                [item for item in found if isinstance(item, LevelUnfilled)],
+            )
+        return found
 
     def _walk_of(self, candle: MarketCandle) -> _Walk | None:
         """Обход этого бара — начатый или новый. `None` — бар идёт по размаху.
@@ -852,7 +901,9 @@ class ExecutionModel:
         self._walk = _Walk(candle.time, tuple(steps))
         return self._walk
 
-    def _walked(self, walk: _Walk, candle: MarketCandle) -> list[Fill | PriceSeen]:
+    def _walked(
+        self, walk: _Walk, candle: MarketCandle
+    ) -> list[Fill | PriceSeen | LevelUnfilled]:
         """Следующее внутрибарное событие обхода: сделки по уровню или наблюдение.
 
         Шаг обхода — отрезок между соседними точками. Сначала сторожа
@@ -877,7 +928,7 @@ class ExecutionModel:
                 previous=step.previous,
             )
             if fills:
-                self.fills.extend(fills)
+                self.fills.extend(_deals(fills))
                 return list(fills)
             if self._open is not None:
                 return [PriceSeen(at=step.minute.time, price=step.end)]
@@ -972,7 +1023,7 @@ class ExecutionModel:
         self.pending = waiting
         return fills
 
-    def _level_fills(self, candle: MarketCandle) -> list[Fill]:
+    def _level_fills(self, candle: MarketCandle) -> list[Fill | LevelUnfilled]:
         """Сторожимые уровни внутри бара.
 
         Достижение считается **по касанию**, и сторона касания приходит
@@ -1015,7 +1066,7 @@ class ExecutionModel:
         reach: tuple[float, float],
         ready_at: datetime,
         previous: float | None,
-    ) -> list[Fill]:
+    ) -> list[Fill | LevelUnfilled]:
         """Сторожа, задетые в размахе `reach`. Общее для бара и отрезка минуток.
 
         * `candle` — бар: его начало — время сделки (`Fill.at`), его закрытие —
@@ -1032,10 +1083,15 @@ class ExecutionModel:
         * `previous` — цена до проверяемого участка, вход сторожа разрыва.
         """
         low, high = reach
-        fills: list[Fill] = []
+        fills: list[Fill | LevelUnfilled] = []
         for order_id, guard in list(self.armed.items()):
             order = guard.order
-            if order.submitted_at > ready_at:
+            if order.submitted_at > ready_at or order.trail_offset is not None:
+                # Условная у брокера (`D-196`, `OrderRequest.trail_offset`):
+                # `price` — цена включения, а не уровень выхода, и касанием
+                # её не исполнить. До порога у прогона уровня нет; после
+                # порога движок подаёт обычное вооружение под тем же именем,
+                # и сторожится уже оно — по минуткам, как скользящий уровень.
                 continue
             level = order.price
             assert level is not None, "вооружение без уровня — дефект движка"
@@ -1049,6 +1105,12 @@ class ExecutionModel:
                 continue
             self._reachable(order, level, touch, span, previous)
             del self.armed[order_id]
+            unfilled = self.unfilled_on.pop(order_id, None)
+            if unfilled is not None:
+                # Выход по уровню снят целиком (Р-10): сделки нет, нога
+                # открыта, сторожа нет. Время — касание на этом отрезке.
+                fills.append(LevelUnfilled(order_id=order_id, at=span.time, reason=unfilled))
+                continue
             at = candle.time
             price = self.costs.fill_price(level, OrderAction.CLOSE, order.side)
             fill = Fill(
@@ -1287,6 +1349,17 @@ class ExecutionModel:
         self, order: OrderRequest, level: float, candle: MarketCandle
     ) -> None:
         """Уровень задет. Базовой модели сказать об этом нечего."""
+
+
+def _deals(items: Sequence[Fill | PriceSeen | LevelUnfilled]) -> list[Fill]:
+    """Сделки ответа — в книгу сделок модели (`ExecutionModel.fills`).
+
+    Событие «уровень не исполнился» и наблюдение цены сделками не являются:
+    их получает движок ответом `fills_at` целиком, а книга модели хранит
+    только то, что изменило позицию. Отбор здесь — про запись, а не про
+    ответ движку: ответ уходит без отбора.
+    """
+    return [item for item in items if isinstance(item, Fill)]
 
 
 def refusal_for(order: OrderRequest, names: dict[str, Refusal]) -> Refusal | None:

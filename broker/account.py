@@ -46,8 +46,10 @@ import enum
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final, Mapping
+from uuid import UUID
 
 from broker.errors import IncompleteAccountData, UnexpectedAnswer
+from broker.orders import ListedOrderStatus, OrdersPage, OrdersQuery, OrderState
 from broker.parsing import first_mapping, moment, number, pick, text
 from broker.session import LIMITS_PATH, PORTFOLIO_PATH, BrokerSession
 from broker.tokens import now_utc
@@ -195,13 +197,17 @@ class AccountSnapshot:
     #: числа считается дневной лимит убытка, и ноль означал бы лимит ноль,
     #: то есть остановку робота на первом же убытке.
     equity_rub: float | None = None
+    #: Активы, позицию которых прочитать нельзя (`read_holdings`). Не мешают
+    #: снимку: отказ получает только тот, кто спросит их тикер.
+    unreadable: tuple[Unreadable, ...] = ()
+    #: Рубли на счёте по портфелю — строка `moneyLimit` RUB срока `T0`
+    #: (`portfolio_cash`, решение 0070). Только для показа в окне: в движок
+    #: идут деньги «Лимитов» (`money`). `None` — строки нет или их несколько.
+    cash_rub: float | None = None
 
     def position(self, ticker: str) -> Position | None:
-        wanted = ticker.strip().upper()
-        for item in self.positions:
-            if item.ticker.strip().upper() == wanted:
-                return item
-        return None
+        """Позиция по тикеру; `None` — её нет. Непрочитанная — `UnexpectedAnswer`."""
+        return _position_of(self.positions, self.unreadable, ticker)
 
     def open_positions(self) -> tuple[Position, ...]:
         return tuple(item for item in self.positions if item.open)
@@ -235,7 +241,10 @@ class AccountSnapshot:
         Ноль и отрицательное отбрасываются: делением на них получилось бы
         «свободных средств хватает на любой объём».
         """
-        position = self.position(ticker)
+        try:
+            position = self.position(ticker)
+        except UnexpectedAnswer:
+            return None  # позицию не прочитали — ГО под контракт тем более «не знаем»
         if position is None or not position.open:
             return None
         locked = position.locked_for_futures
@@ -310,6 +319,10 @@ class AccountSnapshot:
                 f"{item.ticker}: {item.side.value}, {abs(item.quantity):g} шт."
                 + (f", средняя {item.average_price:g}" if item.average_price else "")
                 for item in opened
+            )
+        if self.unreadable:
+            position_text += "; не прочитаны позиции: " + ", ".join(
+                item.ticker for item in self.unreadable
             )
         account = f"счёт {self.account}, " if self.account else ""
         return f"{account}{money_text}. {position_text}."
@@ -411,6 +424,147 @@ def _kind(value: str | None) -> str:
     if value is None:
         return ""
     return value.strip().lower().replace("_", "").replace("-", "").replace(" ", "")
+
+
+#: Срок расчётов, строка которого и есть состояние «сейчас» (`B-096`, `B-090`).
+#:
+#: ⚠️ **Живой портфель 13.11.2026 отдаёт один актив строкой на каждый срок**
+#: `term` — `T0`, `T1`, `T2`, `T365` (04: «код срока расчётов»). У фьючерса
+#: во всех четырёх `quantity: 1` при одном контракте; сложение строк дало
+#: в окне «лонг 4», а сводка счёта повторила каждую бумагу четыре раза.
+#: Срочный рынок расчётов с задержкой не знает, сроки там равны; у бумаг
+#: `T0` — уже рассчитанное, остальные — с учётом сделок в расчёте.
+CURRENT_TERM: Final[str] = "T0"
+
+#: Поля, совпадение которых делает строки портфеля **одним активом** на разных
+#: сроках. `type` сюда не входит: он сравнивается без регистра (`_kind`).
+_SAME_ASSET: Final[tuple[tuple[str, ...], ...]] = (
+    ("account",),
+    ("exchange",),
+    ("board", "classCode", "class_code"),
+    ("ticker",),
+    ("currency",),
+)
+
+#: Виды записей, у которых количество на всех сроках обязано совпадать:
+#: срочный рынок расчётов с задержкой не знает (`_read_group`, звено 1).
+_MATCHED_TERMS: Final[frozenset[str]] = frozenset({"futuresholding"})
+
+
+def _asset(item: Mapping[str, Any]) -> tuple[str, ...]:
+    kind = _kind(text(pick(item, ("type",))))
+    return (kind, *((text(pick(item, names)) or "").upper() for names in _SAME_ASSET))
+
+
+def _term(item: Mapping[str, Any]) -> str | None:
+    found = text(pick(item, ("term",)))
+    return found.upper() if found else None
+
+
+def _same_ticker(left: str, right: str) -> bool:
+    return left.strip().upper() == right.strip().upper()
+
+
+@dataclass(frozen=True, slots=True)
+class Unreadable:
+    """Актив портфеля, позицию которого прочитать нельзя, и почему.
+
+    Отказ **по активу**, а не по портфелю (ревью 13.11.2026): облигация,
+    купленная сегодня и пришедшая без строки `T0`, не должна останавливать
+    робота на фьючерсе. Отказ поднимается тогда, когда спрашивают **этот**
+    тикер (`Holdings.position`).
+    """
+
+    ticker: str
+    #: Кусок фразы для человека: `UnexpectedAnswer` вставит его в готовую.
+    what: str
+    technical: str
+
+    def refusal(self) -> UnexpectedAnswer:
+        """Отказ тому, кто спросил этот тикер."""
+        return UnexpectedAnswer(self.what, self.technical)
+
+
+@dataclass(frozen=True, slots=True)
+class _Group:
+    """Строки одного актива (`_asset`) на разных сроках расчётов."""
+
+    kind: str
+    rows: tuple[Mapping[str, Any], ...]
+
+    @property
+    def ticker(self) -> str:
+        return text(pick(self.rows[0], ("ticker",))) or "без тикера"
+
+    @property
+    def named(self) -> bool:
+        return any(_term(row) is not None for row in self.rows)
+
+    @property
+    def current(self) -> Mapping[str, Any] | None:
+        """Строка «сейчас»: ровно одна `T0`; без сроков — единственная строка."""
+        if not self.named:
+            return self.rows[0] if len(self.rows) == 1 else None
+        found = [row for row in self.rows if _term(row) == CURRENT_TERM]
+        return found[0] if len(found) == 1 else None
+
+
+def _groups(items: list[Mapping[str, Any]]) -> list[_Group]:
+    found: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
+    for item in items:
+        found.setdefault(_asset(item), []).append(item)
+    return [_Group(asset[0], tuple(rows)) for asset, rows in found.items()]
+
+
+def _amount_text(value: float | None) -> str:
+    return "не число" if value is None else f"{value:g}"
+
+
+def _read_group(group: _Group) -> Position | Unreadable:
+    """Позиция актива или почему её прочитать нельзя. Три звена по порядку.
+
+    1. **Фьючерс: сроки обязаны совпадать** (ревью 13.11.2026). Расчётов
+       с задержкой на срочном рынке нет, и расхождение — не законное
+       состояние, а признак, что `T0` ещё не догнал сделку: вечерняя сессия
+       FORTS относится к следующему торговому дню, и после вечернего входа
+       `T0` может стоять на 0 при `T1`/`T365` равных 1. Тихий `T0` здесь —
+       «позиции нет», снятый тейк и вход поверх открытой. У бумаг сроки
+       законно различаются, и для них этого звена нет.
+    2. **Строка «сейчас» одна** (`_Group.current`): нет `T0`, две `T0` или
+       несколько строк без срока — отказ; сложение строк и есть «лонг 4».
+    3. **Количество прочитано**: `Side.of()` читает ноль как «позиции нет».
+    """
+    ticker = group.ticker
+    if group.kind in _MATCHED_TERMS and group.named:
+        amounts = sorted(
+            (_term(row) or "без срока", number(pick(row, _QUANTITY))) for row in group.rows
+        )
+        if any(value is None for _, value in amounts) or len({v for _, v in amounts}) > 1:
+            listed = ", ".join(f"{term} — {_amount_text(value)}" for term, value in amounts)
+            return Unreadable(
+                ticker,
+                f"по {ticker} брокер называет разное количество контрактов на разных "
+                f"сроках расчётов ({listed}), и какая позиция на счёте сейчас, понять нельзя",
+                f"портфель: {ticker} ({group.kind}), сроки разошлись: {listed}",
+            )
+    current = group.current
+    if current is None:
+        terms = ", ".join(sorted(_term(row) or "без срока" for row in group.rows))
+        return Unreadable(
+            ticker,
+            f"по {ticker} брокер не прислал одной строки текущего срока расчётов "
+            f"({CURRENT_TERM}), и сколько на счёте сейчас, понять нельзя",
+            f"портфель: {ticker} ({group.kind}): строк {len(group.rows)}, сроки {terms}",
+        )
+    quantity = number(pick(current, _QUANTITY))
+    if quantity is None:
+        return Unreadable(
+            ticker,
+            "не удалось прочитать количество в позиции",
+            f"портфель: у позиции {ticker} не найдено поле количества "
+            f"(искали {', '.join(_QUANTITY)})",
+        )
+    return _position(current, quantity)
 
 
 def _currency_of(block: Mapping[str, Any]) -> str | None:
@@ -664,7 +818,20 @@ def parse_equity(portfolio: object, marginal: object = None) -> float | None:
     if direct is not None:
         return direct
 
-    items = [item for item in positions_list(portfolio) if isinstance(item, Mapping)]
+    # Размер счёта — **на срок `T0`**: деньги и активы одного среза. Актив
+    # без строки `T0` (бумага, купленная сегодня) в этом срезе ещё не пришёл,
+    # и деньги `T0` за него ещё не списаны — он не входит, и это не пропуск.
+    # Две строки `T0` или несколько без срока — неоднозначность: сумма
+    # по ним завысила бы размер счёта и ослабила дневной лимит убытка.
+    items: list[Mapping[str, Any]] = []
+    for group in _groups(
+        [item for item in positions_list(portfolio) if isinstance(item, Mapping)]
+    ):
+        current = group.current
+        if current is not None:
+            items.append(current)
+        elif not group.named or any(_term(row) == CURRENT_TERM for row in group.rows):
+            return None
     if not items:
         return None
     total = 0.0
@@ -697,60 +864,145 @@ def _is_position(item: Mapping[str, Any]) -> bool:
     )
 
 
-def parse_positions(portfolio: Any) -> tuple[tuple[Position, ...], str | None]:
-    """Разобрать ответ сервиса «Портфель». Возвращает позиции и номер счёта.
+def _position(item: Mapping[str, Any], quantity: float) -> Position:
+    """Позиция из строки «сейчас»; количество прочитано вызывающим (`_read_group`)."""
+    return Position(
+        ticker=text(pick(item, ("ticker",))) or "",
+        class_code=text(pick(item, ("board", "classCode", "class_code"))),
+        side=Side.of(quantity),
+        quantity=quantity,
+        average_price=number(pick(item, ("balancePrice", "averagePrice"))),
+        current_price=number(pick(item, ("currentPrice",))),
+        lot=number(pick(item, ("ratioQuantity", "lotSize"))),
+        price_step=number(pick(item, ("minimumStep",))),
+        currency=text(pick(item, ("currency",))),
+        expires_on=moment(pick(item, ("expireDate", "expirationDate"))),
+        locked_for_futures=number(pick(item, ("lockedForFutures",))),
+        display_name=text(pick(item, ("displayName",))),
+    )
+
+
+def _position_of(
+    positions: tuple[Position, ...], unreadable: tuple[Unreadable, ...], ticker: str
+) -> Position | None:
+    """Позиция по тикеру: непрочитанная — отказ, чужая непрочитанная — не помеха.
+
+    Строк одного тикера после отбора по срокам больше одной бывает только
+    на разных счетах или режимах торгов; сложить их — снова угадать,
+    поэтому и это отказ.
+    """
+    for item in unreadable:
+        if _same_ticker(item.ticker, ticker):
+            raise item.refusal()
+    found = [item for item in positions if _same_ticker(item.ticker, ticker)]
+    if len(found) > 1:
+        raise UnexpectedAnswer(
+            f"позиция по {ticker} пришла несколькими строками разных счетов или режимов торгов",
+            f"портфель: {ticker}, строк после отбора по срокам {len(found)}",
+        )
+    return found[0] if found else None
+
+
+@dataclass(frozen=True, slots=True)
+class Holdings:
+    """Позиции портфеля: прочитанные и непрочитанные — **порознь**.
+
+    Кто спрашивает один тикер, зовёт `position(ticker)`: отказ по чужому
+    активу его чтению не мешает (ревью 13.11.2026). Кому нужен только номер
+    счёта — `portfolio_account`, позиции он не разбирает вовсе.
+    """
+
+    account: str | None
+    positions: tuple[Position, ...]
+    unreadable: tuple[Unreadable, ...] = ()
+
+    def position(self, ticker: str) -> Position | None:
+        """Позиция по тикеру; `None` — её нет. Непрочитанная — `UnexpectedAnswer`."""
+        return _position_of(self.positions, self.unreadable, ticker)
+
+
+def portfolio_account(portfolio: object) -> str | None:
+    """Номер договора из ответа «Портфеля» — **без разбора позиций**.
+
+    Читается из любой записи, включая денежную: на плоском счёте позиций
+    нет вовсе. Непрочитанный актив номер счёта не прячет: ручным кнопкам
+    и включению боя нужен договор, а не чужая облигация.
+    """
+    for item in positions_list(portfolio):
+        if isinstance(item, Mapping):
+            found = text(pick(item, ("agreementId", "agreement_id")))
+            if found:
+                return found
+    return None
+
+
+def read_holdings(portfolio: object) -> Holdings:
+    """Разобрать ответ сервиса «Портфель»: номер счёта и позиции **по активам**.
 
     ⚠️ **Позицией становится не всякая запись.** Ответ портфеля перечисляет
     пять типов (`.docs/broker-api/04-portfolio.md`), и два из них — деньги
     и лимиты: у них в поле `quantity` лежит **сумма**, а не число контрактов.
-    Отбор идёт двумя белыми списками, а незнакомый тип — **отказ**, а не
-    молчаливое «наверное, позиция» и не молчаливое «наверное, деньги».
-    Оба молчания стоят денег, и в разные стороны: призрак закрывают,
-    пропущенную позицию открывают вторым объёмом.
+    Отбор идёт двумя белыми списками, а незнакомый тип — **отказ всему
+    портфелю**: про такую запись неизвестно даже, позиция ли она.
 
-    Номер счёта при этом читается из **любой** записи, включая денежную:
-    на плоском счёте позиций нет вовсе, а номер счёта нужен и там.
+    ⚠️ **Одна позиция — одна строка, срока `T0`** (`B-096`). Живой портфель
+    отдаёт актив строкой на каждый срок расчётов; без отбора один контракт
+    читался как четыре у всех, кто складывает строки по тикеру. Актив,
+    у которого строку «сейчас» выбрать нельзя (`_read_group`), уходит
+    в `unreadable` и отказывает только тому, кто спросит его тикер.
     """
-    account: str | None = None
-    result: list[Position] = []
-
+    held: list[Mapping[str, Any]] = []
     for item in positions_list(portfolio):
-        if not isinstance(item, Mapping):
-            continue
-        account = account or text(pick(item, ("agreementId", "agreement_id")))
-        if not _is_position(item):
-            continue
-        ticker = text(pick(item, ("ticker",)))
-        if ticker is None:
-            continue
-        # Ноль по умолчанию здесь запрещён так же, как для денег: `Side.of()`
-        # читает ноль как «позиции нет», а сверка после обрыва по такому ответу
-        # входит по текущей цене поверх уже открытой позиции — двойной объём
-        # и путь к принудительному закрытию брокером.
-        quantity = number(pick(item, _QUANTITY))
-        if quantity is None:
-            raise UnexpectedAnswer(
-                "не удалось прочитать количество в позиции",
-                f"портфель: у позиции {ticker} не найдено поле количества "
-                f"(искали {', '.join(_QUANTITY)})",
-            )
-        result.append(
-            Position(
-                ticker=ticker,
-                class_code=text(pick(item, ("board", "classCode", "class_code"))),
-                side=Side.of(quantity),
-                quantity=quantity,
-                average_price=number(pick(item, ("balancePrice", "averagePrice"))),
-                current_price=number(pick(item, ("currentPrice",))),
-                lot=number(pick(item, ("ratioQuantity", "lotSize"))),
-                price_step=number(pick(item, ("minimumStep",))),
-                currency=text(pick(item, ("currency",))),
-                expires_on=moment(pick(item, ("expireDate", "expirationDate"))),
-                locked_for_futures=number(pick(item, ("lockedForFutures",))),
-                display_name=text(pick(item, ("displayName",))),
-            )
+        if (
+            isinstance(item, Mapping)
+            and _is_position(item)
+            and text(pick(item, ("ticker",))) is not None
+        ):
+            held.append(item)
+    positions: list[Position] = []
+    unreadable: list[Unreadable] = []
+    for group in _groups(held):
+        found = _read_group(group)
+        if isinstance(found, Unreadable):
+            unreadable.append(found)
+        else:
+            positions.append(found)
+    return Holdings(portfolio_account(portfolio), tuple(positions), tuple(unreadable))
+
+
+def portfolio_cash(portfolio: object) -> float | None:
+    """Рубли на счёте из портфеля: строка `moneyLimit` с тикером RUB срока `T0`.
+
+    Та цифра, которую владелец счёта видит в приложении брокера (решение 0070,
+    панель «Счёт у брокера»). Строк таких несколько (два рынка) или ни одной —
+    `None`: складывать или выбирать здесь значило бы угадывать.
+    """
+    found = [
+        number(pick(item, _QUANTITY))
+        for item in positions_list(portfolio)
+        if isinstance(item, Mapping)
+        and _kind(text(pick(item, ("type",)))) == "moneylimit"
+        and (text(pick(item, ("ticker",))) or "").upper() == "RUB"
+        and _term(item) in (CURRENT_TERM, None)
+    ]
+    return found[0] if len(found) == 1 else None
+
+
+def parse_positions(portfolio: Any) -> tuple[tuple[Position, ...], str | None]:
+    """**Все** позиции портфеля и номер счёта; любой непрочитанный актив — отказ.
+
+    Отдаёт портфель целиком, поэтому и отказывает целиком: позиции «кроме
+    непрочитанной» читались бы как «её нет». Кто спрашивает один тикер —
+    `read_holdings(...).position(ticker)`; кому нужен только номер счёта —
+    `portfolio_account`. Разбор и правила — `read_holdings`.
+    """
+    holdings = read_holdings(portfolio)
+    if holdings.unreadable:
+        first = holdings.unreadable[0]
+        raise UnexpectedAnswer(
+            first.what, "; ".join(item.technical for item in holdings.unreadable)
         )
-    return tuple(result), account
+    return holdings.positions, holdings.account
 
 
 class Account:
@@ -791,13 +1043,35 @@ class Account:
         portfolio = await self._session.read(PORTFOLIO_PATH)
 
         money = parse_money(limits, exchange=self._exchange)
-        positions, account = parse_positions(portfolio)
+        holdings = read_holdings(portfolio)
         stored = self._session.stored()
 
         return AccountSnapshot(
             taken_at=now_utc(),
-            account=account or stored.account,
+            account=holdings.account or stored.account,
             money=money,
-            positions=positions,
+            positions=holdings.positions,
             equity_rub=parse_equity(portfolio),
+            unreadable=holdings.unreadable,
+            cash_rub=portfolio_cash(portfolio),
         )
+
+    async def live_orders(self, ticker: str) -> OrdersPage:
+        """Живые заявки по инструменту у брокера — первая страница списка (15).
+
+        Для панели «Счёт у брокера» (решение 0070): есть ли тейк и по какой
+        цене — по ответу брокера, а не по журналу команд программы.
+        """
+        return await self._session.search_orders(
+            OrdersQuery(statuses=(ListedOrderStatus.ACTIVE,), tickers=(ticker,))
+        )
+
+    async def order_state(self, key: UUID) -> OrderState | None:
+        """Статус заявки по нашему ключу (11) — для той же строки (`B-105`).
+
+        Условную заявку робота 16.11.2026 статус по ключу показал живой,
+        а проверочное чтение списка (15) — нет (разбор — `B-105`). Поэтому
+        живые заявки робота строка спрашивает и по ключу. `None` — 404:
+        заявки с этим ключом у брокера нет.
+        """
+        return await self._session.order_status(key)

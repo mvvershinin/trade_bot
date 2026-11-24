@@ -3,7 +3,7 @@
 Э5, Ф3 задачи З8 (`.docs/plans/E5-hard-close-at-window-end.md`). Что стережётся,
 словами — по одному поведению на проверку:
 
-* три поля окна (форма заявки, отступ в шагах, ожидание) и общий шаг цены
+* три поля окна (форма заявки, отступ в процентах, ожидание) и общий шаг цены
   доезжают до `EngineSettings` **из окна**, а не из прежних настроек;
 * заявка с предельной ценой, пока биржа не сообщила шаг цены, — не отказ:
   шаг программа берёт у биржи сама (решение 05.10.2026), движок до тех пор
@@ -45,7 +45,7 @@ from ui.models import (
 #: значение, взятое не оттуда, видно сразу.
 _WINDOW = Settings(
     time_exit_order=TimeExitKind.LIMIT,
-    time_exit_limit_steps=7,
+    time_exit_limit_pct=7.0,
     time_exit_wait_bars=3,
     price_step=25.0,
 )
@@ -53,7 +53,7 @@ _WINDOW = Settings(
 #: Прежние настройки движка — другие во всех четырёх полях.
 _PREVIOUS = EngineSettings(
     time_exit_order=TimeExitOrder.MARKET,
-    time_exit_limit_steps=10,
+    time_exit_limit_percent=2.0,
     time_exit_wait_bars=1,
     price_step=5.0,
 )
@@ -70,10 +70,10 @@ def test_the_window_values_reach_the_engine_and_not_the_previous_ones() -> None:
     """
     made = convert.engine_settings(_WINDOW, Mode.REVERSE, _PREVIOUS)
     got = (
-        made.time_exit_order, made.time_exit_limit_steps,
+        made.time_exit_order, made.time_exit_limit_percent,
         made.time_exit_wait_bars, made.price_step,
     )
-    assert got == (TimeExitOrder.LIMIT, 7, 3, 25.0), (
+    assert got == (TimeExitOrder.LIMIT, 7.0, 3, 25.0), (
         f"до движка доехало не то, что в окне: {got}"
     )
     market = convert.engine_settings(
@@ -110,13 +110,13 @@ def test_the_limit_form_disables_the_switch_that_it_overrides(make_dialog) -> No
     ))
     assert not dialog.close_on_time_end.isEnabled()
     assert dialog.window_close_note.text() == "", dialog.window_close_note.text()
-    assert dialog.time_exit_limit_steps.isEnabled()
+    assert dialog.time_exit_limit.isEnabled()
     market = make_dialog(Settings(
         close_on_time_end=False, time_exit_order=TimeExitKind.MARKET,
     ))
     assert market.close_on_time_end.isEnabled()
     assert "выключено" in market.window_close_note.text()
-    assert not market.time_exit_limit_steps.isEnabled()
+    assert not market.time_exit_limit.isEnabled()
     assert not market.time_exit_wait_bars.isEnabled()
 
 
@@ -202,7 +202,7 @@ def test_a_file_without_the_exit_form_is_not_said_to_hold_the_market_one(tmp_pat
 
 @pytest.mark.parametrize("changes", [
     {"time_exit_wait_bars": 0},
-    {"time_exit_limit_steps": -3, "average_period": 21},
+    {"time_exit_limit_pct": -3.0, "average_period": 21},
     {"time_exit_wait_bars": 13, "time_exit_order": TimeExitKind.LIMIT},
 ])
 def test_a_number_out_of_range_in_the_file_does_not_stop_the_start(changes) -> None:
@@ -219,8 +219,26 @@ def test_a_number_out_of_range_in_the_file_does_not_stop_the_start(changes) -> N
 
     values, engine, said = _startup_settings(Settings(**changes), Mode.REVERSE)
     assert 1 <= engine.time_exit_wait_bars <= MAX_TIME_EXIT_WAIT_BARS
-    assert engine.time_exit_limit_steps >= 0
+    assert 0 < engine.time_exit_limit_percent < 100
     assert "не принимает" in said, f"подмена числа из файла прошла молча: «{said}»"
     assert values.average_period == changes.get("average_period", Settings().average_period), (
         "вместе с негодным числом пропало годное соседнее"
     )
+
+
+@pytest.mark.parametrize("checked", [True, False], ids=["включена", "выключена"])
+def test_the_reenter_after_disconnect_switch_reaches_the_engine_and_not_the_previous_value(
+    checked: bool,
+) -> None:
+    """Галочка «Заходить заново при обрыве связи» — это `hold_after_unfilled_level` движка.
+
+    Прежние настройки несут противоположное значение: взятое у них поле
+    молча оставило бы робота на прежнем решении, а окно показывало бы другое.
+    Мутация: провести константу вместо галочки (`app/convert.py`, таблица
+    полей движка).
+    """
+    previous = _PREVIOUS.replace(hold_after_unfilled_level=not checked)
+    made = convert.engine_settings(
+        _WINDOW.replace(reenter_after_disconnect=checked), Mode.REVERSE, previous
+    )
+    assert made.hold_after_unfilled_level is checked

@@ -419,7 +419,12 @@ def _mode_points(ground: Ground) -> tuple[Point, ...]:
     return tuple(
         Point(
             label=f"{_reversal_word(reversal)} · {_after_take_word(stop)}",
-            engine=replace(ground.engine, reversal=reversal, stop_after_take_profit=stop),
+            # Стоп по первому убытку (`B-106`) снят явно: подпись точки называет
+            # только два варианта, а основание могло прийти с третьим.
+            engine=replace(
+                ground.engine, reversal=reversal, stop_after_take_profit=stop,
+                stop_after_loss=False,
+            ),
             strategy=ground.strategy,
         )
         for reversal in GRID_REVERSALS
@@ -482,7 +487,7 @@ def full_cross(ground: Ground) -> tuple[Point, ...]:
                   f"{_reversal_word(reversal)} · {_after_take_word(stop)}".replace(".", ","),
             engine=replace(
                 ground.engine, window=window, take_profit=True, take_profit_percent=take,
-                reversal=reversal, stop_after_take_profit=stop,
+                reversal=reversal, stop_after_take_profit=stop, stop_after_loss=False,
             ),
             strategy=replace(ground.strategy, period=period),
             axes=(("period", float(period)), ("take", take)),

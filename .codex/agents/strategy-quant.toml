@@ -1,0 +1,3 @@
+name = "strategy-quant"
+description = "Торговая логика: сигналы, индикаторы, реверс, тейк, окно. Пишет strategies/ и engine/."
+developer_instructions = "Прочитай AGENTS.md и .codex/ROLE_RULES.md, затем .codex/roles/02-strategy-quant.md. Выполни только порученную задачу. Не запускай подагентов. Модель и effort не повышай. Бриф может содержать прежние Opus/Sonnet и команды Claude: они не меняют настройки Codex; последние решения владельца и AGENTS.md имеют приоритет."

@@ -67,9 +67,10 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
-from market.candles import MINUTE, MSK, Candle, floor_to_minute
+from market.candles import MINUTE, MSK, Candle, ensure_msk, floor_to_minute
+from market.tls import exchange_ssl_context
 
 __all__ = [
     "ISS_BASE",
@@ -99,6 +100,9 @@ __all__ = [
     "parse_borders",
     "parse_security",
     "InstrumentSpec",
+    "PriceBand",
+    "parse_price_band",
+    "ask_price_band",
     "DAY_INTERVAL",
     "daily_url",
     "description_url",
@@ -218,7 +222,10 @@ class HttpxTransport:
 
         try:
             if self._client is None:
-                response = httpx.get(url, timeout=timeout, follow_redirects=True)
+                # Сертификат биржи выдан УЦ Минцифры — без своего набора не проверится.
+                response = httpx.get(
+                    url, timeout=timeout, follow_redirects=True, verify=exchange_ssl_context()
+                )
             else:
                 response = self._client.get(url, timeout=timeout)  # type: ignore[attr-defined]
             response.raise_for_status()
@@ -706,16 +713,14 @@ def _first_of(row: dict[str, object], *names: str) -> float | None:
     return None
 
 
-def parse_security(payload: bytes, *, secid: str, market: Market) -> InstrumentSpec:
-    """Карточка инструмента из ответа ISS. Чистая функция — проверяется без сети.
+def _board_row(payload: bytes, *, secid: str, market: Market) -> dict[str, object]:
+    """Строка карточки **нужного режима торгов** — по колонке `BOARDID`.
 
-    Строка выбирается **по режиму торгов**, а не первая попавшаяся: у одного
-    тикера строк бывает несколько. Не нашлась строка нужного режима — отказ
-    вслух: молча взятая чужая строка означала бы стоимость шага другого
-    инструмента под именем нашего.
+    Общая для карточки (`parse_security`) и планки (`parse_price_band`):
+    обе читают один ответ, и правило выбора строки у них обязано быть одно.
 
-    :raises IssPayloadError: инструмента нет, режим не найден, нет `MINSTEP`
-        либо шаг цены не положительный.
+    :raises IssUnknownInstrument: таблица пуста либо строки режима нет.
+    :raises IssPayloadError: ответ не JSON или без блока `securities`.
     """
     document = _decode(payload)
     columns, rows = _block(document, "securities")
@@ -737,7 +742,21 @@ def parse_security(payload: bytes, *, secid: str, market: Market) -> InstrumentS
             f"биржа вернула: {seen}. Брать чужой режим нельзя — у него "
             "могут быть свои шаг цены и стоимость шага"
         )
-    row = matching[0]
+    return matching[0]
+
+
+def parse_security(payload: bytes, *, secid: str, market: Market) -> InstrumentSpec:
+    """Карточка инструмента из ответа ISS. Чистая функция — проверяется без сети.
+
+    Строка выбирается **по режиму торгов**, а не первая попавшаяся: у одного
+    тикера строк бывает несколько. Не нашлась строка нужного режима — отказ
+    вслух: молча взятая чужая строка означала бы стоимость шага другого
+    инструмента под именем нашего.
+
+    :raises IssPayloadError: инструмента нет, режим не найден, нет `MINSTEP`
+        либо шаг цены не положительный.
+    """
+    row = _board_row(payload, secid=secid, market=market)
     step = _optional_float(row, "MINSTEP")
     if step is None or not math.isfinite(step) or step <= 0:
         raise IssPayloadError(
@@ -760,6 +779,150 @@ def parse_security(payload: bytes, *, secid: str, market: Market) -> InstrumentS
         # прочитал бы в окне как «карточка помечена None».
         quoted_at=str(row.get("IMTIME") or ""),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class PriceBand:
+    """Планка биржи: коридор цен, в котором биржа примет заявку, — или почему его нет.
+
+    Нужна выходу по концу окна (решение 0067): продажа ставится по `LOWLIMIT`,
+    покупка — по `HIGHLIMIT`. В API брокера границ коридора нет, поэтому они
+    берутся из карточки срочного рынка ISS — того же ответа, что у
+    `securities_url`, строка `BOARDID=RFUD`.
+
+    Значения **сырые**, как их назвала биржа: в пунктах цены, теми же числами,
+    что у свечей. К сетке шага они не подгоняются, и сторона от закрытия свечи
+    здесь не проверяется — это решения исполнителя заявок (`app/`), а не
+    свойство ответа биржи.
+
+    ⚠️ **Своего времени у границ в ISS нет** (`quality/FINDINGS.md`, 04.11.2026):
+    `IMTIME` — момент данных по ГО, а не планки. Поэтому `answered_at` — момент,
+    когда ответ пришёл **к нам**, по нашим часам в МСК. Насколько ISS отстаёт
+    от биржи при расширении коридора посреди дня, не замерено.
+
+    `high` и `low` либо оба числа, либо оба `None`: половина планки заявке
+    не годится, и отдавать её значило бы приглашать вызывающего достроить
+    вторую половину догадкой. Причина в этом случае — в `told`.
+    """
+
+    secid: str
+    #: `HIGHLIMIT` — выше этой цены биржа заявку не примет. `None` — планки нет.
+    high: float | None
+    #: `LOWLIMIT` — ниже этой цены биржа заявку не примет. `None` — планки нет.
+    low: float | None
+    #: Откуда планка либо почему её нет — фразой для журнала. Пустым не бывает.
+    told: str
+    #: Когда пришёл ответ, МСК. `None` — ответа не было вовсе.
+    answered_at: datetime | None = None
+
+    @property
+    def usable(self) -> bool:
+        """Обе границы названы и прошли проверку. Ложь — подавать предел движка."""
+        return self.high is not None and self.low is not None
+
+
+#: Колонки планки и как они называются в словах. Порядок — порядок проверки.
+_BAND_COLUMNS = (("HIGHLIMIT", "верхняя"), ("LOWLIMIT", "нижняя"))
+
+#: Признак «колонки в ответе нет» — отличить от `null` в колонке.
+_MISSING = object()
+
+#: Цепочка обязанностей: звено — «признак негодной границы → слова».
+#: **Порядок — данные**, и он значим: каждое звено вправе полагаться на то,
+#: что предыдущие не сработали (`isfinite` зовётся только у числа, сравнение
+#: с нулём — только у конечного). `bool` отсекается отдельно: в питоне это
+#: `int`, и `true` из ответа иначе стало бы ценой 1.
+#: Строка с цифрами не принимается: биржа отдаёт планку числом JSON, и строка
+#: значит, что ответ уже не тот, по которому писался разбор.
+_BOUND_REFUSALS: tuple[tuple[Callable[[Any], bool], str], ...] = (
+    (lambda raw: raw is _MISSING, "— такой колонки в ответе нет"),
+    (lambda raw: raw is None or raw == "", "пуста"),
+    (
+        lambda raw: isinstance(raw, bool) or not isinstance(raw, int | float),
+        "не число ({raw!r})",
+    ),
+    (lambda raw: not math.isfinite(raw), "не конечное число ({raw!r})"),
+    (lambda raw: raw <= 0, "не больше нуля ({raw!r})"),
+)
+
+
+def _bound(raw: object) -> float | str:
+    """Граница числом — или словами, что с ней не так (`_BOUND_REFUSALS`)."""
+    for refused, words in _BOUND_REFUSALS:
+        if refused(raw):
+            return words.format(raw=raw)
+    # Цепочка уже отсекла всё, что не число; проверка здесь — для типа.
+    return float(raw) if isinstance(raw, int | float) else "не число"
+
+
+def _band_number(value: float) -> str:
+    """Граница для человека: без хвостовых нулей и с запятой, как в окне."""
+    text = f"{value:.5f}".rstrip("0").rstrip(".")
+    return (text or "0").replace(".", ",")
+
+
+def parse_price_band(
+    payload: bytes, *, secid: str, market: Market, answered_at: datetime
+) -> PriceBand:
+    """Планка из карточки ISS. Чистая функция — проверяется без сети.
+
+    Негодная граница — **не исключение**, а планка без чисел с причиной:
+    пусто, ноль, не число, `LOWLIMIT ≥ HIGHLIMIT`. Ответ при этом пришёл,
+    и повторять его бессмысленно — биржа скажет то же самое.
+
+    :param answered_at: когда пришёл ответ; приводится к МСК.
+    :raises IssUnknownInstrument: инструмента или режима торгов нет.
+    :raises IssPayloadError: ответ не JSON или без блока `securities`.
+    :raises ValueError: `answered_at` без часового пояса.
+    """
+    at = ensure_msk(answered_at)
+    row = _board_row(payload, secid=secid, market=market)
+    name = str(row.get("SECID") or secid)
+    refused = f"планка биржи {name} не годится: "
+    bounds: dict[str, float] = {}
+    for column, side in _BAND_COLUMNS:
+        bound = _bound(row.get(column, _MISSING))
+        if isinstance(bound, str):
+            return PriceBand(name, None, None, f"{refused}{side} граница ({column}) {bound}", at)
+        bounds[column] = bound
+    high, low = bounds["HIGHLIMIT"], bounds["LOWLIMIT"]
+    if low >= high:
+        return PriceBand(
+            name, None, None,
+            f"{refused}нижняя граница {_band_number(low)} не ниже верхней "
+            f"{_band_number(high)} (LOWLIMIT ≥ HIGHLIMIT)",
+            at,
+        )
+    told = (
+        f"планка биржи {name} ({row.get('BOARDID')}): от {_band_number(low)} "
+        f"до {_band_number(high)}, ответ ISS в {at:%H:%M:%S} МСК"
+    )
+    return PriceBand(name, high, low, told, at)
+
+
+def ask_price_band(
+    client: IssClient,
+    secid: str,
+    *,
+    market: Market,
+    clock: Callable[[], datetime] | None = None,
+) -> PriceBand:
+    """Спросить планку у биржи. Ошибок наружу не отдаёт — только слова.
+
+    Не ответившая биржа, неизвестный тикер и битый ответ — такие же законные
+    исходы, как числа: у вызывающего на все один ход (подать предел движка)
+    и одна обязанность — сказать, почему (правило 13).
+
+    Сколько попыток и какой таймаут — решает `client`; для заявки его собирает
+    `IssClient.single_try`.
+
+    :param clock: часы МСК для `answered_at`; `None` — настоящие.
+    """
+    now = clock if clock is not None else (lambda: datetime.now(MSK))
+    try:
+        return client.price_band(secid, market=market, clock=now)
+    except IssError as trouble:
+        return PriceBand(secid, None, None, f"биржа не дала планку {secid}: {trouble}")
 
 
 def _went_forward(previous_first: datetime | None, first_time: datetime) -> bool:
@@ -900,6 +1063,24 @@ class IssClient:
     def stopped(self) -> bool:
         return self._stopped
 
+    def single_try(self, *, timeout: float) -> IssClient:
+        """Клиент **той же сети** на один запрос: одна попытка, свой таймаут, без пауз.
+
+        Для того, что ждёт заявка (планка, решение 0067): четыре попытки
+        по 40 секунд с паузами 1, 3, 5 — до ~169 секунд, а ответ нужен
+        за секунды. Транспорт тот же самый, а не новый: подставная сеть,
+        заданная фасаду, обязана действовать и здесь — иначе проверка
+        ушла бы в настоящий интернет.
+
+        :raises ValueError: таймаут не положительный или не конечный.
+        """
+        if not (math.isfinite(timeout) and timeout > 0):
+            raise ValueError(f"таймаут запроса — положительное число секунд, а не {timeout!r}")
+        return IssClient(
+            self._transport, attempts=1, pause=0, timeout=timeout,
+            sleep=self._sleep, base=self._base,
+        )
+
     def _check_stop(self, secid: str) -> None:
         if self._stopped:
             raise IssStopped(
@@ -929,9 +1110,12 @@ class IssClient:
                 result.retries += 1
                 if attempt + 1 < self._attempts:
                     self._sleep(1 + attempt * 2)
-        raise IssTransportError(
-            f"не загрузилось за {self._attempts} попыток: {last}"
-        ) from last
+        tries = (
+            "с единственной попытки"
+            if self._attempts == 1
+            else f"за {self._attempts} попыток"
+        )
+        raise IssTransportError(f"не загрузилось {tries}: {last}") from last
 
     def candles(
         self,
@@ -1109,5 +1293,24 @@ class IssClient:
         return self._fetch(
             securities_url(secid, market=market, base=self._base),
             lambda body: parse_security(body, secid=secid, market=market),
+            FetchResult(),
+        )
+
+    def price_band(
+        self, secid: str, *, market: Market, clock: Callable[[], datetime]
+    ) -> PriceBand:
+        """Планка из карточки инструмента — тот же адрес, что у `security`.
+
+        Политика повторов — этого клиента; для заявки его собирает
+        `single_try`. Ошибки сети и ответа — исключениями; словами их
+        называет `ask_price_band`.
+
+        :param clock: часы МСК; читаются, когда ответ уже пришёл.
+        """
+        return self._fetch(
+            securities_url(secid, market=market, base=self._base),
+            lambda body: parse_price_band(
+                body, secid=secid, market=market, answered_at=clock()
+            ),
             FetchResult(),
         )

@@ -9,8 +9,10 @@
 
 Источник каждого кода и поля — снимок документации `.docs/broker-api/`:
 11 (статус по ключу), 12 (отмена), 13 (создание), 15 (список заявок),
-16 (список сделок), 24 (поток статусов). С сайтом не сверено, **живьём
-не проверено ни одно поле**: токена с правами торговли в разработке нет.
+16 (список сделок), 24 (поток статусов). **Живьём 13.11.2026** проверены
+подача, отмена, статус по ключу (там `data` — объект, а не массив снимка)
+и список заявок (`side` и `orderStatus` числами, даты с миллисекундами);
+список сделок и поток статусов живьём не сверялись.
 
 Правила разбора — общие для слоя (`broker/parsing.py`) плюс два своих.
 
@@ -62,9 +64,11 @@ class OrderType(enum.Enum):
     CONDITIONAL = "5"
 
 
-#: Что программа вправе подать. Права торгового токена (`broker-api/00`)
-#: называют рыночные и лимитные заявки; условная описана в 13, но годится ли
-#: она нашему токену, выясняется только на живом счёте (план §2.3, Р1, Р2).
+#: Что программа вправе подать **командой `NewOrder`**: рыночная и лимитная.
+#: Условная (`5`) этой командой не подаётся никогда — у неё свои поля
+#: и своя команда `ConditionalTake`, где тип зашит, а не выбирается.
+#: Торговый токен условную принимает: живая проба 13.11.2026 на SPBFUT
+#: (`broker-api/13`, «Пробы 13.11.2026», `D-196`).
 SUBMITTABLE_TYPES: Final[frozenset[OrderType]] = frozenset(
     {OrderType.MARKET, OrderType.LIMIT}
 )
@@ -184,6 +188,11 @@ ORDER_ID_BY_CLIENT: Final[str] = "1"
 #: документация не называет; любое другое — исход неизвестен.
 ACCEPTED_STATUS: Final[str] = "OK"
 
+#: Условные заявки в **своём** перечне типов списка (15): стоп-лимит `4`,
+#: тейк-профит `5` (порождает лимитную), стоп-лосс `6`, тейк-профит и
+#: стоп-лосс `7`, тейк-профит `11`. Их уровень — цена включения, а не `price`.
+LISTED_CONDITIONAL_TYPES: Final[frozenset[int]] = frozenset({4, 5, 6, 7, 11})
+
 #: Размер страницы списков (15, 16): умолчание и потолок документации.
 DEFAULT_PAGE_SIZE: Final[int] = 50
 MAX_PAGE_SIZE: Final[int] = 100
@@ -277,6 +286,101 @@ _NEW_ORDER_CHECKS: Final[tuple[tuple[Callable[[NewOrder], bool], str], ...]] = (
 )
 
 
+#: Поля условной заявки (13), которые программа шлёт всегда одними:
+#: отступ и спред — **в процентах** (`offsetType`/`spreadType` `1`),
+#: исполнение порождённой заявки — **лимитное** (`executionTakeProfitType` `2`,
+#: цена = срабатывание ∓ спред). Ровно так прошли обе живые пробы 13.11.2026
+#: (лонг и шорт, `broker-api/13`). Числами, а не строками, — как в пробе:
+#: другой записи сервер не видел.
+CONDITIONAL_PERCENT: Final[int] = 1
+CONDITIONAL_LIMIT_EXECUTION: Final[int] = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ConditionalTake:
+    """Условная заявка (13, `orderType` `5`) — скользящий тейк, который ведёт брокер.
+
+    Что она делает, установлено живыми пробами 13.11.2026 (`broker-api/13`):
+    до сделки по `take_price` и дальше стоит со статусом `0`; после неё брокер
+    считает лучшую цену и при откате от неё на `offset` % подаёт лимитную
+    заявку по «срабатывание ∓ `spread` %». Исполнение приходит **по тому же
+    ключу** (`orderStatus` `2`, `executionType` `11`, `averagePrice`).
+    Снимается, как любая, отменой (12).
+
+    Ключ сюда не входит — его даёт сессия, как у `NewOrder`. `timeInForce`
+    не шлётся: страница 13 определяет его только рыночной, лимитной
+    и алгоритмической, и проба прошла без него.
+    """
+
+    side: OrderSide
+    quantity: int
+    ticker: str
+    class_code: str
+    #: Цена включения: брокер начинает вести уровень после сделки по ней.
+    take_price: float
+    #: Отступ уровня от лучшей цены после включения, в процентах.
+    offset: float
+    #: Защитный спред цены порождённой лимитной заявки, в процентах.
+    spread: float
+
+    def __post_init__(self) -> None:
+        for broken, why in _CONDITIONAL_CHECKS:
+            if broken(self):
+                raise ValueError(f"условная заявка не годится к подаче: {why}")
+
+    @property
+    def order_type(self) -> OrderType:
+        """Тип заявки у брокера — всегда условная; другим эта команда не бывает."""
+        return OrderType.CONDITIONAL
+
+    def body(self, key: UUID) -> dict[str, object]:
+        """Тело `POST` создания (13) — поле в поле как у живой пробы 13.11.2026."""
+        return {
+            "clientOrderId": str(key),
+            "side": self.side.value,
+            "orderType": OrderType.CONDITIONAL.value,
+            "orderQuantity": self.quantity,
+            "ticker": self.ticker,
+            "classCode": self.class_code,
+            "takePrice": self.take_price,
+            "offset": self.offset,
+            "offsetType": CONDITIONAL_PERCENT,
+            "executionTakeProfitType": CONDITIONAL_LIMIT_EXECUTION,
+            "spread": self.spread,
+            "spreadType": CONDITIONAL_PERCENT,
+        }
+
+
+def _not_positive(value: object) -> bool:
+    return (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value <= 0
+    )
+
+
+#: Проверки условной заявки — та же цепочка «условие → отказ», что у `NewOrder`.
+_CONDITIONAL_CHECKS: Final[
+    tuple[tuple[Callable[[ConditionalTake], bool], str], ...]
+] = (
+    (
+        lambda order: isinstance(order.quantity, bool)
+        or not isinstance(order.quantity, int)
+        or order.quantity < 1,
+        "количество — целое число не меньше единицы",
+    ),
+    (lambda order: _not_text(order.ticker), "тикер пуст или с пробелами по краям"),
+    (lambda order: _not_text(order.class_code), "код класса пуст или с пробелами по краям"),
+    (lambda order: _not_positive(order.take_price), "цена включения — число больше нуля"),
+    (lambda order: _not_positive(order.offset), "отступ — процент больше нуля"),
+    (lambda order: _not_positive(order.spread), "защитный спред — процент больше нуля"),
+)
+
+#: Заявка, которую создаёт пишущий путь (13): рыночная/лимитная или условная.
+PlacedOrder = NewOrder | ConditionalTake
+
+
 @dataclass(frozen=True, slots=True)
 class CancelOrder:
     """Отмена заявки (12) по **нашему** ключу исходной заявки.
@@ -298,7 +402,7 @@ class CancelOrder:
 
 
 #: Команда, меняющая счёт: то, что пишется в журнал до отправки.
-OrderCommand = NewOrder | CancelOrder
+OrderCommand = NewOrder | ConditionalTake | CancelOrder
 
 #: Запись журнала команд, которую передаёт `app/` (план §11, контракт С5).
 #: Вызывается с ключом и командой **до** отправки; успешный возврат значит
@@ -432,6 +536,24 @@ class ListedOrder:
     ordered_at: datetime | None
     updated_at: datetime | None
 
+    @property
+    def conditional(self) -> bool:
+        """Условная заявка по перечню страницы 15 (`LISTED_CONDITIONAL_TYPES`)."""
+        return self.order_type in LISTED_CONDITIONAL_TYPES
+
+    @property
+    def level(self) -> float | None:
+        """Цена, по которой заявку узнают и показывают.
+
+        У условной это цена включения (`takePrice`, у стопа `stopPrice`):
+        своей цены до срабатывания у неё нет — статус по ключу (11) 16.11.2026
+        отдал у живой условной `price` 0. Пустая или нулевая `price` у любой
+        заявки — тоже не цена. У прочих — `price` как есть.
+        """
+        if self.conditional or not self.price:
+            return self.take_price or self.stop_price or None
+        return self.price
+
 
 @dataclass(frozen=True, slots=True)
 class TradeRecord:
@@ -472,7 +594,15 @@ class TradesPage:
 
 
 def _utc_text(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    """Момент в UTC **с миллисекундами**: `2026-11-12T19:00:00.000Z`.
+
+    Живой список заявок 13.11.2026 (`B-095`) требует ровно
+    `yyyy-MM-dd'T'HH:mm:ss.SSSX`: без миллисекунд — 422 `INVALID_FORMAT`.
+    `isoformat()` без `timespec` их опускает при нулевых микросекундах
+    и пишет шесть знаков при ненулевых — обе формы брокер отвергает.
+    """
+    utc = moment.astimezone(timezone.utc)
+    return utc.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _check_window(start: datetime | None, end: datetime | None, page: int, size: int) -> None:
@@ -647,11 +777,30 @@ def _mapping(value: object, what: str) -> Mapping[str, object]:
     return value
 
 
+def _execution_kind(source: Mapping[str, object]) -> ExecutionType:
+    """`executionType`; у условной без него и без исполнения — смена статуса (`12`).
+
+    Кадр срабатывания условной заявки (`D-196`, проба Б 13.11.2026 18:35:12)
+    брокер шлёт **без** `executionType`: `orderStatus` `0`, `orderType` `5`,
+    новый `orderId`, `price` — предел порождённой лимитной, `lastQuantity` 0.
+    Отказ разбора рвал поток, и кадр исполнения, пришедший следом в ту же
+    миллисекунду, терялся. Послабление — только этому кадру: у прочих заявок
+    и у кадра с исполнением (`lastQuantity` > 0) без кода — отказ, как прежде.
+    """
+    if (
+        pick(source, ("executionType",)) is None
+        and text(pick(source, ("orderType",))) == OrderType.CONDITIONAL.value
+        and not _whole(source, "lastQuantity")
+    ):
+        return ExecutionType.ORDER_STATUS
+    return _required_code(source, "executionType", ExecutionType)
+
+
 def parse_report(data: object) -> OrderReport:
     """Сообщение о заявке (`data` в 11 и 24). Отказ — `UnexpectedAnswer`."""
     source = _mapping(data, "сообщение о заявке")
     status = _required_code(source, "orderStatus", OrderStatus)
-    kind = _required_code(source, "executionType", ExecutionType)
+    kind = _execution_kind(source)
     execution_id = text(pick(source, ("executionId",)))
     if kind in EXECUTIONS and execution_id is None:
         raise _unreadable(f"исполнение (executionType {kind.value}) без executionId")
@@ -690,11 +839,31 @@ def parse_order_event(message: object) -> OrderEvent:
 
 
 def parse_order_state(payload: object) -> OrderState:
-    """Ответ статуса по ключу (11). Пустой `data` — отказ: «нет заявки» — это 404."""
+    """Ответ статуса по ключу (11). `data` — объект или массив; иначе отказ.
+
+    ⚠️ **Живой сервер 13.11.2026 шлёт `data` объектом** — одним, последним
+    сообщением о заявке, в той же форме, что событие потока (24). Снимок
+    сайта (11) обещает массив `object[]`. Принимаются оба вида.
+
+    До этой правки объект отвергался текстом «нет сообщений о заявке (data)»,
+    и ровно этот текст 13.11 в 09:55 читался как «брокер прислал 200 без
+    `data`» (`B-094`): тем же текстом разбор отвечал и на отсутствие поля,
+    и на объект. Теперь у трёх случаев три разных технических текста.
+
+    Отсутствие `data` остаётся отказом, а не «заявка жива, отчётов нет»:
+    страница 11 называет `data` обязательным, а «заявки нет» — это 404
+    `NOT_FOUND` (`order_status` → `None`). Пустой массив — тот же отказ.
+    """
     source = _mapping(payload, "ответ статуса заявки")
     data = source.get("data")
-    if not isinstance(data, list) or not data:
-        raise _unreadable("в ответе статуса нет сообщений о заявке (data)")
+    if data is None:
+        raise _unreadable("в ответе статуса нет поля data")
+    if isinstance(data, Mapping):
+        data = [data]
+    if not isinstance(data, list):
+        raise _unreadable(f"data ответа статуса не объект и не массив, {_shown(data)}")
+    if not data:
+        raise _unreadable("в ответе статуса пустой массив data")
     return OrderState(
         client_order_id=_key(pick(source, ("clientOrderId",))),
         original_client_order_id=_key(pick(source, ("originalClientOrderId",))),
@@ -720,16 +889,40 @@ def acceptance_doubt(payload: object, key: UUID) -> str | None:
     return None
 
 
+#: Где у ответа списка лежит массив строк — по порядку доверия. `records` —
+#: снимок (15, 16); `content` и `data` — имена, под которыми страницу отдают
+#: соседние сервисы брокера. Живой ответ 13.11.2026 ключ не записал (`B-095`),
+#: поэтому читается любой из трёх, а ни одного — отказ, не пустая страница.
+_ROWS_KEYS: Final[tuple[str, ...]] = ("records", "content", "data")
+
+
 def _records(payload: object) -> tuple[list[Mapping[str, object]], int | None, int | None]:
     source = _mapping(payload, "ответ списка")
-    records = source.get("records")
-    if not isinstance(records, list):
-        raise _unreadable("в ответе списка нет массива records")
-    return (
-        [_mapping(item, "строка списка") for item in records],
-        _whole(source, "totalRecords"),
-        _whole(source, "totalPages"),
+    rows = next(
+        (found for key in _ROWS_KEYS if isinstance(found := source.get(key), list)), None
     )
+    if rows is None:
+        raise _unreadable(f"в ответе списка нет массива ни под одним из {', '.join(_ROWS_KEYS)}")
+    total = _whole(source, "totalRecords")
+    if total is None:
+        total = _whole(source, "totalElements")
+    return [_mapping(item, "строка списка") for item in rows], total, _whole(source, "totalPages")
+
+
+def _exact_whole(source: Mapping[str, object], field: str) -> int | None:
+    """Целое без потери разрядов: номер заявки биржи — 19 цифр.
+
+    `_whole` идёт через `float`, а у него 15–16 значащих цифр: живой
+    `orderNum` вида `1984994564062258802` (13.11.2026) округлился бы
+    до чужого номера молча. Целое и строка цифр читаются точно, прочее —
+    общим путём `_whole` с его отказами.
+    """
+    raw = pick(source, (field,))
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return _whole(source, field)
 
 
 def parse_orders_page(payload: object) -> OrdersPage:
@@ -738,7 +931,7 @@ def parse_orders_page(payload: object) -> OrdersPage:
     records = tuple(
         ListedOrder(
             status=_required_code(row, "orderStatus", ListedOrderStatus),
-            order_num=_whole(row, "orderNum"),
+            order_num=_exact_whole(row, "orderNum"),
             exchange_order_id=text(pick(row, ("orderId",))),
             ticker=text(pick(row, ("ticker",))),
             class_code=text(pick(row, ("classCode",))),
@@ -765,8 +958,8 @@ def parse_trades_page(payload: object) -> TradesPage:
     rows, total_records, total_pages = _records(payload)
     records = tuple(
         TradeRecord(
-            trade_num=_whole(row, "tradeNum"),
-            order_num=_whole(row, "orderNum"),
+            trade_num=_exact_whole(row, "tradeNum"),
+            order_num=_exact_whole(row, "orderNum"),
             ticker=text(pick(row, ("ticker",))),
             class_code=text(pick(row, ("classCode",))),
             side=_code(row, "side", OrderSide),

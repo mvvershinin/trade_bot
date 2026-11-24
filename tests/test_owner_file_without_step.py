@@ -66,7 +66,7 @@ MARKET_WAIT = "пока выход по концу окна идёт по рын
 #: Ключи, которых в файле владельца не было.
 ABSENT = (
     "minute_order", "minute_bar_limit", "time_exit_order",
-    "time_exit_limit_steps", "time_exit_wait_bars",
+    "time_exit_limit_pct", "time_exit_wait_bars",
 )
 
 

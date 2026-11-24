@@ -105,11 +105,11 @@ def _enum_cells() -> list[Cell]:
 
 
 def _bool_cells() -> list[Cell]:
-    """Пять булевых: верный, чужой тип, целое `1` (похоже, но не булево)."""
+    """Шесть булевых: верный, чужой тип, целое `1` (похоже, но не булево)."""
     cells: list[Cell] = []
     for name in (
         "close_on_time_end", "trade_in_weekend", "stop_after_take_profit",
-        "take_profit", "trailing_take_profit",
+        "stop_after_loss", "take_profit", "trailing_take_profit",
     ):
         cells.append(Cell(f"{name}=верный тип", {name: False}, None))
         cells.append(Cell(f"{name}=чужой тип", {name: "да"}, TypeError, GOT))

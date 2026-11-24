@@ -75,8 +75,12 @@ def body_details(body: str) -> str:
     поперёк значения оставила бы половину токена, которую ни один образец
     `redaction` уже не узнает, — а требование ТЗ §4.1 говорит «ни целиком,
     ни частично».
+
+    Через `quotable`, а не один `scrub` (13.11.2026): `scrub` узнаёт токен только
+    целиком, а тело с 13.11 пишется в WARNING — кусок токена в нём (эхо
+    `Invalid refresh token …`) снимает тело целиком, как и описание.
     """
-    return scrub(body)[:MAX_DETAILS]
+    return quotable(body, MAX_DETAILS)
 
 
 class BrokerError(Exception):

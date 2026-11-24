@@ -89,8 +89,20 @@ DIFFERENT = Settings(
     # Выход по концу окна (Ф3 задачи З8). Предельная форма — требование
     # алгоритма и умолчание; стережётся отдельно (`_COVERED_APART`).
     time_exit_order=TimeExitKind.LIMIT,
-    time_exit_limit_steps=7,
+    time_exit_limit_pct=3.5,
     time_exit_wait_bars=3,
+    # Р-10: «Заходить заново при обрыве связи», не умолчание.
+    reenter_after_disconnect=True,
+    # Ожидания боевого исполнителя (вкладка «Бой»).
+    live_stale_after_sec=90,
+    live_event_wait_sec=5,
+    live_fill_wait_sec=45,
+    live_cancel_wait_sec=20,
+    live_position_settle_sec=2.5,
+    live_reconnect_pauses_sec=(2, 4, 8),
+    live_fok_pct=3.5,
+    live_band_wait_sec=12,
+    live_trailing_spread_pct=0.25,
     log_directory="/tmp/терминал-логи",
     # Оба вида отметки сразу: «не торгуем» на будний день и «торгуем»
     # на субботу. Один вид проверял бы половину: перевод «да/нет» в файл
@@ -511,7 +523,8 @@ def test_the_written_file_is_readable_text() -> None:
 #:
 #: ⚠️ Поля, заведённые **после** снимка, дописываются сюда с умолчанием
 #: (`strategy_id` — 08.09.2026, `minute_order` и `minute_bar_limit` —
-#: 03.10.2026). Иначе проверка
+#: 03.10.2026, шесть ожиданий боевого исполнителя `live_*` — 01.11.2026).
+#: Иначе проверка
 #: «перезапись не портит файл»
 #: падала бы на каждом новом поле и сообщала бы не о формате, а о том, что
 #: полей стало больше, — а это и так видно по другим сторожам.
@@ -538,11 +551,27 @@ OWNER_FILE = """{
     "free_funds_reserve_pct": 30.0,
     "history_depth_days": 90,
     "instrument": "MXU6",
+    "live_band_wait_sec": 5,
+    "live_cancel_wait_sec": 10,
+    "live_event_wait_sec": 10,
+    "live_fill_wait_sec": 30,
+    "live_fok_pct": 2.0,
+    "live_position_settle_sec": 1.0,
+    "live_reconnect_pauses_sec": [
+      1,
+      2,
+      5,
+      10,
+      30
+    ],
+    "live_stale_after_sec": 60,
+    "live_trailing_spread_pct": 0.1,
     "log_directory": "",
     "minute_bar_limit": 5,
     "minute_order": "near_first",
     "on_price_equals_average": "skip",
     "price_step": 1.0,
+    "reenter_after_disconnect": false,
     "reversal_moment": "same_bar",
     "ruble_per_point": 1.0,
     "ruble_per_point_source": "биржей — карточка MXU6",
@@ -573,8 +602,11 @@ def _migrated(text: str) -> str:
     """Файл владельца в нынешнем виде: так его запишет «ОК» после чтения.
 
     Поля убранного алгоритма уходят, имя алгоритма и форма выхода — те,
-    что выставлены при чтении (решение 0063). Строками, а не через `json`:
-    проверка ниже сверяет файл знак в знак.
+    что выставлены при чтении (решение 0063). Отступ предельной цены —
+    процентом по умолчанию вместо шагов (решение 0067, `REPLACED_KEYS`).
+    Пауза сверки позиции — старое умолчание 1,0 поднято до 30 (B-111,
+    `RAISED_DEFAULTS`).
+    Строками, а не через `json`: проверка ниже сверяет файл знак в знак.
     """
     gone = ('"confirm_bars"', '"filter_enabled"', '"on_price_equals_average"',
             '"threshold_percent"')
@@ -583,6 +615,8 @@ def _migrated(text: str) -> str:
         "\n".join(lines)
         .replace('"strategy_id": "ema_reverse"', '"strategy_id": "ma_reverse_always"')
         .replace('"time_exit_order": "market"', '"time_exit_order": "limit"')
+        .replace('"time_exit_limit_steps": 10', '"time_exit_limit_pct": 2.0')
+        .replace('"live_position_settle_sec": 1.0', '"live_position_settle_sec": 30.0')
     )
 
 
@@ -934,3 +968,38 @@ def test_a_file_without_the_minute_bar_limit_is_read_and_left_as_it_is(
     assert read.values.minute_bar_limit is MinuteBarLimit.FIVE
     assert any(f"«{FIELD_CAPTIONS['minute_bar_limit']}»" in line for line in read.notes), read.notes
     assert store.path.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.parametrize(
+    ("saved", "read", "said"),
+    [
+        pytest.param(1.0, 30.0, 1, id="old-default-raised"),
+        pytest.param(3.0, 3.0, 0, id="chosen-kept"),
+        pytest.param(0.5, 0.5, 0, id="chosen-below-old-default-kept"),
+        pytest.param(30.0, 30.0, 0, id="new-default-kept"),
+    ],
+)
+def test_the_old_default_settle_pause_is_raised_and_a_chosen_one_is_kept(
+    tmp_path: pathlib.Path, saved: float, read: float, said: int
+) -> None:
+    """Стережёт B-111: сохранённое старое умолчание паузы сверки 1,0 читается как 30.
+
+    У заказчика в файле лежит 1,0 — умолчание прежних сборок, которого он
+    не выбирал; при нём портфель, отставший от потока сделок, останавливал
+    робота на перевороте (решение владельца 20.11.2026: 30 с). Любое другое
+    сохранённое значение — выбор человека, и оно не трогается. Подъём
+    не молчит: строка в заметках чтения. Файл при чтении не переписывается.
+    """
+    path = tmp_path / SETTINGS_FILE_NAME
+    store = SettingsStore(tmp_path)
+    assert store.save(dataclasses.replace(Settings(), live_position_settle_sec=saved)) == ""
+    body = path.read_text(encoding="utf-8")
+    assert f'"live_position_settle_sec": {saved!r}' in body, "в файл записано не то число"
+
+    loaded = SettingsStore(tmp_path).load()
+
+    assert loaded.values.live_position_settle_sec == read
+    assert loaded.troubles == (), loaded.troubles
+    raised = [note for note in loaded.notes if "прежнее умолчание" in note]
+    assert len(raised) == said, loaded.notes
+    assert path.read_text(encoding="utf-8") == body, "файл переписан при чтении"

@@ -53,6 +53,7 @@ from engine import (
     Mode,
     OrderAction,
     OrderRequest,
+    PriceSeen,
     Refusal,
     Reversal,
     Side,
@@ -422,32 +423,24 @@ def test_an_executor_that_never_stops_talking_halts_the_robot() -> None:
     и потому добавляют круги — порог выбран с запасом и на них
     (`engine/runner.py::_MAX_ROUNDS`).
 
-    ⚠️ Сделка здесь **сопоставляется** со своей заявкой и отвергается
-    по содержанию — сторона другая. Такая сделка заявку в полёте не гасит
-    и робота не останавливает, поэтому поток и получается бесконечным.
-    Сделка вообще без заявки остановила бы движок на первом же круге,
-    и до предохранителя дело бы не дошло.
+    ⚠️ Бесконечный поток здесь — **наблюдения цены**, а не сделки. Раньше
+    это была сделка, сопоставленная со своей заявкой и отвергнутая
+    по содержанию (сторона другая): она робота не останавливала. С решения
+    0066 (Р6) такая сделка — частичное или чужое исполнение — останавливает
+    робота на первом же круге (`engine/pipeline.py::apply_fill`), и до
+    предохранителя дело бы не дошло. Наблюдение цены без позиции не меняет
+    ничего и не останавливает ничего — поток из них и есть «исполнитель
+    не замолкает» в чистом виде.
     """
-    entry = OrderRequest(
-        action=OrderAction.OPEN, side=Side.LONG, volume=1.0,
-        submitted_at=bar(10, 5).closes_at, reason="вход", order_id="open:long:тест",
-    )
-
     class Endless:
         async def submit(self, order: OrderRequest) -> None:
             return None
 
-        async def fills_at(self, market_candle) -> list[Fill]:
-            return [Fill(
-                action=OrderAction.OPEN, side=Side.SHORT, volume=1.0, price=PRICE,
-                at=market_candle.time, order_id=entry.order_id,
-            )]
+        async def fills_at(self, market_candle) -> list[PriceSeen]:
+            return [PriceSeen(at=market_candle.time, price=PRICE)]
 
     lines: list = []
-    engine = Engine(
-        ScriptedStrategy([]), WORKING,
-        state=EngineState(pending=(entry,)), journal=lines.append,
-    )
+    engine = Engine(ScriptedStrategy([]), WORKING, journal=lines.append)
     asyncio.run(engine.on_market_candle(candle(10, 10, close=PRICE), Endless()))
     assert engine.halted
     assert "не сошёлся" in engine.halted
@@ -1637,16 +1630,40 @@ TRAILING = WORKING.replace(
 
 
 def test_below_the_threshold_the_trailing_take_has_no_level_at_all() -> None:
-    """Пока прибыль меньше порога, позицию держит переворот по средней.
+    """Пока прибыль меньше порога, уровня выхода нет — у брокера стоит условная.
 
-    Уровня нет **вовсе** — это не «уровень далеко». Сторожить нечего,
-    и заявка не подаётся.
+    Уровня выхода нет **вовсе** — это не «уровень далеко». Единственная
+    заявка — условная у брокера (`D-196`): цена включения = вход + порог,
+    к сетке шага от рынка, отступ — из плана позиции. Стережёт и то, что
+    до порога движок не подаёт обычного вооружения: прогон его исполнил бы.
     """
     entered = unarmed(plan=TRAILING.plan().initial(PRICE, 1))
     outcome = run(EngineState(position=entered), settings=TRAILING, close=PRICE * 1.004)
-    assert outcome.orders == ()
+    assert [(o.action, o.price, o.trail_offset) for o in outcome.orders] == [
+        (OrderAction.ARM_TAKE_PROFIT, fixed_level(PRICE, 1, 0.5, TRAILING.price_step), 0.2)
+    ]
     assert outcome.state.position is not None
     assert outcome.state.position.take_profit is None
+
+
+def test_a_signal_exit_below_the_threshold_cancels_the_conditional_first() -> None:
+    """(б) До порога условная у брокера жива — выход по сигналу сначала снимает её (`D-196`).
+
+    Стережёт: принятая условная делает позицию «вооружённой», и выход по
+    обратному сигналу подаёт снятие **раньше** заявки на выход. Без снятия
+    условная пережила бы позицию и сработала бы на пустом счёте — шорт без
+    сигнала.
+    """
+    entered = unarmed(plan=TRAILING.plan().initial(PRICE, 1))
+    placed = run(EngineState(position=entered), settings=TRAILING, close=PRICE * 1.004)
+    assert placed.state.position is not None
+    assert placed.state.position.take.activation is not None, "условная не принята движком"
+    outcome = run(
+        placed.state, settings=TRAILING, intent=Intent.SHORT, close=PRICE * 0.999,
+        when=(10, 15),
+    )
+    assert actions(outcome) == [OrderAction.CANCEL_TAKE_PROFIT, OrderAction.CLOSE]
+    assert outcome.orders[0].target_id == take_order_id(entered)
 
 
 def test_at_the_threshold_the_level_appears_at_the_offset_from_the_best_price() -> None:
@@ -2520,5 +2537,6 @@ def test_a_repeated_candle_does_not_fill_an_order_at_its_own_open() -> None:
 
     following = replace(candle(10, 15, close=PRICE), open=PRICE)
     fills = asyncio.run(executor.fills_at(following))
-    assert [fill.price for fill in fills] == [PRICE]
-    assert fills[0].at == following.time, "время сделки — начало свечи исполнения"
+    (deal,) = fills
+    assert isinstance(deal, Fill) and deal.price == PRICE
+    assert deal.at == following.time, "время сделки — начало свечи исполнения"
